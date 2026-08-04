@@ -1,0 +1,37 @@
+query L2ProductionEvents(
+  $limit: Int!
+  $offset: Int!
+  $where: logs_l2_production_events_bool_exp
+  $order_by: [logs_l2_production_events_order_by!]
+) {
+  logs_l2_production_events(
+    limit: $limit
+    offset: $offset
+    where: $where
+    order_by: $order_by
+  ) {
+    ...L2ProductionEventFragment
+  }
+  logs_l2_production_events_aggregate(where: $where) {
+    aggregate {
+      count
+    }
+  }
+}
+
+fragment L2ProductionEventFragment on logs_l2_production_events {
+  event_time
+  event_type
+  job_id
+  work_order_id
+  equipment_id
+  code
+  parent_code
+  gtin
+  node_code
+  reason
+  line_number
+  aggregation_level
+  trace_id
+  event_id
+}

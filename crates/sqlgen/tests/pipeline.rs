@@ -21,6 +21,8 @@ fn col(name: &str, pg_type: &str, nullable: bool) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: pg_type.to_string(),
+        pg_typmod: -1,
+        native_type: None,
         nullable,
         has_default: false,
     }
@@ -33,6 +35,7 @@ fn fixture_catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "author".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4", false),
                 col("name", "text", false),
@@ -40,6 +43,7 @@ fn fixture_catalog() -> Catalog {
                 col("secret", "text", true),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![],
         },
     );
@@ -48,6 +52,7 @@ fn fixture_catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "article".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
             columns: vec![
                 col("id", "int4", false),
                 col("title", "text", false),
@@ -55,6 +60,7 @@ fn fixture_catalog() -> Catalog {
                 col("published", "bool", false),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "article_author_id_fkey".into(),
                 column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),
@@ -72,10 +78,7 @@ fn fixture_catalog() -> Catalog {
 fn user_session() -> Session {
     Session {
         role: "user".into(),
-        vars: std::collections::HashMap::from([(
-            "x-donat-user-id".to_string(),
-            "1".to_string(),
-        )]),
+        vars: std::collections::HashMap::from([("x-donat-user-id".to_string(), "1".to_string())]),
         backend_request: false,
     }
 }
@@ -133,9 +136,7 @@ fn select_with_where_order_limit() {
 
 #[test]
 fn object_relationship() {
-    insta::assert_snapshot!(plan_sql(
-        "query { article { id author { name } } }"
-    ));
+    insta::assert_snapshot!(plan_sql("query { article { id author { name } } }"));
 }
 
 #[test]
@@ -208,23 +209,41 @@ fn distinct_on_columns_lead_order_by() {
 fn string_literals_are_escaped() {
     // sqlgen inlines literals; quotes must be doubled, never raw.
     let sql = plan_sql(r#"query { article(where: { title: { _eq: "O'Brien" } }) { id } }"#);
-    assert!(sql.contains("('O''Brien')::\"text\""), "escaped literal missing in: {sql}");
-    assert!(!sql.contains("'O'Brien'"), "raw unescaped literal leaked into: {sql}");
+    assert!(
+        sql.contains("('O''Brien')::\"text\""),
+        "escaped literal missing in: {sql}"
+    );
+    assert!(
+        !sql.contains("'O'Brien'"),
+        "raw unescaped literal leaked into: {sql}"
+    );
 }
 
 #[test]
 fn injection_payload_in_where_eq_is_escaped() {
     // Classic boolean-injection payload through a string filter.
     let sql = plan_sql(r#"query { article(where: { title: { _eq: "x' OR '1'='1" } }) { id } }"#);
-    assert!(sql.contains("'x'' OR ''1''=''1'"), "payload not doubled in: {sql}");
-    assert!(!sql.contains("'x' OR '1'='1'"), "raw breakout leaked into: {sql}");
+    assert!(
+        sql.contains("'x'' OR ''1''=''1'"),
+        "payload not doubled in: {sql}"
+    );
+    assert!(
+        !sql.contains("'x' OR '1'='1'"),
+        "raw breakout leaked into: {sql}"
+    );
 }
 
 #[test]
 fn injection_payload_in_like_pattern_is_escaped() {
     let sql = plan_sql(r#"query { article(where: { title: { _like: "%' OR '1'='1%" } }) { id } }"#);
-    assert!(sql.contains("'%'' OR ''1''=''1%'"), "payload not doubled in: {sql}");
-    assert!(!sql.contains("'%' OR '1'='1%'"), "raw breakout leaked into: {sql}");
+    assert!(
+        sql.contains("'%'' OR ''1''=''1%'"),
+        "payload not doubled in: {sql}"
+    );
+    assert!(
+        !sql.contains("'%' OR '1'='1%'"),
+        "raw breakout leaked into: {sql}"
+    );
 }
 
 #[test]
@@ -258,8 +277,14 @@ fn injection_payload_in_session_var_is_escaped() {
         backend_request: false,
     };
     let sql = plan_sql_with("query { article { id } }", &session);
-    assert!(sql.contains("'1'' OR ''1''=''1'"), "session var not doubled in: {sql}");
-    assert!(!sql.contains("'1' OR '1'='1'"), "raw breakout leaked into: {sql}");
+    assert!(
+        sql.contains("'1'' OR ''1''=''1'"),
+        "session var not doubled in: {sql}"
+    );
+    assert!(
+        !sql.contains("'1' OR '1'='1'"),
+        "raw breakout leaked into: {sql}"
+    );
 }
 
 #[test]

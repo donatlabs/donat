@@ -1,0 +1,40 @@
+table:
+  name: order_operations
+  schema: public
+select_permissions:
+  - role: customer
+    permission:
+      columns:
+        - order_id
+        - customer_id
+        - order_status
+        - payment_status
+        - fulfilment_status
+        - total_minor
+        - currency
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+  - role: fulfilment
+    permission:
+      columns: "*"
+      filter:
+        order_status:
+          _eq: paid
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+  - role: payment_worker
+    permission:
+      columns:
+        - order_id
+        - order_status
+        - payment_status
+        - total_minor
+        - currency
+      filter: {}

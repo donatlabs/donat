@@ -85,10 +85,19 @@ fn remote_schema_permissions_execution() {
     let s = remote_suite();
     // user-role: exposed field/arg succeed (forwarded to the stub), unexposed
     // field/arg fail validation locally.
-    s.check_query_f(&format!("{PERMS}/execution_with_partial_fields_exposed_to_role.yaml"), Transport::Http);
-    s.check_query_f(&format!("{PERMS}/execution_with_partial_args_exposed_to_role.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{PERMS}/execution_with_partial_fields_exposed_to_role.yaml"),
+        Transport::Http,
+    );
+    s.check_query_f(
+        &format!("{PERMS}/execution_with_partial_args_exposed_to_role.yaml"),
+        Transport::Http,
+    );
     // a role with no remote-schema permission can't see the fields at all.
-    s.check_query_f(&format!("{PERMS}/unknown_role_execution.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{PERMS}/unknown_role_execution.yaml"),
+        Transport::Http,
+    );
 }
 
 const CUSTOM: &str = "queries/remote_schemas/permissions/schema_customization";
@@ -115,7 +124,10 @@ fn customized_remote_schema_partial_fields() {
     );
     // Exposed `foo_user_id` (and fragments on `FooUser`) forward as `user_id`;
     // unexposed `foo_gimmeText` fails validation against the customized SDL.
-    s.check_query_f(&format!("{CUSTOM}/execution_with_partial_fields_exposed_to_role.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{CUSTOM}/execution_with_partial_fields_exposed_to_role.yaml"),
+        Transport::Http,
+    );
 }
 
 #[test]
@@ -124,7 +136,10 @@ fn customized_remote_schema_partial_args() {
         "remote_schema_custom_args",
         "add_permission_with_valid_subset_of_arguments.yaml",
     );
-    s.check_query_f(&format!("{CUSTOM}/execution_with_partial_args_exposed_to_role.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{CUSTOM}/execution_with_partial_args_exposed_to_role.yaml"),
+        Transport::Http,
+    );
 }
 
 const PRESETS: &str = "queries/remote_schemas/permissions/argument_presets";
@@ -147,7 +162,10 @@ fn remote_schema_static_argument_presets() {
         "remote_schema_static_preset",
         "add_permission_with_static_preset_argument.yaml",
     );
-    s.check_query_f(&format!("{PRESETS}/execution_with_static_preset_args.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{PRESETS}/execution_with_static_preset_args.yaml"),
+        Transport::Http,
+    );
 }
 
 #[test]
@@ -156,5 +174,8 @@ fn remote_schema_session_argument_presets() {
         "remote_schema_session_preset",
         "add_permission_with_session_preset_argument.yaml",
     );
-    s.check_query_f(&format!("{PRESETS}/execution_with_session_preset_args.yaml"), Transport::Http);
+    s.check_query_f(
+        &format!("{PRESETS}/execution_with_session_preset_args.yaml"),
+        Transport::Http,
+    );
 }

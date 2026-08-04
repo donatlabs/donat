@@ -1,0 +1,29 @@
+query AnalyticsCodeLifecycleEvents(
+  $limit: Int = 100
+  $order_by: [analytics_code_lifecycle_events_order_by!] = { event_time: desc }
+  $where: analytics_code_lifecycle_events_bool_exp = {}
+) {
+  items: analytics_code_lifecycle_events(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    event_time
+    event_type
+    code_id
+    code
+    cis
+    gtin
+    pg
+    package_type
+    emission_type
+    old_status
+    new_status
+    old_location_id
+    new_location_id
+    parent_id
+    company_id
+    user_id
+    document_id
+  }
+}

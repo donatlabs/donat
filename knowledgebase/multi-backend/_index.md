@@ -1,7 +1,7 @@
 # Multi-Backend Data Sources
 
 > Let a tracked data source run on a database other than Postgres (SQLite,
-> MySQL/MariaDB, SQL Server) and serve it over the same GraphQL surface.
+> MySQL/MariaDB, SQL Server, or read-only ClickHouse) and serve it over the same GraphQL surface.
 > Postgres stays the system/default source and the conformance reference.
 
 **Status: design accepted, implementation gated.** The engine is mid-rename
@@ -20,6 +20,36 @@ reasoning never has to be reconstructed.
 - [[decisions/001-in-process-backend-trait-over-ndc]] — in-process dialect
   trait, NOT an out-of-process NDC-style protocol; performance (preserve the
   one-statement-in-DB invariant, zero IPC hop) is the deciding factor.
+- [[decisions/005-clickhouse-read-only-datasource]] — ClickHouse uses the same
+  compiled-in backend boundary and HTTP transport, with read-only capabilities
+  and native database-side JSON assembly.
+- [[decisions/006-mandatory-conformance-backend-matrix]] — every registered
+  datasource backend runs the same applicable conformance cases in an isolated
+  CI matrix job; Postgres remains the default local and reference target.
+- [[decisions/007-mysql-ordered-text-json-assembly]] — MySQL assembles ordered
+  JSON text in SQL because native binary JSON canonicalizes object keys and
+  cannot preserve the GraphQL selection-order contract.
+- [[decisions/008-clickhouse-ordered-text-json-assembly]] — ClickHouse keeps
+  response objects and arrays as ordered JSON text because casting them to its
+  native `JSON` type canonicalizes object keys.
+- [[decisions/009-parallel-conformance-engine-startup]] — parallel conformance
+  keeps its test-thread speed while retrying transient per-suite engine
+  startup failures with RAII child cleanup and complete diagnostics.
+- [[decisions/010-compose-metadata-sources-in-graphql]] — one GraphQL schema
+  composes per-source planners, executes one statement per participating
+  datasource, and merges top-level values in operation response-slot order.
+- [[decisions/011-compile-schema-at-snapshot-publication]] — schema composition
+  and role projection validation happen once before an immutable engine
+  snapshot is atomically published, never on ordinary request paths.
+- [[decisions/012-parallel-independent-source-queries]] — independent source
+  reads run concurrently while response and error ordering remain
+  deterministic.
+- [[decisions/013-batch-row-dependent-relationships]] — remote and Action
+  relationship keys are deduplicated and resolved with bounded aliased batches
+  instead of row-by-row N+1 calls.
+- [[decisions/014-reuse-backend-connections-and-snapshot-metadata]] — backend
+  connections are pooled and allowlist, REST, remote SDL, and subscription
+  documents are compiled outside the steady-state request path.
 
 ## One-paragraph shape
 

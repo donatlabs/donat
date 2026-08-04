@@ -1,0 +1,23 @@
+description: >
+  tools/call delete rejects an empty where-filter before GraphQL execution.
+  A required but empty where object is equivalent to a bulk delete and is too
+  dangerous for MCP clients.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 50
+  method: tools/call
+  params:
+    name: delete
+    arguments:
+      table: pet
+      where: {}
+response:
+  jsonrpc: "2.0"
+  id: 50
+  result:
+    isError: true

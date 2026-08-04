@@ -1,0 +1,27 @@
+query AnalyticsErrors(
+  $limit: Int = 100
+  $order_by: [analytics_errors_order_by!] = { error_time: desc }
+  $where: analytics_errors_bool_exp = {}
+) {
+  items: analytics_errors(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    error_time
+    error_type
+    error_code
+    error_message
+    severity
+    entity_type
+    entity_id
+    resolved_at
+    resolved_by
+    resolution_notes
+    company_id
+    user_id
+    document_id
+    workflow_id
+    context
+  }
+}

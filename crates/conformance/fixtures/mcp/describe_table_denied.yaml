@@ -21,3 +21,6 @@ response:
   id: 20
   result:
     isError: true
+    content:
+    - type: text
+      text: "table is not accessible"

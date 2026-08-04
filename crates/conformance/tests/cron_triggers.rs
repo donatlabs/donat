@@ -82,7 +82,10 @@ fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration, what: &str) {
 }
 
 fn received_for(cw: &CronWebhook, path: &str) -> Vec<Received> {
-    cw.received().into_iter().filter(|r| r.path == path).collect()
+    cw.received()
+        .into_iter()
+        .filter(|r| r.path == path)
+        .collect()
 }
 
 #[test]

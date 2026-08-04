@@ -4,7 +4,7 @@
 //! remote schema (per its SDL document), the whole request is validated
 //! against that document and forwarded to the remote GraphQL server.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::http::HeaderMap;
 use graphql_parser::query::{
@@ -15,8 +15,44 @@ use serde_json::{Value as Json, json};
 
 use donat_schema::Session;
 
-use crate::state::AppState;
+use crate::state::{AppState, Engine};
 
+pub(crate) type CompiledRemoteSchemas = HashMap<(String, String), Arc<SDoc<'static, String>>>;
+
+pub(crate) fn compile_permission_schemas(
+    metadata: &donat_metadata::Metadata,
+) -> CompiledRemoteSchemas {
+    metadata
+        .remote_schemas
+        .iter()
+        .flat_map(|schema| {
+            schema.permissions.iter().filter_map(move |permission| {
+                graphql_parser::parse_schema::<String>(&permission.definition.schema)
+                    .ok()
+                    .map(|document| {
+                        (
+                            (schema.name.clone(), permission.role.clone()),
+                            Arc::new(document.into_static()),
+                        )
+                    })
+            })
+        })
+        .collect()
+}
+
+fn is_session_header(name: &str) -> bool {
+    name.starts_with("x-donat-") || name.starts_with("x-hasura-")
+}
+
+fn is_session_var_name(name: &str) -> bool {
+    name.get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-donat-"))
+        || name
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-hasura-"))
+}
+
+#[derive(Clone)]
 pub struct RemoteTarget {
     pub url: String,
     pub forward_client_headers: bool,
@@ -28,24 +64,26 @@ pub struct RemoteTarget {
     /// root_fields_namespace: the forwarded response gets wrapped back
     /// under this key.
     pub namespace: Option<String>,
+    /// Per-request upstream deadline from remote-schema metadata.
+    pub timeout_seconds: Option<u64>,
 }
 
 /// If the operation is aimed at a permitted remote schema, validate it
 /// against the role's SDL and return the forwarding target. `None` means
 /// "not a remote operation".
-pub fn match_remote<'m>(
-    metadata: &'m donat_metadata::Metadata,
+pub fn match_remote(
+    engine: &Engine,
     session: &Session,
     doc: &QDoc<'static, String>,
     variables: &mut serde_json::Map<String, Json>,
 ) -> Option<Result<RemoteTarget, crate::gql::GqlError>> {
-    match_remote_with(metadata, session, doc, variables, false)
+    match_remote_with(engine, session, doc, variables, false)
 }
 
 /// `internal` requests (remote-relationship joins) may set arguments that
 /// carry @preset (they are server-built, not client input).
-pub fn match_remote_with<'m>(
-    metadata: &'m donat_metadata::Metadata,
+pub fn match_remote_with(
+    engine: &Engine,
     session: &Session,
     doc: &QDoc<'static, String>,
     variables: &mut serde_json::Map<String, Json>,
@@ -72,9 +110,7 @@ pub fn match_remote_with<'m>(
     }
     // Introspection roots are answered locally; only the data fields
     // must belong to the remote schema.
-    let is_intro = |name: &str| {
-        name == "__schema" || name == "__type" || name == "__typename"
-    };
+    let is_intro = |name: &str| name == "__schema" || name == "__type" || name == "__typename";
     let data_fields: Vec<_> = root_fields
         .iter()
         .filter(|f| !is_intro(&f.name))
@@ -86,12 +122,8 @@ pub fn match_remote_with<'m>(
     }
 
     let mut decustomized_storage: Option<QDoc<'static, String>> = None;
-    for schema in &metadata.remote_schemas {
-        let Some(permission) = schema
-            .permissions
-            .iter()
-            .find(|p| p.role == session.role)
-        else {
+    for schema in &engine.metadata.remote_schemas {
+        let Some(permission) = schema.permissions.iter().find(|p| p.role == session.role) else {
             continue;
         };
         // Customized schemas: unwrap the namespace root and translate
@@ -121,13 +153,12 @@ pub fn match_remote_with<'m>(
                     _ => continue,
                 };
                 for item in &set.items {
-                    if let Selection::Field(f) = item {
-                        if f.name != "__schema"
-                            && f.name != "__type"
-                            && f.name != "__typename"
-                        {
-                            root_fields.push(f);
-                        }
+                    if let Selection::Field(f) = item
+                        && f.name != "__schema"
+                        && f.name != "__type"
+                        && f.name != "__typename"
+                    {
+                        root_fields.push(f);
                     }
                 }
             }
@@ -135,13 +166,14 @@ pub fn match_remote_with<'m>(
         if root_fields.is_empty() {
             continue;
         }
-        let Ok(sdl) = graphql_parser::parse_schema::<String>(&permission.definition.schema)
+        let Some(sdl) = engine
+            .remote_permission_schemas
+            .get(&(schema.name.clone(), permission.role.clone()))
         else {
             continue;
         };
-        let sdl = sdl.into_static();
-        let types = type_map(&sdl);
-        let Some(query_type) = root_type_name(&sdl, &types) else {
+        let types = type_map(sdl);
+        let Some(query_type) = root_type_name(sdl, &types) else {
             continue;
         };
         // All data root fields must exist on the permitted Query type.
@@ -160,7 +192,10 @@ pub fn match_remote_with<'m>(
                 "$.selectionSet.{ns}.selectionSet.{}",
                 display_field(field, customizer.as_ref())
             ),
-            None => format!("$.selectionSet.{}", display_field(field, customizer.as_ref())),
+            None => format!(
+                "$.selectionSet.{}",
+                display_field(field, customizer.as_ref())
+            ),
         };
         for field in &root_fields {
             if field.name == "__typename" {
@@ -210,6 +245,7 @@ pub fn match_remote_with<'m>(
                 .or_else(|| decustomized_storage.as_ref().map(|d| format!("{d}"))),
             has_introspection,
             namespace,
+            timeout_seconds: schema.definition.timeout_seconds,
         }));
     }
     None
@@ -263,10 +299,10 @@ fn type_map<'d>(sdl: &'d SDoc<'static, String>) -> Types<'d> {
 
 fn root_type_name(sdl: &SDoc<'static, String>, types: &Types) -> Option<String> {
     for def in &sdl.definitions {
-        if let SDef::SchemaDefinition(sd) = def {
-            if let Some(q) = &sd.query {
-                return Some(q.clone());
-            }
+        if let SDef::SchemaDefinition(sd) = def
+            && let Some(q) = &sd.query
+        {
+            return Some(q.clone());
         }
     }
     types.contains_key("Query").then(|| "Query".to_string())
@@ -354,14 +390,16 @@ fn validate_field(
         // Arguments carrying @preset are hidden from the role's schema
         // (but server-built join queries may use them).
         let visible = def.arguments.iter().any(|a| {
-            &a.name == arg
-                && (internal || !a.directives.iter().any(|d| d.name == "preset"))
+            &a.name == arg && (internal || !a.directives.iter().any(|d| d.name == "preset"))
         });
         if !visible {
             return Err(crate::gql::GqlError {
                 path: path.to_string(),
                 code: "validation-failed",
-                message: format!("'{}' has no argument named '{arg}'", display_field(field, cust)),
+                message: format!(
+                    "'{}' has no argument named '{arg}'",
+                    display_field(field, cust)
+                ),
             });
         }
     }
@@ -411,15 +449,15 @@ fn decustomize(
     // for the fixtures: prefixes are distinctive).
     let strip_field = |name: &str| -> String {
         for rule in &c.field_names {
-            if let Some(p) = &rule.prefix {
-                if let Some(rest) = name.strip_prefix(p.as_str()) {
-                    return rest.to_string();
-                }
+            if let Some(p) = &rule.prefix
+                && let Some(rest) = name.strip_prefix(p.as_str())
+            {
+                return rest.to_string();
             }
-            if let Some(sfx) = &rule.suffix {
-                if let Some(rest) = name.strip_suffix(sfx.as_str()) {
-                    return rest.to_string();
-                }
+            if let Some(sfx) = &rule.suffix
+                && let Some(rest) = name.strip_suffix(sfx.as_str())
+            {
+                return rest.to_string();
             }
         }
         name.to_string()
@@ -550,10 +588,10 @@ fn apply_presets(
         let mut out = vec![];
         for f in &io.fields {
             for d in &f.directives {
-                if d.name == "preset" {
-                    if let Some((_, v)) = d.arguments.iter().find(|(n, _)| n == "value") {
-                        out.push((f.name.clone(), v.clone()));
-                    }
+                if d.name == "preset"
+                    && let Some((_, v)) = d.arguments.iter().find(|(n, _)| n == "value")
+                {
+                    out.push((f.name.clone(), v.clone()));
                 }
             }
         }
@@ -592,9 +630,7 @@ fn apply_presets(
             SV::Boolean(b) => QValue::Boolean(*b),
             SV::Null => QValue::Null,
             SV::Enum(e) => QValue::Enum(e.clone()),
-            SV::List(items) => {
-                QValue::List(items.iter().map(schema_value_to_query).collect())
-            }
+            SV::List(items) => QValue::List(items.iter().map(schema_value_to_query).collect()),
             SV::Object(map) => QValue::Object(
                 map.iter()
                     .map(|(k, v)| (k.clone(), schema_value_to_query(v)))
@@ -625,9 +661,7 @@ fn apply_presets(
                     continue;
                 };
                 let value = match raw {
-                    graphql_parser::schema::Value::String(s)
-                        if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") =>
-                    {
+                    graphql_parser::schema::Value::String(s) if is_session_var_name(s) => {
                         let Some(found) = session.var(s) else {
                             return Err(crate::gql::GqlError {
                                 path: "$".to_string(),
@@ -676,10 +710,7 @@ fn apply_presets(
             if presets.is_empty() {
                 continue;
             }
-            let existing = field
-                .arguments
-                .iter_mut()
-                .find(|(n, _)| n == &arg.name);
+            let existing = field.arguments.iter_mut().find(|(n, _)| n == &arg.name);
             match existing {
                 Some((_, QValue::Variable(var))) => {
                     let entry = variables
@@ -704,12 +735,13 @@ fn apply_presets(
                 }
                 Some(_) => {}
                 None => {
-                    let map: std::collections::BTreeMap<String, QValue<'static, String>> =
-                        presets
-                            .iter()
-                            .map(|(k, v)| (k.clone(), schema_value_to_query(v)))
-                            .collect();
-                    field.arguments.push((arg.name.clone(), QValue::Object(map)));
+                    let map: std::collections::BTreeMap<String, QValue<'static, String>> = presets
+                        .iter()
+                        .map(|(k, v)| (k.clone(), schema_value_to_query(v)))
+                        .collect();
+                    field
+                        .arguments
+                        .push((arg.name.clone(), QValue::Object(map)));
                     *changed = true;
                 }
             }
@@ -754,13 +786,16 @@ pub async fn forward(
         payload["query"] = Json::String(query.clone());
     }
     let mut request = state.http.post(&target.url).json(&payload);
+    if let Some(seconds) = target.timeout_seconds {
+        request = request.timeout(std::time::Duration::from_secs(seconds));
+    }
     if target.forward_client_headers {
         for (name, value) in headers {
             let name = name.as_str();
-            if name.starts_with("x-donat-") || name == "authorization" || name == "cookie" {
-                if let Ok(value) = value.to_str() {
-                    request = request.header(name, value);
-                }
+            if (is_session_header(name) || name == "authorization" || name == "cookie")
+                && let Ok(value) = value.to_str()
+            {
+                request = request.header(name, value);
             }
         }
     }
@@ -832,7 +867,10 @@ mod tests {
             "http://remote:4000/graphql"
         );
         // Unset variables substitute as empty.
-        assert_eq!(resolve_url_template("{{DONAT_TEST_UNSET_VAR}}/graphql"), "/graphql");
+        assert_eq!(
+            resolve_url_template("{{DONAT_TEST_UNSET_VAR}}/graphql"),
+            "/graphql"
+        );
     }
 
     #[test]
@@ -846,10 +884,7 @@ mod tests {
             std::env::set_var("DONAT_T_A", "A");
             std::env::set_var("DONAT_T_B", "B");
         }
-        assert_eq!(
-            resolve_url_template("{{DONAT_T_A}}-{{DONAT_T_B}}"),
-            "A-B"
-        );
+        assert_eq!(resolve_url_template("{{DONAT_T_A}}-{{DONAT_T_B}}"), "A-B");
     }
 
     #[test]
@@ -955,10 +990,16 @@ mod tests {
         let mut stripped = doc.clone();
         strip_introspection_roots(&mut stripped);
         let r = format!("{stripped}");
-        assert!(!r.contains("__schema") && !r.contains("__typename") && r.contains("user"), "{r}");
+        assert!(
+            !r.contains("__schema") && !r.contains("__typename") && r.contains("user"),
+            "{r}"
+        );
         let mut kept = doc.clone();
         keep_introspection_roots(&mut kept);
         let r = format!("{kept}");
-        assert!(r.contains("__schema") && r.contains("__typename") && !r.contains("user"), "{r}");
+        assert!(
+            r.contains("__schema") && r.contains("__typename") && !r.contains("user"),
+            "{r}"
+        );
     }
 }

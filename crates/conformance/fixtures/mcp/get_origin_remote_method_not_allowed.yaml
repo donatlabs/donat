@@ -1,0 +1,9 @@
+description: >
+  A non-local Origin does not alter the normal 405 response for unsupported
+  GET requests; proxy policy owns origin admission.
+url: /mcp
+method: GET
+status: 405
+headers:
+  Origin: "https://evil.example"
+response: "GET /mcp is not supported (no SSE); use POST with JSON-RPC"

@@ -1,0 +1,77 @@
+name: approve_prescription
+source: default
+permissions:
+  - role: veterinary_reviewer
+arguments:
+  - name: prescription_id
+    type: uuid!
+  - name: decision_id
+    type: uuid!
+  - name: review_note
+    type: string
+steps:
+  - name: prescription_request
+    select_one:
+      table: public.prescription_request
+      by: { id: { arg: prescription_id } }
+      returning: [id, order_line_id, status]
+      require_found: true
+  - name: approval_is_allowed
+    assert:
+      rule: can_transition_prescription
+      with:
+        current: { step: prescription_request, column: status }
+        next: { literal: approved }
+  # `prescription_review.prescription_request_id` is unique and append-only.
+  # It records exactly one reviewer decision before the order line is released.
+  - name: approved_review
+    insert:
+      table: public.prescription_review
+      object:
+        prescription_request_id: { step: prescription_request, column: id }
+        decision: { literal: approved }
+        reviewer_user_id: { session_variable: x-donat-user-id }
+        decision_id: { arg: decision_id }
+        private_note: { arg: review_note }
+      returning: [id, prescription_request_id, decision, decision_id]
+  - name: approval_audit
+    insert:
+      table: public.prescription_event
+      object:
+        prescription_request_id: { step: prescription_request, column: id }
+        event_type: { literal: approved }
+        actor_role: { literal: veterinary_reviewer }
+        request_id: { arg: decision_id }
+      returning: [id, prescription_request_id, event_type, request_id]
+  - name: approved_request
+    update:
+      table: public.prescription_request
+      where: { id: { step: prescription_request, column: id }, status: { literal: submitted } }
+      set: { status: { literal: approved } }
+      returning: [id, order_line_id, status]
+      require_affected: true
+  - name: release_order_line
+    update:
+      table: public.order_line
+      where: { id: { step: approved_request, column: order_line_id } }
+      set: { prescription_release_id: { step: approved_review, column: id } }
+      returning: [id, prescription_release_id]
+      require_affected: true
+result:
+  prescription_id: { step: approved_request, column: id }
+  status: { step: approved_request, column: status }
+  released_order_line_id: { step: release_order_line, column: id }
+  audit: { step: approval_audit }
+idempotency:
+  key: { argument: decision_id }
+  scope:
+    - { argument: prescription_id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: prescription_review
+      signal: prescription_decision_recorded
+      correlate:
+        prescription_id: { step: approved_request, column: id }
+      payload: { decision: { literal: approved } }
+      idempotency_key: { argument: decision_id }

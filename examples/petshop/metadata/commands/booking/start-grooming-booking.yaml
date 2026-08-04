@@ -1,0 +1,39 @@
+# Customer-facing entry point for the grooming Process. The hold itself is
+# reserved by the Process's first Command under the caller's own session, so
+# this command carries the typed request without duplicating that reservation.
+name: start_grooming_booking
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: service_resource_id
+    type: uuid!
+  - name: slot_key
+    type: string!
+  - name: starts_at
+    type: timestamptz!
+  - name: hold_expires_at
+    type: timestamptz!
+  - name: request_id
+    type: uuid!
+steps: []
+result:
+  service_resource_id: { arg: service_resource_id }
+  slot_key: { arg: slot_key }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: service_resource_id }
+    - { argument: slot_key }
+    - { session_variable: x-donat-user-id }
+  retention: 365d
+effects:
+  - start_process:
+      process: grooming_booking
+      input:
+        service_resource_id: { arg: service_resource_id }
+        slot_key: { arg: slot_key }
+        starts_at: { arg: starts_at }
+        hold_expires_at: { arg: hold_expires_at }
+        request_id: { arg: request_id }
+      idempotency_key: { argument: request_id }

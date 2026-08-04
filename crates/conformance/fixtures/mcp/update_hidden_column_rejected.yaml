@@ -1,0 +1,27 @@
+description: >
+  A role with column-restricted update permission cannot set a physical column
+  outside its update mask. MCP rejects `name` before GraphQL execution because
+  `status_updater` may only update `status`.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: status_updater
+body:
+  jsonrpc: "2.0"
+  id: 33
+  method: tools/call
+  params:
+    name: update
+    arguments:
+      table: pet
+      where:
+        id:
+          _eq: 1
+      set:
+        name: Rexx
+response:
+  jsonrpc: "2.0"
+  id: 33
+  result:
+    isError: true

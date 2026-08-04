@@ -1,0 +1,16 @@
+description: >
+  MCP JSON-RPC requests must use jsonrpc: "2.0". Other version markers are
+  rejected as invalid-request before dispatch.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "1.0"
+  id: 68
+  method: tools/list
+response:
+  jsonrpc: "2.0"
+  id: 68
+  error:
+    code: -32600
+    message: "'jsonrpc' must be \"2.0\""

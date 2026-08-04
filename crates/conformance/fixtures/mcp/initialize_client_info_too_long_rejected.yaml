@@ -1,0 +1,22 @@
+description: >
+  initialize bounds clientInfo string fields so oversized handshake metadata is
+  rejected before it can consume unbounded protocol-boundary resources.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 83
+  method: initialize
+  params:
+    protocolVersion: "2025-06-18"
+    capabilities: {}
+    clientInfo:
+      name: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      version: "0"
+response:
+  jsonrpc: "2.0"
+  id: 83
+  error:
+    code: -32602
+    message: "'name' must be at most 256 characters"

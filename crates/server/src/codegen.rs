@@ -279,6 +279,8 @@ mod tests {
         ColumnInfo {
             name: name.into(),
             pg_type: pg_type.into(),
+            pg_typmod: -1,
+            native_type: None,
             nullable,
             has_default: false,
         }
@@ -298,6 +300,8 @@ mod tests {
         let t = TableInfo {
             schema: "public".into(),
             name: "test_t1".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
             columns: vec![
                 col("c1", "int4", false),
                 col("c2", "text", false),
@@ -321,6 +325,8 @@ mod tests {
         let t = TableInfo {
             schema: "public".into(),
             name: "wide".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
             columns: vec![
                 col("a", "int2", false),
                 col("b", "int8", false),
@@ -349,6 +355,8 @@ mod tests {
         let t = TableInfo {
             schema: "public".into(),
             name: "nul".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
             columns: vec![
                 col("id", "int4", false),
                 col("note", "text", true),
@@ -372,6 +380,8 @@ mod tests {
         let t = TableInfo {
             schema: "public".into(),
             name: "arr".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
             columns: vec![
                 col("ids", "_int4", false),  // int4[] -> []int32
                 col("tags", "_text", true),  // nullable text[] -> *[]string
@@ -394,6 +404,8 @@ mod tests {
         let t = TableInfo {
             schema: "public".into(),
             name: "task".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
             columns: vec![
                 col("id", "int4", false),
                 col("status", "task_status", false), // enum
@@ -426,6 +438,8 @@ mod tests {
                 TableInfo {
                     schema: schema.into(),
                     name: name.into(),
+                    relation_kind: donat_catalog::RelationKind::Table,
+                    unique_keys: vec![],
                     columns: vec![col("id", "int4", false)],
                     primary_key: vec![],
                     foreign_keys: vec![],

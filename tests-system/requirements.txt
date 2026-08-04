@@ -1,0 +1,6 @@
+# Black-box system tests for the checked-in Petshop store. Everything here
+# talks HTTP to an already-running stack; nothing imports the engine.
+pytest>=8.3,<9
+requests>=2.32,<3
+PyJWT>=2.9,<3
+websocket-client>=1.8,<2

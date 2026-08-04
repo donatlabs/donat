@@ -33,7 +33,8 @@ Per mutation root, the MySQL executor runs, inside one transaction:
   (capture the rows), then `DELETE ... WHERE <pred>`.
 
 `affected_rows` comes from the DML's row count. The permission check is a
-`CASE WHEN NOT(<check>) THEN 1 ELSE 0 END` flag in the companion SELECT; any set
+`CASE WHEN (<check>) THEN 0 ELSE 1 END` flag in the companion SELECT, so only
+SQL `TRUE` passes and both `FALSE` and `NULL` violate the permission. Any set
 flag → `ROLLBACK` + permission-error (same body as Postgres/SQLite). The whole
 sequence is one transaction, so nothing partially persists.
 

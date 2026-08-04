@@ -1,0 +1,22 @@
+description: >
+  query.table must be a string. Non-string table identifiers are rejected by
+  MCP argument validation before metadata resolution or GraphQL execution.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 62
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: 123
+      columns: [id]
+response:
+  jsonrpc: "2.0"
+  id: 62
+  result:
+    isError: true

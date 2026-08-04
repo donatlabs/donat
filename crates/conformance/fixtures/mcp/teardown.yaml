@@ -5,3 +5,4 @@ args:
     sql: |
       DROP TABLE IF EXISTS pet;
       DROP TABLE IF EXISTS order_item;
+      DROP TABLE IF EXISTS audit_log;

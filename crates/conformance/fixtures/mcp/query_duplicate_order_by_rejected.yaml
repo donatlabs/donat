@@ -1,0 +1,25 @@
+description: >
+  Duplicate query.order_by columns are rejected before GraphQL execution. This
+  keeps MCP sort requests deterministic and avoids redundant planner work.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 58
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      order_by:
+      - id: asc
+      - id: desc
+response:
+  jsonrpc: "2.0"
+  id: 58
+  result:
+    isError: true

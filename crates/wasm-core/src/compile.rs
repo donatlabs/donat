@@ -158,6 +158,8 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                     | donat_ir::MutationRoot::Insert { alias, .. }
                     | donat_ir::MutationRoot::Update { alias, .. }
                     | donat_ir::MutationRoot::Delete { alias, .. }
+                    | donat_ir::MutationRoot::Command { alias, .. }
+                    | donat_ir::MutationRoot::RequestFileUpload { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                 };
                 // Same dialect/stringify_numerics split as the query path above.
@@ -212,8 +214,13 @@ fn hooks_for_root(
         donat_ir::MutationRoot::Delete { delete, .. } => {
             (&delete.table.schema, &delete.table.name, "DELETE")
         }
-        // FunctionCall and Typename carry no table reference → no hooks.
+        // These roots carry no single table reference the trigger metadata can
+        // be matched against, so they emit no table event hooks. A declarative
+        // `Command` does carry its own resolved effects, which the host is to
+        // dispatch from the command journal rather than from table triggers.
         donat_ir::MutationRoot::FunctionCall { .. }
+        | donat_ir::MutationRoot::Command { .. }
+        | donat_ir::MutationRoot::RequestFileUpload { .. }
         | donat_ir::MutationRoot::Typename { .. } => return vec![],
     };
 

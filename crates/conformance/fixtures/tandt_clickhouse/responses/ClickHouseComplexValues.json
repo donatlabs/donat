@@ -1,0 +1,1 @@
+{"data":{"clickhouse_complex_values":[{"id":1,"payload":{"flag":true,"nested":{"value":3}},"attributes":{"alpha":7,"beta":9},"point":{"label":"origin","value":11},"labels":["red","blue"]}]}}

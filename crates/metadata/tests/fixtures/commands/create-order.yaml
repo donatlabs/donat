@@ -1,0 +1,33 @@
+name: create_order
+source: default
+permissions:
+  - role: customer
+arguments:
+  - name: customer_id
+    type: uuid!
+  - name: lines
+    type: "[CreateOrderLine!]!"
+steps:
+  - name: order
+    insert:
+      table: public.orders
+      object:
+        customer_id: { arg: customer_id }
+        status: { literal: draft }
+      returning: [id, customer_id, status]
+  - name: lines
+    insert_many:
+      table: public.order_lines
+      for_each: { arg: lines }
+      object:
+        order_id: { step: order, column: id }
+        sku: { item: sku }
+      returning: [id, sku]
+result:
+  order_id: { step: order, column: id }
+effects:
+  - start_process:
+      process: checkout_order
+      input:
+        order_id: { step: order, column: id }
+      idempotency_key: { argument: request_id }

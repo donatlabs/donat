@@ -1,0 +1,15 @@
+description: >
+  MCP JSON-RPC requests must declare jsonrpc: "2.0". A request with an id but
+  without the jsonrpc member is rejected as invalid-request before dispatch.
+url: /mcp
+method: POST
+status: 200
+body:
+  id: 67
+  method: tools/list
+response:
+  jsonrpc: "2.0"
+  id: 67
+  error:
+    code: -32600
+    message: missing required member 'jsonrpc'

@@ -1,0 +1,27 @@
+description: >
+  list_tables includes tables with write-only permissions. The `writer` role
+  can insert audit_log rows but cannot select the table, so discovery reports
+  only the insert operation and does not require a select permission.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: writer
+body:
+  jsonrpc: "2.0"
+  id: 29
+  method: tools/call
+  params:
+    name: list_tables
+    arguments: {}
+response:
+  jsonrpc: "2.0"
+  id: 29
+  result:
+    isError: false
+    structuredContent:
+      tables:
+      - name: audit_log
+        schema: public
+        operations:
+        - insert

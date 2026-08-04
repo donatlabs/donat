@@ -1,0 +1,11 @@
+# Donat-only mixed source contract.
+query MixedPostgresClickHouse {
+  postgres: contract_probe(order_by: { id: asc }) {
+    id
+    label
+  }
+  clickhouse: analytics_document_daily_stats(limit: 1, order_by: { date: desc }) {
+    date
+    status
+  }
+}

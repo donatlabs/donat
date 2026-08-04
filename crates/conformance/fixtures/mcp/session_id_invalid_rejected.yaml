@@ -1,0 +1,18 @@
+description: >
+  MCP Streamable HTTP session IDs, when supplied, must use bounded visible
+  ASCII. Whitespace-bearing IDs are rejected before JSON-RPC handling.
+url: /mcp
+method: POST
+status: 400
+headers:
+  Mcp-Session-Id: "bad session"
+body:
+  jsonrpc: "2.0"
+  id: 91
+  method: tools/list
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "invalid MCP session id header"

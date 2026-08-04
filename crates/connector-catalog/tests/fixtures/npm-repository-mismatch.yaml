@@ -1,0 +1,91 @@
+record_version: 1
+record_id: source.serpapi.npm.0_1_10
+subject:
+  kind: exact_npm
+  value:
+    name: serpapi
+    version: 0.1.10
+    tarball_url: https://registry.npmjs.org/serpapi/-/serpapi-0.1.10.tgz
+    integrity: sha512-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QA==
+    repository:
+      url: https://github.com/serpapi/serpapi-javascript
+      commit: 1123456789abcdef0123456789abcdef01234567
+      tree: 89abcdef0123456789abcdef0123456789abcdef
+    npm_git_head: 0123456789abcdef0123456789abcdef01234567
+    package_repository: https://github.com/serpapi/serpapi-javascript
+    signature:
+      kind: verified
+      value:
+        signatures:
+          - key_id: npm.key.1
+            signature_sha256: 415263748596a7b8c9daebfc0d1e2f405162738495a6b7c8d9eafb0c1d2e3f50
+        registry_metadata_sha256: 8192a3b4c5d6e7f8091a2b3c4d5e6f8091a2b3c4d5e6f708192a3b4c5d6e7f90
+    provenance:
+      kind: verified_absent
+      value:
+        registry_metadata_sha256: 8192a3b4c5d6e7f8091a2b3c4d5e6f8091a2b3c4d5e6f708192a3b4c5d6e7f90
+    tag_commit: fedcba9876543210fedcba9876543210fedcba98
+    provenance_commit: null
+    maintainers:
+      - maintainer.one
+      - maintainer.two
+    repository_owner:
+      kind: consistent
+      value:
+        package_owner: owner.serpapi
+        repository_owner: owner.serpapi
+reacquisition:
+  kind: exact_npm_review
+  value: null
+artifact_hashes:
+  - artifact_id: artifact.npm
+    algorithm:
+      kind: sha512
+      value: null
+    digest: 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
+    path: serpapi-0.1.10.tgz
+license:
+  kind: permissive
+  value:
+    spdx_id: MIT
+    selected_dual_license_branch: null
+    license_file_path: LICENSE
+    license_file_sha256: c1d2e3f405162738495a6b7c8d9eafc0d1e2f30415263748596a7b8c9daebfd0
+notice:
+  id: notice.serpapi
+  license_file_path: LICENSE
+  license_file_sha256: c1d2e3f405162738495a6b7c8d9eafc0d1e2f30415263748596a7b8c9daebfd0
+  required_copyright_lines:
+    - Copyright SerpAPI
+  notice_bundle_destination: THIRD_PARTY_NOTICES.md
+entrypoints:
+  - package.json
+dependencies:
+  - dependency: n8n-workflow
+    disposition:
+      kind: type_only_replaced
+      value:
+        replacement: donat.value.contract
+embedded_material: []
+provider_contracts: []
+compatibility:
+  kind: tier_a
+  value: null
+admission:
+  kind: inventory_only
+  value:
+    findings:
+      - finding.awaiting.port
+safety_findings:
+  findings:
+    - finding_id: finding.awaiting.port
+      kind: port.pending
+      location: null
+      message: Port implementation has not been approved.
+reviewer: reviewer.demo
+approval_date: 2026-07-29
+proposed_manifest: connector-catalog/manifests/serpapi.yaml
+proposed_destinations:
+  - connector-catalog/sources/records/serpapi.yaml
+red_tests:
+  - serpapi_exact_source_compiles

@@ -3,12 +3,20 @@
 //! selection set. The schema reflects exactly what the planner would
 //! accept: per-role roots, column masks, relationships, mutations.
 
+use std::borrow::Cow;
+
 use serde_json::{Map as JsonMap, Value as Json, json};
 
+use donat_backend::capabilities::JsonOps;
+use donat_ir::{TypeRef, ValueScalar, ValueType};
+use donat_metadata::{
+    Columns, CommandResultValue as MetadataCommandResultValue, CommandStepOperation, Metadata,
+};
 use graphql_parser::query::{Definition, Document, OperationDefinition};
 
+use crate::commands::CompiledCommand;
+use crate::naming::{command_pascal_case, root_names, table_base_name};
 use crate::plan::{Fragments, PlanError, Planner, Session, flatten, value_to_json};
-use crate::naming::{root_names, table_base_name};
 
 /// GraphQL scalar name for a Postgres type (Donat naming).
 fn scalar_name(pg_type: &str) -> &str {
@@ -131,6 +139,367 @@ fn enum_type(name: &str, values: &[&str]) -> Json {
     })
 }
 
+fn command_type_reference(metadata: &Metadata, type_: &str) -> Json {
+    let (non_null_type, nullable) = match type_.strip_suffix('!') {
+        Some(inner) => (inner, false),
+        None => (type_, true),
+    };
+    let inner = if let Some(list) = non_null_type
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        list_of(command_type_reference(metadata, list))
+    } else {
+        let name = match non_null_type {
+            "Boolean" | "bool" => "Boolean".to_string(),
+            "String" | "string" | "ID" => "String".to_string(),
+            "Int" | "int" => "Int".to_string(),
+            "Float" | "float" | "decimal" => "Float".to_string(),
+            other => other.to_string(),
+        };
+        let kind = if metadata
+            .custom_types
+            .input_objects
+            .iter()
+            .any(|input| input.name == name)
+        {
+            "INPUT_OBJECT"
+        } else if metadata
+            .custom_types
+            .enums
+            .iter()
+            .any(|enum_| enum_.name == name)
+        {
+            "ENUM"
+        } else {
+            "SCALAR"
+        };
+        named(kind, &name)
+    };
+    if nullable { inner } else { non_null(inner) }
+}
+
+fn command_type_scalars(
+    metadata: &Metadata,
+    type_: &str,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) {
+    let type_ = type_.strip_suffix('!').unwrap_or(type_);
+    if let Some(inner) = type_
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        command_type_scalars(metadata, inner, types, scalars, generated);
+        return;
+    }
+    let scalar = match type_ {
+        "Boolean" | "bool" => Some("Boolean"),
+        "String" | "string" | "ID" => Some("String"),
+        "Int" | "int" => Some("Int"),
+        "Float" | "float" | "decimal" => Some("Float"),
+        "uuid" | "date" | "timestamp" | "timestamptz" | "json" | "jsonb" => Some(type_),
+        _ => None,
+    };
+    if let Some(scalar) = scalar {
+        scalars.insert(scalar.to_string());
+        return;
+    }
+    if let Some(input) = metadata
+        .custom_types
+        .input_objects
+        .iter()
+        .find(|input| input.name == type_)
+    {
+        if generated.insert(input.name.clone()) {
+            for field in &input.fields {
+                command_type_scalars(metadata, &field.type_, types, scalars, generated);
+            }
+            types.push(input_object_type(
+                &input.name,
+                input
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        input_value(&field.name, command_type_reference(metadata, &field.type_))
+                    })
+                    .collect(),
+            ));
+        }
+        return;
+    }
+    if let Some(enum_) = metadata
+        .custom_types
+        .enums
+        .iter()
+        .find(|enum_| enum_.name == type_)
+        && generated.insert(enum_.name.clone())
+    {
+        types.push(enum_type(
+            &enum_.name,
+            &enum_
+                .values
+                .iter()
+                .map(|value| value.value.as_str())
+                .collect::<Vec<_>>(),
+        ));
+        return;
+    }
+    scalars.insert(type_.to_string());
+}
+
+fn command_result_type(
+    command: &CompiledCommand,
+    name: &str,
+    value: &MetadataCommandResultValue,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let contract = &command.descriptor().result.roots[name].type_ref;
+    let field_order = match value {
+        MetadataCommandResultValue::Step {
+            step,
+            column: None,
+            field: Some(field),
+            ..
+        } => command
+            .definition()
+            .steps
+            .iter()
+            .find(|candidate| candidate.name == *step)
+            .and_then(|step| match &step.operation {
+                CommandStepOperation::AllocateMany { allocate_many } => match field.as_str() {
+                    "groups" => Some(allocate_many.returning.groups.clone()),
+                    "lines" => Some(allocate_many.returning.lines.clone()),
+                    "backorders" => Some(allocate_many.returning.backorders.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }),
+        MetadataCommandResultValue::Step {
+            step,
+            column: None,
+            field: None,
+            ..
+        } => command
+            .definition()
+            .steps
+            .iter()
+            .find(|candidate| candidate.name == *step)
+            .map(|step| match &step.operation {
+                CommandStepOperation::SelectOne { select_one } => select_one.returning.clone(),
+                CommandStepOperation::SelectMany { select_many } => select_many.returning.clone(),
+                CommandStepOperation::Insert { insert } => insert.returning.clone(),
+                CommandStepOperation::InsertMany { insert_many } => insert_many.returning.clone(),
+                CommandStepOperation::Update { update } => update.returning.clone(),
+                CommandStepOperation::UpdateMany { update_many } => update_many.returning.clone(),
+                CommandStepOperation::UpdateWhen { update_when } => update_when.returning.clone(),
+                CommandStepOperation::InsertWhen { insert_when } => insert_when.returning.clone(),
+                CommandStepOperation::Decision { decision } => decision.returning.clone(),
+                CommandStepOperation::DecisionMany { decision_many } => {
+                    decision_many.returning.clone()
+                }
+                CommandStepOperation::Delete { delete } => delete.returning.clone(),
+                CommandStepOperation::Aggregate { aggregate } => {
+                    aggregate.values.keys().cloned().collect()
+                }
+                CommandStepOperation::Project { project } => {
+                    project.values.keys().cloned().collect()
+                }
+                CommandStepOperation::ProjectMany { project_many } => {
+                    project_many.values.keys().cloned().collect()
+                }
+                CommandStepOperation::FixedRows { fixed_rows } => fixed_rows
+                    .rows
+                    .first()
+                    .map(|row| row.keys().cloned().collect())
+                    .unwrap_or_default(),
+                CommandStepOperation::Assert { .. }
+                | CommandStepOperation::AssertWhen { .. }
+                | CommandStepOperation::AllocateMany { .. } => Vec::new(),
+            }),
+        MetadataCommandResultValue::ProjectedStep { project, .. } => {
+            Some(project.keys().cloned().collect())
+        }
+        _ => None,
+    };
+    let row_name = match value {
+        MetadataCommandResultValue::Step {
+            step,
+            as_,
+            column,
+            field,
+            ..
+        } if column.is_none() => as_.clone().unwrap_or_else(|| match field {
+            Some(field) => format!(
+                "{}{}{}Row",
+                command_pascal_case(&command.definition().name),
+                command_pascal_case(step),
+                command_pascal_case(field),
+            ),
+            None => format!(
+                "{}{}Row",
+                command_pascal_case(&command.definition().name),
+                command_pascal_case(step)
+            ),
+        }),
+        MetadataCommandResultValue::ProjectedStep { step, .. } => format!(
+            "{}{}Row",
+            command_pascal_case(&command.definition().name),
+            command_pascal_case(step)
+        ),
+        _ => format!(
+            "{}{}Value",
+            command_pascal_case(&command.definition().name),
+            command_pascal_case(name)
+        ),
+    };
+    command_contract_reference(
+        contract,
+        &row_name,
+        field_order.as_deref(),
+        types,
+        scalars,
+        generated,
+    )
+}
+
+fn command_contract_reference(
+    contract: &TypeRef,
+    object_name: &str,
+    field_order: Option<&[String]>,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    generated: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let inner = match &contract.value_type {
+        ValueType::Scalar { scalar } => {
+            let name = match scalar {
+                ValueScalar::Boolean => "Boolean".to_owned(),
+                ValueScalar::String => "String".to_owned(),
+                ValueScalar::Int32 => "Int".to_owned(),
+                ValueScalar::Int64 => "int8".to_owned(),
+                ValueScalar::UInt64 => "uint8".to_owned(),
+                ValueScalar::Decimal => "Float".to_owned(),
+                ValueScalar::Uuid => "uuid".to_owned(),
+                ValueScalar::Date => "date".to_owned(),
+                ValueScalar::Timestamp => "timestamp".to_owned(),
+                ValueScalar::TimestampTz => "timestamptz".to_owned(),
+                ValueScalar::Json => "json".to_owned(),
+                ValueScalar::Custom { name } => name.clone(),
+            };
+            scalars.insert(name.clone());
+            named("SCALAR", &name)
+        }
+        ValueType::Enum { name, values } => {
+            if generated.insert(name.clone()) {
+                types.push(enum_type(
+                    name,
+                    &values.iter().map(String::as_str).collect::<Vec<_>>(),
+                ));
+            }
+            named("ENUM", name)
+        }
+        ValueType::Object { fields } => {
+            if generated.insert(object_name.to_owned()) {
+                let ordered_fields = field_order
+                    .map(|order| {
+                        order
+                            .iter()
+                            .filter_map(|name| fields.get_key_value(name))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| fields.iter().collect());
+                let output_fields = ordered_fields
+                    .into_iter()
+                    .map(|(name, field_contract)| {
+                        field(
+                            name,
+                            vec![],
+                            command_contract_reference(
+                                &field_contract.type_ref,
+                                &format!("{object_name}{}", command_pascal_case(name)),
+                                None,
+                                types,
+                                scalars,
+                                generated,
+                            ),
+                        )
+                    })
+                    .collect();
+                types.push(object_type(object_name, output_fields));
+            }
+            named("OBJECT", object_name)
+        }
+        ValueType::List { element } => list_of(command_contract_reference(
+            element,
+            object_name,
+            field_order,
+            types,
+            scalars,
+            generated,
+        )),
+        ValueType::Ref { name } => named("OBJECT", name),
+    };
+    if contract.nullable {
+        inner
+    } else {
+        non_null(inner)
+    }
+}
+
+fn add_command_schema(
+    planner: &Planner,
+    command: &CompiledCommand,
+    types: &mut Vec<Json>,
+    scalars: &mut std::collections::BTreeSet<String>,
+    emitted_row_types: &mut std::collections::BTreeSet<String>,
+    emitted_input_types: &mut std::collections::BTreeSet<String>,
+) -> Json {
+    let definition = command.definition();
+    let result_name = format!("{}Result", command_pascal_case(&definition.name));
+    let result_fields = definition
+        .result
+        .fields
+        .iter()
+        .map(|field_definition| {
+            field(
+                &field_definition.name,
+                vec![],
+                command_result_type(
+                    command,
+                    &field_definition.name,
+                    &field_definition.value,
+                    types,
+                    scalars,
+                    emitted_row_types,
+                ),
+            )
+        })
+        .collect();
+    types.push(object_type(&result_name, result_fields));
+    let arguments = definition
+        .arguments
+        .iter()
+        .map(|argument| {
+            command_type_scalars(
+                planner.metadata(),
+                &argument.type_,
+                types,
+                scalars,
+                emitted_input_types,
+            );
+            input_value(
+                &argument.name,
+                command_type_reference(planner.metadata(), &argument.type_),
+            )
+        })
+        .collect();
+    field(&definition.name, arguments, named("OBJECT", &result_name))
+}
+
 const ORDER_BY_VALUES: &[&str] = &[
     "asc",
     "asc_nulls_first",
@@ -154,7 +523,7 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
     let mut mutation_fields: Vec<Json> = vec![];
 
     let select_args = |base: &str| -> Vec<Json> {
-        vec![
+        let mut args = vec![
             input_value("where", named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
             input_value(
                 "order_by",
@@ -162,11 +531,14 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             ),
             input_value("limit", named("SCALAR", "Int")),
             input_value("offset", named("SCALAR", "Int")),
-            input_value(
+        ];
+        if planner.capabilities.distinct_on {
+            args.push(input_value(
                 "distinct_on",
                 list_of(non_null(named("ENUM", &format!("{base}_select_column")))),
-            ),
-        ]
+            ));
+        }
+        args
     };
 
     for (idx, entry) in planner.tables().iter().enumerate() {
@@ -195,45 +567,65 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                 .as_ref()
                 .and_then(|c| c.column_config.get(&col.name))
                 .and_then(|cc| cc.comment.as_deref());
-            fields.push(field_desc(&col.name, vec![], ty, description));
-            select_columns.push(col.name.clone());
+            let gql_name = ctx.column_graphql_name(&col.name);
+            // A declared file column keeps its place among the columns — it is
+            // still filterable and orderable by its id — but what it returns is
+            // the file object, so the schema must say so.
+            if let Some(attachment) = crate::plan::Planner::attachment_of(entry, &col.name) {
+                let file_type = format!("{base}_{}_file", attachment.column);
+                let text = non_null(named("SCALAR", "String"));
+                types.push(object_type(
+                    &file_type,
+                    vec![
+                        field("id", vec![], non_null(named("SCALAR", "uuid"))),
+                        field("file_name", vec![], text.clone()),
+                        field("media_type", vec![], text.clone()),
+                        field("size", vec![], named("SCALAR", "bigint")),
+                        field("url", vec![], text),
+                    ],
+                ));
+                scalars.insert("uuid".to_string());
+                scalars.insert("bigint".to_string());
+                let ty = if col.nullable {
+                    named("OBJECT", &file_type)
+                } else {
+                    non_null(named("OBJECT", &file_type))
+                };
+                fields.push(field_desc(&gql_name, vec![], ty, description));
+                select_columns.push(gql_name);
+                continue;
+            }
+            fields.push(field_desc(&gql_name, vec![], ty, description));
+            select_columns.push(gql_name);
         }
         for rel in &entry.object_relationships {
-            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
-                if let Some(remote_entry) = planner.entry_for(&remote) {
-                    if planner
-                        .table_ctx_by_name(&remote, &session.role)
-                        .is_some()
-                    {
-                        // Donat makes an FK-based object relationship
-                        // non-nullable when the local FK column(s) are NOT
-                        // NULL (the related row always exists).
-                        let base = named("OBJECT", &table_base_name(remote_entry));
-                        let ty = if object_rel_is_non_null(rel, ctx.info) {
-                            non_null(base)
-                        } else {
-                            base
-                        };
-                        fields.push(field(&rel.name, vec![], ty));
-                    }
-                }
+            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$")
+                && let Some(remote_entry) = planner.entry_for(&remote)
+                && planner.table_ctx_by_name(&remote, &session.role).is_some()
+            {
+                // Donat makes an FK-based object relationship
+                // non-nullable when the local FK column(s) are NOT
+                // NULL (the related row always exists).
+                let base = named("OBJECT", &table_base_name(remote_entry));
+                let ty = if object_rel_is_non_null(rel, ctx.info) {
+                    non_null(base)
+                } else {
+                    base
+                };
+                fields.push(field(&rel.name, vec![], ty));
             }
         }
         for rel in &entry.array_relationships {
-            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$") {
-                if let Some(remote_entry) = planner.entry_for(&remote) {
-                    if planner
-                        .table_ctx_by_name(&remote, &session.role)
-                        .is_some()
-                    {
-                        let remote_base = table_base_name(remote_entry);
-                        fields.push(field(
-                            &rel.name,
-                            select_args(&remote_base),
-                            non_null(list_of(non_null(named("OBJECT", &remote_base)))),
-                        ));
-                    }
-                }
+            if let Some((remote, _)) = planner.relationship_target(&ctx, &rel.name, "$")
+                && let Some(remote_entry) = planner.entry_for(&remote)
+                && planner.table_ctx_by_name(&remote, &session.role).is_some()
+            {
+                let remote_base = table_base_name(remote_entry);
+                fields.push(field(
+                    &rel.name,
+                    select_args(&remote_base),
+                    non_null(list_of(non_null(named("OBJECT", &remote_base)))),
+                ));
             }
         }
         types.push(object_type(&base, fields));
@@ -259,14 +651,21 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                 continue;
             }
             let scalar = scalar_name(&col.pg_type).to_string();
+            let gql_name = ctx.column_graphql_name(&col.name);
             bool_exp_fields.push(input_value(
-                &col.name,
+                &gql_name,
                 named("INPUT_OBJECT", &format!("{scalar}_comparison_exp")),
             ));
-            order_by_fields.push(input_value(&col.name, named("ENUM", "order_by")));
+            order_by_fields.push(input_value(&gql_name, named("ENUM", "order_by")));
         }
-        types.push(input_object_type(&format!("{base}_bool_exp"), bool_exp_fields));
-        types.push(input_object_type(&format!("{base}_order_by"), order_by_fields));
+        types.push(input_object_type(
+            &format!("{base}_bool_exp"),
+            bool_exp_fields,
+        ));
+        types.push(input_object_type(
+            &format!("{base}_order_by"),
+            order_by_fields,
+        ));
 
         // Query roots.
         query_fields.push(field(
@@ -275,21 +674,24 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             non_null(list_of(non_null(named("OBJECT", &base)))),
         ));
         if !ctx.info.primary_key.is_empty()
-            && ctx
-                .info
-                .primary_key
-                .iter()
-                .all(|pk| ctx.column_allowed(pk))
+            && ctx.info.primary_key.iter().all(|pk| ctx.column_allowed(pk))
         {
             let pk_args: Vec<Json> = ctx
                 .info
                 .primary_key
                 .iter()
                 .map(|pk| {
-                    let scalar =
-                        scalar_name(&ctx.info.column(pk).map(|c| c.pg_type.clone()).unwrap_or_default())
-                            .to_string();
-                    input_value(pk, non_null(named("SCALAR", &scalar)))
+                    let scalar = scalar_name(
+                        &ctx.info
+                            .column(pk)
+                            .map(|c| c.pg_type.clone())
+                            .unwrap_or_default(),
+                    )
+                    .to_string();
+                    input_value(
+                        &ctx.column_graphql_name(pk),
+                        non_null(named("SCALAR", &scalar)),
+                    )
                 })
                 .collect();
             query_fields.push(field(&names.select_by_pk, pk_args, named("OBJECT", &base)));
@@ -322,21 +724,101 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         }
 
         // Mutations for the role.
-        let insert_perm = planner.resolve_role_perm(&entry.insert_permissions, &session.role, |p| {
-            !p.backend_only || session.backend_request
-        });
-        if insert_perm.is_some() {
+        let insert_perm =
+            planner.resolve_role_perm(&entry.insert_permissions, &session.role, |p| {
+                !p.backend_only || session.backend_request
+            });
+        if let Some(insert_perm) = insert_perm {
+            let mut insert_fields: Vec<Json> = ctx
+                .info
+                .columns
+                .iter()
+                .filter(|column| match &insert_perm.columns {
+                    Columns::Star => true,
+                    Columns::List(columns) => columns.iter().any(|name| name == &column.name),
+                })
+                .filter(|column| !insert_perm.set.contains_key(&column.name))
+                .map(|c| {
+                    let scalar = scalar_name(&c.pg_type).to_string();
+                    input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", &scalar))
+                })
+                .collect();
+            if planner.capabilities.nested_inserts {
+                for rel in &entry.object_relationships {
+                    let Some(manual) = &rel.using.manual_configuration else {
+                        continue;
+                    };
+                    if manual.insertion_order.as_deref() != Some("after_parent") {
+                        continue;
+                    }
+                    let Some(remote_entry) = planner.entry_for(&manual.remote_table) else {
+                        continue;
+                    };
+                    if planner
+                        .table_ctx_by_name(&manual.remote_table, &session.role)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let remote_insert_perm = planner.resolve_role_perm(
+                        &remote_entry.insert_permissions,
+                        &session.role,
+                        |p| !p.backend_only || session.backend_request,
+                    );
+                    if remote_insert_perm.is_none() {
+                        continue;
+                    }
+                    insert_fields.push(input_value(
+                        &rel.name,
+                        named(
+                            "INPUT_OBJECT",
+                            &format!("{}_obj_rel_insert_input", table_base_name(remote_entry)),
+                        ),
+                    ));
+                }
+            }
             types.push(input_object_type(
                 &format!("{base}_insert_input"),
-                ctx.info
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        let scalar = scalar_name(&c.pg_type).to_string();
-                        input_value(&c.name, named("SCALAR", &scalar))
-                    })
-                    .collect(),
+                insert_fields,
             ));
+            if planner.capabilities.nested_inserts {
+                for rel in &entry.object_relationships {
+                    let Some(manual) = &rel.using.manual_configuration else {
+                        continue;
+                    };
+                    if manual.insertion_order.as_deref() != Some("after_parent") {
+                        continue;
+                    }
+                    let Some(remote_entry) = planner.entry_for(&manual.remote_table) else {
+                        continue;
+                    };
+                    if planner
+                        .table_ctx_by_name(&manual.remote_table, &session.role)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let remote_insert_perm = planner.resolve_role_perm(
+                        &remote_entry.insert_permissions,
+                        &session.role,
+                        |p| !p.backend_only || session.backend_request,
+                    );
+                    if remote_insert_perm.is_none() {
+                        continue;
+                    }
+                    let remote_base = table_base_name(remote_entry);
+                    types.push(input_object_type(
+                        &format!("{remote_base}_obj_rel_insert_input"),
+                        vec![input_value(
+                            "data",
+                            non_null(named(
+                                "INPUT_OBJECT",
+                                &format!("{remote_base}_insert_input"),
+                            )),
+                        )],
+                    ));
+                }
+            }
             types.push(object_type(
                 &format!("{base}_mutation_response"),
                 vec![
@@ -364,15 +846,22 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
             .resolve_role_perm(&entry.update_permissions, &session.role, |_| true)
             .is_some()
         {
+            let mut update_args = vec![
+                input_value(
+                    "where",
+                    non_null(named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
+                ),
+                input_value("_set", named("INPUT_OBJECT", &format!("{base}_set_input"))),
+            ];
+            if planner.capabilities.json_ops == JsonOps::Jsonb {
+                update_args.push(input_value(
+                    "_append",
+                    named("INPUT_OBJECT", &format!("{base}_append_input")),
+                ));
+            }
             mutation_fields.push(field(
                 &format!("update_{base}"),
-                vec![
-                    input_value(
-                        "where",
-                        non_null(named("INPUT_OBJECT", &format!("{base}_bool_exp"))),
-                    ),
-                    input_value("_set", named("INPUT_OBJECT", &format!("{base}_set_input"))),
-                ],
+                update_args,
                 named("OBJECT", &format!("{base}_mutation_response")),
             ));
             types.push(input_object_type(
@@ -382,10 +871,23 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
                     .iter()
                     .map(|c| {
                         let scalar = scalar_name(&c.pg_type).to_string();
-                        input_value(&c.name, named("SCALAR", &scalar))
+                        input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", &scalar))
                     })
                     .collect(),
             ));
+            if planner.capabilities.json_ops == JsonOps::Jsonb {
+                types.push(input_object_type(
+                    &format!("{base}_append_input"),
+                    ctx.info
+                        .columns
+                        .iter()
+                        .filter(|c| c.pg_type == "jsonb")
+                        .map(|c| {
+                            input_value(&ctx.column_graphql_name(&c.name), named("SCALAR", "jsonb"))
+                        })
+                        .collect(),
+                ));
+            }
         }
         if planner
             .resolve_role_perm(&entry.delete_permissions, &session.role, |_| true)
@@ -402,27 +904,135 @@ pub(crate) fn build_schema_json(planner: &Planner, session: &Session) -> Json {
         }
     }
 
+    // File attachments: one root field, and it exists only for a role that may
+    // write some declared file column.
+    let writable_attachments = planner.writable_attachments(session);
+    if !writable_attachments.is_empty() {
+        let values: Vec<String> = writable_attachments
+            .iter()
+            .map(|(entry, attachment)| {
+                crate::plan_mutation::attachment_enum_value(entry, attachment)
+            })
+            .collect();
+        let value_refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        types.push(enum_type("donat_file_attachment", &value_refs));
+        types.push(object_type(
+            "donat_file_upload_header",
+            vec![
+                field("name", vec![], non_null(named("SCALAR", "String"))),
+                field("value", vec![], non_null(named("SCALAR", "String"))),
+            ],
+        ));
+        types.push(object_type(
+            "donat_file_upload",
+            vec![
+                field("id", vec![], non_null(named("SCALAR", "uuid"))),
+                field("url", vec![], non_null(named("SCALAR", "String"))),
+                field("method", vec![], non_null(named("SCALAR", "String"))),
+                field(
+                    "headers",
+                    vec![],
+                    non_null(list_of(non_null(named(
+                        "OBJECT",
+                        "donat_file_upload_header",
+                    )))),
+                ),
+                field("complete_url", vec![], named("SCALAR", "String")),
+                field("expires_at", vec![], non_null(named("SCALAR", "String"))),
+            ],
+        ));
+        scalars.insert("uuid".to_string());
+        mutation_fields.push(field(
+            "donat_request_file_upload",
+            vec![
+                input_value(
+                    "attachment",
+                    non_null(named("ENUM", "donat_file_attachment")),
+                ),
+                input_value("file_name", non_null(named("SCALAR", "String"))),
+                input_value("media_type", non_null(named("SCALAR", "String"))),
+                input_value("size", non_null(named("SCALAR", "Int"))),
+            ],
+            non_null(named("OBJECT", "donat_file_upload")),
+        ));
+    }
+
+    let mut emitted_command_input_types = std::collections::BTreeSet::new();
+    for command in planner.command_definitions() {
+        if planner.command_is_visible(command, session) {
+            // Generated output names belong to one command. The static command
+            // catalog rejects cross-command collisions, so introspection must
+            // not silently coalesce two different command definitions here.
+            let mut emitted_command_row_types = std::collections::BTreeSet::new();
+            mutation_fields.push(add_command_schema(
+                planner,
+                command,
+                &mut types,
+                &mut scalars,
+                &mut emitted_command_row_types,
+                &mut emitted_command_input_types,
+            ));
+        }
+    }
+
     // Comparison input objects for every scalar in use.
     for scalar in &scalars {
         let s = named("SCALAR", scalar);
-        types.push(input_object_type(
-            &format!("{scalar}_comparison_exp"),
-            vec![
-                input_value("_eq", s.clone()),
-                input_value("_neq", s.clone()),
-                input_value("_gt", s.clone()),
-                input_value("_gte", s.clone()),
-                input_value("_lt", s.clone()),
-                input_value("_lte", s.clone()),
-                input_value("_in", list_of(non_null(s.clone()))),
-                input_value("_nin", list_of(non_null(s.clone()))),
-                input_value("_is_null", named("SCALAR", "Boolean")),
-            ],
-        ));
+        let mut operators = vec![
+            input_value("_eq", s.clone()),
+            input_value("_neq", s.clone()),
+            input_value("_gt", s.clone()),
+            input_value("_gte", s.clone()),
+            input_value("_lt", s.clone()),
+            input_value("_lte", s.clone()),
+            input_value("_in", list_of(non_null(s.clone()))),
+            input_value("_nin", list_of(non_null(s.clone()))),
+            input_value("_is_null", named("SCALAR", "Boolean")),
+        ];
+        // Pattern matching is text-only, and it is how every search box over
+        // this API is written. The engine accepts these on a text column, so
+        // the schema has to offer them there — a client generating types from
+        // an introspection that omitted them could not express a search the
+        // engine answers perfectly well.
+        // What the engine accepts on a text column. `_like` and `_ilike` are
+        // how every search box over this API is written, and the regex family
+        // is what a backend that has one adds to them.
+        if scalar == "String" {
+            operators.extend([
+                input_value("_like", s.clone()),
+                input_value("_nlike", s.clone()),
+                input_value("_ilike", s.clone()),
+                input_value("_nilike", s.clone()),
+            ]);
+            if planner.capabilities.regex_ops {
+                operators.extend([
+                    input_value("_similar", s.clone()),
+                    input_value("_nsimilar", s.clone()),
+                    input_value("_regex", s.clone()),
+                    input_value("_iregex", s.clone()),
+                    input_value("_nregex", s.clone()),
+                    input_value("_niregex", s.clone()),
+                ]);
+            }
+        }
+        // Key tests belong to the document type that has keys.
+        if scalar == "jsonb"
+            && matches!(
+                planner.capabilities.json_ops,
+                donat_backend::capabilities::JsonOps::Jsonb
+            )
+        {
+            operators.extend([
+                input_value("_has_key", named("SCALAR", "String")),
+                input_value("_has_keys_any", list_of(non_null(named("SCALAR", "String")))),
+                input_value("_has_keys_all", list_of(non_null(named("SCALAR", "String")))),
+            ]);
+        }
+        types.push(input_object_type(&format!("{scalar}_comparison_exp"), operators));
         types.push(scalar_type(scalar));
     }
 
-    let has_mutations = !mutation_fields.is_empty();
+    let has_mutations = planner.capabilities.mutations && !mutation_fields.is_empty();
     let subscription_fields = query_fields.clone();
     types.push(object_type("query_root", query_fields));
     types.push(object_type("subscription_root", subscription_fields));
@@ -471,6 +1081,22 @@ pub fn execute_introspection(
     operation_name: Option<&str>,
     variables: &JsonMap<String, Json>,
 ) -> Option<Result<Json, PlanError>> {
+    execute_introspection_schema(
+        &build_schema_json(planner, session),
+        doc,
+        operation_name,
+        variables,
+    )
+}
+
+/// Project an introspection operation through a prebuilt role schema. This
+/// lets composite planners reuse the exact existing introspection executor.
+pub(crate) fn execute_introspection_schema(
+    schema: &Json,
+    doc: &Document<'static, String>,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> Option<Result<Json, PlanError>> {
     let mut fragments: Fragments = std::collections::HashMap::new();
     let mut operations = vec![];
     for def in &doc.definitions {
@@ -503,18 +1129,15 @@ pub fn execute_introspection(
         return None;
     }
 
-    let schema = build_schema_json(planner, session);
     let mut data = JsonMap::new();
     for root in roots {
         let alias = root.alias.clone().unwrap_or_else(|| root.name.clone());
         let value = match root.name.as_str() {
             "__typename" => Json::String("query_root".to_string()),
-            "__schema" => {
-                match project(&schema, &root.selection_set, &fragments, variables) {
-                    Ok(v) => v,
-                    Err(e) => return Some(Err(e)),
-                }
-            }
+            "__schema" => match project(schema, &root.selection_set, &fragments, variables) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            },
             "__type" => {
                 let name = root
                     .arguments
@@ -548,6 +1171,61 @@ pub fn execute_introspection(
     Some(Ok(Json::Object(data)))
 }
 
+/// Project introspection through a schema that is obtained only when the
+/// selected operation actually contains `__schema` or `__type`.
+pub(crate) fn execute_introspection_schema_lazy<'schema>(
+    schema: impl FnOnce() -> Result<Cow<'schema, Json>, PlanError>,
+    doc: &Document<'static, String>,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> Option<Result<Json, PlanError>> {
+    if !is_introspection_operation(doc, operation_name, variables) {
+        return None;
+    }
+    let schema = match schema() {
+        Ok(schema) => schema,
+        Err(error) => return Some(Err(error)),
+    };
+    execute_introspection_schema(&schema, doc, operation_name, variables)
+}
+
+pub(crate) fn is_introspection_operation(
+    doc: &Document<'static, String>,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> bool {
+    let mut fragments: Fragments = std::collections::HashMap::new();
+    let mut operations = vec![];
+    for definition in &doc.definitions {
+        match definition {
+            Definition::Fragment(fragment) => {
+                fragments.insert(fragment.name.clone(), fragment);
+            }
+            Definition::Operation(operation) => operations.push(operation),
+        }
+    }
+    let operation = match operation_name {
+        Some(wanted) => operations.iter().find(|operation| match operation {
+            OperationDefinition::Query(query) => query.name.as_deref() == Some(wanted),
+            _ => false,
+        }),
+        None if operations.len() == 1 => operations.first(),
+        None => None,
+    };
+    let Some(selection_set) = operation.and_then(|operation| match operation {
+        OperationDefinition::Query(query) => Some(&query.selection_set),
+        OperationDefinition::SelectionSet(selection_set) => Some(selection_set),
+        _ => None,
+    }) else {
+        return false;
+    };
+    flatten(selection_set, &fragments, variables, None).is_ok_and(|roots| {
+        roots
+            .iter()
+            .any(|field| field.name == "__schema" || field.name == "__type")
+    })
+}
+
 /// Project a prebuilt introspection value through a selection set.
 /// An FK-based object relationship is non-nullable when every local FK
 /// column is NOT NULL (the referenced row is guaranteed to exist). Manual
@@ -563,6 +1241,7 @@ fn object_rel_is_non_null(
     let cols: Vec<&str> = match fk {
         ObjRelFkColumns::Single(c) => vec![c.as_str()],
         ObjRelFkColumns::Multiple(cs) => cs.iter().map(String::as_str).collect(),
+        ObjRelFkColumns::Remote(_) => return false,
     };
     !cols.is_empty()
         && cols
@@ -599,5 +1278,177 @@ fn project(
             Ok(Json::Object(out))
         }
         scalar => Ok(scalar.clone()),
+    }
+}
+
+#[cfg(test)]
+mod lazy_schema_tests {
+    use std::borrow::Cow;
+    use std::cell::Cell;
+
+    use super::execute_introspection_schema_lazy;
+    use serde_json::{Map as JsonMap, json};
+
+    #[test]
+    fn ordinary_operations_do_not_materialize_an_introspection_schema() {
+        let schema = json!({ "types": [] });
+        for query in ["{ public_item { id } }", "{ __typename }"] {
+            let builds = Cell::new(0);
+            let doc = graphql_parser::parse_query::<String>(query)
+                .expect("query parses")
+                .into_static();
+
+            let result = execute_introspection_schema_lazy(
+                || {
+                    builds.set(builds.get() + 1);
+                    Ok(Cow::Borrowed(&schema))
+                },
+                &doc,
+                None,
+                &JsonMap::new(),
+            );
+
+            assert!(result.is_none(), "{query} is not introspection");
+            assert_eq!(builds.get(), 0, "{query} must not request a schema");
+        }
+    }
+
+    #[test]
+    fn introspection_materializes_the_schema_once() {
+        let schema = json!({
+            "types": [{
+                "__typename": "__Type",
+                "kind": "OBJECT",
+                "name": "query_root"
+            }]
+        });
+        let builds = Cell::new(0);
+        let doc =
+            graphql_parser::parse_query::<String>(r#"{ __type(name: "query_root") { name } }"#)
+                .expect("query parses")
+                .into_static();
+
+        let data = execute_introspection_schema_lazy(
+            || {
+                builds.set(builds.get() + 1);
+                Ok(Cow::Borrowed(&schema))
+            },
+            &doc,
+            None,
+            &JsonMap::new(),
+        )
+        .expect("introspection is detected")
+        .expect("introspection succeeds");
+
+        assert_eq!(data["__type"]["name"], "query_root");
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn selected_named_operation_controls_schema_materialization() {
+        let schema = json!({ "types": [] });
+        let doc = graphql_parser::parse_query::<String>(
+            r#"
+            query Data { public_item { id } }
+            query Inspect { __type(name: "query_root") { name } }
+            "#,
+        )
+        .expect("query parses")
+        .into_static();
+        let builds = Cell::new(0);
+
+        let data = execute_introspection_schema_lazy(
+            || {
+                builds.set(builds.get() + 1);
+                Ok(Cow::Borrowed(&schema))
+            },
+            &doc,
+            Some("Data"),
+            &JsonMap::new(),
+        );
+        assert!(data.is_none());
+        assert_eq!(builds.get(), 0);
+
+        let introspection = execute_introspection_schema_lazy(
+            || {
+                builds.set(builds.get() + 1);
+                Ok(Cow::Borrowed(&schema))
+            },
+            &doc,
+            Some("Inspect"),
+            &JsonMap::new(),
+        );
+        assert!(introspection.is_some());
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn fragments_and_directives_control_schema_materialization() {
+        let schema = json!({ "types": [] });
+        let doc = graphql_parser::parse_query::<String>(
+            r#"
+            query Inspect($include: Boolean!, $skip: Boolean!) {
+              ...IntrospectionFields @include(if: $include) @skip(if: $skip)
+            }
+            fragment IntrospectionFields on query_root {
+              __type(name: "query_root") { name }
+            }
+            "#,
+        )
+        .expect("query parses")
+        .into_static();
+
+        for (include, skip, expected_builds) in
+            [(false, false, 0), (true, true, 0), (true, false, 1)]
+        {
+            let builds = Cell::new(0);
+            let variables = JsonMap::from_iter([
+                ("include".to_string(), json!(include)),
+                ("skip".to_string(), json!(skip)),
+            ]);
+            let result = execute_introspection_schema_lazy(
+                || {
+                    builds.set(builds.get() + 1);
+                    Ok(Cow::Borrowed(&schema))
+                },
+                &doc,
+                Some("Inspect"),
+                &variables,
+            );
+
+            assert_eq!(builds.get(), expected_builds);
+            assert_eq!(result.is_some(), expected_builds == 1);
+        }
+    }
+
+    #[test]
+    fn mixed_data_and_introspection_preserves_the_validation_error() {
+        let schema = json!({ "types": [] });
+        let builds = Cell::new(0);
+        let doc = graphql_parser::parse_query::<String>(
+            r#"{ __type(name: "query_root") { name } public_item { id } }"#,
+        )
+        .expect("query parses")
+        .into_static();
+
+        let error = execute_introspection_schema_lazy(
+            || {
+                builds.set(builds.get() + 1);
+                Ok(Cow::Borrowed(&schema))
+            },
+            &doc,
+            None,
+            &JsonMap::new(),
+        )
+        .expect("introspection is detected")
+        .expect_err("mixed roots are rejected");
+
+        assert_eq!(builds.get(), 1);
+        assert_eq!(error.code, "validation-failed");
+        assert_eq!(error.path, "$");
+        assert_eq!(
+            error.message,
+            "cannot mix 'public_item' with introspection fields"
+        );
     }
 }

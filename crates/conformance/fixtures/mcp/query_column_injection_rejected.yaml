@@ -1,0 +1,24 @@
+description: >
+  A `columns` entry carrying GraphQL selection syntax is rejected before the
+  MCP tool builds a GraphQL document. MCP `columns` are plain tracked-table
+  column names, not raw selection-set fragments.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 25
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns:
+      - "id } mutation x { delete_pet(where: {}) { affected_rows } }"
+response:
+  jsonrpc: "2.0"
+  id: 25
+  result:
+    isError: true

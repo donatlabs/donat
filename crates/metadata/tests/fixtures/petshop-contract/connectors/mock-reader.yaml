@@ -1,0 +1,31 @@
+name: mock_reader
+module: http
+operations:
+  - name: read
+    version: v1
+    method: GET
+    path: /v1/read
+    input_contract: {}
+    success_statuses: [200]
+    response: {}
+    effect: read_only
+    bounds:
+      deadline_ms: 1000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 1024
+      maximum_aggregate_response_bytes: 1024
+      maximum_output_canonical_bytes: 1024
+      maximum_redirects: 0
+      maximum_json_depth: 4
+      maximum_json_nodes: 16
+    error_map:
+      rules: []
+      fallback: { class: permanent, code: read_failed }
+    timeout: 1s
+    retry:
+      maximum_attempts: 1
+      backoff: 0s
+      retry_on: []
+    redaction: {}

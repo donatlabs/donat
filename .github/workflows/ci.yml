@@ -11,36 +11,128 @@ env:
 
 jobs:
   test:
-    name: Tests (unit + conformance)
+    name: Workspace tests
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgis/postgis:16-3.4
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 15432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
-      # Conformance harness: admin connection for per-suite databases.
       PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The connector source-identity check reads the reviewed bytes out of
+          # the commit its source record pins — `git show <commit>:<path>` —
+          # which a shallow checkout does not have. Verifying a record against
+          # a commit is the point of it, so the history has to be here.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Connector processor boundary policy
+        run: python3 scripts/check_connector_processor_boundary.py
+      # The durable Process journals, the command claim ledger and catalog
+      # introspection are all contracts against a real database, so their
+      # tests need one. They live in the ordinary crates rather than in the
+      # conformance harness because they test one crate's behaviour, not the
+      # engine end to end.
+      - name: Start Postgres
+        run: docker compose -f docker-compose.conformance.yml up -d --wait postgres
+      - name: Workspace tests
+        run: cargo test --workspace --exclude donat-conformance
+
+  backend-core:
+    name: Shared conformance (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: postgres
+          - backend: sqlite
+          - backend: mysql
+          - backend: clickhouse
+    env:
+      CONF_BACKEND: ${{ matrix.backend }}
+      PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
+      MYSQL_URL: mysql://root:root@127.0.0.1:13306/donat
+      CLICKHOUSE_URL: http://donat:donat@127.0.0.1:18123
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Build the engine binary first: conformance suites spawn it.
+        with:
+          key: backend-${{ matrix.backend }}
+      - name: Start backend service
+        if: matrix.backend != 'sqlite'
+        run: docker compose -f docker-compose.conformance.yml up -d --wait "${{ matrix.backend }}"
       - name: Build engine
-        run: cargo build --workspace --bins
-      - name: Unit and snapshot tests
-        run: cargo test --workspace --exclude donat-conformance
-      - name: Conformance suite
-        run: cargo test -p donat-conformance
+        run: cargo build -p donat-server --bin donat
+      - name: Matrix registry and manifest guards
+        run: cargo test -p donat-conformance --lib
+      - name: Shared backend contract
+        run: cargo test -p donat-conformance --test backend_matrix -- --test-threads=4 --nocapture
         env:
           RUST_BACKTRACE: "1"
+      - name: Live MySQL runtime tests
+        if: matrix.backend == 'mysql'
+        run: |
+          cargo test -p donat-server \
+            --test mysql_e2e \
+            --test mysql_runtime \
+            --test mysql_mutations -- --nocapture
+        env:
+          DONAT_EXTERNAL_DB_TESTS: "1"
+      - name: Live ClickHouse runtime tests
+        if: matrix.backend == 'clickhouse'
+        run: cargo test -p donat-server --test clickhouse_runtime -- --include-ignored --nocapture
+        env:
+          DONAT_EXTERNAL_DB_TESTS: "1"
+      # File attachments have no local-disk backend: every one of their cases
+      # goes to an S3-compatible store, so the Postgres reference leg needs one
+      # exactly the way it needs a database.
+      - name: Start the object store
+        if: matrix.backend == 'postgres'
+        run: |
+          docker compose -f docker-compose.conformance.yml up -d --wait minio
+          docker compose -f docker-compose.conformance.yml run --rm minio-init
+      - name: Full Postgres reference conformance
+        if: matrix.backend == 'postgres'
+        run: env -u MYSQL_URL -u CLICKHOUSE_URL cargo test -p donat-conformance -- --test-threads=4
+        env:
+          RUST_BACKTRACE: "1"
+          S3_URL: http://127.0.0.1:19000
+
+  backend-core-gate:
+    name: Conformance matrix
+    if: always()
+    needs: backend-core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every backend
+        run: test '${{ needs.backend-core.result }}' = success
+
+  mixed-backend-conformance:
+    name: Mixed Postgres and ClickHouse conformance
+    runs-on: ubuntu-latest
+    env:
+      DONAT_EXTERNAL_DB_TESTS: "1"
+      PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
+      CLICKHOUSE_URL: http://donat:donat@127.0.0.1:18123
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mixed-postgres-clickhouse
+      - name: Start Postgres and ClickHouse
+        run: docker compose -f docker-compose.conformance.yml up -d --wait postgres clickhouse
+      - name: Build engine
+        run: cargo build -p donat-server --bin donat
+      - name: Multi-database and multi-source contracts
+        run: |
+          cargo test -p donat-conformance \
+            --test clickhouse_multi_database \
+            --test multi_source \
+            --test tandt_clickhouse_contract -- \
+            --test-threads=1 --nocapture
 
   go-sdk:
     name: Go SDK (cgo-free, tests)
@@ -84,6 +176,28 @@ jobs:
       - name: gofmt (must be clean)
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
+  # The wasm core is committed as a blob so that `go get` needs no Rust
+  # toolchain, which means nothing otherwise notices when a crate below it
+  # changes and the blob stops matching the sources. This job rebuilds it and
+  # runs the Go host against the fresh artifact.
+  wasm-core:
+    name: Go SDK (wasm core rebuilds from source)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+      - name: Rebuild the embedded core
+        run: make wasm-core
+      - name: Test the Go host against the freshly built core
+        run: CGO_ENABLED=0 go test ./...
+        working-directory: sdk/go
+
   audit:
     name: Security advisories (cargo-audit)
     runs-on: ubuntu-latest
@@ -101,9 +215,51 @@ jobs:
       - name: cargo audit
         run: cargo audit --deny warnings
 
+  petshop-system:
+    name: Petshop system tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Raises the example the way its README deploys it — migrate, deploy the
+      # Process revisions, then serve — with the engine built from this commit.
+      - name: Raise the stand
+        run: tests-system/stack.sh up
+      # The same store with its declared periods rewritten to seconds. Without
+      # it every deadline branch — dunning, expiries, unanswered approvals —
+      # skips itself, and the run is green having tested none of them.
+      - name: Raise the fast stand
+        run: tests-system/stack.sh up-fast
+      - name: Install the suite
+        run: |
+          python3 -m venv tests-system/.venv
+          tests-system/.venv/bin/pip install -q -r tests-system/requirements.txt
+      - name: Black-box system tests
+        working-directory: tests-system
+        env:
+          PETSHOP_BASE_URL: http://127.0.0.1:8080
+          PETSHOP_PROVIDERS_URL: http://127.0.0.1:8099
+          PETSHOP_FAST_BASE_URL: http://127.0.0.1:8081
+          PETSHOP_FAST_PROVIDERS_URL: http://127.0.0.1:8098
+        run: .venv/bin/python -m pytest -q
+      - name: Engine log
+        if: failure()
+        run: |
+          tail -200 tests-system/.stack/engine.log
+          tail -200 tests-system/.stack/engine-fast.log
+      - name: Drop the stand
+        if: always()
+        run: |
+          tests-system/stack.sh down-fast
+          tests-system/stack.sh down
+
   artifacts:
     name: Build artifact (${{ matrix.target.name }})
-    needs: test
+    needs: [test, backend-core-gate, mixed-backend-conformance, petshop-system]
     strategy:
       matrix:
         target:

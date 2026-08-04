@@ -1,0 +1,15 @@
+metadata:
+  version: 3
+  connectors:
+    - name: unsupported
+      module: does_not_exist
+      config:
+        endpoint_identity: static_connector_test
+        credential_identity: static_connector_credential
+        headers:
+          - name: X-Test-Credential
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations: []
+expect:
+  output_contains: "unknown connector module `does_not_exist`"
+  output_excludes: "connector-present-secret-sentinel"

@@ -25,7 +25,10 @@ fn quote_lit_neutralises_classic_injection_payloads() {
         ("' OR '1'='1", "'' OR ''1''=''1"),
         ("'; DROP TABLE users; --", "''; DROP TABLE users; --"),
         ("admin'--", "admin''--"),
-        ("' UNION SELECT password FROM users --", "'' UNION SELECT password FROM users --"),
+        (
+            "' UNION SELECT password FROM users --",
+            "'' UNION SELECT password FROM users --",
+        ),
         ("1'); DROP TABLE t; --", "1''); DROP TABLE t; --"),
         ("x' OR 1=1 --", "x'' OR 1=1 --"),
     ];
@@ -35,7 +38,11 @@ fn quote_lit_neutralises_classic_injection_payloads() {
         assert_eq!(out, format!("'{doubled}'"), "wrong escaping for {raw:?}");
         // The escaped result has an even number of single quotes — no quote is
         // left to break out of the literal.
-        assert_eq!(out.matches('\'').count() % 2, 0, "odd quote count for {raw:?}: {out}");
+        assert_eq!(
+            out.matches('\'').count() % 2,
+            0,
+            "odd quote count for {raw:?}: {out}"
+        );
     }
 }
 
@@ -63,7 +70,11 @@ fn quote_ident_doubles_double_quotes() {
         "\"x\"\"; DROP TABLE t; --\""
     );
     let out = quote_ident("a\"b\"c");
-    assert_eq!(out.matches('"').count() % 2, 0, "odd double-quote count: {out}");
+    assert_eq!(
+        out.matches('"').count() % 2,
+        0,
+        "odd double-quote count: {out}"
+    );
 }
 
 #[test]

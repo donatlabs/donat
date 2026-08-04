@@ -1,0 +1,59 @@
+name: split_vendor_orders
+source: default
+permissions:
+  - role: marketplace_worker
+arguments:
+  - name: order_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: order
+    select_one:
+      table: public.orders
+      by:
+        id: { arg: order_id }
+      returning: [id, currency, order_status]
+      require_found: true
+  - name: split_candidates
+    select_many:
+      table: public.order_vendor_split_candidate
+      by:
+        order_id: { step: order, column: id }
+      order_by: [vendor_id, line_sequence, offer_id]
+      returning: [vendor_id, offer_id, order_line_id, line_sequence, product_category, gross_minor, currency]
+      require_non_empty: true
+  - name: commissioned_candidates
+    decision_many:
+      decision_table: marketplace_commission_route
+      from: { step: split_candidates }
+      input:
+        gross_minor: { current_column: gross_minor }
+        product_category: { current_column: product_category }
+      returning: [vendor_id, offer_id, order_line_id, line_sequence, product_category, gross_minor, currency, commission_bps, commission_tier]
+      order_by: [vendor_id, line_sequence, offer_id]
+  - name: vendor_orders
+    insert_many:
+      table: public.vendor_order
+      for_each: { step: commissioned_candidates }
+      object:
+        order_id: { step: order, column: id }
+        vendor_id: { item: vendor_id }
+        offer_id: { item: offer_id }
+        order_line_id: { item: order_line_id }
+        line_sequence: { item: line_sequence }
+        product_category: { item: product_category }
+        gross_minor: { item: gross_minor }
+        currency: { item: currency }
+        commission_bps: { item: commission_bps }
+        commission_tier: { item: commission_tier }
+        status: { literal: pending_acceptance }
+      returning: [id, order_id, vendor_id, gross_minor, currency, commission_bps, commission_tier, status]
+result:
+  order_id: { step: order, column: id }
+  vendor_orders: { step: vendor_orders }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: order_id }
+  retention: 365d

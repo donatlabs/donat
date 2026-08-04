@@ -1,0 +1,25 @@
+description: >
+  A GraphQL-looking key inside query.order_by is rejected before GraphQL
+  execution. MCP order_by accepts only tracked selectable column names, not
+  arbitrary GraphQL input object fragments.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 37
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      order_by:
+        "id } mutation x { delete_pet(where: {}) { affected_rows } }": asc
+response:
+  jsonrpc: "2.0"
+  id: 37
+  result:
+    isError: true

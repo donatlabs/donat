@@ -1,0 +1,19 @@
+description: >
+  MCP leaves non-local Host admission to the deployment edge and passes the
+  request to JSON-RPC dispatch.
+url: /mcp
+method: POST
+status: 200
+headers:
+  Host: "mcp.example.com"
+  MCP-Protocol-Version: "2025-06-18"
+body:
+  jsonrpc: "2.0"
+  id: 90
+  method: unknown
+response:
+  jsonrpc: "2.0"
+  id: 90
+  error:
+    code: -32601
+    message: method not found

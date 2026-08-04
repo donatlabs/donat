@@ -1,0 +1,1 @@
+{"data":{"document_stats":{"aggregate":{"sum":{"doc_count":6}},"nodes":[{"status":"error","doc_count":1},{"status":"done","doc_count":5}]},"workflow_stats":{"aggregate":{"count":2},"nodes":[{"status":"completed"},{"status":"failed"}]},"error_stats":{"aggregate":{"count":1},"nodes":[{"severity":"high"}]},"code_events":{"aggregate":{"count":1}}}}

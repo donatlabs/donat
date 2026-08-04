@@ -1,0 +1,24 @@
+query AnalyticsWorkflowExecutions(
+  $limit: Int = 100
+  $order_by: [analytics_workflow_executions_order_by!] = { start_time: desc }
+  $where: analytics_workflow_executions_bool_exp = {}
+) {
+  items: analytics_workflow_executions(
+    limit: $limit
+    order_by: $order_by
+    where: $where
+  ) {
+    workflow_id
+    workflow_type
+    status
+    start_time
+    end_time
+    duration_ms
+    activity_count
+    retry_count
+    error_message
+    company_id
+    user_id
+    document_id
+  }
+}

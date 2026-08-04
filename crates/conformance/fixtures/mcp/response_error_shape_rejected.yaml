@@ -1,0 +1,16 @@
+description: >
+  Incoming JSON-RPC error responses must carry the MCP/JSON-RPC error object
+  shape before the Streamable HTTP transport accepts them.
+url: /mcp
+method: POST
+status: 400
+body:
+  jsonrpc: "2.0"
+  id: "server-request-2"
+  error: "bad"
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "'error' must be an object"

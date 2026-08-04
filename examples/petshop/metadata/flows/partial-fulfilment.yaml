@@ -1,0 +1,384 @@
+name: partial_fulfilment
+kind: process
+version: 1
+source: default
+permissions:
+  - role: fulfilment
+input:
+  - { name: order_id, type: uuid! }
+  - { name: destination_region, type: string! }
+  - { name: allocation_request_id, type: uuid! }
+output:
+  - { name: status, type: string! }
+  - { name: order_id, type: uuid! }
+  - { name: allocations, type: "[AllocationGroup!]!" }
+  - { name: backorders, type: "[Backorder!]!" }
+  - { name: shipment_outcomes, type: "[ShipmentOutcome!]!" }
+  - { name: captures, type: "[PaymentCaptureOutcome!]!" }
+  - { name: unshipped_allocations, type: "[ItemFailure!]!" }
+idempotency:
+  key: { input: allocation_request_id }
+  scope:
+    - { input: order_id }
+start_at: allocate
+states:
+  - id: allocate
+    command:
+      name: allocate_inventory
+      run_as: fulfilment
+      arguments:
+        order_id: { input: order_id }
+        destination_region: { input: destination_region }
+        allocation_request_id: { input: allocation_request_id }
+      next: pack_allocations
+
+  - id: pack_allocations
+    for_each:
+      input: { state: allocate, field: allocations }
+      item_key: allocation_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: mark_order_packed
+        run_as: fulfilment
+        arguments:
+          allocation_id: { item: allocation_id }
+          packed_at: { workflow_time: now }
+          request_id: { activity_key: packed, as: uuid }
+      next: create_shipment_units
+
+  - id: create_shipment_units
+    for_each:
+      input: { state: pack_allocations, field: successful_items }
+      item_key: allocation_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: create_shipment
+        run_as: fulfilment
+        arguments:
+          allocation_id: { item: allocation_id }
+          shipment_key: { activity_key: shipment }
+          request_id: { activity_key: create_shipment, as: uuid }
+      next: request_labels
+
+  - id: request_labels
+    for_each:
+      input: { state: create_shipment_units, field: successful_items }
+      item_key: shipment_key
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      preserve_input: true
+      request:
+        connector: mock_carrier
+        operation: create_label
+        input:
+          shipment_id: { item: shipment_id }
+          shipment_key: { item: shipment_key }
+          origin_location_code: { item: stock_location_code }
+          destination: { input: destination_region }
+          currency: { item: currency }
+          ordered_items: { item: items }
+        idempotency_key:
+          stable: { run: id, state: request_labels, item_key: shipment_key }
+        timeout:
+          schedule_to_start: 10s
+          start_to_close: 12s
+        retry:
+          retry_on: [transport, timeout, http_429, http_5xx]
+          max_attempts: 4
+          initial_interval: 250ms
+          max_interval: 2s
+          jitter: deterministic_full
+        on_error:
+          routes:
+            - { kinds: [authentication, validation], next: reconcile_label_requests }
+            - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_label_requests }
+          fallback: { next: reconcile_label_requests }
+      next: reconcile_label_requests
+
+  - id: reconcile_label_requests
+    for_each:
+      input: { state: request_labels, field: failed_items }
+      item_key: shipment_key
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      preserve_input: true
+      request:
+        connector: mock_carrier
+        operation: lookup_label
+        input:
+          shipment_id: { item: shipment_id }
+          shipment_key: { item: shipment_key }
+          activity_key: { item: activity_key }
+        timeout:
+          schedule_to_start: 5s
+          start_to_close: 6s
+        retry:
+          retry_on: [transport, timeout, http_429, http_5xx]
+          max_attempts: 3
+          initial_interval: 100ms
+          max_interval: 1s
+          jitter: deterministic_full
+        on_error:
+          routes:
+            - { kinds: [authentication, validation], next: record_label_outcomes }
+            - { kinds: [permanent, invariant, timeout, retry_exhausted], next: record_label_outcomes }
+          fallback: { next: record_label_outcomes }
+      next: record_label_outcomes
+
+  - id: record_label_outcomes
+    for_each:
+      input: { state: request_labels, field: successful_items }
+      item_key: shipment_key
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: record_shipment_result
+        run_as: fulfilment
+        arguments:
+          shipment_id: { item: shipment_id }
+          allocation_id: { item: allocation_id }
+          provider_event_id: { item: provider_event_id }
+          outcome: { item: normalized_outcome, as: string }
+          carrier_shipment_reference: { item: carrier_shipment_reference }
+          tracking_number: { item: tracking_number }
+          failure_code: { item: failure_code }
+          failure_message: { item: safe_failure_message }
+      next: record_reconciled_label_outcomes
+
+  - id: record_reconciled_label_outcomes
+    for_each:
+      input: { state: reconcile_label_requests, field: successful_items }
+      item_key: shipment_key
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: record_shipment_result
+        run_as: fulfilment
+        arguments:
+          shipment_id: { item: shipment_id }
+          allocation_id: { item: allocation_id }
+          provider_event_id: { item: provider_event_id }
+          outcome: { item: normalized_outcome, as: string }
+          carrier_shipment_reference: { item: carrier_shipment_reference }
+          tracking_number: { item: tracking_number }
+          failure_code: { item: failure_code }
+          failure_message: { item: safe_failure_message }
+      next: claim_payment_captures
+
+  # A successful label is the sole eligibility gate. This command reserves the
+  # total capture amount on the authorization before any provider call. The
+  # same row/amount fields are the zero-capture guard used by cancellation.
+  - id: claim_payment_captures
+    command:
+      name: claim_payment_captures
+      run_as: payment_worker
+      arguments:
+        payment_id: { state: allocate, field: payment_id }
+        authorization_id: { state: allocate, field: authorization_id }
+        claims:
+          bounded_flatten:
+            from:
+              bounded_concat:
+                inputs:
+                  - { state: record_label_outcomes, field: successful_items }
+                  - { state: record_reconciled_label_outcomes, field: successful_items }
+                maximum_lists: 2
+                maximum_items: 64
+            field: capture_eligible
+            project:
+              shipment_id: shipment_id
+              amount_minor: shipped_value_minor
+              currency: currency
+            maximum_lists: 64
+            maximum_items: 64
+        request_id: { activity_key: claim_payment_captures, as: uuid }
+      next: request_payment_captures
+
+  - id: request_payment_captures
+    for_each:
+      input: { state: claim_payment_captures, field: capture_claims }
+      item_key: shipment_id
+      max_items: 64
+      max_concurrency: 4
+      completion: collect
+      request:
+        connector: mock_payment
+        operation: capture
+        input:
+          payment_id: { state: allocate, field: payment_id }
+          shipment_id: { item: shipment_id }
+          amount_minor: { item: amount_minor }
+          currency: { item: currency }
+        idempotency_key:
+          stable: { run: id, state: request_payment_captures, item_key: shipment_id }
+        timeout:
+          schedule_to_start: 5s
+          start_to_close: 5s
+        retry:
+          retry_on: [transport, timeout, http_429, http_5xx]
+          max_attempts: 3
+          initial_interval: 100ms
+          max_interval: 1s
+          jitter: deterministic_full
+        on_error:
+          routes:
+            - { kinds: [authentication, validation], next: reconcile_payment_capture_requests }
+            - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_payment_capture_requests }
+          fallback: { next: reconcile_payment_capture_requests }
+      next: reconcile_payment_capture_requests
+
+  - id: reconcile_payment_capture_requests
+    for_each:
+      input: { state: request_payment_captures, field: failed_items }
+      item_key: shipment_id
+      max_items: 64
+      max_concurrency: 4
+      completion: collect
+      preserve_input: true
+      request:
+        connector: mock_payment
+        operation: lookup_capture
+        input:
+          payment_id: { state: allocate, field: payment_id }
+          shipment_id: { item: shipment_id }
+          amount_minor: { item: amount_minor }
+          activity_key: { item: activity_key }
+        timeout:
+          schedule_to_start: 5s
+          start_to_close: 6s
+        retry:
+          retry_on: [transport, timeout, http_429, http_5xx]
+          max_attempts: 3
+          initial_interval: 100ms
+          max_interval: 1s
+          jitter: deterministic_full
+        on_error:
+          routes:
+            - { kinds: [authentication, validation], next: record_payment_captures }
+            - { kinds: [permanent, invariant, timeout, retry_exhausted], next: record_payment_captures }
+          fallback: { next: record_payment_captures }
+      next: record_payment_captures
+
+  - id: record_payment_captures
+    for_each:
+      input: { state: request_payment_captures, field: successful_items }
+      item_key: shipment_id
+      max_items: 64
+      max_concurrency: 4
+      completion: collect
+      command:
+        name: capture_payment
+        run_as: payment_worker
+        arguments:
+          payment_id: { state: allocate, field: payment_id }
+          authorization_id: { state: allocate, field: authorization_id }
+          shipment_id: { item: shipment_id }
+          provider_capture_id: { item: provider_capture_id }
+          provider_event_id: { item: provider_event_id }
+          amount_minor: { item: amount_minor }
+          provider_outcome: { item: status }
+          payload: { item: normalized_payload }
+      next: record_reconciled_payment_captures
+
+  - id: record_reconciled_payment_captures
+    for_each:
+      input:
+        bounded_flatten:
+          from: { state: reconcile_payment_capture_requests, field: successful_items }
+          field: captured
+          maximum_lists: 64
+          maximum_items: 64
+      item_key: shipment_id
+      max_items: 64
+      max_concurrency: 4
+      completion: collect
+      command:
+        name: capture_payment
+        run_as: payment_worker
+        arguments:
+          payment_id: { state: allocate, field: payment_id }
+          authorization_id: { state: allocate, field: authorization_id }
+          shipment_id: { item: shipment_id }
+          provider_capture_id: { item: provider_capture_id }
+          provider_event_id: { item: provider_event_id }
+          amount_minor: { item: amount_minor }
+          provider_outcome: { item: outcome }
+          payload: { item: normalized_payload }
+      next: release_absent_capture_claims
+
+  - id: release_absent_capture_claims
+    for_each:
+      input:
+        bounded_flatten:
+          from: { state: reconcile_payment_capture_requests, field: successful_items }
+          field: terminal_absences
+          maximum_lists: 64
+          maximum_items: 64
+      item_key: shipment_id
+      max_items: 64
+      max_concurrency: 4
+      completion: collect
+      command:
+        name: release_absent_capture_claim
+        run_as: payment_worker
+        arguments:
+          payment_id: { state: allocate, field: payment_id }
+          authorization_id: { state: allocate, field: authorization_id }
+          shipment_id: { item: shipment_id }
+          provider_absence_id: { item: provider_absence_id }
+          amount_minor: { item: amount_minor }
+          payload: { item: normalized_payload }
+      next: partial_output
+
+  - id: partial_output
+    output:
+      values:
+        status: { literal: partial }
+        order_id: { input: order_id }
+        allocations: { state: allocate, field: allocations }
+        backorders: { state: allocate, field: backorders }
+        shipment_outcomes:
+          bounded_concat:
+            inputs:
+              - state: record_label_outcomes
+                field: ordered_results
+                project:
+                  [shipment_id, allocation_id, outcome, tracking_number,
+                   failure_code, requires_reconciliation]
+              - state: record_reconciled_label_outcomes
+                field: ordered_results
+                project:
+                  [shipment_id, allocation_id, outcome, tracking_number,
+                   failure_code, requires_reconciliation]
+            maximum_lists: 2
+            maximum_items: 64
+        captures:
+          bounded_concat:
+            inputs:
+              - { state: record_payment_captures, field: ordered_results }
+              - { state: record_reconciled_payment_captures, field: ordered_results }
+              - { state: release_absent_capture_claims, field: ordered_results }
+            maximum_lists: 3
+            maximum_items: 64
+        unshipped_allocations:
+          bounded_concat:
+            inputs:
+              - { state: pack_allocations, field: failed_items }
+              - { state: create_shipment_units, field: failed_items }
+              - { state: reconcile_label_requests, field: failed_items }
+              - { state: record_label_outcomes, field: failed_items }
+              - { state: record_reconciled_label_outcomes, field: failed_items }
+              - { state: reconcile_payment_capture_requests, field: failed_items }
+              - { state: record_payment_captures, field: failed_items }
+              - { state: record_reconciled_payment_captures, field: failed_items }
+              - { state: release_absent_capture_claims, field: failed_items }
+            maximum_lists: 9
+            maximum_items: 64

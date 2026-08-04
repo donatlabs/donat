@@ -39,11 +39,7 @@ fn enabled_apis_graphql_only() {
 
     // REST is disabled: its routes are absent => plain 404 (not the handler's
     // JSON {"code":"not-found"} body).
-    let (status, body) = s.post(
-        "/api/rest/pet/1",
-        &json!({}),
-        &user_headers(),
-    );
+    let (status, body) = s.post("/api/rest/pet/1", &json!({}), &user_headers());
     assert_eq!(status, 404, "rest should be disabled (404): {body}");
     assert!(
         body.get("code").is_none(),

@@ -1,0 +1,18 @@
+description: >
+  tools/list supports MCP pagination through a string cursor only. Non-string
+  cursors are rejected at the method boundary.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 76
+  method: tools/list
+  params:
+    cursor: 1
+response:
+  jsonrpc: "2.0"
+  id: 76
+  error:
+    code: -32602
+    message: "'cursor' must be a string"

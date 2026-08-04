@@ -1,0 +1,24 @@
+description: >
+  query.offset without order_by is rejected before GraphQL execution. Offset
+  pagination needs a stable order so repeated MCP calls do not produce
+  nondeterministic pages with duplicates or skipped rows.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 61
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      offset: 1
+response:
+  jsonrpc: "2.0"
+  id: 61
+  result:
+    isError: true

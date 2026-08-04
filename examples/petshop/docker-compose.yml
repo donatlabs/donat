@@ -3,11 +3,11 @@
 #   docker compose up
 #
 # Uses the project's deploy model: schema is migrated out-of-band by a
-# one-shot `donat migrate`, the metadata is checked against the migrated
-# database by `donat validate`, and only then does the engine serve. All
-# three use the same prebuilt public image (ghcr.io/donatlabs/donat,
-# pushed by .github/workflows/release.yml on each release tag) — no local
-# build. The engine itself never runs DDL.
+# one-shot `donat migrate`, the durable Process definitions are deployed by a
+# second one-shot `migrate` that also reads the metadata, and only then does
+# the engine serve. All of them use the same prebuilt public image
+# (ghcr.io/donatlabs/donat, pushed by .github/workflows/release.yml on each
+# release tag) — no local build. The engine itself never runs DDL.
 #
 # Then open http://localhost:8080/v1/graphql (see README.md for queries per
 # role).
@@ -19,10 +19,17 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: petshop
+      # Empty unless auth.env is passed, and the initdb script below creates
+      # nothing when it is — so a run without the identity profile is left with
+      # no extra role.
+      RAUTHY_DB_PASSWORD: ${RAUTHY_DB_PASSWORD-}
     # Not exposed on the host: only the engine talks to it over the compose
     # network. Add a `ports:` mapping if you want to inspect it with psql.
     volumes:
       - petshop-db:/var/lib/postgresql/data
+      # Creates the database and role for the optional IdP. Entrypoint scripts
+      # run only on first initialization of the volume.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # Check over TCP (-h 127.0.0.1), not the unix socket: on first init the
       # official image runs a socket-only temp server, so a socket pg_isready
@@ -33,41 +40,158 @@ services:
       timeout: 3s
       retries: 20
 
-  # One-shot: apply versioned V{n}__*.sql migrations, then exit.
+  # The five external services the connectors are declared against, answered
+  # locally so the example runs without an account anywhere. Point the five
+  # *_BASE_URL values below at real providers and nothing else changes.
+  mock-providers:
+    image: python:3.12-slim
+    command: ["python", "/srv/providers.py"]
+    volumes:
+      - ./mock-providers:/srv:ro
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/')"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: apply the DDL, then exit.
+  #
+  # Two independently versioned sets go through one migrator and one
+  # `refinery_schema_history`: the engine's own `donat.*` schema — the durable
+  # Process journals, command claims and cron state, which ship in the
+  # repository's top-level `migrations/` rather than in the image — and this
+  # store's schema. They can share a history because both are versioned by
+  # timestamp; two sets of counters would both start at `V1` and collide.
   migrate:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
-    command: ["migrate", "--migrations-dir", "/migrations"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        donat migrate --migrations-dir /engine-migrations &&
+        donat migrate --migrations-dir /app-migrations
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
-      - ./migrations:/migrations:ro
+      - ../../migrations:/engine-migrations:ro
+      - ./migrations:/app-migrations:ro
     restart: "no"
 
-  # One-shot: fail the deploy if metadata is inconsistent with the migrated DB.
-  validate:
+  # One-shot: deploy the durable Process definitions for the `default` source.
+  #
+  # A Process revision is pinned in the database, and the engine refuses to
+  # serve a metadata Process that is not deployed as active — without this
+  # step it boots into "revision ... is not deployed as active" and retries
+  # forever. This step reads the metadata, so every connector's configuration
+  # has to resolve here too.
+  deploy:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
-    command: ["validate", "--metadata-dir", "/metadata"]
+    command:
+      - "migrate"
+      - "--migrations-dir"
+      - "/engine-migrations"
+      - "--metadata-dir"
+      - "/metadata"
+      - "--source"
+      - "default"
     depends_on:
       migrate:
         condition: service_completed_successfully
-    environment:
+    environment: &connector-env
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      # Every connector instance resolves its endpoint and credential from the
+      # environment. Metadata never carries a secret, and an unset variable
+      # fails the deploy rather than the first request that needs it.
+      PETSHOP_PAYMENT_BASE_URL: http://mock-providers:8099
+      PETSHOP_PAYMENT_API_TOKEN: petshop-payment-token
+      PETSHOP_TAX_BASE_URL: http://mock-providers:8099
+      PETSHOP_TAX_API_TOKEN: petshop-tax-token
+      DONAT_MOCK_CARRIER_BASE_URL: http://mock-providers:8099
+      DONAT_MOCK_CARRIER_TOKEN: petshop-carrier-token
+      PETSHOP_NOTIFICATION_BASE_URL: http://mock-providers:8099
+      PETSHOP_NOTIFICATION_API_TOKEN: petshop-notification-token
+      PETSHOP_PAYOUT_BASE_URL: http://mock-providers:8099
+      PETSHOP_PAYOUT_API_TOKEN: petshop-payout-token
     volumes:
+      - ../../migrations:/engine-migrations:ro
       - ./metadata:/metadata:ro
     restart: "no"
+
+  # The identity provider, enabled only with the `auth` env file:
+  #
+  #   docker compose --env-file auth.env up
+  #
+  # Opt-in on purpose — the minimal path stays four services and needs no
+  # login. Everything it serves (client, roles, users, the `customer_id`
+  # attribute) is declared in ./bootstrap and versioned with this example, so
+  # there is nothing to click in its admin UI.
+  #
+  # Note that Rauthy applies ./bootstrap only while initializing an empty
+  # database. Editing those files later does nothing until the volume is
+  # recreated with `docker compose down -v`.
+  rauthy:
+    profiles: ["auth"]
+    image: ghcr.io/sebadob/rauthy:0.36.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Its own database inside the Postgres this example already runs, created
+      # by ./initdb/10-rauthy-database.sh. Identity data never shares a
+      # database with the data plane.
+      HIQLITE: "false"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: rauthy
+      PG_PASSWORD: ${RAUTHY_DB_PASSWORD-}
+      PG_DB_NAME: rauthy
+      # Plain HTTP on the compose network. A real deployment terminates TLS in
+      # front of it; these three settings exist so the demo needs no certs.
+      LISTEN_SCHEME: http
+      COOKIE_MODE: danger-insecure
+      HQL_INSECURE_COOKIE: "true"
+      PUB_URL: localhost:8081
+      # Mandatory even with hiqlite off (the cluster section is always parsed).
+      HQL_NODE_ID: "1"
+      HQL_SECRET_RAFT: petshop-demo-raft-secret
+      HQL_SECRET_API: petshop-demo-api-secret
+      # Passkey/WebAuthn origin. Mandatory even though the demo users log in
+      # with a password.
+      RP_ID: localhost
+      RP_ORIGIN: http://localhost:8081
+      RP_NAME: Petshop demo
+      # Demo key. Generate your own for anything real:
+      #   head -c 32 /dev/urandom | base64
+      ENC_KEYS: petshop/bOdFPFIWcLJ1VVhTyoyP9cpoGriUl1wdZLGtd2Ztz7M=
+      ENC_KEY_ACTIVE: petshop
+      BOOTSTRAP_ADMIN_EMAIL: admin@petshop.local
+      BOOTSTRAP_ADMIN_PASSWORD_PLAIN: petshop-demo-password
+      BOOTSTRAP_DIR: /bootstrap
+    volumes:
+      - ./bootstrap:/bootstrap:ro
+    ports:
+      # 8081 on the host: the engine already owns 8080.
+      - "8081:8080"
 
   engine:
     # Prebuilt public image. Override the tag with ENGINE_TAG, e.g.
     #   ENGINE_TAG=v1.2.3 docker compose up
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     depends_on:
-      validate:
+      deploy:
+        condition: service_completed_successfully
+      mock-providers:
+        condition: service_healthy
+      minio-init:
         condition: service_completed_successfully
     environment:
-      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
+      <<: *connector-env
       DONAT_METADATA_DIR: /metadata
       DONAT_PORT: "8080"
       # The secret marks a request as trusted: it may then assert any role
@@ -77,10 +201,60 @@ services:
       DONAT_GRAPHQL_ADMIN_SECRET: petshop-secret
       # Requests with no/role-less auth fall back to the public catalog role.
       DONAT_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+      # Empty unless auth.env is passed, and an unparseable value simply
+      # leaves JWT mode off — so the default run behaves exactly as before.
+      # With it, a bearer token from the IdP is verified against its JWKS and
+      # `claims_map` turns the token's claims into session variables, so
+      # X-Donat-User-Id arrives from the token instead of from a header.
+      DONAT_GRAPHQL_JWT_SECRET: ${PETSHOP_JWT_CONFIG-}
+      # Signs the one file URL the engine serves itself — the call reporting an
+      # upload finished (see metadata/storage.yaml). Change it for anything
+      # real: it is the only proof that call carries.
+      PETSHOP_FILE_SIGNING_SECRET: petshop-file-signing-secret
+      PETSHOP_S3_KEY: petshopminio
+      PETSHOP_S3_SECRET: petshopminiosecret
     volumes:
       - ./metadata:/metadata:ro
     ports:
       - "8080:8080"
 
+  # Object storage. The engine has no local-disk backend: a browser uploads
+  # straight to this store with a presigned URL, and downloads come from it
+  # too, so no file byte ever passes through the engine.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: petshopminio
+      MINIO_ROOT_PASSWORD: petshopminiosecret
+    ports:
+      # Published because a browser — and the customer avatar's public URL —
+      # must reach it from the host.
+      - "9000:9000"
+    volumes:
+      - petshop-files:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: create the bucket and let anyone read it. The avatar column is
+  # declared public, so its URL carries no signature — which is what makes it
+  # cacheable by a CDN forever.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set petshop http://minio:9000 petshopminio petshopminiosecret &&
+      mc mb --ignore-existing petshop/petshop-media &&
+      mc anonymous set download petshop/petshop-media
+      "
+    restart: "no"
+
 volumes:
   petshop-db:
+  petshop-files:

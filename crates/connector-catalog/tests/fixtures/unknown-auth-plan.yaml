@@ -1,0 +1,4 @@
+auth_plan:
+  kind: dynamic_script
+  value:
+    source: credential.js

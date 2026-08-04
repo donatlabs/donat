@@ -1,0 +1,24 @@
+description: >
+  A GraphQL-looking object key inside insert.objects is rejected before
+  GraphQL execution. Object keys are user-controlled data and must not become
+  reflected GraphQL document structure or writable column names.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 34
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: pet
+      objects:
+      - "name } mutation x { delete_pet(where: {}) { affected_rows } }": Scout
+response:
+  jsonrpc: "2.0"
+  id: 34
+  result:
+    isError: true

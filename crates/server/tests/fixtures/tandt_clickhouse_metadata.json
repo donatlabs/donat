@@ -1,0 +1,204 @@
+{
+  "x_tandt_contract": {
+    "revision": "c780834e50f53e5b4e94f1f33e88748a443f98ec",
+    "source_paths": [
+      "ui/apps/l3-l4-web-ui/src/shared/api/entities/analytics/api.ts",
+      "ui/apps/l3-l4-web-ui/src/shared/api/entities/logs/api.ts",
+      "ui/apps/l3-l4-web-ui/src/shared/api/entities/document/integration-request-api.ts",
+      "ui/packages/l2-api/src/entities/l2-job-event/queries.ts",
+      "ui/packages/l2-api/src/entities/l2-device-event/queries.ts",
+      "ui/packages/l2-api/src/entities/l2-traffic-log/queries.ts",
+      "ui/packages/l2-api/src/entities/l2-production-event/queries.ts"
+    ]
+  },
+  "version": 3,
+  "sources": [
+    {
+      "name": "default",
+      "kind": "postgres",
+      "configuration": {
+        "connection_info": {
+          "database_url": { "from_env": "DONAT_DATABASE_URL" }
+        }
+      },
+      "tables": [
+        {
+          "table": { "schema": "public", "name": "contract_probe" },
+          "select_permissions": [
+            {
+              "role": "company",
+              "permission": { "columns": ["id", "label"], "filter": {} }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clickhouse",
+      "kind": "clickhouse",
+      "configuration": {
+        "template": "{\n  \"url\": {{getEnvironmentVariable(\"CLICKHOUSE_HASURA_URL\")}},\n  \"username\": {{getEnvironmentVariable(\"CLICKHOUSE_HASURA_USERNAME\")}},\n  \"password\": {{getEnvironmentVariable(\"CLICKHOUSE_HASURA_PASSWORD\")}}\n}",
+        "timeout": null,
+        "value": {}
+      },
+      "tables": [
+        {
+          "table": { "schema": "analytics", "name": "document_daily_stats" },
+          "select_permissions": [
+            {
+              "role": "company",
+              "permission": {
+                "columns": ["date", "doc_type", "status", "doc_count", "unique_users", "avg_duration_ms", "company_id"],
+                "filter": { "company_id": { "_eq": "X-Hasura-Company-Id" } },
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "analytics", "name": "workflow_executions" },
+          "select_permissions": [
+            {
+              "role": "company",
+              "permission": {
+                "columns": ["workflow_id", "workflow_type", "status", "start_time", "end_time", "duration_ms", "activity_count", "retry_count", "error_message", "company_id", "user_id", "document_id"],
+                "filter": { "company_id": { "_eq": "X-Hasura-Company-Id" } },
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "analytics", "name": "errors" },
+          "select_permissions": [
+            {
+              "role": "company",
+              "permission": {
+                "columns": ["error_time", "error_type", "error_code", "error_message", "severity", "entity_type", "entity_id", "resolved_at", "resolved_by", "resolution_notes", "company_id", "user_id", "document_id", "workflow_id", "context"],
+                "filter": { "company_id": { "_eq": "X-Hasura-Company-Id" } },
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "analytics", "name": "code_lifecycle_events" },
+          "select_permissions": [
+            {
+              "role": "company",
+              "permission": {
+                "columns": ["event_time", "event_type", "code_id", "code", "cis", "gtin", "pg", "package_type", "emission_type", "old_status", "new_status", "old_location_id", "new_location_id", "parent_id", "company_id", "user_id", "document_id"],
+                "filter": { "company_id": { "_eq": "X-Hasura-Company-Id" } },
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "analytics", "name": "aggregation_operations" },
+          "select_permissions": [
+            {
+              "role": "company",
+              "permission": {
+                "columns": ["operation_time", "operation_type", "parent_code_id", "parent_cis", "parent_package_type", "child_count", "gtin", "pg", "location_id", "company_id", "user_id", "document_id"],
+                "filter": { "company_id": { "_eq": "X-Hasura-Company-Id" } },
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "logs", "name": "application_logs" },
+          "select_permissions": [
+            {
+              "role": "company-admin",
+              "permission": {
+                "columns": ["company_id", "context", "document_id", "environment", "execution_path", "level", "log_id", "log_type", "message", "parent_log_id", "role", "service", "source", "span_id", "timestamp", "trace_id", "user_id", "version", "activity_id"],
+                "filter": { "company_id": { "_eq": "X-Hasura-Company-Id" } },
+                "limit": 100
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "logs", "name": "integration_requests" },
+          "select_permissions": [
+            {
+              "role": "company-admin",
+              "permission": {
+                "columns": ["event_time", "integration_type", "operation", "document_id", "company_id", "request_id", "http_method", "http_url", "http_status", "status", "duration_ms", "request_body", "response_body", "request_size", "response_size", "error_message"],
+                "filter": { "company_id": { "_eq": "X-Hasura-Company-Id" } },
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "logs", "name": "l2_job_events" },
+          "select_permissions": [
+            {
+              "role": "l2-executor",
+              "permission": {
+                "columns": ["event_time", "event_type", "job_id", "work_order_id", "equipment_id", "gtin", "produced_count", "rejected_count", "target_quantity", "reason", "trace_id", "event_id"],
+                "filter": {},
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "logs", "name": "l2_device_events" },
+          "select_permissions": [
+            {
+              "role": "l2-executor",
+              "permission": {
+                "columns": ["event_time", "event_type", "device_id", "device_type", "ip_address", "node_code", "instance_id", "equipment_id", "reason", "error_message", "trace_id", "event_id"],
+                "filter": {},
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "logs", "name": "l2_traffic" },
+          "select_permissions": [
+            {
+              "role": "l2-executor",
+              "permission": {
+                "columns": ["event_time", "equipment_id", "device_id", "direction", "data_ascii", "data_hex", "data_len"],
+                "filter": {},
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "logs", "name": "l2_production_events" },
+          "select_permissions": [
+            {
+              "role": "l2-executor",
+              "permission": {
+                "columns": ["event_time", "event_type", "job_id", "work_order_id", "equipment_id", "code", "parent_code", "gtin", "node_code", "reason", "line_number", "aggregation_level", "trace_id", "event_id"],
+                "filter": {},
+                "allow_aggregations": true
+              }
+            }
+          ]
+        },
+        {
+          "table": { "schema": "logs", "name": "contract_complex_values" },
+          "configuration": { "custom_name": "clickhouse_complex_values" },
+          "select_permissions": [
+            {
+              "role": "company",
+              "permission": {
+                "columns": ["id", "payload", "attributes", "point", "labels"],
+                "filter": {}
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

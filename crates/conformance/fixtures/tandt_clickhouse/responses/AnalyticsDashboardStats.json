@@ -1,0 +1,1 @@
+{"errors":[{"extensions":{"path":"$.selectionSet.analytics_document_daily_stats_aggregate.args.where.date._gte","code":"validation-failed"},"message":"expected a date, but found \"now() - interval '30 days'\""}]}

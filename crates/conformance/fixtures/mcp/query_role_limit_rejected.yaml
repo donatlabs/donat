@@ -1,0 +1,27 @@
+description: >
+  query.limit above the role select-permission row cap is rejected before
+  GraphQL execution. MCP should enforce metadata limits at the tool boundary
+  instead of relying only on backend execution.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: limited_viewer
+body:
+  jsonrpc: "2.0"
+  id: 81
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      limit: 2
+response:
+  jsonrpc: "2.0"
+  id: 81
+  result:
+    isError: true
+    content:
+    - type: text
+      text: "'limit' exceeds role select limit"

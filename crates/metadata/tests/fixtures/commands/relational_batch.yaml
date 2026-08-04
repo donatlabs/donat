@@ -1,0 +1,44 @@
+name: reserve_cart_stock
+source: default
+permissions:
+  - role: customer
+steps:
+  - name: priced_lines
+    select_many:
+      table: { schema: public, name: cart_pricing }
+      by:
+        cart_id: { step: cart, column: id }
+      order_by: [variant_id]
+      returning:
+        [variant_id, sku, title, quantity, unit_price_minor, currency, line_total_minor]
+      require_non_empty: true
+  - name: totals
+    aggregate:
+      from: { step: priced_lines }
+      values:
+        line_count: { count: {} }
+        subtotal_minor: { sum: { column: line_total_minor } }
+        currency_count: { count_distinct: { column: currency } }
+        currency: { min: { column: currency } }
+  - name: reserve_stock
+    update_many:
+      table: { schema: public, name: inventory_stock }
+      for_each: { step: priced_lines }
+      by:
+        variant_id: { item: variant_id }
+      set:
+        reserved:
+          rule: add_int
+          with:
+            left: { current_column: reserved }
+            right: { item: quantity }
+      check:
+        rule: can_reserve
+        with:
+          on_hand: { current_column: on_hand }
+          reserved: { current_column: reserved }
+          requested: { item: quantity }
+      returning: [variant_id, reserved]
+      require_each: true
+result:
+  totals: { step: totals }

@@ -98,8 +98,9 @@ func fixtureMetaCatalogWithTrigger() []byte {
 						map[string]any{"name": "name", "pg_type": "text", "nullable": false, "has_default": false},
 						map[string]any{"name": "secret", "pg_type": "text", "nullable": false, "has_default": true},
 					},
-					"primary_key":  []any{"id"},
-					"foreign_keys": []any{},
+					"relation_kind": "Table",
+					"primary_key":   []any{"id"},
+					"foreign_keys":  []any{},
 				},
 				"public.article": map[string]any{
 					"schema": "public",
@@ -110,7 +111,8 @@ func fixtureMetaCatalogWithTrigger() []byte {
 						map[string]any{"name": "author_id", "pg_type": "int4", "nullable": false, "has_default": false},
 						map[string]any{"name": "published", "pg_type": "bool", "nullable": false, "has_default": true},
 					},
-					"primary_key": []any{"id"},
+					"relation_kind": "Table",
+					"primary_key":   []any{"id"},
 					"foreign_keys": []any{
 						map[string]any{
 							"constraint_name":   "article_author_id_fkey",

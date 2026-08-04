@@ -1,392 +1,237 @@
 <div align="center">
 
-# Donat
+# donat
 
-### Your schema is the backend.
+## Declarative services on PostgreSQL.
 
-**Donat generates permissioned GraphQL, REST, and MCP APIs, event & scheduled
-triggers, and webhook automations from your Postgres schema — no application
-code, no admin backdoor, one binary.**
+**Write the system you drew on the whiteboard. The boxes, the arrows, the
+retries, the "what if the payment provider times out" — as declarations, not
+as glue code.**
 
-[Quick start](#quick-start) · [How it works](#how-it-works) · [Example workflow](#example-workflow) · [Comparison](#how-donat-compares) · [FAQ](#faq)
+[![CI](https://github.com/donatlabs/donat/actions/workflows/ci.yml/badge.svg)](https://github.com/donatlabs/donat/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/donatlabs/donat?display_name=tag&label=release)](https://github.com/donatlabs/donat/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+[Run the Petshop example](#get-started) · [See what you declare](#what-you-declare) · [Explore the architecture](#one-execution-path)
 
 </div>
 
 ---
 
-## What is Donat?
+## The whiteboard is the source
 
-Every team rebuilds the same backend: APIs, authentication, permissions,
-events, integrations, automations. Most tools solve **one** layer — a GraphQL
-server, a REST framework, an event bus, a workflow engine — and you wire the
-rest together by hand and keep it all in sync.
+In a system design interview you draw a checkout in two minutes. A box that
+takes the order. An arrow to the payment provider. A note that says *retry with
+backoff*. A second arrow for *what if it times out and we don't know whether it
+charged*. A box that waits for the warehouse to confirm. A fan-out, one per
+shipment.
 
-Donat takes a different starting point: **your data model is the source of
-truth.** You describe your schema (SQL migrations) and your access rules and
-endpoints (declarative YAML) once. Donat derives a complete, permissioned
-backend from it:
+Everyone in the room understands it. Then it becomes months of glue: outbox
+tables, a job runner, correlation ids, an idempotency table, a reconciliation
+script somebody runs by hand.
 
-- **APIs** — a per-role GraphQL API (`/v1/graphql`, with subscriptions and
-  Relay), the same model exposed as RESTified endpoints (`/api/rest`), and an
-  MCP server (`/mcp`) for AI tools — all over **one** permission model.
-- **Events** — webhooks on row insert/update/delete and on a cron schedule,
-  with retries, invocation logs, and multi-pod-safe delivery.
-- **Automations** — synchronous webhook *actions* with their own typed inputs
-  and outputs, and relationships back into your tracked tables.
-- **Integrations** — remote GraphQL schemas stitched in under role-scoped
-  permissions.
-- **Native handlers** *(in progress)* — write trigger logic as **typed
-  functions in your own service** via a generated SDK, not only as HTTP
-  webhooks. A Go SDK is landing first — a code generator emits typed row structs
-  from your catalog, and you register handlers like
-  `donat.On("on_order_placed", func(ctx, ev) {...})` — with an in-process WASM
-  runtime and Node.js/Python SDKs to follow. See [Roadmap](#roadmap).
+Donat is the bet that the drawing was already the specification.
 
-It is **not** another GraphQL server, ORM, or API gateway. It is a
-database-native backend platform: define the data, get the backend.
+```yaml
+- id: request_authorization
+  request:
+    connector: mock_payment
+    operation: authorize
+    idempotency_key: { stable: { run: id, state: request_authorization } }
+    retry:
+      retry_on: [transport, timeout, http_429, http_5xx]
+      max_attempts: 3
+      initial_interval: 100ms
+      jitter: deterministic_full
+    next: route_authorization_response
+    on_error:
+      # A transport error does not prove the provider skipped the charge.
+      fallback: { next: reconcile_authorization }
+```
 
-> **Status — read this first.** Donat is built TDD-style against a native
-> conformance harness (18 test modules, run with `make conformance`). The
-> capabilities below are the ones that harness verifies on every commit
-> against a real Postgres. **Postgres is the supported backend today.** See
-> [Roadmap](#roadmap) for what is scaffolded but not yet shipping
-> (multi-database GA, OpenAPI export, async actions, event streaming) — we
-> keep that line explicit on purpose.
+That is the arrow, the retry note, and the "what if it times out" branch. No
+worker to write, no queue to run, no correlation id to invent.
 
----
+## What you declare
 
-## Why Donat
+| You draw | You declare | You do not write |
+|---|---|---|
+| A box that changes state | A **Command** — ordered steps in one transaction, with guards, batch writes and an idempotency key | Transaction plumbing, replay handling, a re-select after every write |
+| A decision | A **Rule** or decision table — typed inputs, an expression or ordered rows, unit-testable in metadata | A tangle of `if` in three services that disagree |
+| A long-running flow | A **Process** — states, waits, timers, signals, bounded fan-out, compensation, pinned revisions | An outbox, a scheduler, a status column that lies |
+| An external system | A **Connector** — declared operations with request and response contracts, error classes, retry, rate limits, idempotency headers | A hand-rolled client per provider, and the reconciliation script |
+| A file on a record | An **Attachment** — a uuid column declared beside the table's permissions, stored in S3 | An upload service, a second permission model, a cleanup cron |
+| Who may see what | Per-role row filters, column sets and presets | An authorization layer per transport |
 
-| Pain | How Donat removes it |
+All of it is YAML in review, applied at deploy time. The engine is one Rust
+binary that reads it and serves.
+
+## Durable by construction
+
+A Process is not a background job with a status column. Its journal lives in
+the same database as your data, so a state transition and the rows it wrote
+commit together or not at all.
+
+- **Waits** park on a verified signal or a timer, for minutes or for a month.
+  A signal committed before its wait became receptive is auditable, not lost.
+- **Activities** hold a lease, retry on the classes you declared, and stop at
+  the attempt limit.
+- **Ambiguity is a first-class branch.** A timeout does not mean "it did not
+  happen". Declare the read-only lookup that decides, and route on its answer.
+- **Fan-out is bounded.** A per-item journal with a declared ceiling, so a
+  hundred shipments cannot become an unbounded queue.
+- **Revisions are pinned.** A running instance keeps the definition it started
+  under; deploying a new one does not rewrite history mid-flight.
+
+## It runs, not just parses
+
+[`examples/petshop`](examples/petshop) is not a toy. It is a store with **11
+durable Processes**, **73 Commands**, **60 rules and 10 decision tables** over
+**41 declared types**, and **5 connectors**: checkout with tax and
+authorization, cancellation racing an in-flight charge, partial fulfilment
+with per-shipment capture, returns with three human approvals, subscription
+dunning, B2B credit approval, marketplace payouts, prescription review and
+payment reconciliation.
+
+Every one is exercised end to end over HTTP against the real binary in
+[`crates/conformance`](crates/conformance): a shopper calls the entry-point
+Command, and the durable Process carries the order the rest of the way.
+
+## Explicit access, no way around it
+
+There is **no admin role**. Not "disabled by default" — the permission-bypass
+role does not exist, and neither does a runtime metadata API or a `run_sql`
+endpoint. Every data access resolves through an explicit per-role permission,
+including the ones a Process makes on your behalf: a Process step runs as a
+declared role, or as the caller whose session it captured.
+
+Configuration is deploy-time. `donat migrate` applies DDL, a second `migrate`
+deploys the Process revisions, and the serving engine runs neither.
+
+## One execution path
+
+A request resolves into a SQL-free intermediate representation before the
+backend generates a query. On the Postgres reference backend the response JSON
+is assembled in the database: one statement per root operation, permission
+predicates inside the plan, no N+1.
+
+REST and MCP are not parallel stacks — they translate into that same pipeline,
+so filters, error contracts and policy cannot drift by transport.
+
+<p align="center">
+  <img src="docs/assets/data-plane-overview.png" alt="SQL migrations and metadata feed the Donat engine, which serves GraphQL, REST, MCP, and automation interfaces." width="1200" />
+</p>
+
+| Surface | What it is for |
 |---|---|
-| Rebuilding CRUD + auth + permissions on every project | Derived from your schema + declarative permissions — no handwritten resolvers |
-| Stitching an API layer, event bus, cron, and workflow engine together | APIs, events, and automations live in **one** engine over one model |
-| Permission logic scattered across app code → IDOR holes | Row- and column-level rules are declarative and enforced in-engine; covered by an IDOR/SQL-injection security suite |
-| Runtime admin consoles / `run_sql` as an attack surface | **No admin role and no runtime admin API at all** — configuration is deploy-time only |
-| N+1 and over-fetching from ORMs and naive GraphQL servers | **One SQL statement per operation** — the response is assembled inside Postgres |
+| **GraphQL** | Queries, mutations, subscriptions, Relay, aggregates, relationships, computed fields, JSONB and PostGIS. |
+| **REST** | Metadata-declared endpoints over saved operations; path, query and body become variables. |
+| **MCP** | Permission-aware tools. A separate `mcp.yaml` publishes a small, role-scoped agent contract. |
+| **Commands & Processes** | Transactional domain operations and durable flows, exposed as ordinary mutations. |
+| **Events & actions** | Event triggers, durable cron delivery, verified inbound webhooks, typed synchronous actions. |
+| **Files** | Presigned upload and download URLs for declared file columns on any S3-compatible store, public files served straight from a CDN, and orphaned objects collected in the background. No file byte passes through the engine. |
 
----
+All request-facing surfaces are on by default; restrict them at deploy time
+with `DONAT_GRAPHQL_ENABLED_APIS=graphql`. A mounted route still needs an
+explicit role and a matching permission.
 
-## Quick start
-
-The fastest path is the [`examples/petshop`](examples/petshop) project — a
-catalogue, customers, and orders with a realistic public/shopper/staff
-permission set.
+## Get started
 
 ```sh
+docker build -t ghcr.io/donatlabs/donat:latest .
 cd examples/petshop
 docker compose up
 ```
 
-This runs the deploy model end to end:
+That brings up Postgres, applies the schema, deploys the Process revisions,
+answers the five declared providers with a local fixture, and serves:
 
-1. **`donat migrate`** applies the versioned DDL in `migrations/` (refinery).
-2. **`donat validate`** checks the YAML metadata against the migrated DB and
-   fails the deploy if anything tracked is missing.
-3. **`donat serve`** serves the data plane on `:8080`:
-   - GraphQL → <http://localhost:8080/v1/graphql>
-   - REST → <http://localhost:8080/api/rest/>
-   - MCP → <http://localhost:8080/mcp>
+- **GraphQL** — <http://localhost:8080/v1/graphql>
+- **REST** — <http://localhost:8080/api/rest/>
+- **MCP** — <http://localhost:8080/mcp>
 
-Working from source instead:
+For focused surfaces, see [REST-only](examples/petshop-rest) and
+[MCP-only](examples/petshop-mcp).
+
+### From source
 
 ```sh
 make build
-make test           # unit + snapshot tests (no database needed)
-make run            # serves :8080 with the fixture metadata
-make conformance    # full conformance suite (needs Postgres — see below)
+make test
+make run
 ```
 
----
+Run the compatibility suite with `make conformance`; add
+`make conformance-matrix` for the preview backend contract matrix.
 
-## Example workflow
+## Designed to be operated, not bypassed
 
-**1. Define the schema** (a migration, the only thing that runs DDL):
+<p align="center">
+  <img src="docs/assets/deployment-flow.png" alt="A deploy-time flow from migrations and metadata through validation to a protected Donat engine serving controlled interfaces." width="1200" />
+</p>
 
-```sql
--- migrations/V2__create_pet.sql
-CREATE TABLE pet (
-  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  name        text NOT NULL,
-  category_id bigint REFERENCES category(id),
-  owner_id    text NOT NULL          -- the customer who owns this row
-);
-```
+1. Apply versioned DDL with `donat migrate`.
+2. Deploy Process revisions and check the metadata against the migrated
+   database.
+3. Start the engine behind your normal TLS, auth, rate-limit and observability
+   edge.
 
-**2. Declare access** in metadata (per-role row filter + column mask):
+Webhook handlers should be idempotent: event and cron delivery is at least
+once. So is a Process activity — which is why an idempotency key is part of
+the declaration rather than an afterthought.
 
-```yaml
-# metadata/databases/default/tables/public_pet.yaml
-table: { schema: public, name: pet }
-select_permissions:
-  - role: shopper
-    permission:
-      columns: [id, name, category_id]
-      filter: { owner_id: { _eq: "X-Donat-User-Id" } }    # row-level rule
-```
+## Evidence over assertions
 
-**3. Use it** — the same model, three surfaces:
+A behaviour change starts from a failing fixture. The result must then pass
+unit and snapshot tests plus the native harness against real services.
 
-```graphql
-# POST /v1/graphql   (X-Donat-Role: shopper)
-query { pet { id name category { name } } }   # only this shopper's pets
-```
+- [CI](https://github.com/donatlabs/donat/actions/workflows/ci.yml) runs the
+  workspace against Postgres, full reference conformance, the backend contract
+  matrix, live MySQL and ClickHouse paths, and `cargo audit`.
+- Security fixtures cover SQL injection, IDOR, hidden columns, preset
+  enforcement and missing session variables.
+- The [conformance crate](crates/conformance) is the executable source of truth
+  for request and error behaviour.
+- Design decisions, including the ones that were wrong first, live as ADRs in
+  the [knowledge base](knowledgebase/).
 
-```sh
-# A saved query exposed as REST via metadata/rest_endpoints.yaml
-curl localhost:8080/api/rest/pets -H 'X-Donat-Role: shopper'
-```
+## Backend support
 
-**4. React to changes** — add an event trigger and a nightly cron job in YAML;
-Donat captures the row change in-transaction and delivers a webhook with
-retries and invocation logs, safely across multiple pods.
+Postgres is the supported reference backend. SQLite, MySQL and ClickHouse are
+CI-tested preview targets with explicit capability boundaries — not labels for
+drop-in equivalence. Commands and Processes are Postgres-only.
 
-No resolvers, no event-bus glue, no admin console.
-
----
-
-## How it works
-
-```mermaid
-flowchart LR
-  subgraph deploy["Deploy-time"]
-    M["SQL migrations"] -->|donat migrate| DB[("Postgres")]
-    Y["YAML metadata"] -->|donat validate| DB
-  end
-  DB --> ENG{{"Donat engine"}}
-  Y --> ENG
-  ENG --> GQL["/v1/graphql + ws"]
-  ENG --> REST["/api/rest/"]
-  ENG --> MCP["/mcp"]
-  ENG --> EVT["event & cron triggers → webhooks"]
-  ENG --> ACT["actions → webhooks"]
-```
-
-A request becomes an intermediate representation (IR), which compiles to **one
-Postgres statement** that assembles the entire JSON response in the database
-(`json_build_object` / `json_agg`, correlated subqueries) — no per-row
-post-processing in the app, no N+1. Permissions are merged into that statement,
-so a role can never see a row or column it isn't granted.
-
-| Crate | Purpose |
-|---|---|
-| `crates/metadata` | Donat metadata types + YAML directory loader (`!include`) |
-| `crates/catalog` | Database introspection |
-| `crates/schema` | Per-role GraphQL schema generation + introspection |
-| `crates/ir` | Intermediate representation — the SQL-free boundary |
-| `crates/sqlgen` | IR → one SQL statement (snapshot-tested) |
-| `crates/backend` | Pluggable `Dialect` abstraction (Postgres today) |
-| `crates/server` | axum server: GraphQL/REST/MCP, auth, events, actions; `migrate`/`validate` |
-| `crates/conformance` | Native conformance harness + fixtures |
-
-> **Architecture diagram tip:** the Mermaid block above renders natively on
-> GitHub. For a richer landing page, replace it with an SVG showing the same
-> three-stage flow: *Schema + YAML → engine → (GraphQL · REST · MCP · events ·
-> actions)*.
-
----
-
-## Performance
-
-Because the engine compiles each request to **one SQL statement** and lets
-Postgres assemble the JSON, it holds almost no data itself — the working set
-lives in the database, and the engine just translates and streams. That shows
-up as a tiny footprint:
-
-| | Idle | Under load |
+| Backend | Status | Important limits |
 |---|---|---|
-| **Engine memory** | ~2 MiB | ~7 MiB |
-| **Engine CPU** | 0% | ~⅓ of one core |
+| **Postgres + PostGIS** | Supported reference | Full feature set, including Relay, JSONB, geo, upsert, nested inserts and subscriptions. |
+| **SQLite** | Preview | No Relay, `DISTINCT ON`, upsert or nested inserts; JSON is JSON1 rather than JSONB. |
+| **MySQL 8.0.14+** | Preview | No Relay, `RETURNING`, upsert, `DISTINCT ON` or nested inserts. |
+| **ClickHouse** | Preview, read-only | No mutations, relationships, JSON operators, geo or Relay. |
 
-Driving the `examples/petshop` stack with ApacheBench (20,000 GraphQL queries
-joining `pet → category`, concurrency 50):
+The [matrix](.github/workflows/ci.yml) makes those limits executable: each
+backend runs only the fixtures its declared capabilities support.
 
-- **3,257 req/s**, **0 failed** requests
-- **p50 15 ms · p95 21 ms · p99 25 ms** (max 32 ms)
+## Is Donat a fit?
 
-The container image is **168 MB** (a single static-ish binary plus a minimal
-base).
+Choose Donat when the flow between your services is the hard part — when the
+same data must serve app clients, REST consumers and AI tools, and when
+"charged but not recorded" is a bug you cannot ship.
 
-> Measured on a single engine instance with Postgres in the same Docker network
-> on a developer laptop — not a tuned multi-pod deployment. Treat it as an
-> order-of-magnitude footprint, not a max-throughput benchmark. Reproduce it
-> with `examples/petshop` + `ab` (or any HTTP load tool).
+Donat is not an ORM, a hosted platform, or a place for genuinely computational
+work. What it gives you is declarations with closed grammars: bounded,
+reviewable, and refused at deploy time when they do not hold together. If your
+logic wants a general-purpose language, keep it in a service and reach it
+through a connector.
 
----
+## Get involved
 
-## Capabilities
-
-All of the following are verified by a passing module in the native
-conformance harness (`crates/conformance/tests/`).
-
-### APIs
-- **GraphQL** — per-role row filters and column masks, relationships (FK +
-  manual), aggregates, computed fields, `_by_pk`/`_one`, jsonb & PostGIS
-  operators, Relay connections, and live-query **subscriptions** over
-  WebSocket.
-- **Mutations** — insert (with `on_conflict`/upsert, presets, check
-  expressions), update, delete, `returning` — all in one transaction.
-- **REST** — RESTified endpoints: a method + URL template maps to a saved
-  query; path/query/body bind its variables. Runs through the same per-role
-  pipeline.
-- **MCP** — Model Context Protocol over streamable HTTP: generic,
-  table-parameterized CRUD tools (`list_tables`, `describe_table`, `query`,
-  `insert`, `update`, `delete`), each running under the request's role.
-- **Surface selection** — mount any subset with `--enabled-apis`
-  (`DONAT_GRAPHQL_ENABLED_APIS=graphql,rest,mcp`); a disabled surface is simply
-  not registered.
-
-### Auth & permissions
-- **JWT** (RS/ES/EdDSA/HS families) including **JWK fetch with Cache-Control
-  refresh**; webhook auth hook with unauthorized-role fallback.
-- **Row- and column-level permissions** per role, **inherited roles** with
-  cell-level NULLing and cycle detection, **allowlist / query collections**.
-- **No admin role.** No `run_sql`, no metadata mutation over HTTP. The
-  admin-secret is API-level auth only and never bypasses permissions. This is a
-  deliberate security posture — see [Security](#security).
-
-### Events & automations
-- **Event triggers** — insert/update/delete webhooks, captured in-transaction,
-  delivered with the Donat envelope, `retry_conf`, and per-attempt invocation
-  logs.
-- **Cron (scheduled) triggers** — recurring webhooks from YAML with retries and
-  tolerance windows.
-- Both are **multi-pod safe with no leader election** (`ON CONFLICT`
-  materialization + `FOR UPDATE SKIP LOCKED` → at-least-once; handlers must be
-  idempotent).
-- **Actions (synchronous)** — webhook handlers with a custom type system
-  (input/output objects, scalars, enums), output validation, handler-error
-  surfacing, and output → tracked-table relationships resolved under the
-  calling role.
-
-### Integrations
-- **Remote schemas** — role-scoped SDL permissions and execution, schema
-  customization (namespace/prefix translation), and `@preset` arguments (static
-  + session).
-
-### Deploy
-- **`migrate`** (refinery DDL) + **`validate`** (metadata vs DB) +
-  boot-from-YAML; multi-source metadata with per-source pools.
-
----
-
-## Security
-
-Donat's security model is a feature, not an afterthought:
-
-- **No permission-bypass role and no admin-over-HTTP surface.** A trusted
-  request with no `X-Donat-Role` is denied. Configuration is deploy-time only
-  (`migrate` + YAML).
-- **Declarative, in-engine permissions** are merged directly into the single
-  generated SQL statement.
-- **Adversarial test coverage** — `crates/conformance/tests/security.rs`
-  exercises IDOR / broken-access-control attacks and SQL-injection payloads;
-  there is a query-depth DoS guard.
-
----
-
-## Roadmap
-
-We keep "shipping today" and "not yet" honest — credibility matters more than a
-longer feature list.
-
-**Scaffolded, not yet shipping:**
-- **Native handler SDKs** — the Go SDK lands the handler contract + codegen and
-  defers the in-process **WASM** transport (pure-Go `wazero`, no cgo) behind a
-  single `Dispatch` seam. **Node.js and Python SDKs** follow the same contract.
-  The goal: write business logic as typed native functions in any language,
-  with HTTP webhooks as the fallback rather than the only option.
-- **Multi-database GA** — a pluggable `Dialect` abstraction exists with SQLite
-  and MySQL introspection + SQL generation, but neither is conformance-tested
-  in the running engine yet. **Postgres is the supported backend today.**
-- **Async actions** and request/response (Kriti) transforms — sync actions ship
-  now; async is future work.
-- **Remote relationships across the full native harness** — per-row remote
-  relationships are implemented but currently only exercised by the legacy
-  cross-check; mixed local+remote root queries remain incomplete.
-- **Event-trigger session-variable capture** and column-filtered payloads.
-
-**Planned:**
-- **OpenAPI / Swagger export** — generate an OpenAPI document from the declared
-  REST endpoints. Not implemented yet; REST endpoints are declared in YAML
-  today.
-- **Event streaming** — first-class delivery to streaming backends
-  (Kafka/NATS) alongside today's webhook delivery.
-
-> Note: there is intentionally **no admin role and no runtime admin API**
-> (`run_sql`, metadata mutation). That is a permanent design stance, not a
-> roadmap item — see [Security](#security).
-
----
-
-## How Donat compares
-
-| | Donat | Hasura | Supabase | PostgREST | GraphJin | Convex |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| Schema-first (DB = source of truth) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ (code-first) |
-| GraphQL + REST + MCP from one model | ✅ | partial | partial | REST only | GraphQL only | n/a |
-| Declarative RBAC + inherited roles | ✅ | ✅ | partial | DB roles | basic | code |
-| Events + cron + automations built in | ✅ | ✅ | partial | ❌ | ❌ | ✅ |
-| Typed native handlers (not just webhooks) | 🚧 Go landing (WASM/Node/Py next) | ❌ webhook-only | edge functions | ❌ | ❌ | ✅ TS |
-| **No runtime admin API / `run_sql`** | ✅ | ❌ | ❌ | n/a | n/a | n/a |
-| One SQL statement per operation | ✅ | partial | n/a | ✅ | ✅ | n/a |
-| Self-hosted single binary | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
-
-*Temporal isn't in the table: it's a durable-workflow engine that complements
-Donat's data-bound webhooks rather than competing with them.*
-
----
-
-## FAQ
-
-**Is this a Hasura clone?**
-No. Donat is compatible with the Donat v2 metadata format and API shape (so
-existing metadata loads without conversion), but it is a distinct engine with a
-different security posture — **no admin role, no runtime admin API** — written
-in Rust, configured only at deploy time.
-
-**Do I write any application code?**
-For the core backend, no. You write SQL migrations and YAML metadata. Custom
-business logic lives in *actions* and *trigger handlers* — your own code, not
-the engine.
-
-**Do I have to use webhooks for handlers?**
-No. Webhooks work everywhere, but you can also register **typed native
-handlers** through a generated SDK and skip the HTTP round-trip. The Go SDK is
-first; an in-process WASM runtime and Node.js/Python SDKs are on the
-[Roadmap](#roadmap).
-
-**How are permissions enforced?**
-Row filters and column masks are declared per role and merged into the single
-generated SQL statement, so a role physically cannot select data it isn't
-granted. There is no bypass role.
-
-**Which databases are supported?**
-Postgres today. A pluggable backend abstraction exists with SQLite/MySQL
-groundwork — see [Roadmap](#roadmap).
-
-**Can I run only GraphQL (or only REST)?**
-Yes — `DONAT_GRAPHQL_ENABLED_APIS=graphql`. Surfaces left out aren't mounted.
-
-**How does it run in production?**
-A single binary, multiple pods. Event and cron delivery is safe under
-concurrent instances with no leader election (at-least-once; design your
-webhook handlers to be idempotent).
-
----
-
-## Contributing & docs
-
-- Architecture decisions and design notes live in [`knowledgebase/`](knowledgebase).
-- Engine work is TDD against the conformance harness — see
-  [`crates/conformance/PORTING.md`](crates/conformance/PORTING.md).
-- Run `make conformance` (needs Postgres `postgis/postgis:16-3.4` at `PG_URL`,
-  default `postgresql://postgres:postgres@127.0.0.1:15432/postgres`). Each
-  suite spawns its own engine on a fresh database — hermetic and parallel.
+Star or watch the [repository](https://github.com/donatlabs/donat), report an
+[issue](https://github.com/donatlabs/donat/issues), or start with the
+[examples](examples/). Fixture conventions are documented in the
+[conformance harness](crates/conformance/PORTING.md).
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). Some conformance
-fixtures are derived from a third-party Apache-2.0 test suite; that upstream
-license and attribution are retained in
-`crates/conformance/fixtures/LICENSE.hasura`.
+fixtures are derived from a third-party Apache-2.0 test suite; its license and
+attribution are retained in `crates/conformance/fixtures/LICENSE.hasura`.

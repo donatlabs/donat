@@ -1,0 +1,114 @@
+table:
+  name: payment
+  schema: public
+object_relationships:
+  - name: order
+    using:
+      foreign_key_constraint_on: order_id
+array_relationships:
+  - name: events
+    using:
+      foreign_key_constraint_on:
+        column: payment_id
+        table:
+          name: payment_event
+          schema: public
+  - name: refunds
+    using:
+      foreign_key_constraint_on:
+        column: payment_id
+        table:
+          name: refund
+          schema: public
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+  - role: payment_worker
+    permission:
+      columns:
+        - id
+        - order_id
+        - status
+        - amount_minor
+        - currency
+        - provider_reference
+      filter: {}
+  - role: reconciliation_worker
+    permission:
+      columns: "*"
+      filter: {}
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      filter: {}
+command_select_permissions:
+  - role: payment_worker
+    permission:
+      columns:
+        - id
+        - order_id
+        - status
+        - amount_minor
+        - captured_minor
+        - refunded_minor
+        - chargeback_minor
+        - currency
+        - provider_reference
+      filter: {}
+# A payment is money, so a shopper reaches it only through their own commands
+# — `begin_checkout` opens one, `cancel_order` and
+# `request_authorized_order_cancellation` ask for it to be stopped. There is no
+# ordinary insert or update for the role at all: what a provider answered is
+# the store's to record, and a caller who could write `captured` or
+# `amount_minor` would have set their own price.
+command_insert_permissions:
+  - role: customer
+    permission:
+      columns:
+        - order_id
+        - status
+        - amount_minor
+        - currency
+        - authorization_activity_key
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+command_update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - status
+      filter:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+      check:
+        order:
+          customer_id:
+            _eq: X-Donat-User-Id
+insert_permissions:
+  - role: subscription_worker
+    permission:
+      columns: "*"
+      check: {}
+update_permissions:
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+      check: {}
+  - role: payment_worker
+    permission:
+      columns: "*"
+      filter: {}
+      check: {}

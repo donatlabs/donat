@@ -38,3 +38,6 @@ response:
       selectable_columns:
       - id
       - name
+      select_limit: null
+      insertable_columns: null
+      updatable_columns: null

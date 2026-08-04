@@ -1,0 +1,20 @@
+- name: default
+  kind: sqlite
+  configuration:
+    connection_info:
+      database_url:
+        from_env: PERF_DATABASE_URL
+      pool_settings:
+        max_connections: 16
+        pool_timeout: 5
+  tables:
+    - table:
+        schema: main
+        name: author
+      configuration:
+        custom_name: author
+      select_permissions:
+        - role: user
+          permission:
+            columns: '*'
+            filter: {}

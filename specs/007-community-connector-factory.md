@@ -1,0 +1,2394 @@
+# Spec 007 — Community connector factory
+
+Status: proposed. This specification extends the compiled connector boundary
+from Spec 006 into a repeatable, license-gated factory for provider
+integrations. It does not add a workflow engine or a runtime plugin system.
+
+## 1. Summary and confirmed product boundary
+
+Donat will acquire ordinary provider integrations from two source-level donor
+classes:
+
+1. exact-version, permissively licensed n8n community packages admitted one
+   version at a time; and
+2. permissively licensed provider OpenAPI or Discovery artifacts admitted one
+   immutable revision at a time.
+
+A development-only importer inventories those sources and emits reviewable
+Donat connector artifacts. An offline code generator validates the checked-in
+normalized connector IR and emits checked-in static Rust registrations;
+ordinary Cargo compilation embeds them with hand-written Rust processors in
+the existing Donat binary. Production executes only that embedded catalog.
+
+The deployed product remains exactly one Rust binary plus Postgres:
+
+- no connector UI, visual editor, dynamic options UI, or copied provider field
+  descriptions;
+- no Node.js, JavaScript execution, WASM, shared library, package manager,
+  downloaded package, sidecar, or source-code loading in production;
+- no n8n workflow or logical nodes, including `If`, `Switch`, `Merge`, `Code`,
+  `Wait`, loops, the n8n item/paired-item model, subworkflows, send-and-wait,
+  or AI orchestration;
+- no arbitrary HTTP Request equivalent;
+- no business workflow behavior in connector processors.
+
+The only imported domain is provider integration: credential specifications
+and instances, typed API operations, pagination, provider error mapping,
+provider webhooks, polling triggers, bounded binary/multipart transport, and
+narrow static Rust protocol processors. Donat Rules, Commands, and Processes
+continue to own business decisions, database work, retries, waits, branching,
+iteration, and orchestration.
+
+Commands never perform connector I/O. After the Spec 005 runtime prerequisites
+in Section 13 exist, a durable Process commits intent before a worker calls a
+connector. Every connector instance used by a Process is bound to the same
+Postgres source as that Process, and all activity capacity, polling
+checkpoints, and ingress journals are source-local. There is no admin role,
+runtime metadata mutation API, permission bypass, or connector-call GraphQL
+endpoint.
+
+## 2. Background and governing evidence
+
+Spec 006 established the first two implementation styles:
+
+- `crates/server/src/connectors/http.rs` is a closed declarative HTTP executor;
+- `crates/server/src/connectors/stripe.rs` is an independently implemented,
+  provider-specific Rust module;
+- `crates/server/src/connectors/mod.rs` builds an immutable startup registry;
+- `crates/metadata/src/types.rs` accepts deploy-time connector instances,
+  environment-backed `SecretRef` values, and operation capacity policy.
+
+The current registry is intentionally small and hand-written. At
+`crates/server/src/connectors/mod.rs:137-161`, an enum contains only HTTP and
+Stripe variants. `ConnectorRegistry::execute` at
+`crates/server/src/connectors/mod.rs:445-502` dispatches only a named instance
+and enabled operation; it accepts no request URL, method, header name, or HTTP
+client. `ExecutionContext` at `crates/server/src/connectors/mod.rs:99-109`
+currently exposes only a deadline.
+
+The existing transport invariants are retained:
+
+```rust
+// Existing code, crates/server/src/connectors/mod.rs:112-124.
+pub struct ConnectorDefinition {
+    pub module_name: &'static str,
+    pub semantic_version: &'static str,
+    pub runtime_abi: u32,
+}
+
+pub trait ConnectorModule: Send + Sync {
+    fn definition(&self) -> ConnectorDefinition;
+}
+```
+
+`crates/server/src/connectors/http.rs:996-1060` validates the closed job input,
+canonicalizes its fingerprint, checks the activity deadline, resolves the
+fixed destination twice, enforces the 1 MiB request/response limit, rejects an
+unvetted peer, and maps the response. Paths are static templates whose values
+are percent-encoded (`crates/server/src/connectors/http.rs:1264-1337`).
+Reqwest redirects, proxies, and transport retries are disabled
+(`crates/server/src/connectors/http.rs:830-872`). These are factory
+requirements, not implementation details that a generated connector may
+override.
+
+Stripe supplies the processor-backed reference. The actual operation ID is
+`checkout.create_session`
+(`crates/server/src/connectors/stripe.rs:32-34`); its input is closed and typed
+(`crates/server/src/connectors/stripe.rs:41-150`), its provider origin is
+fixed, and its webhook verifies the untouched raw bytes before parsing JSON
+(`crates/server/src/connectors/stripe.rs:439-532`).
+
+No existing Hasura/Donat-derived fixture governs this new community-connector
+surface. The current Donat-owned cases in
+`crates/conformance/tests/connectors.rs` and
+`crates/conformance/fixtures/connectors/` cover startup rejection, secret
+redaction, Stripe signature rejection, and the temporary verified-event
+`503` boundary only. They are useful regression baselines but do not specify
+source admission, normalized IR, credentials, generic pagination, processors,
+polling, or binary values. New native conformance fixtures created for this
+specification are the ground truth for those behaviors. They must pin exact
+status, body, error class/code, redaction, request shape, and durable outcome;
+there is no legacy pytest result to consult.
+
+This specification follows:
+
+- `knowledgebase/declarative-saas/decisions/001-declarative-saas-runtime-and-porting-policy.md`;
+- `knowledgebase/declarative-saas/decisions/002-durable-process-operational-contracts.md`;
+- `knowledgebase/declarative-saas/decisions/009-durable-process-source-local-compilation-and-journal-contracts.md`;
+- `knowledgebase/declarative-saas/reference-porting-register.md`;
+- `specs/006-in-binary-connectors.md`.
+
+## 3. Sourcing and licensing policy
+
+### 3.1 Hybrid source model
+
+A source is eligible for Phase 1 source-level import only when its exact
+artifact selects one of these SPDX licenses and passes the admission pipeline:
+`MIT`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, or `0BSD`.
+No other identifier, `LicenseRef`, exception, `WITH` expression, or ambiguous
+text is accepted. A dual-licensed artifact is eligible only when the source
+record selects one allowed branch and records every obligation of that
+selection. A repository or npm metadata label is not sufficient. Generated
+files, embedded schemas, icons, fixtures, test payloads, and every dependency
+have their own origin and license decisions.
+
+Each dependency and peer dependency has exactly one closed disposition:
+
+- `Shipped`: its admitted bytes are linked into or distributed with Donat and
+  its source, license, hashes, and notices satisfy the same gate;
+- `BuildOnly`: an admitted Rust build/development dependency that is absent
+  from release artifacts;
+- `TypeOnlyReplaced`: donor types were inspected only to identify the boundary,
+  while Donat supplies an independent neutral type/ABI and copies no bytes;
+- `BehaviorOnly`: a documented observation supplies no compiler input, linked
+  code, generated material, or fixture;
+- `Rejected`: admission stops.
+
+Every community donor in Section 3.2 must record its `n8n-workflow` peer as
+`TypeOnlyReplaced`. The SUL dependency's bytes are not copied, parsed as
+compiler input, executed, linked, generated from, or shipped. A source-policy
+test scans acquisition inputs, committed manifests, generated Rust, Cargo
+metadata, and release artifacts for that prohibition.
+
+Permissive provider OpenAPI/Discovery is a co-equal input. A publicly readable
+schema is not necessarily reusable. The exact artifact requires an immutable
+revision, checksum, license evidence, notice, and per-file record before it can
+generate checked-in Donat IR or Rust.
+
+`n8n-nodes-base` version `2.33.0` at n8n revision
+`b329d57767cb6ec046bb1ecf9293b450c831d720` is
+`LicenseRef-n8n-sustainable-use`. Its source, tests, fixtures, credential
+classes, descriptions, and generated metadata are not eligible for
+source-level import, translation, fixture reuse, or generated-metadata
+extraction under Donat's policy absent an express written grant. They remain
+behavior-only. Such a grant would have to cover source copying, Rust
+translation, derivative-work creation, fixture use, generated-metadata
+extraction, commercial hosting, and redistribution. Enterprise or OEM
+branding alone must not be interpreted as that grant.
+
+For SUL or otherwise non-permissive references, implementers may record a
+path-level behavioral observation and then write independent Donat tests and
+code from provider-owned public behavior. They must not preserve expressive
+descriptions, field text, fixture bodies, code organization, or generated
+catalogs.
+
+### 3.2 Exact research cohort
+
+The n8n verified-node API is discovery evidence only. Its 2026-07-29 snapshot
+contained 1,337 node-type rows and 1,066 distinct package names; the
+concatenated raw responses had SHA-256
+`64a562c831328819b8fb9592f3b2989428f55a6060a1eddc72baa808a29eb9d7`.
+Those counts are not connector or operation coverage claims.
+
+The first donor cohort is pinned below. Every integrity is the npm-published
+SHA-512 that was independently recomputed over the exact tarball in the
+research report.
+
+| Package | Exact repository identity | Exact npm integrity | Admission notes |
+| --- | --- | --- | --- |
+| `n8n-nodes-serpapi@0.1.10` | `serpapi/n8n-nodes-serpapi` at `e48b778878c043f30277b932c4c129804efee66d` (npm `gitHead`) | `sha512-E9tAU4c9mhNWr07s6RGeqzyrlQO8y42YvtMjPWuLf+tIEM8muU/RIgtp+ojhaoNVCP+jfrwmsSC75OIuoMVS9A==` | MIT; verified; no npm provenance statement; first Tier A compiler proof |
+| `@brave/n8n-nodes-brave-search@1.1.2` | provenance source `brave/n8n-nodes-brave-search` at `5361456ed0103c46468d6fba107f735c6a15f4d3`; version-only tag commit `a8efa1adba006a8225b383882af97d370538c354` | `sha512-vmXh668+AmYXClW5D0Wf4HReSgZbhVHUG+NDqFpFNJVGLAZrPmSmoJHUk+GybzRbjkNCiXcTWIw29LONKt2vXA==` | MIT; verified and provenance-backed; retain both commits |
+| `n8n-nodes-resend@2.6.4` | `resend/n8n-nodes-resend` at provenance/tag `b34f90f491e2f0c26b6105720437857028707397` | `sha512-84j71taNrjuUNGdk/vaOdFHe0JF06Qk+hJphh5phBwl6cHiZcmVeqNAIpyBtpN8C7TQIJIOJL4scHai1snqS1Q==` | MIT; verified and provenance-backed; send-and-wait excluded |
+| `n8n-nodes-cloudinary@0.2.1` | `cloudinary/n8n-nodes-cloudinary` at provenance/npm `gitHead` `3aa104e40e2dd6a9d58ab65c8a1b14656935bef6` | `sha512-47KeOgPnVTn37EEceX+rRWSaqLO5XiMaL1sc19QnfWGIFU4JidoCTLFsSpLicXHD3XvpyEoSl+I/ih+jmw0whw==` | MIT; verified and provenance-backed; signing/cursor proof, multipart later |
+| `@mercadopago/n8n-nodes-mercadopago@0.3.6` | `mercadopago/n8n-nodes-mercadopago` at provenance/tag/npm `gitHead` `739228119eeab96f955341e205a30cc9bcd6023b` | `sha512-NKMVqxBO+Rgo0Wsy5+1wTfN3GyaNVlSN70m7OCpeHD6rdV/EioisrYY6+VBtYYXgV8yHGW872o5m44+JAx08nA==` | MIT; verified and provenance-backed |
+| `@apify/n8n-nodes-apify@0.6.10` | `apify/n8n-nodes-apify` at provenance/tag/npm `gitHead` `8edec8b87b811c0e85286b6f56e0124c021e26b5` | `sha512-IkZS1zKzIyt43ygBNeR/Ws5BIOQD6ap3KwWRdV/3IOXIaYidD7msuThT15/OiYs8xe/gXkF4JVnfpoUIzm9frg==` | MIT; verified and provenance-backed; source `package.json` said `0.6.9`, so source/tarball mismatch remains explicit |
+| `@cloudconvert/n8n-nodes-cloudconvert@1.1.1` | `cloudconvert/n8n-nodes-cloudconvert` at npm `gitHead` `e81a9e8069050f1611e6192e04d6c93ca6a1edf7`; version-only tag commit `7a7297594ce513517a4d28ea7a3b0fbf713cef97` | `sha512-dHI4evF8wK2na7mibhKbZps8v5akmYcOxs+uJIphDKSl3maXIOxRlQTKL/tOddNZtHUy5a3c7hX7NaCtmemRXw==` | MIT; verified; no npm provenance statement; later binary/multi-step proof |
+
+Other exact permissive inputs already identified are:
+
+- `n8n-io/n8n-nodes-starter` at
+  `3308a8eca314e388c40b29c9b6cefc49a8cf9115`, MIT. Only independently
+  admitted starter boilerplate may be translated; it does not relicense n8n
+  runtime packages.
+- `stripe/openapi` at
+  `6dfda253ec9229dd4d20e0cac3ec9b1ff31fac69`, MIT. The current reference
+  record gives `openapi/spec3.json` SHA-256
+  `e24a26de4188fd64dec4c043d5d3726277fdcb07556a493ea481c305b0a223d8`.
+
+The HubSpot public API spec collection at
+`b43170f3a2e51ee9dd3933a261d2219485733f11` is proprietary according to its
+immutable README and is behavior-only. Google Discovery documents and any
+future provider schema require their own terms review before generation.
+
+These rows are candidates, not completed port records. Missing license-file
+hashes, per-source-file SHA-256 values, embedded-material decisions,
+destinations, RED tests, notices, and reviewers must be supplied by admission
+before any derived artifact lands.
+
+### 3.3 Derivative work and fixture rule
+
+Source-level translation of an MIT community donor into normalized YAML, Rust,
+or generated static IR is a derivative port. It requires:
+
+- a pre-port `ConnectorSourceRecord` accepted through repository review;
+- one `knowledgebase/declarative-saas/reference-porting-register.md` entry per
+  imported or translated upstream file;
+- the donor's required copyright/license text in root
+  `THIRD_PARTY_NOTICES.md`;
+- a provenance header or generated-record link on every derived destination;
+- a Donat-owned failing test named in the record before the implementation;
+- human review of both the checked-in normalized manifest and the checked-in
+  generated Rust catalog.
+
+Repository-level MIT licensing does not automatically clear fixtures. Each
+fixture must be independently reviewed for third-party provider payloads,
+personal data, secrets, trademarks, copied schemas, and generated proprietary
+material. A fixture that fails that review is replaced with independently
+authored Donat data, even when the donor source itself is eligible.
+
+## 4. Source admission and compiler pipeline
+
+### 4.1 `ConnectorSourceRecord`
+
+Repository review is the admission authority. There is no cryptographic
+signature, signer key, trust root, or self-referential commit claim in Phase 1.
+Recorded npm registry signatures/provenance are retained source facts, not a
+replacement admission authority or Donat trust root.
+Every exact donor version has one versioned pre-port record whose deserializer
+denies unknown fields. Conceptually:
+
+```rust
+struct ConnectorSourceRecord {
+    record_version: u32,
+    record_id: SourceRecordId,
+    subject: SourceSubject,
+    reacquisition: ReacquisitionPlan,
+    artifact_hashes: Vec<ArtifactHash>,
+    license: LicenseDecision,
+    notice: NoticeIdentity,
+    entrypoints: Vec<SourcePath>,
+    dependencies: Vec<DependencyDecision>,
+    embedded_material: Vec<EmbeddedMaterialDecision>,
+    provider_contracts: Vec<ProviderContractReference>,
+    compatibility: CompatibilityDecision,
+    admission: AdmissionState,
+    safety_findings: SafetyFindings,
+    reviewer: ReviewIdentity,
+    approval_date: Date,
+    proposed_manifest: Option<RepoPath>,
+    proposed_destinations: NonEmptyVec<RepoPath>,
+    red_tests: NonEmptyVec<TestId>,
+}
+
+enum SourceSubject {
+    ExactNpm(ExactNpmPackage),
+    ProviderArtifact(ExactProviderArtifact),
+    DonatOwned(DonatOwnedSource),
+}
+
+enum ReacquisitionPlan {
+    ExactNpmReview,
+    ProviderRepositoryReview,
+    ProviderVersionedArtifactReview,
+    DonatOwnedNoNetwork,
+}
+
+struct ExactNpmPackage {
+    name: String,
+    version: ExactSemver,
+    tarball_url: ExactHttpsUrl,
+    integrity: NpmIntegrity,
+    repository: ImmutableRepository,
+    npm_git_head: GitCommit,
+    package_repository: RepositoryUrl,
+    signature: NpmSignatureDecision,
+    provenance: NpmProvenanceDecision,
+    tag_commit: Option<GitCommit>,
+    provenance_commit: Option<GitCommit>,
+    maintainers: Vec<NpmMaintainerIdentity>,
+    repository_owner: RepositoryOwnerDecision,
+}
+
+enum NpmSignatureDecision {
+    Verified {
+        signatures: NonEmptyVec<VerifiedNpmSignature>,
+        registry_metadata_sha256: Hash256,
+    },
+    VerifiedAbsent { registry_metadata_sha256: Hash256 },
+    Rejected { finding: FindingId },
+}
+
+enum NpmProvenanceDecision {
+    Verified {
+        statement_sha256: Hash256,
+        source_commit: GitCommit,
+    },
+    VerifiedAbsent { registry_metadata_sha256: Hash256 },
+    Rejected { finding: FindingId },
+}
+
+enum RepositoryOwnerDecision {
+    Consistent {
+        package_owner: NpmOwnerIdentity,
+        repository_owner: RepositoryOwnerIdentity,
+    },
+    ReviewedMismatch { decision_id: ReviewDecisionId },
+    Rejected { finding: FindingId },
+}
+
+enum ContractFact {
+    ProviderEvidence {
+        source_record_id: SourceRecordId,
+        fact_id: ProviderFactId,
+    },
+    DonatPolicy {
+        policy_id: DonatPolicyId,
+        value: TypedValue,
+    },
+}
+
+struct ProviderContractReference {
+    contract_id: ProviderContractId,
+    facts: NonEmptyVec<ContractFact>,
+}
+```
+
+`record_version` is the integer source-record schema epoch. The complete
+validated record above, including review, admission, legal, dependency,
+embedded-material, destination, and RED-test fields, projects one-for-one to
+`SourceRecordMaterialV1`. Optional fields are explicit value-or-null, enums
+use `{"kind":"<snake_case>","value":<payload-or-null>}`, set-like collections
+sort by stable ID, and duplicates reject. The material never contains its own
+hash:
+
+```text
+record_sha256 =
+  SHA256("donat.connector.source-record.v1\0" ||
+         JCS(SourceRecordMaterialV1))
+```
+
+Generated source identities retain this hash. The exact projection,
+calculation order, and vectors are defined in Section 5.1 and
+[[knowledgebase/declarative-saas/decisions/012-canonical-catalog-projections-and-persisted-header-capabilities]].
+
+`SourceRecordId`, `ProviderContractId`, `ProviderFactId`, `DonatPolicyId`,
+and `NoticeId` are transparent catalog wrappers over the ABI's exact
+const/copy `InlineId` storage and grammar. This keeps generated provenance and
+legal identities const-safe without making them connector execution IDs.
+`ReacquisitionPlan` must match its source-subject variant, and
+`DonatOwnedNoNetwork` is rejected by every networked command.
+
+The npm form records exact package name/version, tarball URL, SHA-512
+integrity, a closed verified-present/verified-absent/rejected npm signature
+decision, a separate closed signed-provenance decision, repository URL, full
+`npm_git_head`, optional distinct tag and provenance commits, source-tree
+hash, the provenance/`gitHead`-to-tarball mapping, package entrypoints, all
+dependency and peer-dependency licenses, license file hash, the reviewed
+maintainer set, and a closed repository-owner consistency/mismatch/rejection
+decision. A present signed-provenance source commit must equal
+`provenance_commit`; no tag or provenance commit silently replaces
+`npm_git_head`.
+
+The provider-artifact form records the repository or immutable download URL,
+full revision, exact schema paths, byte hashes, declared license, mandatory
+notice, provider API version, and terms evidence. Mutable HTML documentation
+can be a dated behavior reference but cannot be compiler input.
+
+`DependencyDecision` uses only the five dispositions in Section 3.1. The
+safety record rejects dynamic code, `eval`, process or shell execution,
+filesystem/environment access, arbitrary destinations, proxy or TLS controls,
+long-lived sockets, local services, unadmitted SDK dependencies, unbounded
+loops, and unbounded binary behavior. A mismatch in package version, tarball
+integrity, signature/provenance disposition, provenance commit, tag decision,
+maintainers, repository-owner decision, git tree, entrypoint, license,
+dependency, or embedded material fails closed.
+
+Provider-authored facts and Donat-owned safety/normalization choices use the
+closed `ContractFact` origin above. A provider-evidence fact must resolve to
+the named immutable `ProviderArtifact` record and exact fact location. A
+Donat policy must resolve to its reviewed policy ID and cannot satisfy a
+required provider fact.
+
+Admission and port evidence are distinct:
+
+1. the pre-port source record proves that exact source bytes and selected paths
+   are eligible inputs and names proposed destinations/RED tests;
+2. the port change checks in the normalized manifest, generated Rust catalog,
+   notices, tests, and per-file reference-register entries;
+3. repository review of that change is the post-port approval. The existing
+   register records source path/hash, destination, adaptation, RED/GREEN
+   evidence, and reviewer. Git history and the review system retain the
+   resulting commit identity outside the record; no file contains its own
+   commit hash.
+
+### 4.2 Hostile acquisition and extraction
+
+The network-capable acquisition tool treats every remote artifact as hostile.
+Its command grammar separates npm and provider-only identities:
+
+```text
+donat-connector-acquire acquire-npm-review \
+  --artifact-url <exact-https-url> \
+  --expected-integrity <canonical-sha512-sri> \
+  --repository-url <exact-https-git-url> \
+  --commit <full-commit> \
+  --output <ignored-quarantine-directory>
+
+donat-connector-acquire acquire-provider-review \
+  --repository-url <exact-https-git-url> \
+  --commit <full-commit> \
+  --output <ignored-quarantine-directory>
+
+donat-connector-acquire acquire-provider-review \
+  --artifact-url <exact-https-url> \
+  --provider-revision <non-empty-immutable-revision> \
+  --expected-sha256 <lower-case-64-hex> \
+  --output <ignored-quarantine-directory>
+
+donat-connector-acquire reacquire-reviewed \
+  --record <approved.yaml> \
+  --output <absent-ignored-quarantine-directory>
+```
+
+The npm form requires its expected SRI before a pre-port record exists and
+rejects provider-only flags. The provider form accepts exactly one of the
+repository pair or versioned-artifact triple and rejects npm fields.
+`reacquire-reviewed` accepts no command-line locator/hash override and derives
+the exact identity from a schema-valid approved record. Tests parse the
+production command enum and prove these grammars are disjoint.
+Its Phase 1 policy is exact:
+
+- acquisition uses HTTPS only;
+- npm/repository bytes may come only from the checked-in allowlist
+  `registry.npmjs.org`, `github.com`, and `codeload.github.com`; adding a
+  provider-schema host is a reviewed source-policy change, not a command-line
+  option;
+- at most three redirects are followed, every redirect remains HTTPS and on
+  the original host, and credentials/cookies are never forwarded;
+- the streaming compressed artifact limit is 64 MiB;
+- the complete tarball is written into an exclusive temporary directory with
+  mode `0700` and hashed before entry inspection. Npm/versioned-artifact
+  bytes must match the command's expected integrity first; repository bytes
+  are safely extracted and then must match the exact commit/tree identity.
+  Reacquisition must match every corresponding record value before admission;
+- extraction permits at most 256 MiB expanded total, 16 MiB per regular file,
+  10,000 entries, and path depth 32;
+- every entry path must be normalized relative UTF-8. Absolute paths, empty
+  components, `.`/`..`, platform prefixes, NUL, duplicate normalized paths,
+  and ASCII-case-folding collisions are rejected;
+- only ordinary directories and regular files are accepted. Symlinks,
+  hardlinks, devices, FIFOs, sockets, sparse entries, and unknown entry types
+  are rejected;
+- files are created exclusively beneath the quarantine root. Subsequent walks
+  use no-follow metadata and verify that every visited path is still a regular
+  file/directory beneath that root;
+- an RAII cleanup guard removes the `0700` directory on success or error; a
+  startup cleanup pass removes abandoned tool-owned directories after a crash;
+- package scripts, executables, donor tests, npm hooks, Node, and JavaScript
+  are never executed.
+
+The same allowlist applies to all three networked commands.
+`docs.stripe.com` is not admitted. Mutable Stripe documentation is represented
+only by independently authored synthetic rejection bytes unless a separate
+checked-in source-policy review adds that host. A repository-provider review
+emits deterministic `provider-source.tar` plus `source/`; the exact
+`reacquire-reviewed --record ... --output ...` command is recorded with an
+accepted provider contract so a clean worktree can reproduce those bytes.
+
+Synthetic adversarial tests cover absolute and `..` traversal, links and every
+special type, sparse/unknown entries, duplicate/case-collision paths,
+over-limit compressed/expanded/file/count/depth inputs, cross-host and excess
+redirects, digest mismatch before extraction, no-follow walk replacement, and
+a package-script sentinel that must remain untouched.
+
+### 4.3 Admission and translation stages
+
+The development pipeline performs these stages in order:
+
+1. discover an exact `(package, version)` or provider artifact;
+2. acquire and extract it under Section 4.2;
+3. verify provenance/repository mapping, license, notices, dependencies,
+   entrypoints, and embedded material;
+4. inventory provider integrations only and classify each operation as Tier A,
+   B, C, or rejected;
+5. emit an unapproved pre-port review bundle containing the candidate source
+   record, per-path hashes, approved-operation proposal, unsupported findings,
+   proposed destinations/RED tests, and notice obligations, but no derivative
+   manifest or Rust;
+6. land and repository-review the pre-port record before any derivative;
+7. start the recorded Donat RED tests, translate only the approved paths, and
+   check in both the normalized manifest and deterministically generated Rust
+   catalog with register/notices;
+8. run offline `generate --check`, crate tests, and repository review over the
+   complete derivative diff.
+
+The importer treats TypeScript as source data. It does not execute package
+scripts, node classes, JavaScript, npm hooks, or donor tests. It may parse an
+AST to locate static object literals and imports. It may mechanically emit
+Tier A fields only when each value maps to the closed Donat grammar.
+
+AST conversion is not automatic translation of imperative code. Functions,
+expressions, hooks, `execute`, `poll`, `trigger`, `webhook`, SDK calls,
+workflow-item access, or ambiguous imports produce an explicit unsupported
+finding or a reviewed processor work item. They never become generated Rust
+behavior. Generated n8n metadata is neither executable truth nor a license
+workaround because function bodies are absent.
+
+### 4.4 Development/build time versus production
+
+The stages are deliberately separated:
+
+| Stage | Inputs | May access donor source/network? | Output | Shipped in `donat`? |
+| --- | --- | --- | --- | --- |
+| Development acquisition | exact HTTPS identity | yes, only through Section 4.2 | ignored quarantine and candidate review bundle | no |
+| Pre-port repository review | source record, hashes, license/dependency decisions | no | approved checked-in source record | no |
+| Offline codegen | approved record plus checked-in normalized manifest | never | checked-in deterministic Rust catalog and digest report | Rust catalog only |
+| Ordinary Cargo build | checked-in Rust catalog | never | `donat` | yes |
+| Production runtime | embedded catalog, deploy-time metadata, Postgres, per-use credential capability | never | bounded provider result or verified ingress event | yes |
+
+The normalized manifest and generated Rust catalog are both reviewed derivative
+artifacts with stable repository paths. `donat-connector-codegen generate
+--check` regenerates into a temporary directory, compares every byte and a
+domain-separated digest with the checked-in Rust, and fails on drift,
+unreferenced output, or unexpected files. There is no server `build.rs` and no
+code generation during `cargo build`. Reproducible builds operate offline.
+Production metadata cannot name a package URL, tarball, repository, source
+path, code blob, processor path, or unregistered connector.
+
+## 5. Normalized connector IR
+
+The compiler emits immutable runtime descriptors. Source descriptions and UI
+hints are discarded; stable field IDs, types, constraints, and protocol
+mappings remain.
+
+`donat-connector-catalog` owns one strict `ConnectorManifest` containing
+closed `CredentialSpec`/auth plans, fixed origins, compiled steps,
+`OperationSpec`/effects/pagination/error maps/bounds, `TriggerSpec` values,
+and typed provenance references. Every nesting level denies unknown fields.
+Credential auth plans are exactly fixed-header API key, fixed-query API key,
+bearer, HTTP Basic, OAuth2 client credentials, or a pre-provisioned
+non-refreshing OAuth access token. Trigger forms are exactly webhook or poll.
+No later metadata/server task defines a replacement credential, operation,
+error, trigger, origin, step, bound, or provenance descriptor.
+
+### 5.1 Canonical JSON v1 and domain-separated projections
+
+Every source record, normalized manifest, and descriptor object denies unknown
+fields at every nesting level. Canonical JSON v1 is
+[RFC 8785 JCS](https://www.rfc-editor.org/rfc/rfc8785.html): UTF-8 without BOM
+or insignificant whitespace, recursively sorted object member names,
+preserved array order, JCS primitive serialization, no duplicate member names,
+and no Unicode normalization. Member-name order is unsigned UTF-16 code-unit
+order; Rust `BTreeMap<String>` UTF-8 order is not a JCS implementation.
+Inputs satisfy [RFC 7493 I-JSON](https://www.rfc-editor.org/rfc/rfc7493.html).
+Schema validation occurs before canonicalization. A format change requires a
+new explicit canonical epoch; a v1 reader never guesses a later format.
+Raw JSON numbers are accepted only when finite binary64 parsing, the
+RFC-8785/ECMAScript serialization, and reparsing preserve the same
+mathematical numeric value. Raw `9007199254740992` is therefore accepted;
+raw `9007199254740993` rejects as `canonical_json_number_not_exact`.
+Full-width catalog integers/decimals remain tagged strings. RFC 7493's
+interoperable-integer recommendation is not a mandatory rejection of exactly
+representable `2^53`.
+
+The `ExactSemver` constructor accepts and preserves
+`1.2.3-alpha.1+build.5` and `1.2.3`; it rejects `^1.2.3`, `latest`,
+`v1.2.3`, `01.2.3`, and `1.2.3-01`. These are normative Task-3 vectors.
+
+Connector, credential, operation, trigger, and event versions are stable
+SemVer core `{major,minor,patch}` values. Phase 1 rejects prerelease/build
+metadata. Donor-package `ExactNpmPackage.version` instead uses the distinct
+`ExactSemver`: one exact canonical SemVer 2.0.0 string that preserves admitted
+prerelease/build components and rejects ranges, distribution tags, leading
+`v`, empty/non-ASCII identifiers, and noncanonical leading zeros. Runtime ABI,
+canonical/source-record schema,
+classifier/generator, and static processor/authenticator/codec/normalizer
+implementation versions are `Epoch = u32`. Every processor-like reference is
+`{id: <ABI-owned ID>, implementation_revision: Epoch}`; no processor field is
+called `version`.
+`ConnectorManifest` has separate `manifest_version` and `connector_version`.
+Safe-width schema/version integers remain JSON numbers. All other `u64` and
+`NonZeroU64` fields are minimal unsigned-decimal JSON strings.
+
+The catalog owns four exact closed projections. ADR 012's normative primitive
+table, branch-complete composite v1 shapes, and machine-checkable owner
+manifest define each normalized leaf/discriminant, projection member, enum
+tag, null, array order, and set sort key through primitive leaves.
+Implementation-struct serialization is not a projection and canonical
+material is not a second behavioral schema:
+
+- `SourceRecordMaterialV1` is every field of the complete validated
+  `ConnectorSourceRecord` in Section 4.1. Nothing is dropped as review-only.
+- `SemanticMaterialV1` has top-level fields
+  `canonical_schema_epoch`, `value_language_epoch`, `connector`,
+  `credentials`, `origins`, `operations`, and `triggers`. Its credentials,
+  origins, operations, and triggers
+  are the recursively closed `SemanticCredentialMaterialV1`,
+  `SemanticOriginMaterialV1`, `SemanticOperationMaterialV1`, and
+  `SemanticTriggerMaterialV1` projections. They retain every behavioral
+  schema/hash, step, transform, `implementation_revision`, static error,
+  selected-header capability, mapping, typed default, resolved fact value,
+  effect, pagination plan, and bound, but no source/artifact/license/notice/
+  review/fact-origin identity. A provenance-bearing `OperationSpec` or
+  `TriggerSpec` is never serialized directly into semantic material.
+- `ProvenanceMaterialV1` has top-level fields
+  `canonical_schema_epoch`, `connector`, `sources`, `artifacts`, `files`,
+  `licenses`, `dependencies`, `embedded_material`, `notices`,
+  `manifest_references`, `provider_evidence`, `donat_policy_ids`,
+  `classifier_epoch`, and `generator_epoch`. Connector
+  retains ID/version/semantic hash; sources are sorted identities with record
+  hashes; the remaining entries retain exact immutable attribution decisions.
+- `ValueContractMaterialV1` has `value_language_epoch`, `roots`, and
+  `named_objects`. It projects complete `ValueContractField`/`TypeRef`/
+  `ValueType` tagged variants and the full named-object closure, including
+  unreachable declarations. Roots, named objects, and fields use JCS member
+  ordering; enum values retain declared order.
+
+The `ValueType::Scalar` payload is `ValueScalarMaterialV1`, an exact
+projection of the Spec-005 Task-1
+`donat_value_contract::ValueScalar` owner:
+
+```text
+ValueScalar::Boolean     {"kind":"boolean","value":null}
+ValueScalar::String      {"kind":"string","value":null}
+ValueScalar::Int32       {"kind":"int32","value":null}
+ValueScalar::Int64       {"kind":"int64","value":null}
+ValueScalar::UInt64      {"kind":"uint64","value":null}
+ValueScalar::Decimal     {"kind":"decimal","value":null}
+ValueScalar::Uuid        {"kind":"uuid","value":null}
+ValueScalar::Date        {"kind":"date","value":null}
+ValueScalar::Timestamp   {"kind":"timestamp","value":null}
+ValueScalar::TimestampTz {"kind":"timestamptz","value":null}
+ValueScalar::Json        {"kind":"json","value":null}
+ValueScalar::Custom{name}
+  {"kind":"custom","value":{"name":"..."}}
+```
+
+The catalog defines no second `Scalar` owner. Nullability is represented only
+by `TypeRefMaterialV1.nullable`, so `Null` is not a scalar branch.
+`InlineBytes` remains only the inert `TypedValueMaterialV1` branch below
+until a separately approved value-language epoch adds a corresponding
+`ValueScalar`.
+
+Optional fields are always present as value-or-null. Every enum uses
+`{"kind":"<snake_case>","value":<payload-or-null>}`. Set-like arrays sort by
+stable ID and reject duplicates; steps, transforms, and error rules retain
+declared order. No material contains the hash it produces.
+
+Task 3 parses the ADR manifest and rejects wildcard/family entries, a missing
+normalized leaf/discriminant, an extra or stale owner, an unowned canonical
+member, duplicate `(domain,canonical_path)`, or two direct-material mappings
+for one normalized owner. Recursive composite expansion proves exact
+normalized-leaf coverage by comparing independently built owner, projection,
+and manifest inventories as sets. No test pins a fixed manifest row count.
+
+Resolved evidence is structurally `(value, origin)`. At each stable fact-use
+site, `ResolvedFactValueMaterialV1` stores `{use_site,value}` exactly once at
+the owning `SemanticOperationMaterialV1.resolved_fact_values[]`, and
+`ResolvedFactOriginMaterialV1` stores `{use_site,origin}` exactly once at
+`ManifestProvenanceMaterialV1.contract_fact_origins[]`. No top-level fact
+value/origin collection exists. Duplicate `(use_site,fact)` entries reject,
+and semantic/provenance use-site sets must match. Provider-evidence inventory
+facts retain immutable identity/location without becoming a second use-site
+origin. Origin-only mutation leaves semantic bytes/hash unchanged. Value-only
+mutation leaves direct origin material unchanged, but final provenance
+changes because its connector member commits the new `semantic_sha256`.
+
+The catalog, not `donat-value-contract`, projects `TypedValue` losslessly:
+
+```text
+Null          {"kind":"null","value":null}
+Boolean       {"kind":"boolean","value":true|false}
+String        {"kind":"string","value":"..."}
+I64           {"kind":"i64","value":"<minimal signed decimal>"}
+U64           {"kind":"u64","value":"<minimal unsigned decimal>"}
+Decimal       {"kind":"decimal","value":"<accepted exact spelling>"}
+List          {"kind":"list","value":[...]}
+Object        {"kind":"object","value":{"key":...}}
+InlineBytes   {"kind":"inline_bytes","value":{
+                 "$binary":"<RFC 4648 base64url without padding>",
+                 "file_name":<string-or-null>,
+                 "media_type":<string-or-null>}}
+```
+
+Object keys use RFC 8785 UTF-16 ordering. Variant tags keep `I64(1)`,
+`U64(1)`, `Decimal("1")`, and `String("1")` distinct; strings preserve
+`u64::MAX` and exact decimal spelling. This adapter does not change or reuse
+the lower crate's separate `canonical_size`.
+
+Hashes and order are normative:
+
+```text
+record_sha256 =
+  SHA256("donat.connector.source-record.v1\0" ||
+         JCS(SourceRecordMaterialV1))
+semantic_sha256 =
+  SHA256("donat.connector.semantic.v1\0" || JCS(SemanticMaterialV1))
+provenance_sha256 =
+  SHA256("donat.connector.provenance.v1\0" ||
+         JCS(ProvenanceMaterialV1))
+value_contract_sha256 =
+  SHA256("donat.connector.value-contract.v1\0" ||
+         JCS(ValueContractMaterialV1))
+```
+
+Calculation is record hashes, resolved manifest/value-contract hashes,
+semantic hash, provenance hash, then generated Rust/tree digest.
+
+Golden vectors are normative:
+
+| Canonical bytes | source-record | semantic | provenance | value-contract |
+| --- | --- | --- | --- | --- |
+| `{}` | `210c9ca679adf8e51a22e107484e4dd5e27a1d894901541bf5b5abd5a71fcbd4` | `799ea52772e70c9b45d9af5fcd185ae47f0fdcccd5957214d5425a1941c36f19` | `a0b89c2c2f1c7e90d8427e2c4251234ce596f2af9105f23745237aa08b1e06f4` | `6f72f51c0e8b4f09a064c507a1d879921d4753cc4378fb6fefecb27e25e3dd2f` |
+| `{"a":1,"b":[true,null,"x"]}` | `d6c4fc943d8ed980d248ffa25f2d8d16be65953603705d5afc29e5e8a045269f` | `2f7116c006c1fdfccdd12b1fa954cd94feffee889ceac39a0f76df616da7be34` | `4e31e445b6c8d06e6b93fd5cc66731b850a84853dd4ee28d6a76663138217a23` | `e74426ca8fb7b23e99f1f14f4a6d281575489c33312e27df9e9005f37158d4ab` |
+
+The empty-domain vectors above are hashing-oracle inputs, not schema-valid
+materials. ADR 012 additionally pins exact independently reproducible
+nonempty full-material canonical bytes and hashes:
+
+```text
+source-record 420f0a4efd63b5d02479658c7686ec3da5ee688a0bc6aaf45bebfb98809fe991
+value-contract 79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a
+semantic f6bc86c9d5004885bb3156ab320fa76ad3ff7e9686320c54735dcfbd8c27e934
+provenance 326236f741dfa72628b63ae308599b94e83b1c2aa1aa00bd80025ff5381a7531
+```
+
+The suite exercises complete provider evidence, credential/OAuth behavior,
+provider-idempotent effect, bounded cursor pagination, complete errors and
+bounds/defaults, both trigger families, and value/origin splitting. Task 3
+must reproduce the bytes and hashes independently.
+
+The existing string-only value-contract canonical bytes and
+`79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a`
+hash remain unchanged. Using that full vector as the exact template, Task 3
+substitutes each `ValueScalarMaterialV1` byte object above and independently
+pins these value-contract domain hashes:
+
+```text
+boolean      d0b19f2e9f814ddc5457fd85728dfe4ef649042a5134f12d3ac42fb4009ecc58
+string       79654c21d469a22dc151e57c973b41c2539a7b7e197b1652ff80d6b3dcc3c18a
+int32        d91c7215c24937b62dc176287b48ca5c5f923d034777706323f0b61157a6a2f2
+int64        d1f1966e3e49124f6cce79167814e323315c0e810143684321e7bc7ade23a972
+uint64       a64ccafb81f9b513c634d8f0e206e1aac705d5fcbd06fa8c5adacc34247f7ddb
+decimal      8f1a181165ec3d629693f106d9566d02f76eefe9317746044ee0693b7aa08f6b
+uuid         66c4b3a082f73831d439eb7c624409e9741621b4f7af14892896229f0bee524a
+date         93ed861bcc9b7f6213abcbdb87514515856c4d84eab444f13b3d678e3f3716a7
+timestamp    f1c17e281b279e50480d60a9ee6568df17f7eef1da6e18fd60131a2300df971a
+timestamptz  d79bbe1e56bc00033fcae029d1c9b5826bb805e0657bf0acac285420bf42b169
+json         0b3c1359fac4024dc5dc65e6bace2144f075ba8cc55cfb62e8003ae244b0a879
+custom.demo  5f7c7c1db65b1e54751e4189a4ae314952912d31c0cab1b0d0f7b7ca6792e6ad
+custom.changed
+             fec7767e4fc33c84ce50cc7a7b1e1c51395260f96a65aa1c8afa59b07937ea46
+```
+
+The two custom rows use exact scalar bytes
+`{"kind":"custom","value":{"name":"custom.demo"}}` and
+`{"kind":"custom","value":{"name":"custom.changed"}}`, proving the payload
+owner is observable independently of the branch tag. The separate
+`nullable:true` mutation retains the nested string scalar tag and hashes to
+`9630316fc75152223f33663a03f6be51d4953603a7fa9ccabf8560ca9585bd84`;
+no `null` or `inline_bytes` scalar vector exists. These requirements do not
+change any `TypedValueMaterialV1` tag.
+
+Independent tests construct these bytes, pin complete material vectors, mutate
+one field per material, prove value/origin separation, distinguish every
+tagged numeric/string variant with exact bytes
+`{"kind":"i64","value":"1"}`,
+`{"kind":"u64","value":"1"}`,
+`{"kind":"decimal","value":"1"}`, and
+`{"kind":"string","value":"1"}`. They pin `u64::MAX` as
+`{"kind":"u64","value":"18446744073709551615"}`, bytes `[0xff,0x00]`
+as `_wA`, a JSON-looking string versus a tagged object as non-colliding,
+exact decimal spelling, and U+10000 before U+FFFD by UTF-16.
+
+### 5.2 `CredentialSpec`
+
+A `CredentialSpec` contains:
+
+- stable connector-qualified ID and version;
+- typed field IDs, optionality, secret classification, maximum size, and
+  redaction behavior;
+- one Phase 1 common auth plan: fixed-header API key, fixed-query API key,
+  bearer, HTTP Basic, OAuth2 client credentials acquired once per activity, or
+  a pre-provisioned non-refreshing OAuth access token;
+- fixed allowed origins to which the capability may apply;
+- declared scopes, a fixed token origin/response mapping for client
+  credentials, and maximum credential/token sizes;
+- an optional statically registered auth processor ID plus
+  `implementation_revision` for a narrow provider signature scheme;
+- an optional credential-test operation ID plus stable SemVer.
+
+It contains no display widget, HTML, arbitrary expression, raw secret, runtime
+URL, refresh token, refresh/writeback plan, or JavaScript hook.
+
+### 5.3 `OperationSpec` and effect/idempotency
+
+An `OperationSpec` is behavioral and non-circular. It contains:
+
+- connector ID and stable SemVer, operation ID and stable SemVer, runtime ABI
+  epoch, and value-language epoch;
+- complete input and output `ValueContractMaterialV1` values plus independently
+  recomputed `value_contract_sha256` values;
+- an optional versioned credential reference containing credential ID and
+  stable SemVer;
+- the exact resolved fixed-origin closure and complete compiled steps in
+  declared order. Each step retains fixed method, origin, path, query/header
+  keys, credential action, encoding, binding optionality/defaults, request
+  shape, success statuses, response selection/normalization, selected response
+  header mappings, and complete `StepBounds`;
+- ordered pre-request and post-response transform references plus an optional
+  static operation processor reference. Every processor-like reference is its
+  ABI-owned ID plus integer `implementation_revision`;
+- one closed `OperationEffect`, one `PaginationPlan`, and one complete ordered
+  `ErrorMap`;
+- capacity, rate, and typed serialization-key defaults;
+- complete operation request, response, inline-binary, page, item, call,
+  redirect, aggregate, output, and deadline bounds; and
+- stable resolved fact values at their use sites, but no provenance identity.
+
+These fields are the closed self-contained snapshot listed by
+`OperationSpec` in ADR 012; null and empty values remain explicit. A
+processorless declarative operation has exactly one compiled step. Multiple
+steps require a static operation processor ID plus
+`implementation_revision`. Generated Rust and every
+pinned process consumer retain the full behavioral snapshot. Source/artifact/
+license/notice/review/fact-origin identities and deployment identity live only
+in the separate `CatalogIdentityEnvelopeV1` described in Section 10.
+
+No operation field can carry an arbitrary expression, dynamic method,
+caller-owned header key, raw URL, proxy/TLS option, ambient workflow item,
+database handle, role, filesystem path, process state, retry policy, or
+business branch.
+
+The only executable Phase 1 effect classes are:
+
+```rust
+pub enum OperationEffect {
+    ReadOnly,
+    ProviderIdempotent {
+        side_effect_steps: NonEmptyVec<ProviderIdempotentStep>,
+    },
+}
+
+pub struct ProviderIdempotentStep {
+    step: CompiledStepId,
+    fixed_binding: FixedIdempotencyBinding,
+    scope: ProviderIdempotencyScope,
+    minimum_retention_ms: NonZeroU64,
+    clock_safety_margin_ms: NonZeroU64,
+}
+
+pub enum FixedIdempotencyBinding {
+    Header { name: StaticHeaderName },
+    BodyField { pointer: StaticBodyPointer },
+}
+```
+
+`ReadOnly` is headerless and is admitted only when the provider contract has
+no external mutation. Worker-level automatic retry after a retryable failure
+and lease takeover after ambiguous worker loss are safe for this class; the
+HTTP client still performs no hidden transport retry.
+
+`ProviderIdempotencyScope` is the canonical static ID for the
+provider-documented uniqueness namespace, for example a connected provider
+account plus API idempotency namespace. Each `ProviderIdempotentStep` is
+sourced from immutable provider evidence that establishes the exact binding,
+scope, and conservative minimum retention. The selected safety margin covers
+provider/Donat clock uncertainty and is positive and strictly smaller than
+`minimum_retention_ms`. These fields enter the source record, normalized IR,
+semantic hash and public behavioral operation descriptor. Their source
+origins enter provenance material; their resolved values enter semantic
+material. The process pin's separately defined deployment fingerprint commits
+the non-secret configuration that selects the descriptor.
+
+Binding, scope, and retention cite
+`ContractFact::ProviderEvidence`; the safety margin cites
+`ContractFact::DonatPolicy`. Validation rejects either fact origin in the
+other slot.
+
+Every side-effecting compiled step has exactly one such entry; read-only steps
+have none. Duplicate, missing, or unproven entries reject executable
+admission. This permits a multi-step mutation only when every side-effecting
+step is independently safe. For each entry the stable provider key is:
+
+```text
+base64url_no_pad(SHA256(
+  "donat.connector.idempotency.step.v1\0" ||
+  JCS({ "logical_activity_id": logical_activity_id,
+        "scope": scope,
+        "step": compiled_step_id })
+))
+```
+
+The same key is applied to that step's one compiled header/body binding on
+every retry and takeover. Neither another step nor another scope reuses it.
+
+Before a Process revision can reference the operation, process compilation
+calculates a conservative `maximum_send_horizon_ms` independently for each
+side-effecting step. It is the maximum elapsed time from that step's first
+provider attempt through the last instant any configured execution path may
+send it again, including all remaining schedule/capacity/rate/serialization
+delay, start-to-close time, lease expiry, takeover delay, maximum retry
+backoff/jitter, and any other delay before the last possible send. Every
+component uses its configured worst-case bound; a missing or unbounded
+component in Spec 005 makes the operation non-executable until that contract
+is added. It is never treated as infinity that somehow passes.
+
+Compilation requires, with checked integer arithmetic:
+
+```text
+usable_window_ms = minimum_retention_ms - clock_safety_margin_ms
+maximum_send_horizon_ms <= usable_window_ms
+```
+
+The source-local activity journal persists `first_provider_attempt_at` from
+the database clock for each `(logical_activity_id, compiled_step_id)` in a
+short transaction committed before that step's first network send. A retry or
+takeover reuses it. Immediately before every later send the server checks the
+database clock; equality with
+`first_provider_attempt_at + usable_window_ms` is allowed, while a later time
+permanently refuses I/O with
+`connector_idempotency_window_exhausted`. This journal field and compiler
+calculation are Spec 005 prerequisites; the factory must not create a parallel
+lease/history store.
+
+There is no executable non-idempotent side-effect class in Phase 1. A donor
+side effect without provider idempotency may be inventoried and reported, but
+cannot enter the generated executable catalog, be enabled in deployment
+metadata, or be referenced by a Process. `max_attempts: 1` is not an escape:
+lease loss can still leave an ambiguous provider outcome.
+
+This contract normatively supersedes Spec 006's blanket rule that every
+durable HTTP operation has an idempotency header. It also replaces the
+currently proposed Spec 005 `ConnectorIdempotencySupport::{StableKeyHeader,
+Unsupported}` before Spec 005 Task 2 publishes descriptors:
+
+- `ReadOnly` projects as a first-class read-only effect with no binding;
+- `ProviderIdempotent` projects every side-effect step's fixed binding, scope,
+  retention, and clock margin;
+- `Unsupported` is inventory-only and is rejected from the executable
+  descriptor catalog.
+
+There is no persisted implementation to migrate today. The compiler has
+negative tests for inventory-only side effects, exact-boundary and
+one-millisecond-over retention tests, and independent multi-step validation.
+Spec 005-gated two-worker tests prove headerless read-only takeover,
+stable-step-key provider mutation takeover, and late-takeover refusal before
+I/O.
+
+Every selected response header on a compiled step is stored as
+`{canonical_lowercase_header_name, capability}`. Catalog normalization derives
+the `CapabilityId` once:
+
+```text
+digest = SHA256(
+  "donat.connector.response-header-capability.v1\0" ||
+  JCS({
+    "connector": connector_id,
+    "header": canonical_ascii_lowercase_header,
+    "operation": operation_id,
+    "operation_version": StableSemver,
+    "step": compiled_step_id
+  })
+)
+CapabilityId = "response-header." || lowercase_hex(digest)
+```
+
+The result is exactly 80 ASCII bytes and fits the ABI's 96-byte bound. The
+full connector/operation/version/step scope prevents equal header names in
+different steps or versions from colliding. Header names and IDs enter
+semantic material.
+
+### 5.4 `PaginationPlan`
+
+`PaginationPlan` is a closed enum:
+
+- `None`;
+- `Cursor { request_binding, response_pointer, bounds }`;
+- `OffsetLimit { offset_binding, limit_binding, initial_offset, page_size,
+  bounds }`;
+- `PageNumber { page_binding, page_size_binding, initial_page, page_size,
+  bounds }`;
+- `LinkRelation { relation, selected_header, bounds }`, accepting only a
+  relative or same-compiled-origin relation; and
+- `Processor { processor: { id, implementation_revision }, bounds }`.
+
+Every non-`None` plan carries the same mandatory `PaginationBounds` fields:
+maximum calls, pages, items, per-response bytes, aggregate response bytes,
+and canonical output bytes. A
+provider-returned absolute continuation is rejected in Phase 1 unless it
+matches the already compiled origin exactly. A future continuation capability
+may allow an explicit compiled origin set, but it remains HTTPS-only,
+DNS/peer-validated, redirect-bounded, expiry-bounded, and size-bounded. It can
+never be a caller-supplied arbitrary URL.
+
+### 5.5 `ErrorMap`
+
+`ErrorMap` orders rules over status ranges, a fixed provider-code pointer,
+fixed header fields, and response shape. It maps every failure to the existing
+closed `ConnectorErrorClass`:
+
+`transport`, `timeout`, `http_429`, `http_5xx`, `authentication`,
+`validation`, `permanent`, or `invariant`.
+
+The compiler expands a complete deterministic fallback:
+
+- transport/TLS/DNS failures → `transport`;
+- activity deadline or HTTP 408 → `timeout`;
+- HTTP 429 → `http_429`;
+- declared 5xx → `http_5xx`;
+- HTTP 401/403 → `authentication`;
+- declared provider validation errors and malformed declared success bodies →
+  `validation`;
+- other supported non-success responses → `permanent`;
+- a violated compiled contract → `invariant`.
+
+Rules may extract `Retry-After` as integer seconds or an HTTP date and may
+retain allowlisted provider correlation IDs. Safe messages are Donat-owned
+constants. Raw provider bodies, authorization material, tokens, credential
+fields, and unreviewed provider messages never cross the failure boundary.
+Each `ErrorAction` carries ABI-owned `StaticErrorCode` and
+`StaticSafeMessage` values after strict normalized validation. Catalog
+construction is the sole runtime-string producer of those values. Each
+correlation binding retains both canonical lower-case header name and the
+stored step-local `CapabilityId` from Section 5.3, or a validated link to that
+exact mapping. Catalog validation rejects missing, ambiguous, duplicate, or
+more-than-64 resolutions and includes the static text, names, and stored IDs
+in semantic hashing. Neither an error action nor runtime code derives another
+capability.
+Connectors classify outcomes; Process metadata alone owns retry and
+`on_error` policy.
+
+### 5.6 `TriggerSpec`
+
+Both `TriggerSpec` forms carry connector/connector version, trigger/trigger
+version, event version, and runtime ABI epoch. Their remaining fields are:
+
+- `Webhook`: fixed authenticator, server-codec, and pure normalizer IDs each
+  paired with `implementation_revision`,
+  selected headers, raw-body maximum, timestamp window, event
+  ID/type/output contract, redaction, and optional explicit
+  create/delete/check subscription operation IDs;
+- `Poll`: checkpoint contract, static poll processor ID plus
+  `implementation_revision`, event type,
+  per-poll event limit, and operation bounds.
+
+A webhook authenticator verifies bounded raw bytes and returns only an opaque
+`AuthenticatedRawBody`. The server codec can parse the body only after that
+token exists; a pure processor then normalizes the decoded typed value into a
+verified provider event ID, event type, and typed payload. Authentication
+failure is audit-only and never reaches the codec. Durable dedupe, delivery
+audit, correlation, process start, and acknowledgement remain in the
+source-local process ingress transaction defined by ADR 002/009.
+
+A poll processor receives a typed checkpoint, database-derived `now`, deadline,
+and event limit and returns ordered typed events plus the next checkpoint.
+Postgres owns scheduling, locking, checkpoint persistence, retries, and the
+transaction. A connector cannot maintain workflow static data.
+
+Long-lived listener/socket `trigger()` implementations are excluded.
+
+## 6. Credentials and capabilities
+
+### 6.1 Specification versus instance
+
+The compiled `CredentialSpec` defines what a connector can request. A
+deploy-time `CredentialInstance` binds that spec to:
+
+- a source name and non-secret `credential_identity`;
+- field-by-field read-only deploy-time `SecretRef` values;
+- an immutable credential-spec version;
+- no plaintext secret in metadata, a process revision, logs, errors, or
+  conformance output.
+
+Phase 1 supports static API keys, Basic secrets, bearer tokens, OAuth2 client
+credentials whose access token is acquired fresh and never refreshed within
+an activity, and pre-provisioned non-refreshing OAuth access tokens. It accepts
+no refresh-token field and stores no token returned by a provider. A client
+credentials token request uses a fixed compiled origin/step, consumes the same
+call/byte/deadline budget as provider calls, and its capability is dropped
+with the logical attempt.
+
+Interactive authorization/consent, refresh-token persistence or rotation,
+distributed refresh, external writable resolvers, tenant ownership/lifecycle,
+a credential vault/API, and credential CRUD are a later ADR and
+specification. They must preserve explicit roles without an admin role,
+runtime metadata mutation, or data bypass.
+
+### 6.2 Resolver and execution capability
+
+The server reserves an internal read-only `CredentialResolver` boundary.
+Resolver implementations are compiled into the binary; metadata cannot load
+one. The Phase 1 production implementation is the environment resolver used
+by the current `SecretRef`. Startup validates reference syntax and required
+availability without retaining the value. `ConnectorRegistry` stores the
+resolver binding/reference and resolves it again for every use, so no rotating
+value is frozen into the immutable registry. A later read-only external
+resolver remains possible, but no writable method exists in this ABI.
+
+Resolution returns an opaque `CredentialCapability`, not a secret map. The
+generic executor can apply only the auth action compiled for the selected
+step. A named auth/verifier processor can request only its compiled primitive,
+such as HMAC over bounded bytes. Operation processors cannot enumerate
+credentials, read unrelated fields, expose raw values, select a new origin, or
+log capability output.
+
+The resolver has no enumerate, write, compare-and-swap, refresh, delete, or
+administration method. Credential and token response errors are bounded,
+typed, and fully redacted.
+
+## 7. Static processor and I/O ABI
+
+### 7.1 Crate graph and mechanical boundary
+
+In this graph `A -> B` means crate `A` depends on crate `B`:
+
+```text
+donat-ir                    -> donat-value-contract
+donat-connector-catalog     -> donat-value-contract
+donat-connector-catalog     -> donat-connector-abi
+donat-connector-abi         -> donat-value-contract
+donat-connector-processors  -> donat-connector-abi
+donat-connector-processors  -> donat-value-contract
+
+donat-connector-acquire     -> donat-connector-catalog
+donat-connector-codegen     -> donat-connector-catalog
+
+donat-server -> donat-ir
+donat-server -> donat-connector-catalog
+donat-server -> donat-connector-abi
+donat-server -> donat-connector-processors
+donat-schema -> donat-ir
+```
+
+`donat-value-contract` is the single owner of the closed `ValueType`/`TypeRef`
+language, `TypedValue`, bounded/canonical constructors, deterministic object
+ordering, canonical-size accounting, and inline-byte representation. It
+exposes no `serde_json::Value`. `donat-ir` re-exports these types rather than
+defining a second representation. This supersedes ADR 009's accepted
+`donat-ir` ownership statement; implementation must update ADR 009 or accept a
+superseding ADR before the value-contract slice lands.
+
+`donat-connector-catalog` explicitly owns `ConnectorSourceRecord`, the
+normalized connector IR, the exact versioned projections and domain-separated
+record/semantic/provenance/value-contract hashes from Section 5.1, the tagged
+`TypedValue` JCS adapter, and the checked-in generated catalog. The lower value
+crate gains no Serde/JCS dependency, and this adapter does not replace
+`canonical_size`. Catalog imports the ABI-owned connector, operation,
+compiled-step, processor, authenticator, codec, normalizer, credential, and
+capability ID/envelope types directly. It never defines a catalog-local string
+copy or conversion type for them. Catalog may use serde and pure hashing but
+does not depend on `donat-ir`, server, Tokio, reqwest, filesystem, or network
+libraries. `donat-connector-acquire` and `donat-connector-codegen` are sibling
+development/CI crates that each depend on the catalog; neither depends on the
+other. Acquisition alone owns HTTPS/archive handling. Codegen reads checked-in
+records/manifests and writes checked-in Rust. Neither is a server dependency
+or runtime image component.
+
+`donat-connector-abi` owns neutral IDs, bounded envelopes, errors, contexts,
+and server-implemented host capability traits. The processor crate owns sealed
+processor traits, implementations, and its private registry. The value,
+ABI, and processor crates declare:
+
+```rust
+#![no_std]
+#![forbid(unsafe_code)]
+extern crate alloc;
+```
+
+All three crates are unpublished, have no build script, have empty default
+features, and expose no Phase 1 `std` feature. The Phase 1 processor runtime
+closure contains only local path dependencies on `donat-connector-abi` and
+`donat-value-contract`; the ABI depends only on the value contract. There are
+no third-party runtime, build, or procedural-macro dependencies in that
+closure. A future exception requires an exact version/checksum/features/target
+and transitive-closure review; it is not part of Phase 1.
+
+The catalog-to-ABI edge is one-way. It does not pull catalog serde/hashing,
+generated entries, acquisition, or codegen into the ABI or processor
+dependency closure.
+
+The server exclusively owns and implements `ConnectorIo`,
+`ProcessorControl`, credential and cryptographic primitives, JSON/form/URL and
+UUID/text/time codecs, credential materialization, clocks, cancellation,
+reqwest, TLS/DNS/peer checks, response header/status handling, compiled-step
+lookup, and every other I/O. Processors receive only canonical values and
+opaque host capabilities. An auth primitive returns a non-serializable,
+non-debuggable opaque binding consumable only by the exact compiled step/slot;
+it never returns a raw secret or authentication tag.
+
+CI mechanically enforces the boundary by:
+
+- evaluating locked metadata for normal, build, procedural-macro, optional,
+  target-specific, and feature-unified edges for every supported target, then
+  comparing package/version/checksum/feature/target data with the checked-in
+  exact local-only allowlist;
+- rejecting build scripts, build/procedural-macro/native/git/patched
+  dependencies, `links`, FFI, inline/global assembly, and unsafe code in the
+  boundary closure;
+- compiling all three crates with default features disabled for a
+  CI-installed no-OS target;
+- canonicalizing path dependencies and scanning source plus expanded imports
+  for symlink/workspace escapes, `include!`, `#[path]`, `env!`,
+  `option_env!`, generated paths, `extern crate std`, `std::`,
+  unsafe/FFI/assembly/link attributes, network/socket, filesystem,
+  environment, process, database, reqwest, Tokio, and unapproved crate paths;
+- forbidding generated or donor source inside the hand-written processor
+  directory;
+- compile-asserting object safety plus `Send + Sync` for every host and
+  processor trait, and rejecting processor implementation blocks outside the
+  processor crate; and
+- scanning the separately packaged `donat` runtime closure as specified in
+  Section 14, not the tooling-bearing workspace artifact directory.
+
+This is an API/dependency policy for trusted in-tree native code, not a
+sandbox. Mechanical checks do not preempt an infinite CPU loop, panic,
+excessive allocation, static-state misuse, or exfiltration through a
+semantically overbroad allowed step. The Rust toolchain, server adapters and
+host capabilities, manifest admission, processor algorithms, and narrowness
+of every compiled binding remain trusted review surfaces.
+
+The initial Task 2 checker owns deterministic positive and mutated-negative
+fixtures for restricted namespace producers, test paths, trait implementations,
+and allocation leaks. Task 6 modifies that same checker rather than creating a
+second Python checker, wrapper, or parallel policy mechanism. Processor
+production code reads `BoundedTransportResponse` only through `status()`,
+`selected_headers()`, `decoded()`, `response_bytes()`, and
+`authorized_correlations()`. It uses `StaticErrorCode::literal` and
+`StaticSafeMessage::literal` for Donat-owned failures, never refers to
+`catalog_construction` or `host_construction`, never uses an allocation-leak
+API, and neither constructs nor names `StaticFailureText`.
+
+The checker follows ADR 011's version-independent lexical contract. It uses
+Rust's fixed `Pattern_White_Space` and ASCII punctuation boundaries, treats
+every other maximal scalar run as an identifier candidate, preserves `r#`
+state, matches grammar only on non-raw tokens, and matches protected names
+regardless of raw spelling. A recursive `use`-tree parser resolves visibility,
+nested groups, `self`, siblings, descendants, globs, and aliases into
+full-path leaves. It vendors no XID table and invokes no Rust parser or second
+checker.
+
+### 7.2 Core operation ABI
+
+A processor orchestrates compiled step IDs; it does not construct a transport
+request. `ConnectorIo` and `ProcessorControl` are ABI-owned host traits whose
+only implementation is server-owned. `OperationProcessor` is a sealed
+processor-crate trait:
+
+```rust
+pub trait ProcessorControl: Send + Sync {
+    fn check(&self) -> Result<(), ConnectorFailure>;
+}
+
+// Defined in donat-connector-abi; implemented only by donat-server.
+pub trait ConnectorIo: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        step: CompiledStepId,
+        bindings: TypedBindings,
+    ) -> BoxFuture<'a, Result<BoundedTransportResponse, ConnectorFailure>>;
+}
+
+// Defined and sealed in donat-connector-processors.
+pub trait OperationProcessor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        context: ProcessorContext<'a>,
+        input: TypedValue,
+        io: &'a dyn ConnectorIo,
+    ) -> BoxFuture<'a, Result<TypedValue, ConnectorFailure>>;
+}
+```
+
+`BoxFuture` uses only `core::future`, `core::pin`, and `alloc::boxed`.
+The ABI imports `use alloc::boxed::Box;` and owns the following public,
+invariant-carrying response and failure contract. Fields without `pub` are
+immutable and private to `donat-connector-abi`; there is no raw constructor,
+compatibility shim, mutable accessor, insertion path, or conversion shim.
+
+```rust
+use alloc::boxed::Box;
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct StaticErrorCode(InlineId);
+
+#[repr(C)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct StaticSafeMessage {
+    len: u16,
+    bytes: [u8; MAXIMUM_SAFE_MESSAGE_BYTES],
+}
+
+pub struct AuthorizedCorrelations {
+    values: BTreeMap<CapabilityId, BoundedString>,
+}
+
+pub struct BoundedTransportResponse {
+    status: u16,
+    selected_headers: BTreeMap<CapabilityId, BoundedString>,
+    decoded: TypedValue,
+    response_bytes: u32,
+    authorized_correlations: AuthorizedCorrelations,
+}
+
+impl BoundedTransportResponse {
+    pub fn try_new(
+        status: u16,
+        selected_headers: BTreeMap<CapabilityId, BoundedString>,
+        decoded: TypedValue,
+        response_bytes: u32,
+    ) -> Result<Self, AbiError>;
+
+    pub const fn status(&self) -> u16;
+    pub fn selected_headers(
+        &self,
+    ) -> &BTreeMap<CapabilityId, BoundedString>;
+    pub fn decoded(&self) -> &TypedValue;
+    pub const fn response_bytes(&self) -> u32;
+    pub fn authorized_correlations(&self) -> &AuthorizedCorrelations;
+}
+
+struct StaticFailureText {
+    code: StaticErrorCode,
+    safe_message: StaticSafeMessage,
+}
+
+pub struct ConnectorFailure {
+    class: ConnectorErrorClass,
+    static_text: Box<StaticFailureText>,
+    retry_after_seconds: Option<u32>,
+    correlation_ids: BTreeMap<CapabilityId, BoundedString>,
+}
+
+impl ConnectorFailure {
+    pub fn try_new(
+        class: ConnectorErrorClass,
+        code: StaticErrorCode,
+        safe_message: StaticSafeMessage,
+        retry_after_seconds: Option<u64>,
+        correlations: Option<&AuthorizedCorrelations>,
+    ) -> Result<Self, AbiError>;
+
+    pub const fn class(&self) -> ConnectorErrorClass;
+    pub fn code(&self) -> &str;
+    pub fn safe_message(&self) -> &str;
+    pub const fn retry_after_seconds(&self) -> Option<u32>;
+    pub fn correlation_ids(
+        &self,
+    ) -> &BTreeMap<CapabilityId, BoundedString>;
+}
+```
+
+`status` accepts every `u16`, including `0` and `u16::MAX`. Ordinary response
+construction produces empty authorization. `ConnectorFailure::try_new`
+performs exactly one private box allocation only after every non-allocation
+validation succeeds; `code()` and `safe_message()` dereference that box.
+Allocation failure uses standard `alloc` behavior without a new `AbiError`.
+`StaticFailureText` cannot be named or constructed outside the ABI.
+
+The ABI exposes only these mechanically restricted construction namespaces:
+
+```rust
+#[doc(hidden)]
+pub mod catalog_construction {
+    pub fn static_error_code(
+        value: &str,
+    ) -> Result<StaticErrorCode, AbiError>;
+
+    pub fn static_safe_message(
+        value: &str,
+    ) -> Result<StaticSafeMessage, AbiError>;
+}
+
+#[doc(hidden)]
+pub mod host_construction {
+    pub fn transport_response(
+        status: u16,
+        selected_headers: BTreeMap<CapabilityId, BoundedString>,
+        decoded: TypedValue,
+        response_bytes: u32,
+        allowed_correlations: &[CapabilityId],
+    ) -> Result<BoundedTransportResponse, AbiError>;
+
+    pub fn authorized_correlations(
+        selected_headers: &BTreeMap<CapabilityId, BoundedString>,
+        allowed_correlations: &[CapabilityId],
+    ) -> Result<AuthorizedCorrelations, AbiError>;
+}
+```
+
+`catalog_construction` is callable only from `crates/connector-catalog/src/`
+after strict normalized policy validation. `host_construction` is callable
+only from `crates/server/src/connectors/`, where it intersects captured
+selected headers with the selected error action's catalog-stored
+`CapabilityId` allowlist. Task 8 matches canonical header names and stores
+their bounded values under the persisted step mapping; it contains no
+capability domain string, hashing, derivation, or caller-provided allowlist
+path. Rust
+privacy has no friend crates, so Task 2 creates
+`scripts/check_connector_processor_boundary.py` with deterministic producer
+and test-path fixtures; Task 6 extends that exact checker with dependency and
+processor-source rules. Neither namespace is a sandbox.
+
+`TypedBindings` uses shared counters across all roots. Its validation order is:
+
+```text
+1. reject more than 64 binding slots;
+2. traverse every root with shared node, inline-value, and decoded-byte
+   counters while restarting depth at zero per root;
+3. sum canonical_size for every root with checked arithmetic;
+4. construct TypedBindings only after all checks pass.
+```
+
+The response validator uses the same shape rules for its decoded root.
+`ProcessorContext` exposes only connector/operation identity, stable logical
+activity/idempotency identity, canonical request fingerprint, opaque
+capability IDs, and a borrowed `ProcessorControl`. The control capability
+checks the server's monotonic deadline and cancellation state without exposing
+Tokio types. `ConnectorIo::call` resolves a step within the current compiled
+operation. A foreign or undeclared step is an `invariant` failure before
+network I/O.
+
+The ABI contains no raw HTTP client, URL, method, header map, proxy, TLS
+control, database pool, role, process instance/graph, Rule evaluator, retry
+policy, environment, filesystem path, workflow item, persistent static data,
+thread/process handle, or unbounded stream. A processor cannot recurse or call
+another connector through the ABI.
+
+The runtime invokes `ProcessorControl::check` before and after every transform,
+credential/crypto action, page, codec, and I/O step; `ConnectorIo` checks
+again on entry and completion. It charges each call, page, item, and byte
+against the compiled operation budget. Processor output is revalidated
+against the compiled output type before it can reach a process journal. This
+cannot interrupt a processor stuck in native CPU work, which remains a trusted
+review risk.
+
+The processor crate's private table maps stable
+`(processor_id, implementation_revision: u32)` pairs to implementations
+compiled into the binary. Constructors and registration
+are private. Its public lookup accepts only generated admitted IDs and returns
+an opaque processor handle; the server cannot implement/register an alternate
+processor or provide a dynamic fallback. CI rejects implementation blocks
+outside this crate.
+
+Three compile-only checkpoints assign the exact same ABI-owned Rust ID types
+without `String`, `&str`, parse, serialization round-trip, `From`/`Into`,
+wrapper copy, or other conversion:
+
+1. phase 2 `catalog_descriptor_ids_match_connector_io` assigns normalized
+   descriptor IDs directly to `ConnectorIo` parameters;
+2. phase 3b `generated_catalog_ids_match_abi`, run only after codegen creates
+   the actual checked-in generated entries, assigns every generated ID to its
+   ABI type; and
+3. phase 4 `processor_lookup_ids_match_abi` assigns generated processor-family
+   IDs directly to private-table lookup.
+
+### 7.3 Auxiliary object-safe ABIs
+
+The processor crate defines and seals its pure/orchestration traits. Their
+contexts, values, results, and ABI-owned host capabilities remain neutral:
+
+```rust
+pub trait PureTransform {
+    fn apply(
+        &self,
+        context: TransformContext<'_>,
+        input: TypedValue,
+    ) -> Result<TypedValue, ConnectorFailure>;
+}
+
+pub trait AuthProcessor {
+    fn apply(
+        &self,
+        context: AuthContext<'_>,
+        input: BoundedAuthInput,
+        crypto: &dyn CredentialPrimitives,
+    ) -> Result<TypedBindings, ConnectorFailure>;
+}
+
+pub trait WebhookAuthenticator {
+    fn authenticate(
+        &self,
+        context: WebhookContext<'_>,
+        input: BoundedWebhookInput,
+        crypto: &dyn CredentialPrimitives,
+    ) -> Result<AuthenticatedRawBody, WebhookRejection>;
+}
+
+pub trait WebhookNormalizer {
+    fn normalize(
+        &self,
+        context: WebhookNormalizeContext<'_>,
+        decoded: TypedValue,
+    ) -> Result<VerifiedInboundEvent, WebhookRejection>;
+}
+
+pub trait PaginationProcessor {
+    fn next(
+        &self,
+        context: PaginationContext<'_>,
+        response: BoundedTransportResponse,
+        state: PaginationState,
+    ) -> Result<PaginationDecision, ConnectorFailure>;
+}
+
+pub trait PollProcessor {
+    fn poll<'a>(
+        &'a self,
+        context: PollContext<'a>,
+        checkpoint: TypedCheckpoint,
+        io: &'a dyn ConnectorIo,
+    ) -> BoxFuture<'a, Result<PollBatch, ConnectorFailure>>;
+}
+```
+
+`CredentialPrimitives` exposes only catalog-declared operations such as
+constant-time HMAC verification or opaque auth binding with an opaque field
+ID; it never returns raw credential/tag bytes. `PaginationDecision` is only
+`Done` or
+`Continue { compiled_step, bindings }`; it cannot contain a URL or method.
+Webhook authentication receives bounded raw bytes, selected copied headers, a
+server-supplied receipt timestamp value, and credential capability. Success
+returns an opaque `AuthenticatedRawBody` whose fields cannot be inspected,
+serialized, formatted, or converted by processor code. Only the server-owned
+codec consumes it and parses the bounded raw bytes into `TypedValue`; only
+then does the pure `WebhookNormalizer` produce a typed event. Authentication
+failure never invokes the codec, so raw-byte verification still precedes
+parsing. Poll inputs contain a typed versioned checkpoint, server-supplied
+database-time value, control capability, and event limit. Every output is
+type- and budget-validated by server code.
+
+Phase 1 implements common auth without an `AuthProcessor`, generic declarative
+pagination, pure transforms needed by the first donors, the
+`OperationProcessor` for the Stripe migration, and the existing Stripe
+webhook as `WebhookAuthenticator` plus server codec and
+`WebhookNormalizer`, while retaining `503`. Provider-specific auth and
+pagination processors require a selected admitted donor. `PollProcessor` may
+be added with a real donor, but scheduling/checkpoint persistence is Spec
+005-gated. Binary and continuation ABIs remain gated by Section 9.
+
+## 8. Fixed-origin egress and runtime bounds
+
+Provider connectors compile all outbound origin IDs. Deployment can select an
+endpoint identity but cannot replace a provider origin. The existing generic
+`http` module may retain a deploy-time fixed base URL for independently
+authored integrations, but it remains `public_only` in the current
+implementation. Neither process input nor an imported provider operation may
+select its scheme, host, port, method, header names, proxy, certificate policy,
+or redirect behavior.
+
+Phase 1 provider origins are HTTPS and `public_only`. Every request:
+
+- validates the initial origin and path;
+- resolves under the activity deadline;
+- denies non-global/special-use addresses according to the existing HTTP
+  policy and IANA IPv6 decision;
+- resolves again immediately before connection;
+- pins the vetted addresses in the HTTP client;
+- disables environment/system proxies and automatic retries;
+- validates the connected peer;
+- does not follow redirects.
+
+A later compiled redirect/continuation step must repeat the same checks and
+remain within an explicit origin allowlist. `private_allowed` is not available
+to imported community/provider connectors.
+
+Every operation declares stricter limits within these Phase 1 engine ceilings:
+
+| Resource | Phase 1 engine ceiling |
+| --- | ---: |
+| Outbound calls, including provider, credential, auth, pagination, and continuation calls | 16 per logical attempt |
+| Pages | 16 |
+| Normalized output items | 10,000 |
+| Request headers | 64 |
+| Header name | 256 bytes |
+| Header value | 8 KiB |
+| Aggregate request/response headers retained or mapped | 32 KiB each |
+| Rendered URL | 8 KiB |
+| Rendered path | 2 KiB |
+| Rendered query | 6 KiB |
+| Parsed JSON depth | 64 |
+| Parsed JSON nodes | 100,000 |
+| Individual JSON string | 256 KiB |
+| Request body per call | 1 MiB |
+| Response body per call | 1 MiB |
+| Aggregate request bodies | 4 MiB per logical attempt |
+| Aggregate response bodies | 4 MiB per logical attempt |
+| Normalized process-bound output | 256 KiB canonical JSON |
+| Inline-binary values | 16 per complete typed value |
+| Aggregate decoded inline binary | 128 KiB (131,072 bytes) and still within the 256 KiB canonical result |
+| Raw webhook body | 1 MiB |
+| Redirects | 0 |
+| `Retry-After` delay | 86,400 seconds |
+
+All auxiliary, credential/token, pagination, and future continuation calls
+consume the same call, request-byte, response-byte, and activity deadline
+budgets. No nested processor receives a fresh budget. `Retry-After` accepts
+integer seconds or an HTTP date, clamps a later delay to 86,400 seconds, treats
+a past date as zero, and ignores malformed values; it never expands the
+activity deadline.
+
+Build/deployment validation rejects a zero, contradictory, or larger static
+declaration with `ConnectorConfigError`, outside activity retry routing.
+Runtime overflow uses this exact closed policy:
+
+| Overflow source | Class | Code |
+| --- | --- | --- |
+| operation input renders too many/large headers, URL/path/query, JSON structure/string, request body, or inline bytes | `validation` | `connector_input_limit_exceeded` |
+| resolved credential/auth material exceeds its declared or engine limit | `authentication` | `connector_credential_limit_exceeded` |
+| one provider response exceeds header/body/JSON structural limits | `validation` | `connector_response_limit_exceeded` |
+| provider-driven pages/items or aggregate request/response bytes exceed the logical-attempt budget | `validation` | `connector_execution_limit_exceeded` |
+| normalized typed output exceeds 256 KiB canonical JSON | `validation` | `connector_output_limit_exceeded` |
+| a processor requests an undeclared step or exceeds its compiled step/call budget | `invariant` | `connector_processor_budget_exceeded` |
+
+The safe message names only the limit category, never a value, URL, header, or
+body. Overflow is never partial success or silent truncation. The process
+activity's start-to-close deadline is authoritative and may be stricter.
+Increasing an engine ceiling requires a reviewed runtime-ABI change, fresh
+adversarial tests, and a process dependency revision.
+
+No connector stores unbounded response bodies or provider diagnostics. Item
+normalization stops before exceeding the item/byte budget and returns a typed
+failure; it never silently truncates a success.
+
+The response status domain is all `u16` values: `0..=u16::MAX` is accepted.
+Status classification remains in the compiled error map; no HTTP semantic
+subrange is an ABI construction invariant.
+
+## 9. Binary and multipart contract
+
+Phase 1 supports only bounded inline bytes for small payloads after the shared
+`donat-value-contract` crate gains an explicit bytes form. Its exact external
+and canonical JSON representation is:
+
+```json
+{"$binary":"<unpadded-base64url>","media_type":"<ASCII>"}
+```
+
+or, when a filename is present:
+
+```json
+{"$binary":"<unpadded-base64url>","file_name":"<UTF-8>","media_type":"<ASCII>"}
+```
+
+Those member orders are the RFC 8785 JCS orders (`$binary`, optional
+`file_name`, `media_type`) regardless of input member order; there is no
+second custom ordering rule. `$binary` is RFC 4648 base64url without `=`
+padding. A canonical decoder rejects padding, standard-base64 `+`/`/`,
+non-zero discarded bits, duplicate/unknown members, or any other noncanonical
+spelling. `media_type` is at most 255 ASCII bytes. `file_name`, when present,
+is at most 255 UTF-8 bytes and is data only, never a path.
+
+A complete typed value contains at most 16 inline-binary values and at most
+131,072 aggregate decoded bytes. The complete normalized process-bound JCS
+encoding remains at most 262,144 bytes. A binary-capable operation declares
+finite maxima for every other string and every list/object cardinality. The
+compiler calculates the worst-case complete canonical size, including object
+keys, escaping, base64url expansion, media types, filenames, and enclosing
+output structure, and rejects a declared contract whose maximum exceeds
+262,144 bytes. An operation may therefore need a decoded-byte limit below the
+engine ceiling.
+
+These normative vectors use the exact representation above:
+
+| Typed value | JCS byte length | Result |
+| --- | ---: | --- |
+| root binary of 131,072 zero bytes, media type `application/octet-stream`, no filename | 174,817 | accepted |
+| root binary of 131,073 zero bytes, same media type, no filename | not encoded as a valid value | rejected by the decoded aggregate cap |
+| `{"binary": <the accepted root binary>, "padding": "a" repeated 87,303 times}` | 262,144 | accepted |
+| `{"binary": <the accepted root binary>, "padding": "a" repeated 87,304 times}` | 262,145 | rejected by the complete canonical cap |
+
+The vector descriptions denote typed inputs; their serialized bytes contain
+no spaces. Tests construct the zero bytes and filler independently, encode
+with the production-independent RFC 4648/JCS helper, and assert the exact byte
+counts. The 1 MiB per-call and 4 MiB logical-attempt raw transport ceilings
+still apply. Multipart field names, content disposition, and media-type policy
+are compiled. Runtime input supplies only typed scalar or inline-byte values.
+
+The runtime never accepts a filesystem path, file descriptor, stream handle,
+bucket/key pair disguised as text, `file://` URI, or arbitrary HTTP(S) URL.
+Temporary buffering, if required by reqwest, is memory-only and charged before
+the request is sent.
+
+A larger object-reference capability is later work. It must be an opaque,
+resolver-qualified capability with tenant/source ownership, expiry, content
+length/hash, and operation allowlist. It cannot be a URL and cannot weaken the
+fixed-origin egress policy.
+
+## 10. Static catalog, deployment metadata, and revision pinning
+
+`donat-connector-codegen` emits an immutable, checked-in Rust table under
+`crates/connector-catalog/src/generated/` containing:
+
+- connector ID/stable SemVer, manifest schema epoch, runtime ABI epoch,
+  value-language epoch, provider ID, and API identity;
+- `CredentialSpec`, `OperationSpec`, `PaginationPlan`, `ErrorMap`, and
+  `TriggerSpec` entries and their complete portable generated catalog
+  identities;
+- processor/authenticator/codec/normalizer IDs and implementation revisions;
+- fixed origins and network policy;
+- each selected response header's canonical name and persisted capability ID;
+- every side-effect step's provider idempotency binding, scope,
+  minimum-retention evidence, and clock margin;
+- canonical record/semantic/provenance/value-contract hashes, snapshot
+  identities, and exact deployment fingerprints;
+- source-record IDs, source file hashes, license class, and notice IDs;
+- compiler/classifier versions.
+
+The top-level const-safe shape is normative:
+
+```rust
+pub struct GeneratedConnectorEntry {
+    pub connector: ConnectorId,
+    pub connector_version: StableSemver,
+    pub manifest_version: u32,
+    pub runtime_abi_epoch: u32,
+    pub value_language_epoch: u32,
+    pub provider: ProviderId,
+    pub api_identity: GeneratedApiIdentity,
+    pub credentials: &'static [GeneratedCredentialSpec],
+    pub operations: &'static [GeneratedOperationEntry],
+    pub triggers: &'static [GeneratedTriggerSpec],
+    pub source_records: &'static [GeneratedSourceIdentity],
+    pub legal: &'static [GeneratedLegalIdentity],
+    pub semantic_sha256: Hash256,
+    pub provenance_sha256: Hash256,
+}
+
+pub struct GeneratedSourceIdentity {
+    pub record_id: SourceRecordId,
+    pub record_sha256: Hash256,
+    pub artifact_hashes: &'static [GeneratedArtifactHash],
+}
+
+pub struct GeneratedLegalIdentity {
+    pub source_record_id: SourceRecordId,
+    pub license_id: LicenseIdentity,
+    pub notice_id: NoticeId,
+    pub license_file_sha256: Hash256,
+}
+```
+
+The generated credential, operation, and trigger entries carry every strict
+behavioral Section 5 field, including auth plan, fixed origins/steps, error
+map, bounds, and resolved fact values. Their adjacent generated
+catalog identities carry the separately hashed provenance identity. The
+process compiler adds the deployment fingerprint to form
+`CatalogIdentityEnvelopeV1`. Every connector,
+credential, field, operation, step, trigger, processor, authenticator, codec,
+normalizer, capability, and origin identity is the exact ABI-owned const/copy
+type. Generated source/legal identities retain the matching record and legal
+hashes. Compile tests pass
+`&'static GeneratedCredentialSpec` to the Task-7-shaped consumer and
+`&'static GeneratedTriggerSpec` to the Task-16-shaped consumer without
+defining a server-owned descriptor.
+
+`GeneratedOperationEntry` is the exact const-safe projection of the complete
+Section 5.3 `OperationSpec`: connector/version, operation/version,
+runtime/value epochs, complete input/output contracts and hashes, optional
+versioned credential, resolved origin closure, ordered complete steps and
+transforms, optional processor ID plus `implementation_revision`, effect,
+pagination, complete error
+map, capacity/rate/typed serialization defaults, all bounds, resolved fact
+values, and selected-header name/capability mappings. Codegen has a
+field-for-field equality test against the normalized operation and cannot
+restate a smaller generated shape.
+
+Each operation and trigger also has the portable part of ADR-012
+`CatalogIdentityEnvelopeV1`: canonical/source-record epochs, sorted
+`(SourceRecordId, record_sha256)` identities, semantic/provenance hashes,
+every referenced input/output/event/named/transitive value-contract hash, a
+tagged complete snapshot identity. The process compiler combines it with the
+separately computed `deployment_fingerprint`. The fingerprint is
+`SHA256("donat.connector.deployment.v1\0" || JCS(DeploymentMaterialV1))`.
+That closed material contains source/instance, connector, endpoint-reference,
+credential-reference, resolver, non-secret configuration, enabled
+operation/trigger, and override identities; secret values and resolved URLs
+never enter it. Process reload compares the behavioral snapshot and every
+envelope field.
+
+Generated files are sorted by stable connector/operation ID and contain a
+header naming their manifest, source record, generator version, record hash,
+semantic hash, provenance hash, and every referenced value-contract hash. The
+generated-artifact digest is
+`SHA256("donat.connector.generated-rust.v1\0" || entries)`, where `entries` is
+the concatenation, in UTF-8 repository-path byte order, of each path length as
+an eight-byte big-endian integer, path bytes, file length in the same form, and
+file bytes. `generate --check` reproduces those bytes in a fresh temporary
+directory and rejects any digest/file/path difference. Cargo never invokes the
+generator.
+
+Generation observes the Section 5.1 order: source records, resolved manifests
+and value-contract hashes, semantic hash, provenance hash, then generated tree
+digest. No generated material is fed back into an earlier projection.
+
+`ConnectorRegistry::build` continues to run before the listener opens. It
+validates deploy-time instances against this table, probes declared read-only
+secret references without retaining values, and materializes immutable
+resolver bindings plus operation contracts. Credentials are re-resolved per
+use. The generated table replaces the `RegistryInstance::Http`/`Stripe`
+dispatch match without adding runtime discovery. Existing `http` and `stripe`
+module IDs remain supported through catalog entries during migration.
+
+`ConnectorInstance` in `crates/metadata/src/types.rs` evolves rather than
+creating a runtime API. A factory-backed instance selects:
+
+- a source name;
+- compiled connector/module ID;
+- non-secret endpoint and credential identities;
+- one compatible deploy-time credential instance;
+- an enabled subset of compiled operations/triggers;
+- worker-owned capacity/rate/serialization overrides within compiled bounds.
+
+The connector catalog publishes public, secret-free typed operation/event
+descriptors for the two-stage process compiler in ADR 009. A process revision
+pins the complete behavioral snapshot: versions and epochs, every step's
+effect/idempotency evidence value, the compiler-calculated maximum send
+horizon, contracts/hashes, every processor-like
+`implementation_revision`, credential identity, resolved origins/values,
+stored selected-header mappings, defaults, pagination/errors, and bounds.
+Beside it, `CatalogIdentityEnvelopeV1` pins canonical/source-record epochs,
+sorted source IDs/record hashes, semantic/provenance hashes, every referenced
+contract hash, snapshot identity, and the exact secret-free deployment
+fingerprint. This publication, live-retired execution, and worker claim
+behavior do not exist until the prerequisites in Section 13 are met.
+
+Rotating a read-only secret value does not serialize it into or change the
+revision. A change to resolver identity, credential class/spec, endpoint
+identity, origin, scope set, API version, effect/idempotency, processor,
+operation schema, idempotency scope/retention/margin, pagination/error plan,
+or runtime bound creates a new dependency fingerprint.
+
+## 11. Donat-owned examples
+
+These examples are independently authored for this specification. They
+illustrate the proposed Phase 1 shape and do not copy donor descriptions,
+icons, display metadata, or executable source.
+
+### 11.1 SerpAPI declarative connector instance
+
+An admitted, compiled catalog entry fixes `https://serpapi.com`, the API-key
+query slot, `GET /search.json`, the allowed inputs, and the normalized output.
+Deployment metadata selects it and supplies only a secret reference and worker
+policy:
+
+```yaml
+- name: public_web_search
+  source: app
+  module: serpapi
+  config:
+    endpoint_identity: serpapi_public_v1
+    credential_identity: serpapi_primary
+    credential:
+      spec: serpapi.api_key.v1
+      fields:
+        api_key:
+          value_from_env: SERPAPI_API_KEY
+  operations:
+    - name: search.google
+      capacity:
+        max_in_flight: 8
+        rate_limit: { permits: 20, per: 1s, burst: 4 }
+```
+
+The corresponding Donat-owned normalized operation is conceptually:
+
+```yaml
+id: search.google
+version: 1
+effect: read_only
+input:
+  query: { type: "string!", min_length: 1, max_length: 512 }
+steps:
+  - id: search
+    method: GET
+    origin: serpapi_public
+    path: /search.json
+    query:
+      engine: { literal: google }
+      q: { input: query }
+      api_key: { credential: api_key }
+    success_statuses: [200]
+output:
+  results:
+    type: "[json!]!"
+    from_json_pointer: /organic_results
+bounds:
+  calls: 1
+  pages: 1
+  response_bytes: 1048576
+  items: 100
+  output_canonical_bytes: 262144
+```
+
+The pinned donor record is the authority for the literal `/search.json`
+path. The immutable official provider repository uses `/search`; its facts
+support compatible `GET` semantics, fixed `https://serpapi.com`, API-key
+binding, JSON behavior, and provider-owned result/error examples, but they do
+not prove the `.json` suffix. Exact `[200]` success, top-level-error rejection,
+missing-as-empty, and generic status normalization are typed
+`ContractFact::DonatPolicy` values rather than provider facts.
+
+Neither the caller nor a processor can add a query key, change `engine`,
+select an origin, or request a raw response. The first compiler test compares
+this canonical IR to a reviewed `insta` snapshot and separately proves the
+prepared HTTP request through a local Donat-owned server.
+
+### 11.2 Stripe processor-backed operation
+
+The existing `checkout.create_session` behavior moves behind the static
+processor table without changing its public connector contract:
+
+```yaml
+id: checkout.create_session
+version: 1
+effect:
+  provider_idempotent:
+    side_effect_steps:
+      - step: create_session
+        fixed_binding: { header: Idempotency-Key }
+        scope: stripe.account.v1
+        minimum_retention_ms: 86400000
+        clock_safety_margin_ms: 300000
+processor: stripe.checkout.create_session.v1
+steps:
+  - id: create_session
+    method: POST
+    origin: stripe_api
+    path: /v1/checkout/sessions
+    encoding: form_urlencoded
+    auth: stripe.secret_key.v1
+    success_statuses: [200]
+bounds:
+  calls: 1
+  pages: 1
+  request_bytes: 1048576
+  response_bytes: 1048576
+  output_canonical_bytes: 262144
+```
+
+The scope and timing values are executable only when the admitted immutable
+provider evidence records those exact conservative values; the example does
+not authorize them by assertion.
+
+The Rust processor validates the existing typed input, creates only bindings
+for `CompiledStepId("create_session")`, calls `ConnectorIo`, and normalizes the
+existing `id`, `url`, `status`, and `expires_at` output. It cannot construct
+`https://api.stripe.com` or an Authorization header itself. The existing raw
+Stripe webhook authentication becomes a static `TriggerSpec::Webhook`
+authenticator/codec/normalizer registration. This is a registry/ABI migration
+of independent Donat Rust, not a claim that n8n's SUL Stripe implementation
+was ported.
+
+## 12. First implementation cohort
+
+Implement slices in this order, keeping only named provider operations:
+
+| Order | Connector slice | Target style | Explicit exclusions/deferments |
+| ---: | --- | --- | --- |
+| 0 | Existing Stripe Checkout creation and completion webhook | static processor plus two-stage webhook authentication/normalization | no broad Stripe/n8n port |
+| 1 | SerpAPI Google search, then selected search engines | Tier A generic HTTP; pagination only when proven | no UI metadata or arbitrary engine/request fields |
+| 2 | Brave web/news/image search | generic HTTP plus one named query transform | no ambient expressions |
+| 3 | Resend contact list and verified inbound events; inventory email send | generic/error/pagination IR plus Rust verifier | email send is executable only with admitted provider idempotency; send-and-wait excluded; attachments deferred |
+| 4 | Cloudinary asset metadata, admin search, and signed delivery transforms | named signing/URL transform and cursor plan | upload-by-URL excluded; multipart upload waits for Phase 1 inline-byte ABI |
+| 5 | Mercado Pago report list; inventory payment-link creation | generic HTTP plus pagination | payment-link creation needs admitted provider idempotency; report download/SFTP deferred |
+| 6 | Apify inspect run and dataset items; inventory run/webhook mutation operations | bounded processor, pagination, explicit webhook operations | mutations need admitted provider idempotency; no workflow wait node or unbounded poll loop |
+| 7 | CloudConvert job/result inventory | bounded multi-step processor | job creation needs admitted provider idempotency and begins only after binary/continuation policy |
+| Parallel | Donat-owned fixed-origin OAuth2 REST example from a permissive provider schema | common auth plus generic HTTP | access token is pre-provisioned/non-refreshing or client-credentials-per-activity; no generic HTTP Request behavior |
+
+Slack, HubSpot, Google Sheets, Gmail, and Drive may follow from permissive
+provider artifacts or independently authored provider-doc behavior. The
+inspected n8n built-ins remain SUL behavior-only. Breadth never justifies
+copying a built-in description or implementing n8n's workflow model.
+Any cohort side effect that lacks provider idempotency remains inventory-only;
+cohort membership is not executable admission.
+
+## 13. Prerequisites and implementation decomposition
+
+Spec 005 is proposed and its process runtime, V6 journal, shared value
+contract, descriptor publication, and worker do not exist in the current
+tree. A connector-factory task must not invent a parallel form of any of those
+contracts. Because Section 7 places that shared contract in
+`donat-value-contract` rather than the `donat-ir` owner accepted by ADR 009,
+an ADR 009 update or accepted superseding ADR is a hard prerequisite to the
+first implementation slice.
+
+### 13.1 Hard prerequisite matrix
+
+| Spec 007 capability | May land before the process runtime? | Exact prerequisite | Boundary until the prerequisite is green |
+| --- | --- | --- | --- |
+| shared canonical value/type contract | yes | accepted ADR ownership update, then Spec 005 Task 1 implemented in `donat-value-contract` with `donat-ir` re-export and `value_type_language_is_closed_and_canonical` | no parallel value type in catalog, ABI, or IR |
+| neutral connector ABI ID/envelope foundation | yes | shared value contract above | IDs, envelopes, and host traits only; no catalog descriptors, processor implementation, or registry |
+| normalized catalog model, source records, canonical hashes, and checked-in generated-table shape | yes | shared value contract plus compiling ABI ID/envelope foundation | model/tests only; all connector IDs import the exact ABI types; no acquisition, generation, or executable operation yet |
+| hostile acquisition, licensing/notices, and update inventory | yes | compiling `donat-connector-catalog` source-record model | development tooling only; no donor source enters a runtime dependency |
+| deterministic checked-in Rust generation | yes | compiling catalog model and manifest validation | codegen uses checked-in inputs only and cannot acquire sources |
+| static catalog, read-only credential capability, fixed-origin transport, error mapping, and a direct server-side SerpAPI harness | yes | value contract, catalog, and process-independent ABI/runtime slices | no Process descriptor or public execution route |
+| public connector operation/inbound descriptors | yes, after the named contract | Spec 005 Task 2, updated to the Section 5.3 per-step effect/retention model, and `connector_descriptor_is_typed_and_non_secret` | registry remains server-internal |
+| process connector source binding and candidate compilation | no | Spec 005 Task 3 plus `process_connector_instance_has_one_source` | no process YAML may reference a factory operation |
+| durable connector activity invocation and committed intent | no | Spec 005 Sections 7 and 9, including its V6 journal/migrations, worker, per-step `first_provider_attempt_at`, and `process_activity_does_not_hold_tx` | tests may call the registry directly only |
+| idempotency-window compilation and runtime refusal | no | Spec 005 supplies finite upper bounds for every Section 5.3 horizon component plus the per-step timestamp/deadline contract | a provider mutation stays inventory-only/non-executable; no missing component gets an assumed safe value |
+| retry, lease takeover, capacity, rate, and serialization behavior | no | Spec 005 Section 9 and `process_lease_takeover_is_safe`, `process_activity_capacity_is_global`, `process_capacity_bucket_serializes_two_claimers`, and the Section 14 retention-boundary/late-takeover proofs | no factory-local lease, reservation, or first-attempt table |
+| generic two-stage webhook dispatch | yes | static event descriptor plus authenticator/codec/normalizer ABI | preserve every current route outcome, including empty-body `503` after successful verification |
+| durable webhook 2xx acknowledgement, audit, dedupe, correlation, and process start | no | Spec 005 Section 10 and `process_inbound_audit_is_split`, `process_accepted_delivery_links_instance_history`, and `process_invalid_signature_is_audit_only` | no factory persistence; a verified event remains unacknowledged with `503` |
+| pure poll processor ABI and donor-local tests | yes, with an admitted donor | processor ABI and typed checkpoint value | no scheduler or durable checkpoint |
+| poll scheduling/checkpoint persistence | no | a future explicit Spec 005 source-local checkpoint schema, transaction, restart, and DB-clock contract; Spec 005 currently has none | do not infer a persistence model from this specification |
+| revision fingerprint pinning, retirement, and reload | no | Spec 005 Section 5 and `process_live_connector_rebind_is_rejected` plus `process_retired_revision_reloads_and_completes` | catalog fingerprints are inspectable only, not process lifecycle state |
+| bounded inline bytes and multipart | no | `donat-value-contract` implements the Section 9 bytes value and exact canonical-size vectors, then Spec 005 accepts that shared value in descriptors/journals | JSON/form operations only |
+| rolling-binary and two-worker/takeover proofs | no | the corresponding Spec 005 runtime row above and `process_revision_runtime_abi_is_fenced` where ABI compatibility is involved | single-process direct registry tests only |
+
+The provider-observation proof for durable invocation is stronger than an
+in-process sequence assertion: the provider stub blocks while a separate
+Postgres connection observes the committed activity job and any applicable
+capacity reservation. Only then may it accept the request. This proof belongs
+to the Spec 005-gated activity integration, not the process-independent
+factory.
+
+### 13.2 Process-independent factory phases
+
+All paths below are current repository paths unless marked **Create**. These
+phases may land without the process migrations/worker. Each row starts from a
+green predecessor, adds its own failing test, and must compile/test as a
+standalone slice before the next row begins:
+
+| Order | Files | Deliverable and RED gate |
+| ---: | --- | --- |
+| 0 | update/supersede ADR 009; **Create** `crates/value-contract/`; modify `crates/ir/` to re-export | single `no_std + alloc` type/value owner, canonical sizing, and Spec 005 Task 1 tests; `donat-ir` retains no duplicate |
+| 1 | **Create** `crates/connector-abi/`, initial `scripts/check_connector_processor_boundary.py`, and its foundation policy/tests | local-only no-OS canonical connector/operation/step/processor-family IDs, private safe envelopes/static failure text, restricted construction namespaces, exact-boundary/compile-fail proof, and deterministic initial checker fixtures; no processor implementation |
+| 2 | **Create** `crates/connector-catalog/`, `connector-catalog/sources/records/`, and `connector-catalog/manifests/` | catalog-owned strict source record; exact `SourceRecordMaterialV1`, `SemanticMaterialV1`, `ProvenanceMaterialV1`, and `ValueContractMaterialV1` projections/domains/order; tagged `TypedValue` JCS adapter; complete self-contained versioned credential/auth/origin/step/operation/error/bounds/trigger/provenance IR importing exact ABI IDs; persisted selected-header capability derivation/mapping; strict `catalog_construction`; value/origin split, per-step effect, hash-vector, UTF-16, and descriptor-to-`ConnectorIo` identity proofs |
+| 3a | **Create** `crates/connector-acquire/`; modify workspace `Cargo.toml` | sibling tool depending only on catalog for disjoint npm/provider acquisition, record-derived reacquisition, and hostile HTTPS/archive handling; synthetic extraction/license/dependency tests |
+| 3b | **Create** `crates/connector-codegen/` and `crates/connector-catalog/src/generated/` | sibling tool depending only on catalog for deterministic checked-in Rust carrying exact behavioral credential/operation/trigger projections, stored header mappings, resolved fact values, portable catalog identity, and separate source/legal provenance; every version/hash/default/origin/`implementation_revision`; `generate --check`, field-for-field normalized/generated equality, actual-generated-entry-to-ABI ID identity proof, and exact Task-7/Task-16 consumer compile proofs; no acquisition dependency, `build.rs`, or Cargo-time generation |
+| 4 | **Create** `crates/connector-processors/` and extend the initial boundary checker | local-only no-OS processor implementation closure, sealed private registry, private-lookup-to-ABI ID identity proof, opaque host capabilities, and independent Cloudinary-shaped proof |
+| 5 | modify `crates/metadata/src/types.rs` and loader/type fixtures; modify `crates/server/src/state.rs`; **Create** `crates/server/src/connectors/credentials.rs` | source/credential instance validation, per-use read-only resolution, capabilities, and redaction |
+| 6 | modify `crates/server/src/connectors/http.rs`; **Create** focused transport/executor tests | sole fixed-origin `ConnectorIo`, server-owned codecs/crypto/control, typed JSON/query/form encoding, complete errors, bounds, then bounded pagination |
+| 7 | modify `crates/server/src/connectors/mod.rs`; **Create** `crates/server/src/connectors/catalog.rs` | immutable generated catalog and registry dispatch through processor-crate lookup with no runtime registration/discovery |
+| 8 | admit SerpAPI records/manifests/notices; extend server tests | first Tier A exact request/result/error/fingerprint proof through a Donat-owned local provider stub; no public execution route |
+| 9 | modify Stripe connector/tests | compiled-step processor migration without moving transport, codec, crypto, clock, UUID/text/time, or credentials into the processor crate |
+| 10 | generalize two-stage webhook authentication/codec/normalization and Stripe adapter/tests | bounded raw authentication before server parsing, existing route matrix, and verified-event `503` unchanged |
+| 11 | add a selected real donor to pure pagination/auth/verifier/poll ABI as needed | processor-specific tests only; no process scheduling or ingress persistence |
+| 12 | extend sibling acquisition/codegen update commands | exact-version re-admission and semantic/provenance diff; never automatic admission |
+
+The first derivative port also creates root `THIRD_PARTY_NOTICES.md` and
+updates `knowledgebase/declarative-saas/reference-porting-register.md` in the
+same reviewed change. The catalog generator reads only checked-in source
+records and manifests and writes only checked-in Rust. There is no
+`OUT_DIR` artifact and no `crates/server/build.rs`.
+
+### 13.3 Process-dependent integration phases
+
+After the exact matrix rows are green, separately reviewable tasks may:
+
+1. publish typed connector descriptors and bind them to the process source;
+2. compile every provider side-effect step against its complete bounded send
+   horizon and reject equality-plus-one-millisecond policies;
+3. persist per-step `first_provider_attempt_at`, derive the stable step key,
+   and dispatch only committed jobs while enforcing source-local capacity,
+   retry, takeover, and the usable idempotency deadline;
+4. replace the verified-webhook `503` only through the Spec 005-owned inbound
+   transaction and its separately specified exact success response;
+5. add polling persistence only after Spec 005 defines its missing checkpoint
+   schema/transaction/restart contract;
+6. pin catalog dependencies in revisions and retain live-retired operations;
+7. add inline bytes only after the shared value contract owns them; and
+8. run corresponding two-worker and rolling-binary proofs.
+
+Each behavior slice starts with its Donat-owned failing crate/native
+conformance test, lands as a separately reviewable commit, and retains old
+operation versions needed by live Process revisions. `donat-schema` never
+depends on `donat-server`; descriptor publication preserves ADR 009's
+two-stage candidate build.
+
+## 14. TDD acceptance matrix
+
+No Donat-derived fixture can be copied to fill this matrix because this is a
+new non-Hasura surface. Tests use independently authored records, hostile
+archives, manifests, provider stubs, DNS/peer doubles, token endpoints,
+webhook bytes, and payloads. Tests never call a live provider API.
+
+| ID | Level | Required proof |
+| --- | --- | --- |
+| `value_contract_has_one_owner` | value/IR compile | the no-std value crate owns types/canonical sizing, `donat-ir` re-exports them, and catalog/ABI compile against the same type identity without a conversion copy |
+| `safe_abi_fields_are_private` | external compile-fail | four independent external field-assignment failures prove that `status`, `selected_headers`, `decoded`, and `response_bytes` cannot be assigned; separate failures prove the response/correlation constructors and forbidden runtime conversions are unavailable |
+| `safe_abi_boundaries_are_exact` | ABI unit | all `0..=u16::MAX` statuses, response/correlation limits, static-code/static-message limits, and retry clamping accept exact boundaries and reject one over; ordinary responses carry empty authorization |
+| `typed_bindings_account_across_roots` | ABI unit | aggregate multi-root node, inline-value, decoded-byte, and checked canonical-size accounting shares counters while depth restarts per root |
+| `connector_boundary_checker_is_deterministic` | checker self-test | deterministic positive fixtures pass and every restricted namespace, producer, test-path, allocation-leak, and later processor-boundary mutation fails with its stable diagnostic; post-Python-Unicode aliases for both namespaces/static types/host traits, Rust `Pattern_White_Space`, raw-keyword decoys/alias destinations, and nested/grouped sibling-before-`self` or descendant aliases prove the version-independent lexical and `use`-tree contract |
+| `safe_abi_lints_are_strict` | ABI/CI | `cargo clippy -- -D warnings -D clippy::result_large_err` passes without an allow, expectation, crate lint override, or command-line suppression; negative scans reject lint-suppression additions |
+| `catalog_descriptor_ids_match_connector_io` | phase 2 catalog compile | normalized catalog descriptors pass their exact ABI-owned IDs directly to `ConnectorIo`, with no string, wrapper, parse, serialization, or `From`/`Into` conversion copy |
+| `catalog_contracts_are_closed_and_complete` | phase 2 catalog unit | credentials/auth plans, fixed origins/steps, operations/effects/pagination/error maps/bounds, webhook/poll triggers, and provenance references round-trip together; every unknown variant/field, dynamic destination, raw provider message, missing reference, or unbounded declaration rejects |
+| `contract_fact_origins_are_non_substitutable` | phase 2 catalog unit | provider evidence resolves to its exact immutable record/fact location, Donat policy resolves to its reviewed policy ID, each hashes in its assigned semantic/provenance material, and neither origin can satisfy the other |
+| `npm_provenance_state_is_exact` | catalog/acquisition unit | signature and signed-provenance present/absent/rejected decisions, optional tag/provenance commits, maintainers, and repository-owner decisions round-trip and every mismatch fails |
+| `exact_npm_semver_is_exact` | catalog/acquisition unit | `1.2.3-alpha.1+build.5` round-trips byte-for-byte as `ExactSemver`; `^1.2.3`, `latest`, `v1.2.3`, `01.2.3`, and `1.2.3-01` reject; the donor-package version owner is exclusively `ExactSemver` |
+| `acquisition_command_schemas_are_disjoint` | acquisition CLI unit | npm acquisition requires expected SRI, provider acquisition requires exactly one provider identity form, cross-form flags reject, unallowlisted Stripe documentation rejects, and record-derived reacquisition permits no locator override |
+| `generated_catalog_ids_match_abi` | phase 3b post-codegen catalog compile | after deterministic codegen creates the actual checked-in entries, every generated connector/operation/step/processor-family/credential/capability/trigger/authenticator/codec/normalizer/origin ID assigns directly to its ABI-owned type |
+| `generated_consumers_use_catalog_types` | phase 3b compile | Task-7-shaped credential validation accepts `&'static GeneratedCredentialSpec` and Task-16-shaped webhook lookup accepts `&'static GeneratedTriggerSpec` without any server-owned descriptor |
+| `processor_lookup_ids_match_abi` | phase 4 processor compile | private static-table lookup accepts the exact generated ABI-owned processor-family IDs without a conversion copy |
+| `source_record_requires_exact_artifacts` | catalog/acquisition unit | catalog-owned records reject missing or mismatched exact version, integrity, repository/tree/license/file hash, provenance mapping, entrypoint, closed dependency/embedded-material decision, reviewer, destination, RED test, or notice; unknown fields fail at every nesting level |
+| `hostile_archive_is_never_trusted` | acquisition integration | HTTPS/host/three-redirect policy, hash-before-extract, every archive size/count/depth ceiling, normalized-path collisions, links/special/sparse/unknown entries, no-follow replacement, cleanup, and an unexecuted package-script sentinel are pinned |
+| `license_and_dependency_disposition_is_closed` | admission unit | only the six Section 3.1 SPDX choices and an explicit allowed dual-license selection pass; every dependency has one closed disposition |
+| `sul_source_cannot_generate_artifacts` | policy integration | every donor marks `n8n-workflow` `TypeOnlyReplaced`; SUL bytes are absent from parser input, manifests, generated Rust, fixtures, Cargo metadata, and release artifacts |
+| `imperative_ast_emits_work_item_not_rust` | codegen snapshot | function-valued routing, `execute`, `poll`, webhook code, or an ambiguous expression produces a processor/unsupported inventory finding, never guessed behavior |
+| `canonical_projection_domains_are_exact` | catalog unit | independent bytes produce every source-record/semantic/provenance/value-contract Section 5.1 vector; one-field mutation changes the applicable domain; no material includes its result; calculation order is record, resolved manifest/value contract, semantic, provenance, generated tree |
+| `canonical_projection_field_matrix_is_total` | catalog compile/unit | the ADR-012 owner manifest parses without wildcard/family entries or duplicate `(domain,canonical_path)`; independent owner/projection/manifest inventories compare as exact sets without a fixed row count, recursive expansion equals the normalized leaf/discriminant set, every projection member has a normalized/constant/named-derived owner, and one direct material never maps an owner twice |
+| `value_scalar_projection_matches_spec_005_owner` | catalog unit | exhaustive construction accepts exactly the twelve Spec-005 `ValueScalar` branches and the Section-5.1 canonical bytes/hashes, observes a `Custom.name` mutation, rejects an unowned branch, proves nullable null semantics change only `TypeRefMaterialV1.nullable`, and admits neither `Null` nor `InlineBytes` as a scalar |
+| `canonical_projection_every_field_and_branch_mutates` | catalog unit | generated mutations visit every normalized field and every source/auth/request/response/effect/pagination/error/retry/redaction/trigger/value/provenance branch, including every real `ValueScalar` tag and `Custom.name`; each changes its applicable direct bytes/hash and preserves the other direct domain |
+| `contract_fact_value_and_origin_projections_are_separate` | catalog unit | every stable use site contributes one resolved value only at its semantic operation owner and one exact provider/policy origin only at its manifest-reference owner; duplicate `(use_site,fact)`, substitution, omission, or unequal semantic/provenance use-site sets reject |
+| `typed_value_jcs_projection_is_lossless` | catalog unit | tagged `I64(1)`, `U64(1)`, `Decimal("1")`, and `String("1")` do not collide; `u64::MAX`, exact decimal spelling, canonical base64url, inline metadata nulls, and U+10000-before-U+FFFD UTF-16 member ordering match independent bytes |
+| `operation_snapshot_is_complete_and_versioned` | catalog unit | every behavioral Section 5.3 field, stable SemVer/epoch distinction, input/output recomputed hash, resolved origin/value, transform/processor `implementation_revision`, default, bound, and stored selected-header mapping is required; provenance identities are forbidden; prerelease/build versions reject; processorless multi-step rejects |
+| `response_header_capabilities_are_persisted_and_scoped` | catalog/codegen unit | case folding matches the exact Section 5.3 vector; connector/operation/version/step changes separate IDs; missing/ambiguous/duplicate/more-than-64 mappings reject; every result is 80 ASCII bytes and fits the 96-byte ABI ID |
+| `generated_catalog_is_checked_in_and_deterministic` | codegen/CI | `generate --check` reproduces every path/byte/digest in two clean worktrees; deletion, drift, extra output, or manifest/source-record mismatch fails |
+| `generated_operation_projection_is_exact` | codegen/catalog compile | every generated operation equals the normalized behavioral projection field-for-field, including all versions, hashes, defaults, origins, processor `implementation_revision` values, capabilities, and resolved fact values; portable catalog identity is compared separately and no partial generated shape compiles |
+| `serpapi_exact_source_compiles` | codegen insta + local HTTP | admitted `0.1.10` record produces the reviewed manifest/generated Rust and fixed prepared request; snapshots are individually reviewed |
+| `operation_effect_is_closed` | catalog/compiler | headerless `ReadOnly` and per-side-effect-step `ProviderIdempotent` binding/scope/retention/margin compile; missing/duplicate/unproven step entries and non-idempotent side effects remain inventory-only |
+| `provider_idempotency_horizon_is_bounded` | Spec 005-gated process compiler | a complete policy whose maximum send horizon equals the usable window compiles; the same policy one millisecond over rejects, and any missing/unbounded schedule/capacity/start-to-close/lease/takeover/backoff component rejects |
+| `provider_idempotency_steps_are_independent` | catalog/process compiler | a multi-step mutation derives different stable keys and independently validates the evidence, scope, retention, margin, and horizon of every side-effect step |
+| `late_takeover_exhausts_idempotency_window` | Spec 005-gated two binaries | the persisted per-step first-attempt timestamp and stable key survive takeover; a database clock one millisecond after the usable deadline performs no provider I/O and returns permanent `connector_idempotency_window_exhausted` |
+| `credential_capability_is_read_only_and_per_use` | metadata/server | only SecretRef-backed Phase 1 fields pass; the registry retains a binding, resolves each use, exposes only compiled primitives, and cannot enumerate/write/refresh/CAS/delete secrets |
+| `client_credentials_is_one_activity_step` | server/local token stub | token acquisition consumes the same call/byte/deadline budget, is not refreshed or persisted, and its opaque capability is dropped after the logical attempt |
+| `processor_boundary_is_mechanical` | ABI/CI | value/ABI/processor crates compile without default features for the pinned no-OS target; locked checks cover normal/build/proc-macro/optional/target edges, feature unification, build scripts, native links, include/path/env indirection, unsafe/FFI, generated/donor source, and any nonlocal runtime dependency |
+| `processor_registry_is_closed` | processor/server compile + source policy | only private processor-crate constructors/table can create handles for admitted IDs; server-side implementation or registration and dynamic fallback are impossible/rejected |
+| `processor_calls_only_compiled_steps` | processor/server | every auxiliary ABI is object-safe and bounded; a foreign step, URL-shaped continuation, undeclared primitive, excess budget, deadline, or cancellation fails before further I/O |
+| `webhook_authentication_precedes_codec` | processor/server/endpoint | invalid authentication never invokes the server codec; valid raw authentication creates one opaque token, then server decoding, then pure typed normalization, while the public route matrix remains exact |
+| `fixed_origin_is_unescapable` | server integration | input, processor bindings, pagination, provider body, redirects, DNS rebinding, proxy environment, and peer mismatch cannot change the compiled destination |
+| `runtime_uses_stored_header_capabilities_only` | server/source policy | Task 8 matches response header names to stored IDs and passes the selected action's stored allowlist; source contains no capability domain string, SHA-256 derivation path, or caller-provided allowlist |
+| `runtime_limits_have_exact_failures` | server/local-provider matrix | every header/URL/path/query/JSON/body/aggregate/item/page/call/output/inline-byte ceiling reaches the exact Section 8 class/code without partial output or leakage; `Retry-After` clamps at 86,400 seconds |
+| `error_map_is_closed_and_redacted` | server/local-provider matrix | every transport/status/provider-code/malformed-success case reaches one existing class and Donat-owned safe message with no secret/raw body leakage |
+| `pagination_is_bounded` | server integration | cursor/offset/page/link plans share the logical-attempt budget and stop at calls/pages/items/aggregate bytes/deadline; cross-origin `next` is rejected |
+| `public_surfaces_cannot_execute_connectors` | server/native conformance | GraphQL introspection, REST endpoint compilation, MCP tool listing/calls, and admin/unknown routes expose no connector execution surface; `POST /v1/connectors/{instance}/execute` returns HTTP `404` with an empty body |
+| `commands_cannot_plan_connector_io` | command compiler/IR | every connector-effect syntax or descriptor is rejected and no command plan/IR variant can carry connector I/O |
+| `webhook_route_preserves_phase1_boundary` | endpoint/native conformance | `POST /v1/connectors/{instance}/webhooks` returns empty `404` for unknown/no verifier, empty `413` for an oversized body, empty `400` for malformed/invalid verification, and empty `503` after valid verification |
+| `provider_observes_only_committed_activity` | Spec 005-gated Postgres/provider integration | the provider stub accepts no request until a separate connection sees the committed job and applicable capacity reservation |
+| `read_only_and_provider_idempotent_takeover_are_safe` | Spec 005-gated two binaries | headerless read-only takeover and within-window stable per-step-key mutation takeover create one durable transition with stale-worker audit |
+| `durable_webhook_ack_is_source_local` | Spec 005-gated webhook integration | only the Spec 005 transaction may change valid verification from `503`; exact success status/body must be specified there before a fixture lands, after audit/dedupe/correlation commit |
+| `poll_checkpoint_persistence_matches_process_contract` | future Spec 005-gated process integration | only after the missing explicit checkpoint contract exists, restart/DB-clock/source-local transaction tests prove persistence; the processor has no static workflow data |
+| `inline_binary_is_bounded` | value-contract/server/native conformance | exact Section 9 JCS/base64url vectors prove 131,072/131,073 decoded-byte acceptance/rejection and 262,144/262,145 complete-value acceptance/rejection; 17 values, paths, URLs, and object references fail before I/O |
+| `semantic_projection_never_serializes_provenance_descriptors` | catalog unit | semantic construction recursively projects credential/origin/operation/trigger behavior; compile/source-policy checks reject direct serialization of provenance-bearing `OperationSpec` or `TriggerSpec` |
+| `resolved_fact_value_and_origin_hashes_are_separate` | catalog unit | origin-only mutation preserves semantic bytes/hash; value-only mutation preserves direct origin material; final provenance changes through its committed semantic hash |
+| `raw_ijson_rejections_are_exact` | catalog raw-byte fixtures | escaped/unescaped noncharacters, lone/invalid surrogate pairs, invalid UTF-8, decoded duplicate names, `1e400`, and raw `9007199254740993` reject with the closed ADR-012 codes; raw `9007199254740992` succeeds unchanged and recursive UTF-16 ordering matches RFC 8785 |
+| `revision_fingerprint_is_complete` | Spec 005-gated compiler/reconcile | the complete behavioral `OperationSpec`, per-step horizon, and every `CatalogIdentityEnvelopeV1` field are pinned; any one-field change to source records, contracts, snapshot, provenance, or deployment identity rejects live-retired reload |
+| `upgrade_diff_is_semantic` | codegen snapshot | upgrade reports record/integrity/license, operation/type/effect, scopes, origin, request, pagination, errors, bounds, processors, tests, and notices; no retag auto-accept |
+| `workspace_build_is_offline` | clean network-disabled CI | `cargo build --workspace --release --offline --locked` succeeds without network; expected acquisition/codegen source and artifacts are separately inventoried and allowed in this proof |
+| `runtime_package_is_source_free` | runtime package/image CI | a separate locked offline `donat-server --bin donat` release build has a runtime-package dependency tree/SBOM; only that binary, package/image, and runtime closure are scanned and contain no acquisition/codegen/donor/SUL, Node, JS, WASM, npm, n8n, dynamic plugin, or unapproved processor runtime material |
+
+### 14.1 RED/GREEN sequence
+
+Representative focused commands for the implementation:
+
+```bash
+# Shared value owner, then ABI ID/envelope foundation, then catalog.
+cargo test -p donat-value-contract --no-default-features
+cargo test -p donat-ir value_contract
+cargo check -p donat-value-contract --target thumbv7em-none-eabihf \
+  --no-default-features --offline --locked
+cargo test -p donat-connector-abi --no-default-features
+cargo check -p donat-connector-abi --target thumbv7em-none-eabihf \
+  --no-default-features --offline --locked
+cargo clippy -p donat-connector-abi --no-default-features -- \
+  -D warnings -D clippy::result_large_err
+python3 scripts/check_connector_processor_boundary.py
+lint_policy_inputs=(
+  crates/connector-abi/src
+  crates/connector-abi/Cargo.toml
+  Cargo.toml
+  .github/workflows
+)
+for cargo_config in .cargo/config.toml .cargo/config; do
+  if test -f "$cargo_config"; then
+    lint_policy_inputs+=("$cargo_config")
+  fi
+done
+if rg -n \
+  -e '(?:allow|expect|warn|force_warn)\s*\([^)]*clippy::result_large_err' \
+  -e 'result-large-err\s*=\s*(?:\{\s*level\s*=\s*)?"(?:allow|warn)"' \
+  -e '(?:-A|-W|--allow|--warn|--force-warn)(?:=|\s*)clippy::result[_-]large[_-]err' \
+  -e '--cap-lints(?:=|\s+)(?:allow|warn)' \
+  "${lint_policy_inputs[@]}"; then
+  exit 1
+fi
+cargo test -p donat-connector-catalog
+cargo test -p donat-connector-catalog catalog_descriptor_ids_match_connector_io
+cargo test -p donat-connector-catalog --test catalog_contracts
+cargo test -p donat-connector-catalog --test contract_facts
+
+# Acquisition and codegen are independent siblings over that catalog.
+cargo test -p donat-connector-acquire --test cli_contract
+cargo test -p donat-connector-acquire --test source_admission
+cargo test -p donat-connector-acquire --test hostile_archives
+cargo test -p donat-connector-codegen --test deterministic_catalog
+cargo test -p donat-connector-codegen --test serpapi_compile
+cargo insta test -p donat-connector-codegen
+cargo insta review
+cargo test -p donat-connector-catalog generated_catalog_ids_match_abi
+cargo test -p donat-connector-catalog --test generated_consumers
+
+# The later local-only processor implementation is checked on a no-OS target
+# before any real processor is admitted.
+cargo check -p donat-connector-processors --target thumbv7em-none-eabihf \
+  --no-default-features --offline --locked
+cargo tree -p donat-connector-processors --target all \
+  --edges normal,build --no-default-features --offline --locked
+
+cargo test -p donat-connector-processors --no-default-features
+cargo test -p donat-connector-processors processor_lookup_ids_match_abi
+
+# Metadata, credential, egress, pagination, error, and adapter slices.
+cargo test -p donat-metadata connectors
+cargo test -p donat-server --test connectors_factory
+cargo test -p donat-server --test connectors_http
+cargo test -p donat-server --test connectors_stripe
+cargo test -p donat-server --test connector_webhook
+
+# Native ground truth after rebuilding the binary used by the harness. Process-
+# gated targets run only after their Section 13 prerequisite is implemented.
+cargo build -p donat-server --bin donat
+cargo test -p donat-conformance --test connectors
+
+# A clean CI image has the locked Rust cache/toolchain prepared first; the
+# whole workspace, including expected development tools, must build offline.
+podman run --rm --network=none <pinned-build-image> \
+  cargo build --workspace --release --offline --locked
+
+# Runtime absence is a separate package proof, never a workspace-artifact
+# absence assertion.
+cargo build -p donat-server --bin donat --release --offline --locked
+cargo tree -p donat-server --target all --edges normal \
+  --offline --locked
+
+# Required regression proof after each engine-behavior slice is green.
+cargo test -p donat-conformance
+```
+
+`cargo insta review` is interactive evidence review, not blanket acceptance.
+The implementation report records every changed snapshot and why it changed.
+CI compares generated path/byte/digest output across two clean worktrees,
+checks locked metadata plus the complete boundary closure/feature allowlist,
+and inventories the expected development tools in workspace source/artifacts.
+A repository-pinned SBOM generator then emits the `donat-server` runtime
+package closure. The absence scan is restricted to that dependency tree/SBOM,
+the packaged `donat` binary, production package/image, and runtime filesystem;
+it rejects acquisition/codegen/donor/SUL, Node, JavaScript, WASM, npm, n8n,
+dynamic-plugin, and unapproved processor runtime material. It does not require
+the workspace source or workspace release artifact directory to omit its
+development tooling.
+Live provider credentials and provider network access are forbidden in tests.
+
+## 15. Upgrade and semantic-diff policy
+
+An update is a new exact source admission, even when the package name is
+unchanged. The importer refetches the immutable tarball/repository/schema,
+recomputes every hash, rechecks ownership/provenance/license/dependencies and
+embedded material, and creates a new record. A mutable verified-registry row,
+retag, semver range, or npm `latest` change never updates Donat.
+
+The generated review report must diff:
+
+- package/repository/schema identity, integrity, provenance, and license;
+- source paths/file hashes and notices;
+- provider API version and fixed origins;
+- credential fields, auth class, OAuth scopes, non-refreshing token acquisition
+  behavior, and redactions;
+- manifest schema epoch; connector/credential/operation/trigger/event stable
+  SemVer; runtime/value/canonical/source-record/classifier/generator epochs;
+- complete operation input/output contracts and hashes, resolved origins,
+  ordered request steps/transforms, stored selected-header capabilities,
+  mappings/defaults, effects/idempotency, pagination, complete error plan,
+  capacity/rate/serialization and every step/operation bound;
+- processor/authenticator/codec/normalizer IDs, implementation revisions, and
+  Rust diffs;
+- record/semantic/provenance/value-contract hashes, exact fact value/origin
+  bindings, and complete generated projection equality;
+- Donat tests, fixtures, and snapshots.
+
+Any protocol-visible or type-semantic change receives a new operation or
+credential version. Removal is rejected while a non-terminal Process revision
+pins the dependency. Security response can retire new starts through
+deploy-time metadata, but it does not reinterpret history or silently swap the
+implementation under active work.
+
+A projection-schema change receives a new epoch/domain; it never mutates the
+meaning of a v1 hash. A pinned operation retains every field listed above, so
+the upgrade report cannot compare only IDs or current catalog summaries.
+
+Every generated diff and snapshot receives human review. Source records,
+reference register entries, and notices are updated in the same change. A
+meaningful new trade-off requires an ADR before implementation.
+
+## 16. Exact out of scope
+
+The following are not part of this specification:
+
+- any UI, editor, form generator, icon catalog, provider description catalog,
+  dynamic options callback, or n8n-compatible node UX;
+- Node.js, JavaScript execution, npm installation at runtime, WASM, dynamic
+  libraries, downloaded/native plugins, package URLs, sidecars, or connector
+  microservices;
+- source-level use of n8n built-ins or SUL tests/fixtures/metadata without
+  explicit derivative-work rights;
+- automatic TypeScript-to-Rust translation of imperative code;
+- `If`, `Switch`, `Merge`, `Code`, `Wait`, loops, batching as workflow logic,
+  n8n items/paired items, subworkflows, AI agent/tool orchestration, or
+  send-and-wait;
+- arbitrary URL/method/header HTTP requests, caller-selected proxy/TLS policy,
+  private-network access for imported providers, or provider-returned
+  cross-origin URLs;
+- business branching, compensation, retries, sleeps, durable timers, database
+  writes, authorization decisions, or Process transitions inside a connector;
+- a generic connector execution endpoint through GraphQL, REST, MCP, or an
+  admin route;
+- an admin role, data-permission bypass, runtime metadata mutation, credential
+  management API, or mutable process operator API;
+- interactive tenant OAuth consent/onboarding, refresh-token
+  persistence/rotation, distributed refresh, writable external resolvers, a
+  built-in credential vault, tenant credential CRUD, or consent callback
+  routing;
+- filesystem or shell access, arbitrary environment access, browser
+  automation, database-driver nodes, local service nodes, or long-lived socket
+  triggers;
+- unbounded streaming, resumable/multi-gigabyte transfers, external object
+  storage, or URL-shaped binary references;
+- complete provider catalog parity, copied upstream prose, or live-provider
+  tests;
+- claiming exactly-once external delivery. Once Spec 005 integration exists,
+  durable activities remain at-least-once; Phase 1 executes only headerless
+  read-only calls or side effects protected by the compiled provider
+  idempotency binding.
+
+## 17. Acceptance and estimated complexity
+
+The factory is accepted only when:
+
+- the exact cohort records pass immutable admission and the first derivative
+  port carries per-file provenance and notices;
+- SerpAPI proves the generic Tier A compiler without executing JavaScript;
+- the existing Stripe slice proves the compiled-step processor ABI without a
+  behavior regression;
+- credentials resolve per use only as read-only capabilities, client
+  credentials tokens are per-activity and non-refreshing, pre-provisioned
+  access tokens are never refreshed or persisted, and no interactive/admin
+  surface exists;
+- fixed-origin egress, runtime budgets, pagination, errors, triggers, and
+  inline binary behavior pass the matrix above;
+- clean production builds and runtime operate offline with no donor
+  source/package/runtime or acquisition/codegen dependency;
+- every process-dependent behavior remains absent until its exact Section 13
+  Spec 005 prerequisite and proof are green;
+- new native connector conformance is exact and the full conformance crate is
+  green after rebuilding `donat`.
+
+Estimated complexity: XL. This is a new acquisition/admission subsystem,
+offline checked-in code generator, cross-cutting runtime ABI, metadata
+evolution, credential boundary, and native conformance surface. The ordered
+slices keep the legal gate, generic executor, processor ABI, triggers, and
+binary work independently reviewable.
+
+## 18. References
+
+- `.superpowers/sdd/2026-07-29-n8n-connector-sourcing/research-report.md`
+- `specs/006-in-binary-connectors.md`
+- `docs/superpowers/plans/2026-07-28-in-binary-connectors.md`
+- `knowledgebase/declarative-saas/reference-porting-register.md`
+- `knowledgebase/declarative-saas/decisions/001-declarative-saas-runtime-and-porting-policy.md`
+- `knowledgebase/declarative-saas/decisions/002-durable-process-operational-contracts.md`
+- `knowledgebase/declarative-saas/decisions/009-durable-process-source-local-compilation-and-journal-contracts.md`
+- `knowledgebase/declarative-saas/decisions/010-static-community-connector-factory-and-runtime-boundaries.md`
+- `knowledgebase/declarative-saas/decisions/012-canonical-catalog-projections-and-persisted-header-capabilities.md`
+- [RFC 8785 — JSON Canonicalization Scheme](https://www.rfc-editor.org/rfc/rfc8785.html)
+- [RFC 7493 — The I-JSON Message Format](https://www.rfc-editor.org/rfc/rfc7493.html)
+- `crates/metadata/src/types.rs`
+- `crates/server/src/connectors/mod.rs`
+- `crates/server/src/connectors/http.rs`
+- `crates/server/src/connectors/stripe.rs`
+- `crates/server/tests/connectors_http.rs`
+- `crates/server/tests/connectors_stripe.rs`
+- `crates/server/tests/connector_webhook.rs`
+- `crates/conformance/tests/connectors.rs`
+- `crates/conformance/fixtures/connectors/`

@@ -1,0 +1,18 @@
+decision_tables:
+  - name: invoice_route
+    inputs:
+      amount: int!
+    output:
+      route: string!
+    hit_policy: first
+    rows:
+      - id: invalid_amount
+        when:
+          amount: "amount + true"
+        output:
+          route: manual
+      - id: default
+        when:
+          amount: "true"
+        output:
+          route: automatic

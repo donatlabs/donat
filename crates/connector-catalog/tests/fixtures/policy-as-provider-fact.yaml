@@ -1,0 +1,79 @@
+record_version: 1
+record_id: source.demo.provider.v1
+subject:
+  kind: provider_artifact
+  value:
+    provider: demo
+    evidence:
+      - source:
+          kind: repository_file
+          value:
+            repository: https://github.com/example/demo
+            commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+            path: openapi.json
+        accessed_on: 2026-07-29
+        content_sha256: '1111111111111111111111111111111111111111111111111111111111111111'
+        terms:
+          kind: reviewed_use
+          value:
+            decision_id: review.demo
+            evidence_url: https://example.test/terms/v1
+        facts:
+          - fact_id: fact.idempotency
+            location:
+              kind: json_pointer
+              value:
+                path: openapi.json
+                pointer: /paths/~1widgets/post
+            normalized_value:
+              kind: string
+              value: Idempotency-Key
+reacquisition:
+  kind: provider_repository_review
+  value: null
+artifact_hashes:
+  - artifact_id: artifact.openapi
+    algorithm:
+      kind: sha256
+      value: null
+    digest: '1111111111111111111111111111111111111111111111111111111111111111'
+    path: openapi.json
+license:
+  kind: permissive
+  value:
+    spdx_id: MIT
+    selected_dual_license_branch: null
+    license_file_path: LICENSE
+    license_file_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+notice:
+  id: notice.demo
+  license_file_path: LICENSE
+  license_file_sha256: '2222222222222222222222222222222222222222222222222222222222222222'
+  required_copyright_lines: [Copyright Demo]
+  notice_bundle_destination: THIRD_PARTY_NOTICES.md
+entrypoints: [openapi.json]
+dependencies: []
+embedded_material: []
+provider_contracts:
+  - contract_id: contract.demo
+    facts:
+      - kind: donat_policy
+        value:
+          policy_id: policy.idempotency.header
+          value:
+            kind: string
+            value: Idempotency-Key
+compatibility:
+  kind: tier_a
+  value: null
+admission:
+  kind: evidence_accepted
+  value:
+    contracts: [contract.demo]
+safety_findings:
+  findings: []
+reviewer: reviewer.demo
+approval_date: 2026-07-29
+proposed_manifest: null
+proposed_destinations: [connector-catalog/sources/records/demo.yaml]
+red_tests: [provider_fact_red]

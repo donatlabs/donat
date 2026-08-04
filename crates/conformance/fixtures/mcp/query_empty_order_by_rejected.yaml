@@ -1,0 +1,27 @@
+description: >
+  query rejects an empty order_by list before GraphQL. An empty list must not
+  count as stable ordering for offset pagination.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 127
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      order_by: []
+      offset: 1
+      limit: 1
+response:
+  jsonrpc: "2.0"
+  id: 127
+  result:
+    isError: true
+    structuredContent:
+      errors: []

@@ -1,0 +1,24 @@
+description: >
+  MCP request metadata progressToken must be a string or integer. tools/call
+  rejects invalid progressToken values before tool routing.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 85
+  method: tools/call
+  params:
+    name: query
+    _meta:
+      progressToken: []
+    arguments:
+      table: pet
+      columns: [id]
+response:
+  jsonrpc: "2.0"
+  id: 85
+  result:
+    isError: true

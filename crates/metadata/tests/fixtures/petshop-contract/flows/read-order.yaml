@@ -1,0 +1,10 @@
+name: read_order
+kind: process
+version: 1
+source: default
+start_at: done
+states:
+  - id: done
+    output:
+      values:
+        status: { literal: complete }

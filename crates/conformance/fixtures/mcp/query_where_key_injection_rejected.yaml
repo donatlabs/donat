@@ -1,0 +1,25 @@
+description: >
+  A GraphQL-looking key inside query.where is rejected before GraphQL
+  execution. MCP where keys are structured GraphQL input field/operator names,
+  while user values stay in variables.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 41
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      where:
+        "name } mutation x { delete_pet(where: {}) { affected_rows } }":
+          _eq: Rex
+response:
+  jsonrpc: "2.0"
+  id: 41
+  result:
+    isError: true

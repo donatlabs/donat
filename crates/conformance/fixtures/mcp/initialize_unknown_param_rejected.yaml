@@ -1,0 +1,23 @@
+description: >
+  initialize params are strict apart from MCP metadata. Unknown params keys are
+  rejected instead of becoming hidden protocol controls.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 81
+  method: initialize
+  params:
+    protocolVersion: "2025-06-18"
+    capabilities: {}
+    clientInfo:
+      name: conformance
+      version: "0"
+    extra: true
+response:
+  jsonrpc: "2.0"
+  id: 81
+  error:
+    code: -32602
+    message: "unknown parameter"

@@ -1,0 +1,105 @@
+name: prescription_review
+kind: process
+version: 1
+source: default
+permissions:
+  - role: customer
+    owner_session_variable: x-donat-user-id
+owner:
+  type: string!
+  capture: { session_variable: x-donat-user-id }
+input:
+  - { name: order_line_id, type: uuid! }
+  - { name: review_deadline, type: timestamptz! }
+  - { name: request_id, type: uuid! }
+output:
+  - { name: prescription_id, type: uuid! }
+  - { name: status, type: PrescriptionState! }
+  - { name: released, type: bool! }
+idempotency:
+  key: { input: request_id }
+  scope:
+    - { input: order_line_id }
+signals:
+  - name: prescription_decision_recorded
+    role: veterinary_reviewer
+    correlation:
+      prescription_id: uuid!
+    payload:
+      decision: ApprovalDecision!
+start_at: submit_review
+states:
+  - id: submit_review
+    command:
+      name: submit_prescription_review
+      run_as: caller
+      arguments:
+        order_line_id: { input: order_line_id }
+        review_deadline: { input: review_deadline }
+        request_id: { input: request_id }
+      next: await_veterinary_decision
+
+  # The reviewer role is fixed in the declaration. Verified committed command
+  # signals are persisted before matching, so duplicate or early delivery
+  # cannot create a second review decision.
+  - id: await_veterinary_decision
+    wait:
+      signal: prescription_decision_recorded
+      role: veterinary_reviewer
+      verification: required
+      persist_before_match: true
+      correlate:
+        prescription_id: { state: submit_review, field: prescription_id }
+      deadline: { state: submit_review, field: review_deadline }
+      next: route_veterinary_decision
+      on_timeout: expire_review
+
+  - id: route_veterinary_decision
+    when:
+      cases:
+        - rule: approval_was_approved
+          with:
+            decision: { state: await_veterinary_decision, field: decision }
+          next: approved
+        - rule: approval_was_rejected
+          with:
+            decision: { state: await_veterinary_decision, field: decision }
+          next: rejected
+      default: unexpected_reviewer_decision
+
+  - id: expire_review
+    command:
+      name: expire_prescription
+      run_as: prescription_worker
+      arguments:
+        prescription_id: { state: submit_review, field: prescription_id }
+        deadline_id: { activity_key: expire_review, as: uuid }
+      next: expired
+
+  # Customer output intentionally omits reviewer identity, private note, and
+  # audit content. Those remain available only through explicit data roles.
+  - id: approved
+    output:
+      values:
+        prescription_id: { state: submit_review, field: prescription_id }
+        status: { literal: approved }
+        released: { literal: true }
+
+  - id: rejected
+    output:
+      values:
+        prescription_id: { state: submit_review, field: prescription_id }
+        status: { literal: rejected }
+        released: { literal: false }
+
+  - id: expired
+    output:
+      values:
+        prescription_id: { state: expire_review, field: prescription_id }
+        status: { state: expire_review, field: status, as: PrescriptionState }
+        released: { literal: false }
+
+  - id: unexpected_reviewer_decision
+    fail:
+      code: unexpected_prescription_reviewer_decision
+      message: The veterinary reviewer supplied an invalid prescription decision

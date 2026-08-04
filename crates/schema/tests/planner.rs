@@ -8,10 +8,13 @@
 use std::collections::{BTreeMap, HashMap};
 
 use donat_catalog_types::{Catalog, ColumnInfo, ForeignKey, TableInfo};
-use donat_ir::{BoolExp, CompareOp, FieldValue, RootField, Scalar, SelectQuery};
-use donat_metadata::Metadata;
-use donat_schema::{Plan, PlanError, Planner, Session};
-use serde_json::{Value as Json, json};
+use donat_ir::{
+    BoolExp, CompareOp, FieldValue, MutationRoot, OrderByTarget, RootField, Scalar, SelectQuery,
+    SetOp,
+};
+use donat_metadata::{Metadata, SourceKind};
+use donat_schema::{Plan, PlanError, Planner, Session, execute_introspection};
+use serde_json::{Map as JsonMap, Value as Json, json};
 
 fn metadata() -> Metadata {
     serde_json::from_value(json!({
@@ -23,6 +26,12 @@ fn metadata() -> Metadata {
             "tables": [
                 {
                     "table": { "schema": "public", "name": "author" },
+                    "configuration": {
+                        "custom_column_names": { "display_name": "displayName" },
+                        "column_config": {
+                            "display_name": { "custom_name": "legacyDisplayName" }
+                        }
+                    },
                     "array_relationships": [{
                         "name": "articles",
                         "using": { "foreign_key_constraint_on": {
@@ -30,13 +39,25 @@ fn metadata() -> Metadata {
                             "column": "author_id"
                         }}
                     }],
+                    "object_relationships": [{
+                        "name": "profile",
+                        "using": { "manual_configuration": {
+                            "remote_table": { "schema": "public", "name": "profile" },
+                            "column_mapping": { "id": "author_id" },
+                            "insertion_order": "after_parent"
+                        }}
+                    }],
                     "insert_permissions": [
                         { "role": "user", "permission": { "check": {}, "columns": ["name"] } }
                     ],
                     "select_permissions": [
                         { "role": "user", "permission": {
-                            "columns": ["id", "name"],
+                            "columns": ["id", "name", "display_name"],
                             "filter": { "id": { "_eq": "X-Donat-User-Id" } }
+                        }},
+                        { "role": "hasura_user", "permission": {
+                            "columns": ["id", "name"],
+                            "filter": { "id": { "_eq": "X-Hasura-User-Id" } }
                         }},
                         { "role": "nopk", "permission": { "columns": ["name"], "filter": {} } },
                         { "role": "s1", "permission": {
@@ -48,10 +69,23 @@ fn metadata() -> Metadata {
                         { "role": "s3", "permission": { "columns": ["id"], "filter": {} } }
                     ],
                     "update_permissions": [
-                        { "role": "user", "permission": { "columns": ["name"], "filter": {} } },
+                        { "role": "user", "permission": { "columns": ["name", "system_meta"], "filter": {} } },
                         { "role": "preset_user", "permission": {
                             "columns": ["name"], "filter": {}, "set": { "name": "preset" }
                         }}
+                    ]
+                },
+                {
+                    "table": { "schema": "public", "name": "profile" },
+                    "object_relationships": [{
+                        "name": "author",
+                        "using": { "foreign_key_constraint_on": "author_id" }
+                    }],
+                    "insert_permissions": [
+                        { "role": "user", "permission": { "check": {}, "columns": ["author_id", "bio"] } }
+                    ],
+                    "select_permissions": [
+                        { "role": "user", "permission": { "columns": ["author_id", "bio"], "filter": {} } }
                     ]
                 },
                 {
@@ -97,6 +131,8 @@ fn col(name: &str, pg_type: &str) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: pg_type.to_string(),
+        pg_typmod: -1,
+        native_type: None,
         nullable: false,
         has_default: false,
     }
@@ -109,9 +145,34 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "author".into(),
-            columns: vec![col("id", "int4"), col("name", "text"), col("secret", "text")],
+            relation_kind: donat_catalog_types::RelationKind::Table,
+            columns: vec![
+                col("id", "int4"),
+                col("name", "text"),
+                col("display_name", "text"),
+                col("secret", "text"),
+                col("system_meta", "jsonb"),
+            ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![],
+        },
+    );
+    tables.insert(
+        "public.profile".to_string(),
+        TableInfo {
+            schema: "public".into(),
+            name: "profile".into(),
+            relation_kind: donat_catalog_types::RelationKind::Table,
+            columns: vec![col("author_id", "int4"), col("bio", "text")],
+            primary_key: vec!["author_id".into()],
+            unique_keys: vec![],
+            foreign_keys: vec![ForeignKey {
+                constraint_name: "profile_author_id_fkey".into(),
+                column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),
+                referenced_schema: "public".into(),
+                referenced_table: "author".into(),
+            }],
         },
     );
     tables.insert(
@@ -119,6 +180,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "article".into(),
+            relation_kind: donat_catalog_types::RelationKind::Table,
             columns: vec![
                 col("id", "int4"),
                 col("title", "text"),
@@ -126,6 +188,7 @@ fn catalog() -> Catalog {
                 col("published", "bool"),
             ],
             primary_key: vec!["id".into()],
+            unique_keys: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "article_author_id_fkey".into(),
                 column_mapping: BTreeMap::from([("author_id".into(), "id".into())]),
@@ -134,7 +197,10 @@ fn catalog() -> Catalog {
             }],
         },
     );
-    Catalog { tables, functions: BTreeMap::new() }
+    Catalog {
+        tables,
+        functions: BTreeMap::new(),
+    }
 }
 
 fn session(role: &str, vars: &[(&str, &str)]) -> Session {
@@ -153,7 +219,17 @@ fn user() -> Session {
 }
 
 fn plan_gql(query: &str, sess: &Session, variables: Json) -> Result<Plan, PlanError> {
-    let md = metadata();
+    plan_gql_for_source(SourceKind::Postgres, query, sess, variables)
+}
+
+fn plan_gql_for_source(
+    source_kind: SourceKind,
+    query: &str,
+    sess: &Session,
+    variables: Json,
+) -> Result<Plan, PlanError> {
+    let mut md = metadata();
+    md.sources[0].kind = source_kind;
     let cat = catalog();
     let planner = Planner::new(&md, &cat);
     let doc = graphql_parser::parse_query::<String>(query)
@@ -161,6 +237,19 @@ fn plan_gql(query: &str, sess: &Session, variables: Json) -> Result<Plan, PlanEr
         .into_static();
     let vars = variables.as_object().cloned().unwrap_or_default();
     planner.plan(&doc, None, &vars, sess)
+}
+
+fn introspect_for_source(source_kind: SourceKind, query: &str) -> Json {
+    let mut md = metadata();
+    md.sources[0].kind = source_kind;
+    let cat = catalog();
+    let planner = Planner::new(&md, &cat);
+    let doc = graphql_parser::parse_query::<String>(query)
+        .expect("query parses")
+        .into_static();
+    execute_introspection(&planner, &user(), &doc, None, &JsonMap::new())
+        .expect("introspection query")
+        .expect("introspection succeeds")
 }
 
 fn first_select(plan: Plan) -> SelectQuery {
@@ -197,6 +286,315 @@ fn article_where(where_exp: Json, sess: &Session) -> Result<Option<BoolExp>, Pla
     .map(|q| q.predicate)
 }
 
+#[test]
+fn custom_column_names_are_exposed_in_introspection() {
+    let md = metadata();
+    let cat = catalog();
+    let planner = Planner::new(&md, &cat);
+    let doc =
+        graphql_parser::parse_query::<String>(r#"{ __type(name: "author") { fields { name } } }"#)
+            .expect("query parses")
+            .into_static();
+    let data = execute_introspection(&planner, &user(), &doc, None, &JsonMap::new())
+        .expect("introspection query")
+        .expect("introspection succeeds");
+
+    let fields = data["__type"]["fields"]
+        .as_array()
+        .expect("fields array")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(fields.contains(&"displayName"), "{fields:?}");
+    assert!(!fields.contains(&"display_name"), "{fields:?}");
+}
+
+#[test]
+fn custom_column_names_plan_to_physical_columns() {
+    let query = r#"
+        query {
+          author(
+            where: { displayName: { _eq: "Ada" } }
+            order_by: { displayName: asc }
+          ) {
+            displayName
+          }
+        }
+    "#;
+    let select = gql_select(query, &user());
+
+    let [field] = select.fields.as_slice() else {
+        panic!("expected one selected field, got {:?}", select.fields);
+    };
+    assert!(matches!(
+        &field.value,
+        FieldValue::Column { column, .. } if column == "display_name"
+    ));
+    assert!(matches!(
+        &select.order_by[0].target,
+        OrderByTarget::Column(column) if column == "display_name"
+    ));
+    assert!(matches!(
+        select.predicate,
+        Some(BoolExp::And(items)) if items.iter().any(|item| {
+            matches!(item, BoolExp::Compare { column, .. } if column == "display_name")
+        })
+    ));
+}
+
+#[test]
+fn insert_input_exposes_after_parent_object_relationships() {
+    let md = metadata();
+    let cat = catalog();
+    let planner = Planner::new(&md, &cat);
+    let doc = graphql_parser::parse_query::<String>(
+        r#"{ __type(name: "author_insert_input") { inputFields { name type { name } } } }"#,
+    )
+    .expect("query parses")
+    .into_static();
+    let data = execute_introspection(&planner, &user(), &doc, None, &JsonMap::new())
+        .expect("introspection query")
+        .expect("introspection succeeds");
+
+    let fields = data["__type"]["inputFields"]
+        .as_array()
+        .expect("inputFields array")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(fields.contains(&"profile"), "{fields:?}");
+}
+
+#[test]
+fn insert_one_accepts_after_parent_object_relationship_data() {
+    let plan = plan_gql(
+        r#"
+        mutation {
+          insert_author_one(object: { name: "Ada", profile: { data: { bio: "math" } } }) {
+            id
+            name
+          }
+        }
+        "#,
+        &user(),
+        json!({}),
+    )
+    .expect("nested object insert plans");
+
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected mutation plan")
+    };
+    let [MutationRoot::Insert { insert, .. }] = roots.as_slice() else {
+        panic!("expected one insert root, got {roots:?}")
+    };
+    assert_eq!(insert.nested_object_inserts.len(), 1);
+    let nested = &insert.nested_object_inserts[0];
+    assert_eq!(nested.relationship_name, "profile");
+    assert_eq!(nested.table.name, "profile");
+    assert_eq!(
+        nested.column_mapping,
+        vec![("id".to_string(), "author_id".to_string())]
+    );
+    assert_eq!(
+        nested.columns,
+        vec![("bio".to_string(), "text".to_string())]
+    );
+}
+
+#[test]
+fn sqlite_and_mysql_hide_and_reject_after_parent_nested_inserts() {
+    let nested_insert = r#"
+        mutation {
+          insert_author_one(object: { name: "Ada", profile: { data: { bio: "math" } } }) {
+            id
+          }
+        }
+    "#;
+
+    for source_kind in [SourceKind::Sqlite, SourceKind::Mysql] {
+        let data = introspect_for_source(
+            source_kind,
+            r#"{ __type(name: "author_insert_input") { inputFields { name } } }"#,
+        );
+        let fields = data["__type"]["inputFields"]
+            .as_array()
+            .expect("insert input fields")
+            .iter()
+            .filter_map(|field| field["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!fields.contains(&"profile"), "{source_kind:?}: {fields:?}");
+
+        let error = plan_gql_for_source(source_kind, nested_insert, &user(), json!({}))
+            .expect_err("unsupported nested insert must fail during planning");
+        assert_eq!(
+            error.message, "field 'profile' not found in type: 'author_insert_input'",
+            "{source_kind:?}"
+        );
+    }
+}
+
+#[test]
+fn update_by_pk_accepts_jsonb_append_input() {
+    let plan = plan_gql(
+        r#"
+        mutation {
+          update_author_by_pk(
+            pk_columns: { id: 1 }
+            _append: { system_meta: { deleted: { by: "user-1" } } }
+          ) {
+            id
+          }
+        }
+        "#,
+        &user(),
+        json!({}),
+    )
+    .expect("jsonb append update plans");
+
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected mutation plan")
+    };
+    let [MutationRoot::Update { update, .. }] = roots.as_slice() else {
+        panic!("expected one update root, got {roots:?}")
+    };
+    assert!(
+        update.sets.iter().any(|op| matches!(
+            op,
+            SetOp::JsonbAppend { column, .. } if column == "system_meta"
+        )),
+        "{:?}",
+        update.sets
+    );
+}
+
+#[test]
+fn update_introspection_exposes_jsonb_append_input() {
+    let md = metadata();
+    let cat = catalog();
+    let planner = Planner::new(&md, &cat);
+    let doc = graphql_parser::parse_query::<String>(
+        r#"
+        {
+          __type(name: "author_append_input") {
+            inputFields { name }
+          }
+        }
+        "#,
+    )
+    .expect("query parses")
+    .into_static();
+    let data = execute_introspection(&planner, &user(), &doc, None, &JsonMap::new())
+        .expect("introspection query")
+        .expect("introspection succeeds");
+
+    let fields = data["__type"]["inputFields"]
+        .as_array()
+        .expect("inputFields array")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(fields, vec!["system_meta"]);
+}
+
+#[test]
+fn sqlite_and_mysql_hide_and_reject_jsonb_append_updates() {
+    let append_update = r#"
+        mutation {
+          update_author_by_pk(
+            pk_columns: { id: 1 }
+            _append: { system_meta: { deleted: true } }
+          ) { id }
+        }
+    "#;
+
+    for source_kind in [SourceKind::Sqlite, SourceKind::Mysql] {
+        let mutation = introspect_for_source(
+            source_kind,
+            r#"{ __type(name: "mutation_root") { fields { name args { name } } } }"#,
+        );
+        let update = mutation["__type"]["fields"]
+            .as_array()
+            .expect("mutation fields")
+            .iter()
+            .find(|field| field["name"] == "update_author")
+            .expect("update_author field");
+        let args = update["args"]
+            .as_array()
+            .expect("update arguments")
+            .iter()
+            .filter_map(|arg| arg["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!args.contains(&"_append"), "{source_kind:?}: {args:?}");
+
+        let append_type = introspect_for_source(
+            source_kind,
+            r#"{ __type(name: "author_append_input") { name } }"#,
+        );
+        assert_eq!(append_type["__type"], Json::Null, "{source_kind:?}");
+
+        let error = plan_gql_for_source(source_kind, append_update, &user(), json!({}))
+            .expect_err("unsupported jsonb append must fail during planning");
+        assert_eq!(
+            error.message, "unexpected argument: \"_append\"",
+            "{source_kind:?}"
+        );
+    }
+}
+
+#[test]
+fn sqlite_and_mysql_reject_deferred_upserts_during_planning() {
+    for source_kind in [SourceKind::Sqlite, SourceKind::Mysql] {
+        let error = plan_gql_for_source(
+            source_kind,
+            r#"
+            mutation {
+              insert_author(
+                objects: [{ name: "Ada" }]
+                on_conflict: { constraint: author_pkey, update_columns: [name] }
+              ) {
+                affected_rows
+              }
+            }
+            "#,
+            &user(),
+            json!({}),
+        )
+        .expect_err("deferred upsert must be rejected by the planner");
+
+        assert_eq!(
+            error.message, "unexpected argument: \"on_conflict\"",
+            "{source_kind:?}"
+        );
+    }
+}
+
+#[test]
+fn postgres_still_plans_upserts() {
+    let plan = plan_gql(
+        r#"
+        mutation {
+          insert_author(
+            objects: [{ name: "Ada" }]
+            on_conflict: { constraint: author_pkey, update_columns: [name] }
+          ) {
+            affected_rows
+          }
+        }
+        "#,
+        &user(),
+        json!({}),
+    )
+    .expect("Postgres upsert plans");
+
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected a mutation plan")
+    };
+    let MutationRoot::Insert { insert, .. } = &roots[0] else {
+        panic!("expected an insert root")
+    };
+    assert!(insert.on_conflict.is_some());
+}
+
 // ---------------------------------------------------------------------
 // predicate.rs: bool_exp parsing
 // ---------------------------------------------------------------------
@@ -209,26 +607,59 @@ fn legacy_dollar_logical_ops_parse() {
     )
     .unwrap()
     .expect("predicate present");
-    let BoolExp::Or(items) = pred else { panic!("expected Or, got {pred:?}") };
+    let BoolExp::Or(items) = pred else {
+        panic!("expected Or, got {pred:?}")
+    };
     assert_eq!(items.len(), 2);
-    assert!(matches!(&items[0], BoolExp::Compare { column, op: CompareOp::Gt(_), .. } if column == "id"));
-    let BoolExp::Not(inner) = &items[1] else { panic!("expected Not") };
-    assert!(matches!(&**inner, BoolExp::Compare { op: CompareOp::Eq(_), .. }));
+    assert!(
+        matches!(&items[0], BoolExp::Compare { column, op: CompareOp::Gt(_), .. } if column == "id")
+    );
+    let BoolExp::Not(inner) = &items[1] else {
+        panic!("expected Not")
+    };
+    assert!(matches!(
+        &**inner,
+        BoolExp::Compare {
+            op: CompareOp::Eq(_),
+            ..
+        }
+    ));
 }
 
 #[test]
 fn legacy_dollar_comparison_ops_parse() {
-    let pred = article_where(json!({ "id": { "$gt": 5 } }), &user()).unwrap().unwrap();
-    assert!(matches!(pred, BoolExp::Compare { op: CompareOp::Gt(_), .. }));
+    let pred = article_where(json!({ "id": { "$gt": 5 } }), &user())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        pred,
+        BoolExp::Compare {
+            op: CompareOp::Gt(_),
+            ..
+        }
+    ));
     // `$ne` is the legacy alias of `_neq`.
-    let pred = article_where(json!({ "id": { "$ne": 3 } }), &user()).unwrap().unwrap();
-    assert!(matches!(pred, BoolExp::Compare { op: CompareOp::Neq(_), .. }));
+    let pred = article_where(json!({ "id": { "$ne": 3 } }), &user())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        pred,
+        BoolExp::Compare {
+            op: CompareOp::Neq(_),
+            ..
+        }
+    ));
 }
 
 #[test]
 fn bare_value_is_implicit_eq() {
     let pred = article_where(json!({ "id": 7 }), &user()).unwrap().unwrap();
-    let BoolExp::Compare { column, op: CompareOp::Eq(Scalar::Json(v)), .. } = pred else {
+    let BoolExp::Compare {
+        column,
+        op: CompareOp::Eq(Scalar::Json(v)),
+        ..
+    } = pred
+    else {
         panic!("expected implicit _eq compare")
     };
     assert_eq!(column, "id");
@@ -239,14 +670,20 @@ fn bare_value_is_implicit_eq() {
 fn unknown_operator_error_shape() {
     let err = article_where(json!({ "id": { "_bogus": 1 } }), &user()).unwrap_err();
     assert_eq!(err.code, "validation-failed");
-    assert_eq!(err.message, "unexpected operator \"_bogus\" for column 'id'");
+    assert_eq!(
+        err.message,
+        "unexpected operator \"_bogus\" for column 'id'"
+    );
 }
 
 #[test]
 fn unknown_column_in_bool_exp_error_shape() {
     let err = article_where(json!({ "nope": { "_eq": 1 } }), &user()).unwrap_err();
     assert_eq!(err.code, "validation-failed");
-    assert_eq!(err.message, "field 'nope' not found in type: 'article_bool_exp'");
+    assert_eq!(
+        err.message,
+        "field 'nope' not found in type: 'article_bool_exp'"
+    );
 }
 
 #[test]
@@ -266,9 +703,17 @@ fn exists_predicate_parses() {
     )
     .unwrap()
     .unwrap();
-    let BoolExp::Exists { table, predicate } = pred else { panic!("expected Exists") };
+    let BoolExp::Exists { table, predicate } = pred else {
+        panic!("expected Exists")
+    };
     assert_eq!(table.name, "author");
-    assert!(matches!(&*predicate, BoolExp::Compare { op: CompareOp::Eq(_), .. }));
+    assert!(matches!(
+        &*predicate,
+        BoolExp::Compare {
+            op: CompareOp::Eq(_),
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -276,12 +721,45 @@ fn session_var_substituted_in_permission_filter() {
     // The author filter references X-Donat-User-Id (mixed case); lookup is
     // case-insensitive and the substituted value lands as a string literal.
     let q = gql_select("query { author { id } }", &user());
-    let Some(BoolExp::Compare { column, op: CompareOp::Eq(Scalar::Json(v)), .. }) = q.predicate
+    let Some(BoolExp::Compare {
+        column,
+        op: CompareOp::Eq(Scalar::Json(v)),
+        ..
+    }) = q.predicate
     else {
         panic!("expected the permission filter as the only predicate")
     };
     assert_eq!(column, "id");
     assert_eq!(v, json!("7"));
+}
+
+#[test]
+fn hasura_session_var_substituted_in_permission_filter() {
+    let q = gql_select(
+        "query { author { id } }",
+        &session("hasura_user", &[("x-hasura-user-id", "42")]),
+    );
+    let Some(BoolExp::Compare {
+        column,
+        op: CompareOp::Eq(Scalar::Json(v)),
+        ..
+    }) = q.predicate
+    else {
+        panic!("expected the permission filter as the only predicate")
+    };
+    assert_eq!(column, "id");
+    assert_eq!(v, json!("42"));
+}
+
+#[test]
+fn missing_hasura_session_var_error_shape() {
+    let err = gql_err("query { author { id } }", &session("hasura_user", &[]));
+    assert_eq!(err.code, "not-found");
+    assert_eq!(err.path, "$");
+    assert_eq!(
+        err.message,
+        "missing session variable: \"x-hasura-user-id\""
+    );
 }
 
 #[test]
@@ -302,7 +780,11 @@ fn session_var_not_resolved_in_user_where() {
     )
     .unwrap()
     .unwrap();
-    let BoolExp::Compare { op: CompareOp::Eq(Scalar::Json(v)), .. } = pred else {
+    let BoolExp::Compare {
+        op: CompareOp::Eq(Scalar::Json(v)),
+        ..
+    } = pred
+    else {
         panic!("expected compare")
     };
     assert_eq!(v, json!("X-Donat-User-Id"));
@@ -316,7 +798,11 @@ fn in_session_var_accepts_array_spellings() {
         &session("tagged", &[("x-donat-allowed-ids", "{1,2}")]),
     )
     .unwrap();
-    let Some(BoolExp::Compare { op: CompareOp::In(items), .. }) = q.predicate else {
+    let Some(BoolExp::Compare {
+        op: CompareOp::In(items),
+        ..
+    }) = q.predicate
+    else {
         panic!("expected In predicate")
     };
     assert_eq!(
@@ -330,7 +816,11 @@ fn in_session_var_accepts_array_spellings() {
         &session("tagged", &[("x-donat-allowed-ids", "[1,2]")]),
     )
     .unwrap();
-    let Some(BoolExp::Compare { op: CompareOp::In(items), .. }) = q.predicate else {
+    let Some(BoolExp::Compare {
+        op: CompareOp::In(items),
+        ..
+    }) = q.predicate
+    else {
         panic!("expected In predicate")
     };
     assert_eq!(
@@ -350,11 +840,63 @@ fn is_null_parses_bool_operand() {
     let pred = article_where(json!({ "title": { "_is_null": true } }), &user())
         .unwrap()
         .unwrap();
-    assert!(matches!(pred, BoolExp::Compare { op: CompareOp::IsNull(true), .. }));
+    assert!(matches!(
+        pred,
+        BoolExp::Compare {
+            op: CompareOp::IsNull(true),
+            ..
+        }
+    ));
     let pred = article_where(json!({ "title": { "_is_null": false } }), &user())
         .unwrap()
         .unwrap();
-    assert!(matches!(pred, BoolExp::Compare { op: CompareOp::IsNull(false), .. }));
+    assert!(matches!(
+        pred,
+        BoolExp::Compare {
+            op: CompareOp::IsNull(false),
+            ..
+        }
+    ));
+}
+
+fn permission_is_null(session_value: &str) -> Result<SelectQuery, PlanError> {
+    let mut metadata = metadata();
+    metadata.sources[0].tables[2].select_permissions.push(
+        serde_json::from_value(json!({
+            "role": "null_filter",
+            "permission": {
+                "columns": ["id", "title"],
+                "filter": {
+                    "title": { "_is_null": "X-Donat-Is-Null" }
+                }
+            }
+        }))
+        .expect("permission fixture deserializes"),
+    );
+    let catalog = catalog();
+    Planner::new(&metadata, &catalog).plan_v1_select(
+        &json!({ "table": "article", "columns": ["id"] }),
+        &session("null_filter", &[("x-donat-is-null", session_value)]),
+    )
+}
+
+#[test]
+fn is_null_permission_session_string_is_strict_boolean() {
+    for (value, expected) in [("TRUE", true), ("false", false)] {
+        let query = permission_is_null(value)
+            .unwrap_or_else(|error| panic!("`{value}` must parse: {error:?}"));
+        assert!(matches!(
+            query.predicate,
+            Some(BoolExp::Compare {
+                op: CompareOp::IsNull(actual),
+                ..
+            }) if actual == expected
+        ));
+    }
+
+    let error = permission_is_null("yes").expect_err("non-boolean session text must fail closed");
+    assert_eq!(error.code, "validation-failed");
+    assert_eq!(error.message, "expected a boolean");
 }
 
 #[test]
@@ -363,17 +905,31 @@ fn column_compare_root_and_relationship_paths() {
     let pred = article_where(json!({ "id": { "$ceq": ["$", "author_id"] } }), &user())
         .unwrap()
         .unwrap();
-    let BoolExp::Compare { op: CompareOp::CompareColumn { sql_op, column, root }, .. } = pred
+    let BoolExp::Compare {
+        op:
+            CompareOp::CompareColumn {
+                sql_op,
+                column,
+                root,
+            },
+        ..
+    } = pred
     else {
         panic!("expected CompareColumn")
     };
-    assert_eq!((sql_op.as_str(), column.as_str(), root), ("=", "author_id", true));
+    assert_eq!(
+        (sql_op.as_str(), column.as_str(), root),
+        ("=", "author_id", true)
+    );
 
     // [rel, col] compares against a column of the related table.
     let pred = article_where(json!({ "id": { "_ceq": ["author", "id"] } }), &user())
         .unwrap()
         .unwrap();
-    let BoolExp::Compare { op: CompareOp::CompareColumnRel { table, column, .. }, .. } = pred
+    let BoolExp::Compare {
+        op: CompareOp::CompareColumnRel { table, column, .. },
+        ..
+    } = pred
     else {
         panic!("expected CompareColumnRel")
     };
@@ -388,7 +944,10 @@ fn column_compare_root_and_relationship_paths() {
 fn variable_defaults_and_overrides() {
     // The definition's default applies when the variable is absent...
     let q = "query($lim: Int = 3) { article(limit: $lim) { id } }";
-    assert_eq!(first_select(plan_gql(q, &user(), json!({})).unwrap()).limit, Some(3));
+    assert_eq!(
+        first_select(plan_gql(q, &user(), json!({})).unwrap()).limit,
+        Some(3)
+    );
     // ...and a provided value overrides it.
     assert_eq!(
         first_select(plan_gql(q, &user(), json!({ "lim": 7 })).unwrap()).limit,
@@ -399,7 +958,10 @@ fn variable_defaults_and_overrides() {
 #[test]
 fn missing_required_variable_error() {
     let err = gql_err("query($lim: Int!) { article(limit: $lim) { id } }", &user());
-    assert_eq!(err.message, "expecting a value for non-nullable variable: \"lim\"");
+    assert_eq!(
+        err.message,
+        "expecting a value for non-nullable variable: \"lim\""
+    );
 }
 
 #[test]
@@ -426,7 +988,10 @@ fn fragment_errors() {
         "query { article { ...Bits } } fragment Bits on author { id }",
         &user(),
     );
-    assert_eq!(err.message, "fragment \"Bits\" is defined on 'author', not 'article'");
+    assert_eq!(
+        err.message,
+        "fragment \"Bits\" is defined on 'author', not 'article'"
+    );
     // An undefined fragment is reported by name.
     let err = gql_err("query { article { ...Nope } }", &user());
     assert_eq!(err.message, "fragment \"Nope\" not found");
@@ -435,8 +1000,14 @@ fn fragment_errors() {
 #[test]
 fn by_pk_hidden_when_role_cannot_select_all_pk_columns() {
     // Role "nopk" may select author.name but not the pk column id.
-    let err = gql_err("query { author_by_pk(id: 1) { name } }", &session("nopk", &[]));
-    assert_eq!(err.message, "field 'author_by_pk' not found in type: 'query_root'");
+    let err = gql_err(
+        "query { author_by_pk(id: 1) { name } }",
+        &session("nopk", &[]),
+    );
+    assert_eq!(
+        err.message,
+        "field 'author_by_pk' not found in type: 'query_root'"
+    );
 }
 
 #[test]
@@ -474,14 +1045,23 @@ fn columnless_role_has_no_column_aggregate_ops() {
         "query { article_aggregate { aggregate { max { id } } } }",
         &session("counter", &[]),
     );
-    assert_eq!(err.message, "field 'max' not found in type: 'article_aggregate_fields'");
+    assert_eq!(
+        err.message,
+        "field 'max' not found in type: 'article_aggregate_fields'"
+    );
 }
 
 #[test]
 fn aggregate_root_requires_allow_aggregations() {
     // The user's author permission has no allow_aggregations.
-    let err = gql_err("query { author_aggregate { aggregate { count } } }", &user());
-    assert_eq!(err.message, "field 'author_aggregate' not found in type: 'query_root'");
+    let err = gql_err(
+        "query { author_aggregate { aggregate { count } } }",
+        &user(),
+    );
+    assert_eq!(
+        err.message,
+        "field 'author_aggregate' not found in type: 'query_root'"
+    );
 }
 
 #[test]
@@ -520,11 +1100,37 @@ fn order_by_relationship_aggregate_allows_whitelisted_function() {
 }
 
 #[test]
+fn clickhouse_order_by_rejects_tracked_relationships() {
+    for (relationship, nested) in [
+        ("articles_aggregate", "articles_aggregate: { count: asc }"),
+        ("profile", "profile: { id: asc }"),
+    ] {
+        let query = format!("query {{ author(order_by: {{ {nested} }}) {{ id }} }}");
+        let err = plan_gql_for_source(SourceKind::Clickhouse, &query, &user(), json!({}))
+            .expect_err("ClickHouse must not plan relationship order_by");
+        assert_eq!(err.code, "validation-failed");
+        assert_eq!(
+            err.message,
+            format!("field '{relationship}' not found in type: 'author'")
+        );
+    }
+}
+
+#[test]
 fn permission_limit_caps_user_limit() {
     // article select for "user" carries limit: 100.
-    assert_eq!(gql_select("query { article { id } }", &user()).limit, Some(100));
-    assert_eq!(gql_select("query { article(limit: 5) { id } }", &user()).limit, Some(5));
-    assert_eq!(gql_select("query { article(limit: 500) { id } }", &user()).limit, Some(100));
+    assert_eq!(
+        gql_select("query { article { id } }", &user()).limit,
+        Some(100)
+    );
+    assert_eq!(
+        gql_select("query { article(limit: 5) { id } }", &user()).limit,
+        Some(5)
+    );
+    assert_eq!(
+        gql_select("query { article(limit: 500) { id } }", &user()).limit,
+        Some(100)
+    );
 }
 
 #[test]
@@ -555,7 +1161,9 @@ fn inherited_role_limit_and_filter_combine_parents() {
     // inh = [s1 (limit 10), s2 (limit 20)]: max limit, OR of filters.
     let q = gql_select("query { author { id } }", &session("inh", &[]));
     assert_eq!(q.limit, Some(20));
-    let Some(BoolExp::Or(parts)) = q.predicate else { panic!("expected OR of parent filters") };
+    let Some(BoolExp::Or(parts)) = q.predicate else {
+        panic!("expected OR of parent filters")
+    };
     assert_eq!(parts.len(), 2);
 
     // inh2 = [s1 (limit 10), s3 (no limit, unrestricted)]: unlimited wins.
@@ -570,7 +1178,10 @@ fn inherited_role_partially_granted_column_is_guarded() {
     // id is granted by both parents and stays plain.
     let q = gql_select("query { author { id name } }", &session("inh", &[]));
     assert!(matches!(q.fields[0].value, FieldValue::Column { .. }));
-    assert!(matches!(q.fields[1].value, FieldValue::ColumnGuarded { .. }));
+    assert!(matches!(
+        q.fields[1].value,
+        FieldValue::ColumnGuarded { .. }
+    ));
 }
 
 #[test]
@@ -593,7 +1204,10 @@ fn conflicting_inherited_mutation_permission_hides_field() {
         "mutation { delete_article(where: {}) { affected_rows } }",
         &session("kid", &[]),
     );
-    assert_eq!(err.message, "field 'delete_article' not found in type: 'mutation_root'");
+    assert_eq!(
+        err.message,
+        "field 'delete_article' not found in type: 'mutation_root'"
+    );
 }
 
 #[test]
@@ -604,7 +1218,9 @@ fn identical_parent_permissions_are_inherited() {
         json!({}),
     )
     .expect("identical parent permissions resolve");
-    let Plan::Mutation(roots) = plan else { panic!("expected a mutation plan") };
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected a mutation plan")
+    };
     assert_eq!(roots.len(), 1);
     assert!(matches!(&roots[0], donat_ir::MutationRoot::Delete { .. }));
 }
@@ -651,7 +1267,39 @@ fn v1_insert_not_allowed_shape_keeps_trailing_space() {
     assert_eq!(err.code, "permission-denied");
     assert_eq!(err.path, "$.args");
     // Donat's exact message ends with ". " — the trailing space matters.
-    assert_eq!(err.message, "insert on \"author\" for role \"stranger\" is not allowed. ");
+    assert_eq!(
+        err.message,
+        "insert on \"author\" for role \"stranger\" is not allowed. "
+    );
+}
+
+#[test]
+fn sqlite_and_mysql_v1_reject_deferred_upserts_during_planning() {
+    for source_kind in [SourceKind::Sqlite, SourceKind::Mysql] {
+        let mut md = metadata();
+        md.sources[0].kind = source_kind;
+        let cat = catalog();
+        let error = Planner::new(&md, &cat)
+            .plan_v1_insert(
+                &json!({
+                    "table": "author",
+                    "objects": [{ "name": "Ada" }],
+                    "on_conflict": {
+                        "constraint": "author_pkey",
+                        "action": "update"
+                    }
+                }),
+                &user(),
+            )
+            .expect_err("deferred v1 upsert must be rejected by the planner");
+
+        assert_eq!(error.code, "validation-failed", "{source_kind:?}");
+        assert_eq!(error.path, "$", "{source_kind:?}");
+        assert_eq!(
+            error.message, "on_conflict is not supported by this backend",
+            "{source_kind:?}"
+        );
+    }
 }
 
 #[test]
@@ -695,8 +1343,11 @@ fn v1_update_preset_column_shape() {
 #[test]
 fn v1_select_distinguishes_hidden_and_unknown_columns() {
     // A column outside the mask is permission-denied with its index path...
-    let err = v1_select(json!({ "table": "author", "columns": ["id", "secret"] }), &user())
-        .unwrap_err();
+    let err = v1_select(
+        json!({ "table": "author", "columns": ["id", "secret"] }),
+        &user(),
+    )
+    .unwrap_err();
     assert_eq!(err.code, "permission-denied");
     assert_eq!(err.path, "$.args.columns[1]");
     assert_eq!(
@@ -704,8 +1355,7 @@ fn v1_select_distinguishes_hidden_and_unknown_columns() {
         "role \"user\" does not have permission to select column \"secret\""
     );
     // ...an unknown column is a validation failure.
-    let err = v1_select(json!({ "table": "author", "columns": ["nope"] }), &user())
-        .unwrap_err();
+    let err = v1_select(json!({ "table": "author", "columns": ["nope"] }), &user()).unwrap_err();
     assert_eq!(err.code, "validation-failed");
     assert_eq!(err.path, "$");
     assert_eq!(err.message, "column \"nope\" not found");
@@ -724,7 +1374,10 @@ fn st_d_within_parses_2d_and_3d_variants() {
     .unwrap();
     assert!(matches!(
         pred,
-        BoolExp::Compare { op: CompareOp::StDWithin { three_d: false, .. }, .. }
+        BoolExp::Compare {
+            op: CompareOp::StDWithin { three_d: false, .. },
+            ..
+        }
     ));
 
     let pred = article_where(
@@ -735,6 +1388,91 @@ fn st_d_within_parses_2d_and_3d_variants() {
     .unwrap();
     assert!(matches!(
         pred,
-        BoolExp::Compare { op: CompareOp::StDWithin { three_d: true, .. }, .. }
+        BoolExp::Compare {
+            op: CompareOp::StDWithin { three_d: true, .. },
+            ..
+        }
     ));
+}
+
+// ---------------------------------------------------------------------
+// validators.rs: per-role value validators
+// ---------------------------------------------------------------------
+
+/// Metadata where `user` declares a validator and `assistant` inherits the
+/// permission without declaring anything of its own.
+fn metadata_with_inherited_validator() -> Metadata {
+    let mut md = metadata();
+    let author = md.sources[0]
+        .tables
+        .iter_mut()
+        .find(|entry| entry.table.name() == "author")
+        .expect("the author table is in the fixture");
+    author.insert_permissions[0].permission.validate = serde_json::from_value(json!([{
+        "expression": "size(name) >= 3",
+        "message": "name must be at least 3 characters"
+    }]))
+    .expect("a validate list parses");
+    md.inherited_roles.push(
+        serde_json::from_value(json!({ "role_name": "assistant", "role_set": ["user"] })).unwrap(),
+    );
+    md
+}
+
+fn plan_author_insert(md: &Metadata, role: &str) -> Result<Plan, PlanError> {
+    let cat = catalog();
+    let planner = Planner::new(md, &cat);
+    let doc = graphql_parser::parse_query::<String>(
+        r#"mutation { insert_author(objects: [{ name: "Ada" }]) { affected_rows } }"#,
+    )
+    .expect("query parses")
+    .into_static();
+    planner.plan(
+        &doc,
+        None,
+        &JsonMap::new(),
+        &session(role, &[("x-donat-user-id", "7")]),
+    )
+}
+
+fn insert_validator_messages(plan: Plan) -> Vec<String> {
+    let Plan::Mutation(roots) = plan else {
+        panic!("expected a mutation plan")
+    };
+    let MutationRoot::Insert { insert, .. } = &roots[0] else {
+        panic!("expected an insert root")
+    };
+    insert
+        .validators
+        .iter()
+        .map(|validator| validator.message.clone())
+        .collect()
+}
+
+/// The role that declared the validators is held to them.
+#[test]
+fn a_declaring_role_carries_its_validators_into_the_plan() {
+    let md = metadata_with_inherited_validator();
+    let plan = plan_author_insert(&md, "user").expect("the declaring role plans an insert");
+    assert_eq!(
+        insert_validator_messages(plan),
+        vec!["name must be at least 3 characters".to_string()]
+    );
+}
+
+/// An inherited role is granted the parent's write permission wholesale —
+/// columns, check, presets. It must inherit the parent's value contract with
+/// them. Keying the validator lookup on the request role instead of the
+/// declaring role made inheritance a way to shed the parent's checks, which
+/// is exactly the shape of hole this asserts against.
+#[test]
+fn an_inherited_role_cannot_shed_the_parents_validators() {
+    let md = metadata_with_inherited_validator();
+    let plan = plan_author_insert(&md, "assistant")
+        .expect("the inherited role plans an insert through the parent's permission");
+    assert_eq!(
+        insert_validator_messages(plan),
+        vec!["name must be at least 3 characters".to_string()],
+        "an inherited role must be held to the permission's validators"
+    );
 }

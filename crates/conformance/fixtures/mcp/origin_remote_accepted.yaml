@@ -1,0 +1,19 @@
+description: >
+  MCP leaves non-local Origin admission to the deployment edge and passes the
+  request to JSON-RPC dispatch.
+url: /mcp
+method: POST
+status: 200
+headers:
+  Origin: "https://evil.example"
+  MCP-Protocol-Version: "2025-06-18"
+body:
+  jsonrpc: "2.0"
+  id: 89
+  method: unknown
+response:
+  jsonrpc: "2.0"
+  id: 89
+  error:
+    code: -32601
+    message: method not found

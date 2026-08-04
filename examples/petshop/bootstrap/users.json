@@ -1,0 +1,53 @@
+[
+    {
+        "email": "alice@example.com",
+        "given_name": "Alice",
+        "family_name": "Buyer",
+        "password": {
+            "Plain": "petshop-demo-password"
+        },
+        "roles": [
+            "customer"
+        ],
+        "enabled": true,
+        "email_verified": true,
+        "attributes": [
+            {
+                "key": "customer_id",
+                "value": "customer-1"
+            }
+        ]
+    },
+    {
+        "email": "bob@example.com",
+        "given_name": "Bob",
+        "family_name": "Buyer",
+        "password": {
+            "Plain": "petshop-demo-password"
+        },
+        "roles": [
+            "customer"
+        ],
+        "enabled": true,
+        "email_verified": true,
+        "attributes": [
+            {
+                "key": "customer_id",
+                "value": "customer-2"
+            }
+        ]
+    },
+    {
+        "email": "sam@example.com",
+        "given_name": "Sam",
+        "family_name": "Staff",
+        "password": {
+            "Plain": "petshop-demo-password"
+        },
+        "roles": [
+            "staff"
+        ],
+        "enabled": true,
+        "email_verified": true
+    }
+]

@@ -1,0 +1,13 @@
+[package]
+name = "donat-connector-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutral IDs, bounded envelopes, and host traits for compiled connectors"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+donat-value-contract = { path = "../value-contract" }

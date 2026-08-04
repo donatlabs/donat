@@ -1,0 +1,144 @@
+name: payment_reconciliation
+kind: process
+version: 1
+source: default
+permissions:
+  - role: reconciliation_worker
+input:
+  - { name: payment_id, type: uuid! }
+  - { name: provider_event_id, type: string! }
+  - { name: expected_amount_minor, type: bigint! }
+  - { name: expected_currency, type: string! }
+  - { name: expected_status, type: PaymentState! }
+  - { name: expected_provider_reference, type: string! }
+  - { name: request_id, type: uuid! }
+output:
+  - { name: payment_id, type: uuid! }
+  - { name: reconciliation_status, type: ReconciliationState! }
+  - { name: reconciliation_id, type: uuid }
+idempotency:
+  key: { input: provider_event_id }
+  scope:
+    - { input: payment_id }
+signals:
+  - name: payment_reconciliation_resolved
+    role: support
+    correlation:
+      payment_id: uuid!
+      provider_event_id: string!
+    payload:
+      reconciliation_status: ReconciliationState!
+      reconciliation_id: uuid!
+start_at: request_reconciliation
+states:
+  # The synchronous provider response carries the complete normalized evidence.
+  # The named Rule gates an automatic match against the trusted local snapshot.
+  - id: request_reconciliation
+    request:
+      connector: mock_payment
+      operation: reconcile
+      input:
+        payment_id: { input: payment_id }
+        provider_event_id: { input: provider_event_id }
+        provider_reference: { input: expected_provider_reference }
+      timeout:
+        schedule_to_start: 5s
+        start_to_close: 6s
+      retry:
+        retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
+      next: route_reconciliation
+      on_error:
+        routes:
+          - { kinds: [authentication, validation], next: provider_unavailable }
+          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: provider_unavailable }
+        fallback: { next: provider_unavailable }
+
+  - id: route_reconciliation
+    when:
+      cases:
+        - rule: payment_reconciliation_supports_decision
+          with:
+            local_amount_minor: { input: expected_amount_minor }
+            local_currency: { input: expected_currency }
+            local_status: { input: expected_status, as: string }
+            local_provider_reference: { input: expected_provider_reference }
+            provider_amount_minor: { state: request_reconciliation, field: provider_amount_minor }
+            provider_currency: { state: request_reconciliation, field: provider_currency }
+            provider_status: { state: request_reconciliation, field: provider_status }
+            provider_reference: { state: request_reconciliation, field: provider_reference }
+            decision: { literal: matched }
+          next: record_exact_match
+      default: record_manual_review
+
+  - id: record_exact_match
+    command:
+      name: reconcile_payment
+      run_as: reconciliation_worker
+      arguments:
+        payment_id: { input: payment_id }
+        provider_event_id: { input: provider_event_id }
+        reconciliation_decision: { literal: matched }
+        provider_amount_minor: { state: request_reconciliation, field: provider_amount_minor }
+        provider_currency: { state: request_reconciliation, field: provider_currency }
+        provider_status: { state: request_reconciliation, field: provider_status }
+        provider_reference: { state: request_reconciliation, field: provider_reference }
+        payload: { state: request_reconciliation, field: normalized_payload }
+      next: matched
+
+  - id: record_manual_review
+    command:
+      name: reconcile_payment
+      run_as: reconciliation_worker
+      arguments:
+        payment_id: { input: payment_id }
+        provider_event_id: { input: provider_event_id }
+        reconciliation_decision: { literal: manual_review }
+        provider_amount_minor: { state: request_reconciliation, field: provider_amount_minor }
+        provider_currency: { state: request_reconciliation, field: provider_currency }
+        provider_status: { state: request_reconciliation, field: provider_status }
+        provider_reference: { state: request_reconciliation, field: provider_reference }
+        payload: { state: request_reconciliation, field: normalized_payload }
+      next: await_support_resolution
+
+  # The automatic recorder deliberately cannot resolve the review. The process
+  # stays durable until support commits the dedicated resolution Command.
+  - id: await_support_resolution
+    wait:
+      signal: payment_reconciliation_resolved
+      role: support
+      verification: required
+      persist_before_match: true
+      correlate:
+        payment_id: { input: payment_id }
+        provider_event_id: { input: provider_event_id }
+      deadline: 14d
+      next: resolved
+      on_timeout: support_resolution_overdue
+
+  - id: matched
+    output:
+      values:
+        payment_id: { input: payment_id }
+        reconciliation_status: { literal: matched }
+        reconciliation_id: { state: record_exact_match, field: reconciliation_id }
+
+  - id: resolved
+    output:
+      values:
+        payment_id: { input: payment_id }
+        reconciliation_status: { state: await_support_resolution, field: reconciliation_status }
+        reconciliation_id: { state: await_support_resolution, field: reconciliation_id }
+
+  - id: provider_unavailable
+    fail:
+      code: payment_reconciliation_provider_unavailable
+      message: Payment reconciliation provider could not be reached
+
+  - id: support_resolution_overdue
+    fail:
+      code: payment_reconciliation_support_overdue
+      message: Support did not resolve the payment reconciliation before its deadline

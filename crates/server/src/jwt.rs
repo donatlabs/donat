@@ -1,10 +1,13 @@
 //! JWT authentication mode (DONAT_GRAPHQL_JWT_SECRET): verifies bearer
-//! tokens and builds the session from the x-donat-* claims. The admin
-//! secret still wins; plain X-Donat-* headers are not trusted in this
-//! mode.
+//! tokens and builds the session from x-donat-* and Hasura-compatible
+//! x-hasura-* claims. The admin secret still wins; plain session headers
+//! are not trusted in this mode.
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::Value as Json;
+
+const DEFAULT_CLAIMS_NAMESPACE: &str = "https://donat.io/jwt/claims";
+const HASURA_CLAIMS_NAMESPACE: &str = "https://hasura.io/jwt/claims";
 
 pub struct JwtConfig {
     keys: KeySource,
@@ -50,6 +53,10 @@ pub struct JwtSession {
 pub struct JwtError {
     pub code: &'static str,
     pub message: String,
+}
+
+fn is_session_claim(name: &str) -> bool {
+    name.starts_with("x-donat-") || name.starts_with("x-hasura-")
 }
 
 impl JwtConfig {
@@ -129,28 +136,21 @@ impl JwtConfig {
             namespace: config
                 .get("claims_namespace")
                 .and_then(Json::as_str)
-                .unwrap_or("https://donat.io/jwt/claims")
+                .unwrap_or(DEFAULT_CLAIMS_NAMESPACE)
                 .to_string(),
             namespace_path: config
                 .get("claims_namespace_path")
                 .and_then(Json::as_str)
                 .map(parse_json_path),
-            claims_map: config
-                .get("claims_map")
-                .and_then(Json::as_object)
-                .cloned(),
-            stringified: config
-                .get("claims_format")
-                .and_then(Json::as_str)
+            claims_map: config.get("claims_map").and_then(Json::as_object).cloned(),
+            stringified: config.get("claims_format").and_then(Json::as_str)
                 == Some("stringified_json"),
             header: match (
                 config.pointer("/header/type").and_then(Json::as_str),
                 config.pointer("/header/name").and_then(Json::as_str),
             ) {
                 (Some("Cookie"), Some(name)) => TokenLocation::Cookie(name.to_string()),
-                (Some("CustomHeader"), Some(name)) => {
-                    TokenLocation::CustomHeader(name.to_string())
-                }
+                (Some("CustomHeader"), Some(name)) => TokenLocation::CustomHeader(name.to_string()),
                 _ => TokenLocation::Authorization,
             },
             jwk_url: None,
@@ -189,19 +189,14 @@ impl JwtConfig {
             namespace: config
                 .get("claims_namespace")
                 .and_then(Json::as_str)
-                .unwrap_or("https://donat.io/jwt/claims")
+                .unwrap_or(DEFAULT_CLAIMS_NAMESPACE)
                 .to_string(),
             namespace_path: config
                 .get("claims_namespace_path")
                 .and_then(Json::as_str)
                 .map(parse_json_path),
-            claims_map: config
-                .get("claims_map")
-                .and_then(Json::as_object)
-                .cloned(),
-            stringified: config
-                .get("claims_format")
-                .and_then(Json::as_str)
+            claims_map: config.get("claims_map").and_then(Json::as_object).cloned(),
+            stringified: config.get("claims_format").and_then(Json::as_str)
                 == Some("stringified_json"),
             header: TokenLocation::Authorization,
             jwk_url: Some(url.to_string()),
@@ -244,10 +239,10 @@ impl JwtConfig {
                                 key,
                             });
                         }
-                        if !new_keys.is_empty() {
-                            if let Ok(mut guard) = keys.write() {
-                                *guard = new_keys;
-                            }
+                        if !new_keys.is_empty()
+                            && let Ok(mut guard) = keys.write()
+                        {
+                            *guard = new_keys;
                         }
                     }
                 }
@@ -256,7 +251,10 @@ impl JwtConfig {
         });
     }
 
-    fn decode(&self, token: &str) -> Result<jsonwebtoken::TokenData<Json>, jsonwebtoken::errors::Error> {
+    fn decode(
+        &self,
+        token: &str,
+    ) -> Result<jsonwebtoken::TokenData<Json>, jsonwebtoken::errors::Error> {
         match &self.keys {
             KeySource::Static(key, alg) => {
                 let mut validation = self.validation.clone();
@@ -266,18 +264,16 @@ impl JwtConfig {
             KeySource::Jwks(keys) => {
                 let header = jsonwebtoken::decode_header(token)?;
                 let guard = keys.read().map_err(|_| {
-                    jsonwebtoken::errors::Error::from(
-                        jsonwebtoken::errors::ErrorKind::InvalidToken,
-                    )
+                    jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidToken)
                 })?;
                 let mut last_err = jsonwebtoken::errors::Error::from(
                     jsonwebtoken::errors::ErrorKind::InvalidToken,
                 );
                 for k in guard.iter() {
-                    if let (Some(kid), Some(tkid)) = (&k.kid, &header.kid) {
-                        if kid != tkid {
-                            continue;
-                        }
+                    if let (Some(kid), Some(tkid)) = (&k.kid, &header.kid)
+                        && kid != tkid
+                    {
+                        continue;
                     }
                     let mut validation = self.validation.clone();
                     validation.algorithms = vec![k.alg];
@@ -306,37 +302,36 @@ impl JwtConfig {
         backend_request: bool,
     ) -> Result<JwtSession, JwtError> {
         let data = self.decode(token).map_err(|e| {
-                use jsonwebtoken::errors::ErrorKind;
-                let reason = match e.kind() {
-                    ErrorKind::ExpiredSignature => "JWTExpired".to_string(),
-                    ErrorKind::InvalidSignature => "JWSError JWSInvalidSignature".to_string(),
-                    // Donat verifies with the configured key and reports a
-                    // signature failure even when the token header names a
-                    // different algorithm.
-                    ErrorKind::InvalidAlgorithm => "JWSError JWSInvalidSignature".to_string(),
-                    ErrorKind::InvalidAudience => "JWTNotInAudience".to_string(),
-                    ErrorKind::InvalidIssuer => "JWTNotInIssuer".to_string(),
-                    other => format!("{other:?}"),
-                };
-                JwtError {
-                    code: "invalid-jwt",
-                    message: format!("Could not verify JWT: {reason}"),
-                }
-            })?;
+            use jsonwebtoken::errors::ErrorKind;
+            let reason = match e.kind() {
+                ErrorKind::ExpiredSignature => "JWTExpired".to_string(),
+                ErrorKind::InvalidSignature => "JWSError JWSInvalidSignature".to_string(),
+                // Donat verifies with the configured key and reports a
+                // signature failure even when the token header names a
+                // different algorithm.
+                ErrorKind::InvalidAlgorithm => "JWSError JWSInvalidSignature".to_string(),
+                ErrorKind::InvalidAudience => "JWTNotInAudience".to_string(),
+                ErrorKind::InvalidIssuer => "JWTNotInIssuer".to_string(),
+                other => format!("{other:?}"),
+            };
+            JwtError {
+                code: "invalid-jwt",
+                message: format!("Could not verify JWT: {reason}"),
+            }
+        })?;
         // claims_map mode: every session variable is mapped from the
         // token payload (JSONPath) or a literal.
         if let Some(map) = &self.claims_map {
             return self.session_from_claims_map(map, &data.claims, requested_role);
         }
         let claims_raw = match &self.namespace_path {
-            Some(path) => walk_json_path(&data.claims, path).cloned().ok_or(JwtError {
-                code: "jwt-missing-role-claims",
-                message: "claims not found at claims_namespace_path".to_string(),
-            })?,
-            None => data.claims.get(&self.namespace).cloned().ok_or(JwtError {
-                code: "jwt-missing-role-claims",
-                message: format!("claims key: '{}' not found", self.namespace),
-            })?,
+            Some(path) => walk_json_path(&data.claims, path)
+                .cloned()
+                .ok_or(JwtError {
+                    code: "jwt-missing-role-claims",
+                    message: "claims not found at claims_namespace_path".to_string(),
+                })?,
+            None => self.claims_from_namespace(&data.claims)?,
         };
         let claims = if self.stringified {
             claims_raw
@@ -361,7 +356,9 @@ impl JwtConfig {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v)
         };
-        let allowed: Vec<String> = match get("x-donat-allowed-roles") {
+        let allowed: Vec<String> = match get("x-donat-allowed-roles")
+            .or_else(|| get("x-hasura-allowed-roles"))
+        {
             None => {
                 return Err(JwtError {
                     code: "jwt-missing-role-claims",
@@ -390,6 +387,7 @@ impl JwtConfig {
             }
         };
         let default_role = get("x-donat-default-role")
+            .or_else(|| get("x-hasura-default-role"))
             .and_then(Json::as_str)
             .map(str::to_string)
             .ok_or(JwtError {
@@ -412,7 +410,7 @@ impl JwtConfig {
         let mut vars = std::collections::HashMap::new();
         for (k, v) in claims {
             let key = k.to_ascii_lowercase();
-            if !key.starts_with("x-donat-") {
+            if !is_session_claim(&key) {
                 continue;
             }
             let value = match v {
@@ -422,8 +420,31 @@ impl JwtConfig {
             vars.insert(key, value);
         }
         vars.insert("x-donat-role".to_string(), role.clone());
+        vars.insert("x-hasura-role".to_string(), role.clone());
         let _ = backend_request;
         Ok(JwtSession { role, vars })
+    }
+
+    fn claims_from_namespace(&self, claims: &Json) -> Result<Json, JwtError> {
+        if let Some(value) = claims.get(&self.namespace) {
+            return Ok(value.clone());
+        }
+        if self.namespace == DEFAULT_CLAIMS_NAMESPACE {
+            if let Some(value) = claims.get(HASURA_CLAIMS_NAMESPACE) {
+                return Ok(value.clone());
+            }
+            return Err(JwtError {
+                code: "jwt-missing-role-claims",
+                message: format!(
+                    "claims key: '{}' or '{}' not found",
+                    DEFAULT_CLAIMS_NAMESPACE, HASURA_CLAIMS_NAMESPACE
+                ),
+            });
+        }
+        Err(JwtError {
+            code: "jwt-missing-role-claims",
+            message: format!("claims key: '{}' not found", self.namespace),
+        })
     }
 
     fn session_from_claims_map(
@@ -445,8 +466,26 @@ impl JwtConfig {
         };
 
         let mut vars = std::collections::HashMap::new();
-        let mut allowed: Vec<String> = vec![];
-        let mut default_role: Option<String> = None;
+        let parse_allowed = |value: &Json| -> Result<Vec<String>, JwtError> {
+            value
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or(JwtError {
+                    code: "jwt-missing-role-claims",
+                    message: "JWT claim does not contain x-donat-allowed-roles".to_string(),
+                })
+        };
+
+        let mut donat_allowed: Option<Vec<String>> = None;
+        let mut hasura_allowed: Option<Result<Vec<String>, JwtError>> = None;
+        let mut donat_default_seen = false;
+        let mut donat_default_role: Option<String> = None;
+        let mut hasura_default_seen = false;
+        let mut hasura_default_role: Option<String> = None;
         for (key, spec) in map {
             let key_lc = key.to_ascii_lowercase();
             let value = resolve(spec).ok_or(JwtError {
@@ -455,23 +494,23 @@ impl JwtConfig {
             })?;
             match key_lc.as_str() {
                 "x-donat-allowed-roles" => {
-                    allowed = value
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .ok_or(JwtError {
-                            code: "jwt-missing-role-claims",
-                            message: "JWT claim does not contain x-donat-allowed-roles"
-                                .to_string(),
-                        })?;
+                    donat_allowed = Some(parse_allowed(&value)?);
+                }
+                "x-hasura-allowed-roles" => {
+                    hasura_allowed = Some(parse_allowed(&value));
                 }
                 "x-donat-default-role" => {
-                    default_role = value.as_str().map(str::to_string);
+                    donat_default_seen = true;
+                    donat_default_role = value.as_str().map(str::to_string);
+                }
+                "x-hasura-default-role" => {
+                    hasura_default_seen = true;
+                    hasura_default_role = value.as_str().map(str::to_string);
                 }
                 _ => {
+                    if !is_session_claim(&key_lc) {
+                        continue;
+                    }
                     let rendered = match &value {
                         Json::String(s) => s.clone(),
                         other => other.to_string(),
@@ -480,13 +519,33 @@ impl JwtConfig {
                 }
             }
         }
+        let allowed = match donat_allowed {
+            Some(allowed) => allowed,
+            None => match hasura_allowed {
+                Some(Ok(allowed)) => allowed,
+                Some(Err(err)) => return Err(err),
+                None => {
+                    return Err(JwtError {
+                        code: "jwt-missing-role-claims",
+                        message: "JWT claim does not contain x-donat-allowed-roles".to_string(),
+                    });
+                }
+            },
+        };
         if allowed.is_empty() {
             return Err(JwtError {
                 code: "jwt-missing-role-claims",
                 message: "JWT claim does not contain x-donat-allowed-roles".to_string(),
             });
         }
-        let default_role = default_role.ok_or(JwtError {
+        let default_role = if donat_default_seen {
+            donat_default_role
+        } else if hasura_default_seen {
+            hasura_default_role
+        } else {
+            None
+        }
+        .ok_or(JwtError {
             code: "jwt-missing-role-claims",
             message: "JWT claim does not contain x-donat-default-role".to_string(),
         })?;
@@ -503,6 +562,7 @@ impl JwtConfig {
             None => default_role,
         };
         vars.insert("x-donat-role".to_string(), role.clone());
+        vars.insert("x-hasura-role".to_string(), role.clone());
         Ok(JwtSession { role, vars })
     }
 }
@@ -644,7 +704,10 @@ mod tests {
         let token = sign(&json!({ "sub": "abc", "https://donat.io/jwt/claims": donat_claims() }));
         let s = c.session(&token, None, false).unwrap();
         assert_eq!(s.role, "user");
-        assert_eq!(s.vars.get("x-donat-user-id").map(String::as_str), Some("42"));
+        assert_eq!(
+            s.vars.get("x-donat-user-id").map(String::as_str),
+            Some("42")
+        );
         assert_eq!(s.vars.get("x-donat-role").map(String::as_str), Some("user"));
 
         // Custom claims_namespace replaces the default key.
@@ -654,12 +717,42 @@ mod tests {
     }
 
     #[test]
+    fn default_namespace_accepts_hasura_claims_namespace() {
+        let c = config("");
+        let token = sign(&json!({
+            "sub": "abc",
+            "https://hasura.io/jwt/claims": {
+                "x-hasura-allowed-roles": ["user", "operator"],
+                "x-hasura-default-role": "user",
+                "x-hasura-user-id": "42",
+            }
+        }));
+        let s = c.session(&token, Some("operator"), false).unwrap();
+        assert_eq!(s.role, "operator");
+        assert_eq!(
+            s.vars.get("x-hasura-user-id").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            s.vars.get("x-hasura-role").map(String::as_str),
+            Some("operator")
+        );
+        assert_eq!(
+            s.vars.get("x-donat-role").map(String::as_str),
+            Some("operator")
+        );
+    }
+
+    #[test]
     fn missing_namespace_claim_is_missing_role_claims() {
         let c = config("");
         let token = sign(&json!({ "sub": "abc" }));
         let e = c.session(&token, None, false).unwrap_err();
         assert_eq!(e.code, "jwt-missing-role-claims");
-        assert_eq!(e.message, "claims key: 'https://donat.io/jwt/claims' not found");
+        assert_eq!(
+            e.message,
+            "claims key: 'https://donat.io/jwt/claims' or 'https://hasura.io/jwt/claims' not found"
+        );
     }
 
     #[test]
@@ -678,7 +771,10 @@ mod tests {
         let c = config(r#","claims_namespace_path":"$.donat['claims%']""#);
         let token = sign(&json!({ "donat": { "claims%": donat_claims() } }));
         let s = c.session(&token, None, false).unwrap();
-        assert_eq!(s.vars.get("x-donat-user-id").map(String::as_str), Some("42"));
+        assert_eq!(
+            s.vars.get("x-donat-user-id").map(String::as_str),
+            Some("42")
+        );
     }
 
     #[test]
@@ -721,11 +817,172 @@ mod tests {
         let token = sign(&json!({ "roles": ["user", "editor"], "user": { "id": "42" } }));
         let s = c.session(&token, None, false).unwrap();
         assert_eq!(s.role, "user"); // $.role absent -> default applied
-        assert_eq!(s.vars.get("x-donat-user-id").map(String::as_str), Some("42"));
-        assert_eq!(s.vars.get("x-donat-org-id").map(String::as_str), Some("org-7"));
+        assert_eq!(
+            s.vars.get("x-donat-user-id").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            s.vars.get("x-donat-org-id").map(String::as_str),
+            Some("org-7")
+        );
         // The requested role is checked against the mapped allowed roles.
-        assert_eq!(c.session(&token, Some("editor"), false).unwrap().role, "editor");
+        assert_eq!(
+            c.session(&token, Some("editor"), false).unwrap().role,
+            "editor"
+        );
         let e = c.session(&token, Some("admin"), false).unwrap_err();
+        assert_eq!(e.code, "access-denied");
+    }
+
+    /// The claims_map the petshop example ships with its IdP profile
+    /// (`examples/petshop/auth.env`), against payloads copied from tokens the
+    /// example's provider actually issues: roles at the top level, per-user
+    /// attributes nested under `custom`. `x-donat-user-id` — which every
+    /// customer row filter in that example compares against
+    /// `customer.customer_id` — is populated from the token with no header
+    /// involved.
+    fn petshop_claims_map() -> JwtConfig {
+        config(
+            r#","claims_map":{
+                "x-donat-allowed-roles":{"path":"$.roles"},
+                "x-donat-default-role":{"path":"$.roles[0]"},
+                "x-donat-user-id":{"path":"$.custom.customer_id","default":""}}"#,
+        )
+    }
+
+    /// The default role is read from the token, not written as a literal,
+    /// because `session()` checks a *requested* role against the allowed set
+    /// and a default one against nothing. A literal would therefore hand that
+    /// role to every valid token, including one whose claims never mentioned
+    /// it — this asserts the shipped mapping cannot do that.
+    #[test]
+    fn petshop_claims_map_never_defaults_to_a_role_outside_the_token() {
+        let staff_only = sign(&json!({ "roles": ["staff"] }));
+        let session = petshop_claims_map()
+            .session(&staff_only, None, false)
+            .unwrap();
+        assert_eq!(session.role, "staff");
+
+        // A literal default is what this mapping avoids: the same token would
+        // come back holding `customer`, which its claims never granted.
+        let literal = config(
+            r#","claims_map":{
+                "x-donat-allowed-roles":{"path":"$.roles"},
+                "x-donat-default-role":"customer",
+                "x-donat-user-id":{"path":"$.custom.customer_id","default":""}}"#,
+        );
+        assert_eq!(
+            literal.session(&staff_only, None, false).unwrap().role,
+            "customer",
+            "engine behaviour this mapping is written around"
+        );
+    }
+
+    #[test]
+    fn petshop_claims_map_populates_user_id_from_the_token() {
+        let c = petshop_claims_map();
+
+        let alice = sign(&json!({
+            "iss": "http://localhost:8081/auth/v1/",
+            "aud": "petshop",
+            "sub": "rV1PzHSGqoFt5Eql2DUpc7XN",
+            "typ": "Bearer",
+            "azp": "petshop",
+            "scope": "openid donat",
+            "roles": ["customer"],
+            "custom": { "customer_id": "customer-1" },
+        }));
+        let s = c.session(&alice, None, false).unwrap();
+        assert_eq!(s.role, "customer");
+        assert_eq!(
+            s.vars.get("x-donat-user-id").map(String::as_str),
+            Some("customer-1")
+        );
+
+        // A second shopper gets their own id from their own token.
+        let bob = sign(&json!({
+            "roles": ["customer"],
+            "custom": { "customer_id": "customer-2" },
+        }));
+        let s = c.session(&bob, None, false).unwrap();
+        assert_eq!(
+            s.vars.get("x-donat-user-id").map(String::as_str),
+            Some("customer-2")
+        );
+
+        // The token bounds the roles: a shopper cannot ask for `staff`.
+        let e = c.session(&alice, Some("staff"), false).unwrap_err();
+        assert_eq!(e.code, "access-denied");
+    }
+
+    /// Staff have no `customer_id` attribute, so their tokens carry no
+    /// `custom` object at all. The `default` in the mapping is what keeps that
+    /// a valid login; the empty value matches no `customer.customer_id`.
+    #[test]
+    fn petshop_claims_map_admits_a_token_without_the_custom_attribute() {
+        let sam = sign(&json!({ "roles": ["staff"], "scope": "openid donat" }));
+
+        let s = petshop_claims_map()
+            .session(&sam, Some("staff"), false)
+            .unwrap();
+        assert_eq!(s.role, "staff");
+        assert_eq!(s.vars.get("x-donat-user-id").map(String::as_str), Some(""));
+
+        // Without the default the same token is rejected outright.
+        let no_default = config(
+            r#","claims_map":{
+                "x-donat-allowed-roles":{"path":"$.roles"},
+                "x-donat-default-role":"customer",
+                "x-donat-user-id":{"path":"$.custom.customer_id"}}"#,
+        );
+        let e = no_default.session(&sam, Some("staff"), false).unwrap_err();
+        assert_eq!(e.code, "jwt-invalid-claims");
+        assert_eq!(e.message, "invalid claims_map entry for x-donat-user-id");
+    }
+
+    #[test]
+    fn claims_map_accepts_hasura_role_claims() {
+        let c = config(
+            r#","claims_map":{
+                "x-hasura-allowed-roles":{"path":"$.roles"},
+                "x-hasura-default-role":{"path":"$.role"},
+                "x-hasura-user-id":{"path":"$.user.id"}}"#,
+        );
+        let token = sign(&json!({
+            "roles": ["user", "editor"],
+            "role": "user",
+            "user": { "id": "42" }
+        }));
+        let s = c.session(&token, Some("editor"), false).unwrap();
+        assert_eq!(s.role, "editor");
+        assert_eq!(
+            s.vars.get("x-hasura-user-id").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            s.vars.get("x-hasura-role").map(String::as_str),
+            Some("editor")
+        );
+    }
+
+    #[test]
+    fn claims_map_donat_role_claims_take_precedence_over_hasura_claims() {
+        let c = config(
+            r#","claims_map":{
+                "x-hasura-allowed-roles":{"path":"$.hasura_roles"},
+                "x-hasura-default-role":{"path":"$.hasura_role"},
+                "x-donat-allowed-roles":{"path":"$.donat_roles"},
+                "x-donat-default-role":{"path":"$.donat_role"}}"#,
+        );
+        let token = sign(&json!({
+            "hasura_roles": ["hasura_user"],
+            "hasura_role": "hasura_user",
+            "donat_roles": ["donat_user"],
+            "donat_role": "donat_user"
+        }));
+        let s = c.session(&token, None, false).unwrap();
+        assert_eq!(s.role, "donat_user");
+        let e = c.session(&token, Some("hasura_user"), false).unwrap_err();
         assert_eq!(e.code, "access-denied");
     }
 
@@ -751,7 +1008,10 @@ mod tests {
         }));
         let e = c.session(&token, None, false).unwrap_err();
         assert_eq!(e.code, "jwt-missing-role-claims");
-        assert_eq!(e.message, "JWT claim does not contain x-donat-allowed-roles");
+        assert_eq!(
+            e.message,
+            "JWT claim does not contain x-donat-allowed-roles"
+        );
 
         let token = sign(&json!({
             "https://donat.io/jwt/claims": { "x-donat-allowed-roles": ["user"] }
@@ -770,14 +1030,23 @@ mod tests {
                 "x-donat-default-role": "user",
             }})
         };
-        let e = c.session(&sign(&claims(json!("user"))), None, false).unwrap_err();
+        let e = c
+            .session(&sign(&claims(json!("user"))), None, false)
+            .unwrap_err();
         assert_eq!(e.code, "jwt-invalid-claims");
         assert_eq!(
             e.message,
             "invalid x-donat-allowed-roles; should be a list of roles: parsing [] failed, expected Array, but encountered String"
         );
-        let e = c.session(&sign(&claims(json!(5))), None, false).unwrap_err();
-        assert!(e.message.ends_with("expected Array, but encountered Number"), "{}", e.message);
+        let e = c
+            .session(&sign(&claims(json!(5))), None, false)
+            .unwrap_err();
+        assert!(
+            e.message
+                .ends_with("expected Array, but encountered Number"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
@@ -786,7 +1055,10 @@ mod tests {
         let token = sign(&json!({ "https://donat.io/jwt/claims": donat_claims() }));
         let s = c.session(&token, Some("editor"), false).unwrap();
         assert_eq!(s.role, "editor");
-        assert_eq!(s.vars.get("x-donat-role").map(String::as_str), Some("editor"));
+        assert_eq!(
+            s.vars.get("x-donat-role").map(String::as_str),
+            Some("editor")
+        );
         let e = c.session(&token, Some("admin"), false).unwrap_err();
         assert_eq!(e.code, "access-denied");
         assert_eq!(e.message, "Your requested role is not in allowed roles");
@@ -807,6 +1079,45 @@ mod tests {
     }
 
     #[test]
+    fn hasura_claims_resolve_session_and_vars() {
+        let c = config("");
+        let token = sign(&json!({ "https://donat.io/jwt/claims": {
+            "x-hasura-allowed-roles": ["user", "editor"],
+            "x-hasura-default-role": "user",
+            "x-hasura-user-id": "42",
+        }}));
+        let s = c.session(&token, Some("editor"), false).unwrap();
+        assert_eq!(s.role, "editor");
+        assert_eq!(
+            s.vars.get("x-hasura-user-id").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            s.vars.get("x-hasura-role").map(String::as_str),
+            Some("editor")
+        );
+        assert_eq!(
+            s.vars.get("x-donat-role").map(String::as_str),
+            Some("editor")
+        );
+    }
+
+    #[test]
+    fn donat_role_claims_take_precedence_over_hasura_claims() {
+        let c = config("");
+        let token = sign(&json!({ "https://donat.io/jwt/claims": {
+            "x-donat-allowed-roles": ["donat_user"],
+            "x-donat-default-role": "donat_user",
+            "x-hasura-allowed-roles": ["hasura_user"],
+            "x-hasura-default-role": "hasura_user",
+        }}));
+        let s = c.session(&token, None, false).unwrap();
+        assert_eq!(s.role, "donat_user");
+        let e = c.session(&token, Some("hasura_user"), false).unwrap_err();
+        assert_eq!(e.code, "access-denied");
+    }
+
+    #[test]
     fn expired_token_reports_jwt_expired() {
         let c = config("");
         let token = sign(&json!({ "exp": 1000, "https://donat.io/jwt/claims": donat_claims() }));
@@ -823,26 +1134,38 @@ mod tests {
         let token = sign_with(&payload, "other-secret", Algorithm::HS256);
         let e = c.session(&token, None, false).unwrap_err();
         assert_eq!(e.code, "invalid-jwt");
-        assert_eq!(e.message, "Could not verify JWT: JWSError JWSInvalidSignature");
+        assert_eq!(
+            e.message,
+            "Could not verify JWT: JWSError JWSInvalidSignature"
+        );
         // Wrong algorithm in the token header maps to the same report.
         let token = sign_with(&payload, "top-secret", Algorithm::HS384);
         let e = c.session(&token, None, false).unwrap_err();
         assert_eq!(e.code, "invalid-jwt");
-        assert_eq!(e.message, "Could not verify JWT: JWSError JWSInvalidSignature");
+        assert_eq!(
+            e.message,
+            "Could not verify JWT: JWSError JWSInvalidSignature"
+        );
     }
 
     #[test]
     fn parse_json_path_segments() {
         assert!(parse_json_path("$").is_empty());
         assert_eq!(parse_json_path("$.donat.claims"), vec!["donat", "claims"]);
-        assert_eq!(parse_json_path("$.donat['claims%']"), vec!["donat", "claims%"]);
+        assert_eq!(
+            parse_json_path("$.donat['claims%']"),
+            vec!["donat", "claims%"]
+        );
         assert_eq!(parse_json_path(r#"$["a"].b[0]"#), vec!["a", "b", "0"]);
     }
 
     #[test]
     fn walk_json_path_objects_and_arrays() {
         let v = json!({ "a": { "b": [ { "c": 1 } ] } });
-        assert_eq!(walk_json_path(&v, &parse_json_path("$.a.b[0].c")), Some(&json!(1)));
+        assert_eq!(
+            walk_json_path(&v, &parse_json_path("$.a.b[0].c")),
+            Some(&json!(1))
+        );
         assert_eq!(walk_json_path(&v, &parse_json_path("$.a.missing")), None);
         assert_eq!(walk_json_path(&v, &parse_json_path("$.a.b.c")), None);
         assert_eq!(walk_json_path(&v, &parse_json_path("$")), Some(&v));

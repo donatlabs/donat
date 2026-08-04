@@ -52,7 +52,10 @@ async fn run(state: SharedState) {
         .unwrap_or(10)
         .max(1);
     let interval = Duration::from_secs(interval);
-    tracing::info!(poll_seconds = interval.as_secs(), "cron delivery loop started");
+    tracing::info!(
+        poll_seconds = interval.as_secs(),
+        "cron delivery loop started"
+    );
     loop {
         if let Err(e) = tick(&state).await {
             tracing::warn!(error = %e, "cron tick failed");
@@ -148,7 +151,9 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         });
 
         let (http_status, response_body) = deliver(state, trigger, &envelope).await;
-        let success = http_status.map(|s| (200..300).contains(&s)).unwrap_or(false);
+        let success = http_status
+            .map(|s| (200..300).contains(&s))
+            .unwrap_or(false);
 
         tx.execute(
             "INSERT INTO donat.cron_event_invocation_logs (event_id, status, request, response) \
@@ -192,7 +197,11 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
 /// POST the envelope to the trigger's webhook. Returns the HTTP status (None
 /// on a transport error) and the response body captured for the invocation
 /// log.
-async fn deliver(state: &SharedState, trigger: &CronTrigger, envelope: &Json) -> (Option<i32>, Json) {
+async fn deliver(
+    state: &SharedState,
+    trigger: &CronTrigger,
+    envelope: &Json,
+) -> (Option<i32>, Json) {
     let url = resolve_url_template(&trigger.webhook);
     let timeout = trigger
         .retry_conf
@@ -274,7 +283,11 @@ mod tests {
     #[test]
     fn header_resolution_prefers_literal_and_skips_unset_env() {
         let headers = vec![
-            ActionHeader { name: "X-Lit".into(), value: Some("v".into()), value_from_env: None },
+            ActionHeader {
+                name: "X-Lit".into(),
+                value: Some("v".into()),
+                value_from_env: None,
+            },
             ActionHeader {
                 name: "X-Env".into(),
                 value: None,

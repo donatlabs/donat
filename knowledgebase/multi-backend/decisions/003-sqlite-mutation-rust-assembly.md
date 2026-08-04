@@ -31,10 +31,12 @@ are unaffected — they keep full in-database assembly; this is mutations only.)
 
 For SQLite **mutations**, emit one top-level DML per mutation root with a
 `RETURNING json_object(<bare output columns>), <check-flag>` clause, where the
-check-flag is `CASE WHEN NOT(<check expr over bare columns>) THEN 1 ELSE 0
-END`. The SQLite mutation executor runs this inside a transaction, iterates the
-returned rows to build the `returning` array and `affected_rows` count, and —
-if any row's check-flag is set — rolls back and returns a permission error.
+check-flag is `CASE WHEN (<check expr over bare columns>) THEN 0 ELSE 1 END`.
+Only SQL `TRUE` satisfies a permission check; both `FALSE` and `NULL` set the
+violation flag. The SQLite mutation executor runs this inside a transaction,
+iterates the returned rows to build the `returning` array and `affected_rows`
+count, and — if any row's check-flag is set — rolls back and returns a
+permission error.
 
 This is a documented **per-backend carve-out** to M4's "assembled in the
 database" clause, scoped to SQLite mutations only. M4's load-bearing

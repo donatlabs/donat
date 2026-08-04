@@ -1,0 +1,26 @@
+# Marketplace entry point for one payout cycle. Candidate selection, the payout
+# fan-out, and reconciliation belong to the Process.
+name: start_vendor_payout
+source: default
+permissions:
+  - role: marketplace_worker
+arguments:
+  - name: payout_cycle_id
+    type: uuid!
+  - name: request_id
+    type: uuid!
+steps: []
+result:
+  payout_cycle_id: { arg: payout_cycle_id }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: payout_cycle_id }
+  retention: 365d
+effects:
+  - start_process:
+      process: vendor_payout
+      input:
+        payout_cycle_id: { arg: payout_cycle_id }
+        request_id: { arg: request_id }
+      idempotency_key: { argument: request_id }

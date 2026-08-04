@@ -1,0 +1,47 @@
+name: expire_prescription
+source: default
+permissions:
+  - role: prescription_worker
+arguments:
+  - name: prescription_id
+    type: uuid!
+  - name: deadline_id
+    type: uuid!
+steps:
+  - name: prescription_request
+    select_one:
+      table: public.prescription_request
+      by: { id: { arg: prescription_id } }
+      returning: [id, status]
+      require_found: true
+  - name: expiry_is_allowed
+    assert:
+      rule: can_transition_prescription
+      with:
+        current: { step: prescription_request, column: status }
+        next: { literal: expired }
+  - name: expiry_audit
+    insert:
+      table: public.prescription_event
+      object:
+        prescription_request_id: { step: prescription_request, column: id }
+        event_type: { literal: expired }
+        actor_role: { literal: prescription_worker }
+        request_id: { arg: deadline_id }
+      returning: [id, prescription_request_id, event_type, request_id]
+  - name: expired_request
+    update:
+      table: public.prescription_request
+      where: { id: { step: prescription_request, column: id }, status: { literal: submitted } }
+      set: { status: { literal: expired } }
+      returning: [id, status]
+      require_affected: true
+result:
+  prescription_id: { step: expired_request, column: id }
+  status: { step: expired_request, column: status }
+  audit: { step: expiry_audit }
+idempotency:
+  key: { argument: deadline_id }
+  scope:
+    - { argument: prescription_id }
+  retention: 365d

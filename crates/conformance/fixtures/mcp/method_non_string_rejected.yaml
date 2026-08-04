@@ -1,0 +1,16 @@
+description: >
+  MCP JSON-RPC request method must be a string. Non-string methods are rejected
+  with invalid-request before dispatch.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 66
+  method: 123
+response:
+  jsonrpc: "2.0"
+  id: 66
+  error:
+    code: -32600
+    message: "'method' must be a string"

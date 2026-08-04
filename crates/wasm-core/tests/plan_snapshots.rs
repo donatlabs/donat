@@ -99,6 +99,8 @@ fn col(name: &str, pg_type: &str) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         pg_type: pg_type.to_string(),
+        pg_typmod: -1,
+        native_type: None,
         nullable: false,
         has_default: false,
     }
@@ -111,6 +113,8 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "author".into(),
+            relation_kind: donat_catalog_types::RelationKind::Table,
+            unique_keys: vec![],
             columns: vec![col("id", "int4"), col("name", "text"), col("secret", "text")],
             primary_key: vec!["id".into()],
             foreign_keys: vec![],
@@ -121,6 +125,8 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "article".into(),
+            relation_kind: donat_catalog_types::RelationKind::Table,
+            unique_keys: vec![],
             columns: vec![
                 col("id", "int4"),
                 col("title", "text"),

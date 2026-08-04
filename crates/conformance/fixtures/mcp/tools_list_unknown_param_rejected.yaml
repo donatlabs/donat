@@ -1,0 +1,18 @@
+description: >
+  tools/list params are strict. Unknown params keys are rejected instead of
+  being silently accepted as hidden execution controls.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 77
+  method: tools/list
+  params:
+    extra: true
+response:
+  jsonrpc: "2.0"
+  id: 77
+  error:
+    code: -32602
+    message: "unknown parameter"

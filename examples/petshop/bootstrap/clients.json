@@ -1,0 +1,36 @@
+[
+    {
+        "id": "petshop",
+        "name": "Petshop demo",
+        "secret": null,
+        "redirect_uris": [
+            "http://localhost:5173/callback"
+        ],
+        "allowed_origins": [
+            "http://localhost:5173"
+        ],
+        "enabled": true,
+        "flows_enabled": [
+            "authorization_code",
+            "password",
+            "refresh_token"
+        ],
+        "access_token_alg": "RS256",
+        "id_token_alg": "RS256",
+        "auth_code_lifetime": 300,
+        "access_token_lifetime": 1800,
+        "scopes": [
+            "openid",
+            "profile",
+            "donat"
+        ],
+        "default_scopes": [
+            "openid",
+            "donat"
+        ],
+        "challenges": [
+            "S256"
+        ],
+        "force_mfa": false
+    }
+]

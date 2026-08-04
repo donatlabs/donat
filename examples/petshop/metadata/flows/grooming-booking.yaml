@@ -1,0 +1,105 @@
+name: grooming_booking
+kind: process
+version: 1
+source: default
+permissions:
+  - role: customer
+    owner_session_variable: x-donat-user-id
+owner:
+  type: string!
+  capture: { session_variable: x-donat-user-id }
+input:
+  - { name: service_resource_id, type: uuid! }
+  - { name: slot_key, type: string! }
+  - { name: starts_at, type: timestamptz! }
+  - { name: hold_expires_at, type: timestamptz! }
+  - { name: request_id, type: uuid! }
+output:
+  - { name: booking_id, type: uuid! }
+  - { name: slot_key, type: string! }
+  - { name: status, type: BookingState! }
+idempotency:
+  key: { input: request_id }
+  scope:
+    - { input: slot_key }
+signals:
+  - name: booking_transition_recorded
+    correlation:
+      booking_id: uuid!
+    payload:
+      outcome: BookingOutcome!
+start_at: reserve_slot
+states:
+  - id: reserve_slot
+    command:
+      name: reserve_grooming_slot
+      run_as: caller
+      arguments:
+        service_resource_id: { input: service_resource_id }
+        slot_key: { input: slot_key }
+        starts_at: { input: starts_at }
+        hold_expires_at: { input: hold_expires_at }
+        request_id: { input: request_id }
+      next: await_customer_confirmation
+
+  - id: await_customer_confirmation
+    wait:
+      signal: booking_transition_recorded
+      role: customer
+      verification: required
+      persist_before_match: true
+      correlate:
+        booking_id: { state: reserve_slot, field: booking_id }
+      deadline: { state: reserve_slot, field: hold_expires_at }
+      next: route_hold_transition
+      on_timeout: expire_hold
+
+  - id: route_hold_transition
+    when:
+      cases:
+        - rule: booking_outcome_is
+          with:
+            actual: { state: await_customer_confirmation, field: outcome }
+            expected: { literal: confirmed }
+          next: confirmed
+        - rule: booking_outcome_is
+          with:
+            actual: { state: await_customer_confirmation, field: outcome }
+            expected: { literal: cancelled }
+          next: cancelled
+      default: unexpected_hold_transition
+
+  - id: expire_hold
+    command:
+      name: expire_booking_hold
+      run_as: booking_worker
+      arguments:
+        booking_id: { state: reserve_slot, field: booking_id }
+        deadline_id: { activity_key: expire_hold, as: uuid }
+      next: expired
+
+  - id: confirmed
+    output:
+      values:
+        booking_id: { state: reserve_slot, field: booking_id }
+        slot_key: { state: reserve_slot, field: slot_key }
+        status: { literal: confirmed }
+
+  - id: cancelled
+    output:
+      values:
+        booking_id: { state: reserve_slot, field: booking_id }
+        slot_key: { state: reserve_slot, field: slot_key }
+        status: { literal: cancelled }
+
+  - id: expired
+    output:
+      values:
+        booking_id: { state: expire_hold, field: booking_id }
+        slot_key: { state: expire_hold, field: slot_key }
+        status: { state: expire_hold, field: status, as: BookingState }
+
+  - id: unexpected_hold_transition
+    fail:
+      code: unexpected_booking_hold_transition
+      message: The grooming booking hold received an invalid transition

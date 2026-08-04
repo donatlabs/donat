@@ -1,0 +1,76 @@
+name: create_shipment
+source: default
+permissions:
+  - role: fulfilment
+arguments:
+  - name: allocation_id
+    type: uuid!
+  - name: shipment_key
+    type: string!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: allocation
+    select_one:
+      table: { schema: public, name: inventory_allocation_group }
+      by:
+        allocation_id: { arg: allocation_id }
+        status: { literal: packed }
+      returning: [allocation_id, order_id, stock_location_code, status, quantity, currency]
+      require_found: true
+  - name: allocation_lines
+    select_many:
+      table: { schema: public, name: inventory_allocation_line }
+      by: { allocation_id: { arg: allocation_id } }
+      order_by: [line_sequence, order_line_id]
+      returning: [order_line_id, line_sequence, variant_id, quantity, unit_price_minor, line_value_minor, currency]
+      require_non_empty: true
+  - name: shipped_value
+    aggregate:
+      from: { step: allocation_lines }
+      values:
+        shipped_value_minor: { sum: { column: line_value_minor } }
+        currency: { min: { column: currency } }
+  - name: shipment
+    insert:
+      table: { schema: public, name: shipment }
+      object:
+        order_id: { step: allocation, column: order_id }
+        allocation_id: { arg: allocation_id }
+        stock_location_code: { step: allocation, column: stock_location_code }
+        shipment_key: { arg: shipment_key }
+        status: { literal: packed }
+        shipped_value_minor: { step: shipped_value, column: shipped_value_minor }
+        currency: { step: shipped_value, column: currency }
+      returning: [id, allocation_id, shipment_key, stock_location_code, status, shipped_value_minor, currency]
+  - name: shipment_items
+    insert_many:
+      table: { schema: public, name: shipment_item }
+      for_each: { step: allocation_lines }
+      object:
+        shipment_id: { step: shipment, column: id }
+        order_line_id: { item: order_line_id }
+        quantity: { item: quantity }
+        unit_price_minor: { item: unit_price_minor }
+        line_value_minor: { item: line_value_minor }
+        currency: { item: currency }
+      returning: [shipment_id, order_line_id, quantity, line_value_minor]
+result:
+  shipment_id: { step: shipment, column: id }
+  allocation_id: { arg: allocation_id }
+  shipment_key: { arg: shipment_key }
+  stock_location_code: { step: allocation, column: stock_location_code }
+  shipped_value_minor: { step: shipment, column: shipped_value_minor }
+  currency: { step: shipment, column: currency }
+  items:
+    step: allocation_lines
+    project:
+      order_line_id: order_line_id
+      variant_id: variant_id
+      quantity: quantity
+      unit_price_minor: unit_price_minor
+      currency: currency
+    maximum_items: 64
+idempotency:
+  key: { argument: request_id }
+  scope: command

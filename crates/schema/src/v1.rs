@@ -3,11 +3,12 @@
 //! GraphQL; only the argument syntax differs. As everywhere: no admin
 //! role — these planners always run as the request's explicit role.
 
+use donat_backend::capabilities::UpsertKind;
 use donat_ir::*;
 use donat_metadata::Columns;
 use serde_json::Value as Json;
 
-use crate::plan::{PlanError, Planner, Session, TableCtx};
+use crate::plan::{PlanError, Planner, Session, TableCtx, is_session_var_name};
 
 fn parse_table(args: &Json, path: &str) -> Result<donat_metadata::QualifiedTable, PlanError> {
     let table = args
@@ -25,25 +26,23 @@ impl<'a> Planner<'a> {
         path: &str,
     ) -> Result<(donat_metadata::QualifiedTable, TableCtx<'a>), PlanError> {
         let table = parse_table(args, path)?;
-        let ctx = self.table_ctx_by_name(&table, &session.role).ok_or_else(|| {
-            PlanError::new(
-                path,
-                "permission-denied",
-                format!(
-                    "role \"{}\" does not have permission to select from table \"{table}\"",
-                    session.role
-                ),
-            )
-        })?;
+        let ctx = self
+            .table_ctx_by_name(&table, &session.role)
+            .ok_or_else(|| {
+                PlanError::new(
+                    path,
+                    "permission-denied",
+                    format!(
+                        "role \"{}\" does not have permission to select from table \"{table}\"",
+                        session.role
+                    ),
+                )
+            })?;
         Ok((table, ctx))
     }
 
     /// v1 `select`: returns the rows array directly.
-    pub fn plan_v1_select(
-        &self,
-        args: &Json,
-        session: &Session,
-    ) -> Result<SelectQuery, PlanError> {
+    pub fn plan_v1_select(&self, args: &Json, session: &Session) -> Result<SelectQuery, PlanError> {
         let path = "$";
         let (_, ctx) = self.v1_table_ctx(args, session, path)?;
         self.v1_select_on(&ctx, args, session, path)
@@ -119,7 +118,7 @@ impl<'a> Planner<'a> {
                                 alias: col.name.clone(),
                                 value: FieldValue::Column {
                                     column: col.name.clone(),
-                                    pg_type: col.pg_type.clone(),
+                                    pg_type: col.sql_type().to_string(),
                                 },
                             });
                         }
@@ -148,28 +147,22 @@ impl<'a> Planner<'a> {
                         alias: name.clone(),
                         value: FieldValue::Column {
                             column: info.name.clone(),
-                            pg_type: info.pg_type.clone(),
+                            pg_type: info.sql_type().to_string(),
                         },
                     });
                 }
                 Json::Object(obj) => {
-                    let name = obj
-                        .get("name")
-                        .and_then(Json::as_str)
-                        .ok_or_else(|| {
-                            PlanError::validation(path, "relationship column needs a name")
-                        })?;
-                    let Some((remote_table, join)) =
-                        self.relationship_target(ctx, name, path)
+                    let name = obj.get("name").and_then(Json::as_str).ok_or_else(|| {
+                        PlanError::validation(path, "relationship column needs a name")
+                    })?;
+                    let Some((remote_table, join)) = self.relationship_target(ctx, name, path)
                     else {
                         return Err(PlanError::validation(
                             path,
                             format!("relationship \"{name}\" not found"),
                         ));
                     };
-                    let Some(remote) =
-                        self.relationship_ctx(&remote_table, session, false)
-                    else {
+                    let Some(remote) = self.relationship_ctx(&remote_table, session, false) else {
                         return Err(PlanError::new(
                             path,
                             "permission-denied",
@@ -220,11 +213,7 @@ impl<'a> Planner<'a> {
     }
 
     /// v1 `count`: `{ count: N }`.
-    pub fn plan_v1_count(
-        &self,
-        args: &Json,
-        session: &Session,
-    ) -> Result<SelectQuery, PlanError> {
+    pub fn plan_v1_count(&self, args: &Json, session: &Session) -> Result<SelectQuery, PlanError> {
         let path = "$";
         let table = parse_table(args, path)?;
         // Donat's count op reports the permission failure with its own shape.
@@ -344,10 +333,13 @@ impl<'a> Planner<'a> {
                         return Err(PlanError::new(
                             &format!("{path}.args[\"{key}\"]"),
                             "permission-denied",
-                            format!("role \"{}\" does not have permission to update column \"{col}\"", session.role),
+                            format!(
+                                "role \"{}\" does not have permission to update column \"{col}\"",
+                                session.role
+                            ),
                         ));
                     }
-                    let pg_type = ctx.info.column(col).unwrap().pg_type.clone();
+                    let pg_type = ctx.info.column(col).unwrap().sql_type().to_string();
                     let value = Scalar::Json(v.clone());
                     sets.push(match kind {
                         "inc" => SetOp::Inc {
@@ -366,10 +358,12 @@ impl<'a> Planner<'a> {
         }
         // Update-permission presets are applied on every v1 update.
         for (col, value) in &perm.set {
-            let Some(info) = ctx.info.column(col) else { continue };
+            let Some(info) = ctx.info.column(col) else {
+                continue;
+            };
             sets.push(SetOp::Set {
                 column: col.clone(),
-                pg_type: info.pg_type.clone(),
+                pg_type: info.sql_type().to_string(),
                 value: Scalar::Json(resolve_preset(value, session)?),
             });
         }
@@ -391,7 +385,15 @@ impl<'a> Planner<'a> {
             _ => Some(BoolExp::And(predicates)),
         };
 
+        let validators = self.resolved_validators(
+            &ctx,
+            &ctx.entry.update_permissions,
+            perm,
+            crate::validators::ValidatorOp::Update,
+            "$",
+        )?;
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
+        let file_claims = self.file_claims_for_sets(&ctx.entry.table, &sets, session, "$");
 
         Ok(UpdateMutation {
             table: Table {
@@ -402,6 +404,8 @@ impl<'a> Planner<'a> {
             predicate,
             check: None,
             check_path: "$".to_string(),
+            validators,
+            file_claims,
             output,
         })
     }
@@ -475,8 +479,7 @@ impl<'a> Planner<'a> {
             .insert_permissions
             .iter()
             .find(|p| {
-                p.role == session.role
-                    && (!p.permission.backend_only || session.backend_request)
+                p.role == session.role && (!p.permission.backend_only || session.backend_request)
             })
             .map(|p| &p.permission)
             .ok_or_else(|| {
@@ -516,7 +519,10 @@ impl<'a> Planner<'a> {
                     return Err(PlanError::new(
                         path,
                         "permission-denied",
-                        format!("role \"{}\" does not have permission to insert column \"{key}\"", session.role),
+                        format!(
+                            "role \"{}\" does not have permission to insert column \"{key}\"",
+                            session.role
+                        ),
                     ));
                 }
                 if !columns.contains(key) {
@@ -539,7 +545,12 @@ impl<'a> Planner<'a> {
 
         let typed_columns: Vec<(String, String)> = columns
             .iter()
-            .map(|c| (c.clone(), ctx.info.column(c).unwrap().pg_type.clone()))
+            .map(|c| {
+                (
+                    c.clone(),
+                    ctx.info.column(c).unwrap().sql_type().to_string(),
+                )
+            })
             .collect();
         let rows: Vec<Vec<Option<Scalar>>> = objects
             .iter()
@@ -557,8 +568,7 @@ impl<'a> Planner<'a> {
             })
             .collect();
 
-        let check = if perm.check.is_null()
-            || perm.check.as_object().is_some_and(|o| o.is_empty())
+        let check = if perm.check.is_null() || perm.check.as_object().is_some_and(|o| o.is_empty())
         {
             None
         } else {
@@ -568,13 +578,17 @@ impl<'a> Planner<'a> {
         // v1 on_conflict: { constraint | constraint_on, action: update|ignore }.
         let on_conflict = match args.get("on_conflict") {
             None | Some(Json::Null) => None,
+            Some(_) if self.capabilities.upsert == UpsertKind::None => {
+                return Err(PlanError::validation(
+                    path,
+                    "on_conflict is not supported by this backend",
+                ));
+            }
             Some(oc) => {
                 let constraint = oc
                     .get("constraint")
                     .and_then(Json::as_str)
-                    .ok_or_else(|| {
-                        PlanError::validation(path, "on_conflict needs a constraint")
-                    })?
+                    .ok_or_else(|| PlanError::validation(path, "on_conflict needs a constraint"))?
                     .to_string();
                 let action = oc.get("action").and_then(Json::as_str).unwrap_or("update");
                 let update_columns = if action == "ignore" {
@@ -587,33 +601,34 @@ impl<'a> Planner<'a> {
                 // filter also gates which existing rows may change.
                 let mut predicate = None;
                 let mut set_ops = vec![];
-                if !update_columns.is_empty() {
-                    if let Some(update_perm) = ctx
+                if !update_columns.is_empty()
+                    && let Some(update_perm) = ctx
                         .entry
                         .update_permissions
                         .iter()
                         .find(|p| p.role == session.role)
                         .map(|p| &p.permission)
+                {
+                    if !update_perm.filter.is_null()
+                        && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
                     {
-                        if !update_perm.filter.is_null()
-                            && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
-                        {
-                            predicate = Some(self.parse_bool_exp(
-                                &update_perm.filter,
-                                &ctx,
-                                session,
-                                true,
-                                path,
-                            )?);
-                        }
-                        for (col, value) in &update_perm.set {
-                            let Some(info) = ctx.info.column(col) else { continue };
-                            set_ops.push(SetOp::Set {
-                                column: col.clone(),
-                                pg_type: info.pg_type.clone(),
-                                value: Scalar::Json(resolve_preset(value, session)?),
-                            });
-                        }
+                        predicate = Some(self.parse_bool_exp(
+                            &update_perm.filter,
+                            &ctx,
+                            session,
+                            true,
+                            path,
+                        )?);
+                    }
+                    for (col, value) in &update_perm.set {
+                        let Some(info) = ctx.info.column(col) else {
+                            continue;
+                        };
+                        set_ops.push(SetOp::Set {
+                            column: col.clone(),
+                            pg_type: info.sql_type().to_string(),
+                            value: Scalar::Json(resolve_preset(value, session)?),
+                        });
                     }
                 }
                 Some(OnConflict {
@@ -625,7 +640,15 @@ impl<'a> Planner<'a> {
             }
         };
 
+        let validators = self.resolved_validators(
+            &ctx,
+            &ctx.entry.insert_permissions,
+            perm,
+            crate::validators::ValidatorOp::Insert,
+            "$",
+        )?;
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
+        let file_claims = self.file_claims(&ctx.entry.table, &typed_columns, &rows, session, "$");
 
         Ok(InsertMutation {
             table: Table {
@@ -634,9 +657,12 @@ impl<'a> Planner<'a> {
             },
             columns: typed_columns,
             rows,
+            nested_object_inserts: vec![],
             on_conflict,
             check,
             check_path: "$".to_string(),
+            validators,
+            file_claims,
             output,
         })
     }
@@ -684,7 +710,7 @@ fn ctx_ref<'b, 'a>(ctx: &'b TableCtx<'a>) -> &'b TableCtx<'a> {
 
 fn resolve_preset(value: &Json, session: &Session) -> Result<Json, PlanError> {
     match value {
-        Json::String(s) if s.len() >= 7 && s[..7].eq_ignore_ascii_case("x-donat") => {
+        Json::String(s) if is_session_var_name(s) => {
             let v = session.var(s).ok_or_else(|| {
                 PlanError::new(
                     "$",

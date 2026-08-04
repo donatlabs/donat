@@ -1,0 +1,24 @@
+description: >
+  An explicit query.limit above the MCP page-size cap is rejected before
+  GraphQL execution. This bounds per-tool-call result size for LLM clients and
+  reduces accidental or malicious high-volume reads.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 47
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      limit: 1001
+response:
+  jsonrpc: "2.0"
+  id: 47
+  result:
+    isError: true

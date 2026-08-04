@@ -15,6 +15,10 @@
 pub mod compile;
 pub mod plan;
 
+// The host supplies entropy as a wasm import; a native build uses the OS.
+#[cfg(target_arch = "wasm32")]
+mod rng;
+
 use std::cell::RefCell;
 
 pub use compile::{compile, CompileInput, CoreState};

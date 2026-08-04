@@ -1,0 +1,27 @@
+description: >
+  insert without an explicit returning list returns affected_rows only. MCP
+  write tools should not return untrusted database rows by default.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 82
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: pet
+      objects:
+      - id: 101
+        name: Affected Only
+        status: available
+response:
+  jsonrpc: "2.0"
+  id: 82
+  result:
+    isError: false
+    structuredContent:
+      affected_rows: 1

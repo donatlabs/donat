@@ -39,3 +39,6 @@ response:
       object_relationships: []
       array_relationships: []
       selectable_columns: "*"
+      select_limit: null
+      insertable_columns: "*"
+      updatable_columns: "*"

@@ -1,0 +1,1 @@
+{"data":{"items":[{"event_time":"2026-06-05 10:00:00.000","event_type":"location_change","code_id":101,"code":"NEW","cis":"CIS-NEW","gtin":"04600000000002","pg":"water","package_type":"unit","emission_type":"own","old_status":"printed","new_status":"circulation","old_location_id":1,"new_location_id":2,"parent_id":500,"company_id":1,"user_id":"user-2","document_id":42}]}}

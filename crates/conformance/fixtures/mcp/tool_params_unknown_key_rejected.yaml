@@ -1,0 +1,24 @@
+description: >
+  tools/call params are strict at the MCP method boundary. Unknown params keys
+  are rejected before tool routing and are not treated as hidden execution
+  controls.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 73
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+    extra: true
+response:
+  jsonrpc: "2.0"
+  id: 73
+  result:
+    isError: true

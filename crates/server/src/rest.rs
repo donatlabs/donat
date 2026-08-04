@@ -15,7 +15,7 @@
 //! GraphQL execution errors (permission, validation, ...) are returned as
 //! `execute_full` produced them (the `{"errors":[...]}` body and its status).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::{RawQuery, State},
@@ -24,9 +24,49 @@ use axum::{
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use donat_metadata::RestEndpoint;
+use donat_metadata::{Metadata, RestEndpoint};
 
 use crate::{gql, state::SharedState};
+
+pub(crate) type CompiledRestQueries =
+    HashMap<(String, String), Result<Arc<CompiledRestQuery>, String>>;
+
+pub(crate) struct CompiledRestQuery {
+    query: String,
+    document: graphql_parser::query::Document<'static, String>,
+    variable_definitions: Vec<VarDef>,
+}
+
+/// Parse saved REST queries once per engine snapshot. Invalid queries remain
+/// cached as errors so dispatch preserves the same configuration-error body
+/// without repeating the failed parse on every request.
+pub(crate) fn compile_saved_queries(metadata: &Metadata) -> CompiledRestQueries {
+    let mut compiled = HashMap::new();
+    for collection in &metadata.query_collections {
+        for query in &collection.definition.queries {
+            let entry = if gql::query_too_deep(&query.query) {
+                Err(format!(
+                    "query exceeds maximum nesting depth of {}",
+                    gql::MAX_QUERY_DEPTH
+                ))
+            } else {
+                graphql_parser::parse_query::<String>(&query.query)
+                    .map_err(|error| error.to_string())
+                    .map(|document| {
+                        let document = document.into_static();
+                        let variable_definitions = variable_definitions_from_document(&document);
+                        Arc::new(CompiledRestQuery {
+                            query: query.query.clone(),
+                            document,
+                            variable_definitions,
+                        })
+                    })
+            };
+            compiled.insert((collection.name.clone(), query.name.clone()), entry);
+        }
+    }
+    compiled
+}
 
 /// A REST error body: `{"code": ..., "error": ...}`.
 fn rest_error(code: &str, message: impl Into<String>) -> Json {
@@ -83,21 +123,27 @@ pub async fn dispatch(
         }
     };
 
-    // Resolve the saved query text from query_collections.
-    let query_text = engine
-        .metadata
-        .query_collections
-        .iter()
-        .find(|c| c.name == endpoint.definition.query.collection_name)
-        .and_then(|c| {
-            c.definition
-                .queries
-                .iter()
-                .find(|q| q.name == endpoint.definition.query.query_name)
-        })
-        .map(|q| q.query.clone());
-    let query_text = match query_text {
-        Some(q) => q,
+    // Saved queries and their variable definitions are compiled with the
+    // immutable engine snapshot; clone only the Arc before releasing it.
+    let query_key = (
+        endpoint.definition.query.collection_name.clone(),
+        endpoint.definition.query.query_name.clone(),
+    );
+    let compiled_query = match engine.rest_queries.get(&query_key) {
+        Some(Ok(query)) => query.clone(),
+        Some(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(rest_error(
+                    "unexpected",
+                    format!(
+                        "rest endpoint '{}' has an unparsable saved query: {error}",
+                        endpoint.name
+                    ),
+                )),
+            )
+                .into_response();
+        }
         None => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -116,27 +162,17 @@ pub async fn dispatch(
     };
     drop(engine);
 
-    // Read the variable definitions from the saved query.
-    let var_defs = match variable_definitions(&query_text) {
-        Ok(defs) => defs,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(rest_error(
-                    "unexpected",
-                    format!("rest endpoint '{}' has an unparsable saved query: {e}", endpoint.name),
-                )),
-            )
-                .into_response();
-        }
-    };
-
     let query_params = parse_query_string(raw_query.as_deref().unwrap_or(""));
     let body_obj = body
         .and_then(|axum::Json(v)| v.as_object().cloned())
         .unwrap_or_default();
 
-    let variables = match build_variables(&var_defs, &path_params, &query_params, &body_obj) {
+    let variables = match build_variables(
+        &compiled_query.variable_definitions,
+        &path_params,
+        &query_params,
+        &body_obj,
+    ) {
         Ok(vars) => vars,
         Err(msg) => {
             return (
@@ -148,19 +184,27 @@ pub async fn dispatch(
     };
 
     let gql_body = json!({
-        "query": query_text,
+        "query": compiled_query.query,
         "variables": variables,
         "operationName": Json::Null,
     });
 
-    let (status, resp) = gql::execute_full(&state, &session, &gql_body, false, &headers).await;
+    let (status, resp) = gql::execute_preparsed_full(
+        &state,
+        &session,
+        &gql_body,
+        false,
+        &headers,
+        &compiled_query.document,
+    )
+    .await;
 
     // Success (data, no errors) -> unwrap the data object; otherwise pass
     // through the engine's status + error body unchanged.
-    if resp.get("errors").is_none() {
-        if let Some(data) = resp.get("data") {
-            return (StatusCode::OK, axum::Json(data.clone())).into_response();
-        }
+    if resp.get("errors").is_none()
+        && let Some(data) = resp.get("data")
+    {
+        return (StatusCode::OK, axum::Json(data.clone())).into_response();
     }
     (status, axum::Json(resp)).into_response()
 }
@@ -185,12 +229,18 @@ struct VarDef {
 /// Parse the saved query and read the first operation's variable definitions.
 /// Returns one [`VarDef`] per declared variable (named/list/non-null types are
 /// unwrapped to their innermost named type to choose the scalar kind).
+#[cfg(test)]
 fn variable_definitions(query: &str) -> Result<Vec<VarDef>, String> {
+    let doc = graphql_parser::parse_query::<String>(query).map_err(|e| e.to_string())?;
+    Ok(variable_definitions_from_document(&doc.into_static()))
+}
+
+fn variable_definitions_from_document(
+    doc: &graphql_parser::query::Document<'static, String>,
+) -> Vec<VarDef> {
     use graphql_parser::query::{Definition, OperationDefinition, Type};
 
-    let doc = graphql_parser::parse_query::<String>(query).map_err(|e| e.to_string())?;
-
-    fn named<'a>(t: &'a Type<'a, String>) -> &'a str {
+    fn named<'a>(t: &'a Type<'static, String>) -> &'a str {
         match t {
             Type::NamedType(n) => n.as_str(),
             Type::ListType(inner) | Type::NonNullType(inner) => named(inner),
@@ -214,15 +264,15 @@ fn variable_definitions(query: &str) -> Result<Vec<VarDef>, String> {
             Definition::Operation(OperationDefinition::SelectionSet(_)) => continue,
             Definition::Fragment(_) => continue,
         };
-        return Ok(defs
+        return defs
             .iter()
             .map(|vd| VarDef {
                 name: vd.name.clone(),
                 kind: kind_of(named(&vd.var_type)),
             })
-            .collect());
+            .collect();
     }
-    Ok(vec![])
+    vec![]
 }
 
 /// The outcome of resolving a request against the `rest_endpoints` table.
@@ -249,11 +299,7 @@ fn template_specificity(template: &str) -> usize {
 /// specific (most literal segments) is chosen, so a literal route (e.g.
 /// `pet/featured`) is never shadowed by an earlier parameterized one (e.g.
 /// `pet/:id`) regardless of declaration order.
-fn select_endpoint<'a>(
-    endpoints: &'a [RestEndpoint],
-    method: &str,
-    path: &str,
-) -> Routing<'a> {
+fn select_endpoint<'a>(endpoints: &'a [RestEndpoint], method: &str, path: &str) -> Routing<'a> {
     let mut url_matched = false;
     let mut allowed_methods: Vec<String> = Vec::new();
     let mut chosen: Option<(&RestEndpoint, HashMap<String, String>, usize)> = None;
@@ -418,7 +464,10 @@ mod tests {
     use super::*;
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn ep(name: &str, url: &str, methods: &[&str]) -> RestEndpoint {
@@ -522,12 +571,27 @@ mod tests {
     #[test]
     fn coerce_int_float_bool_string() {
         assert_eq!(coerce_scalar("5", ScalarKind::Int, "x").unwrap(), json!(5));
-        assert_eq!(coerce_scalar("1.5", ScalarKind::Float, "x").unwrap(), json!(1.5));
-        assert_eq!(coerce_scalar("true", ScalarKind::Boolean, "x").unwrap(), json!(true));
-        assert_eq!(coerce_scalar("false", ScalarKind::Boolean, "x").unwrap(), json!(false));
-        assert_eq!(coerce_scalar("abc", ScalarKind::Other, "x").unwrap(), json!("abc"));
+        assert_eq!(
+            coerce_scalar("1.5", ScalarKind::Float, "x").unwrap(),
+            json!(1.5)
+        );
+        assert_eq!(
+            coerce_scalar("true", ScalarKind::Boolean, "x").unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            coerce_scalar("false", ScalarKind::Boolean, "x").unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            coerce_scalar("abc", ScalarKind::Other, "x").unwrap(),
+            json!("abc")
+        );
         // A numeric-looking string stays a string for String/ID/custom.
-        assert_eq!(coerce_scalar("123", ScalarKind::Other, "x").unwrap(), json!("123"));
+        assert_eq!(
+            coerce_scalar("123", ScalarKind::Other, "x").unwrap(),
+            json!("123")
+        );
     }
 
     #[test]
@@ -539,9 +603,18 @@ mod tests {
     #[test]
     fn build_variables_precedence_path_over_query_over_body() {
         let defs = vec![
-            VarDef { name: "id".into(), kind: ScalarKind::Int },
-            VarDef { name: "limit".into(), kind: ScalarKind::Int },
-            VarDef { name: "obj".into(), kind: ScalarKind::Other },
+            VarDef {
+                name: "id".into(),
+                kind: ScalarKind::Int,
+            },
+            VarDef {
+                name: "limit".into(),
+                kind: ScalarKind::Int,
+            },
+            VarDef {
+                name: "obj".into(),
+                kind: ScalarKind::Other,
+            },
         ];
         let path = map(&[("id", "1")]);
         let query = map(&[("id", "2"), ("limit", "10")]);
@@ -565,18 +638,29 @@ mod tests {
         // variable is coerced just like a path/query value, so behavior does
         // not depend on which source supplied the value.
         let defs = vec![
-            VarDef { name: "id".into(), kind: ScalarKind::Int },
-            VarDef { name: "ratio".into(), kind: ScalarKind::Float },
-            VarDef { name: "on".into(), kind: ScalarKind::Boolean },
-            VarDef { name: "note".into(), kind: ScalarKind::Other },
+            VarDef {
+                name: "id".into(),
+                kind: ScalarKind::Int,
+            },
+            VarDef {
+                name: "ratio".into(),
+                kind: ScalarKind::Float,
+            },
+            VarDef {
+                name: "on".into(),
+                kind: ScalarKind::Boolean,
+            },
+            VarDef {
+                name: "note".into(),
+                kind: ScalarKind::Other,
+            },
         ];
         let mut body = JsonMap::new();
         body.insert("id".into(), json!("11"));
         body.insert("ratio".into(), json!("1.5"));
         body.insert("on".into(), json!("true"));
         body.insert("note".into(), json!("hi"));
-        let vars =
-            build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
+        let vars = build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
         assert_eq!(vars.get("id"), Some(&json!(11)));
         assert_eq!(vars.get("ratio"), Some(&json!(1.5)));
         assert_eq!(vars.get("on"), Some(&json!(true)));
@@ -587,21 +671,29 @@ mod tests {
     fn build_variables_passes_through_already_typed_body() {
         // A correctly-typed JSON body value (number/object) is left untouched.
         let defs = vec![
-            VarDef { name: "id".into(), kind: ScalarKind::Int },
-            VarDef { name: "obj".into(), kind: ScalarKind::Other },
+            VarDef {
+                name: "id".into(),
+                kind: ScalarKind::Int,
+            },
+            VarDef {
+                name: "obj".into(),
+                kind: ScalarKind::Other,
+            },
         ];
         let mut body = JsonMap::new();
         body.insert("id".into(), json!(7));
         body.insert("obj".into(), json!({ "k": "v" }));
-        let vars =
-            build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
+        let vars = build_variables(&defs, &HashMap::new(), &HashMap::new(), &body).unwrap();
         assert_eq!(vars.get("id"), Some(&json!(7)));
         assert_eq!(vars.get("obj"), Some(&json!({ "k": "v" })));
     }
 
     #[test]
     fn build_variables_omits_unsupplied() {
-        let defs = vec![VarDef { name: "id".into(), kind: ScalarKind::Int }];
+        let defs = vec![VarDef {
+            name: "id".into(),
+            kind: ScalarKind::Int,
+        }];
         let vars =
             build_variables(&defs, &HashMap::new(), &HashMap::new(), &JsonMap::new()).unwrap();
         assert!(vars.is_empty(), "unsupplied variable must be omitted");
@@ -609,10 +701,12 @@ mod tests {
 
     #[test]
     fn build_variables_reports_coercion_failure() {
-        let defs = vec![VarDef { name: "id".into(), kind: ScalarKind::Int }];
+        let defs = vec![VarDef {
+            name: "id".into(),
+            kind: ScalarKind::Int,
+        }];
         let path = map(&[("id", "notanint")]);
-        let err =
-            build_variables(&defs, &path, &HashMap::new(), &JsonMap::new()).unwrap_err();
+        let err = build_variables(&defs, &path, &HashMap::new(), &JsonMap::new()).unwrap_err();
         assert!(err.contains("Int"), "got: {err}");
     }
 

@@ -1,0 +1,30 @@
+description: >
+  An unknown but GraphQL-valid `returning` column is rejected without reflecting
+  the supplied name back into the MCP tool response.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 79
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: pet
+      objects:
+      - id: 100
+        name: Unknown Returning
+        status: available
+      returning:
+      - drop_table_payload
+response:
+  jsonrpc: "2.0"
+  id: 79
+  result:
+    isError: true
+    content:
+    - type: text
+      text: "'returning' contains unknown column"

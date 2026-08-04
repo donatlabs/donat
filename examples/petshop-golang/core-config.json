@@ -501,7 +501,8 @@
         "primary_key": [
           "id"
         ],
-        "foreign_keys": []
+        "foreign_keys": [],
+        "relation_kind": "Table"
       },
       "public.customer": {
         "schema": "public",
@@ -529,7 +530,8 @@
         "primary_key": [
           "id"
         ],
-        "foreign_keys": []
+        "foreign_keys": [],
+        "relation_kind": "Table"
       },
       "public.order_item": {
         "schema": "public",
@@ -586,7 +588,8 @@
             "referenced_schema": "public",
             "referenced_table": "pet"
           }
-        ]
+        ],
+        "relation_kind": "Table"
       },
       "public.orders": {
         "schema": "public",
@@ -629,7 +632,8 @@
             "referenced_schema": "public",
             "referenced_table": "customer"
           }
-        ]
+        ],
+        "relation_kind": "Table"
       },
       "public.pet": {
         "schema": "public",
@@ -684,7 +688,8 @@
             "referenced_schema": "public",
             "referenced_table": "category"
           }
-        ]
+        ],
+        "relation_kind": "Table"
       },
       "public.refinery_schema_history": {
         "schema": "public",
@@ -718,7 +723,8 @@
         "primary_key": [
           "version"
         ],
-        "foreign_keys": []
+        "foreign_keys": [],
+        "relation_kind": "Table"
       }
     },
     "functions": {}

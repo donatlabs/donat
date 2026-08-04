@@ -1,0 +1,19 @@
+description: >
+  tools/call params must be an object. Non-object params are rejected by MCP
+  boundary validation before tool routing.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 64
+  method: tools/call
+  params: "query"
+response:
+  jsonrpc: "2.0"
+  id: 64
+  error:
+    code: -32600
+    message: "'params' must be an object"

@@ -1,0 +1,27 @@
+description: >
+  A tools/call query with an argument not declared in the tool inputSchema is
+  rejected before GraphQL execution. Runtime validation must enforce
+  additionalProperties:false even if the MCP client does not validate schemas.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 28
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      unexpected: true
+response:
+  jsonrpc: "2.0"
+  id: 28
+  result:
+    isError: true
+    content:
+    - type: text
+      text: "unknown argument"

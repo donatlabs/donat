@@ -1,0 +1,20 @@
+description: The first command generation persists a revision-A Process start.
+url: /v1/graphql
+status: 200
+headers:
+  X-Donat-Role: customer
+query:
+  query: |
+    mutation StartCheckoutA {
+      enqueue_checkout(
+        order_id: "550e8400-e29b-41d4-a716-446655440110"
+        request_id: "550e8400-e29b-41d4-a716-446655440112"
+        semantic_key: "550e8400-e29b-41d4-a716-446655440112"
+      ) {
+        order_id
+      }
+    }
+response:
+  data:
+    enqueue_checkout:
+      order_id: "550e8400-e29b-41d4-a716-446655440110"

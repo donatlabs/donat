@@ -2,36 +2,385 @@
 //! snapshot (metadata + per-source catalogs) that metadata operations
 //! mutate at runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use donat_backend::{AnyDialect, MySqlDialect, SqliteDialect};
+use donat_backend::{AnyDialect, ClickhouseDialect, Dialect, MySqlDialect, SqliteDialect};
 use donat_catalog::Catalog;
 use donat_ir::RootField;
-use donat_metadata::{DatabaseUrl, Metadata, Source, SourceKind};
+use donat_metadata::{
+    ConnectorBaseUrl, ConnectorConfig, ConnectorInstance, DatabaseUrl, Metadata,
+    RuleTypeDeclaration, Source, SourceKind,
+};
+use donat_rules::{
+    DecisionRow as RuleDecisionRow, DecisionTableDefinition as RuleDecisionTableDefinition,
+    DecisionTableTestCase as RuleDecisionTableTestCase,
+    DecisionTestExpectation as RuleDecisionTestExpectation, ExpressionContext, ExpressionOwner,
+    HitPolicy, RuleCatalog, RuleDefinition, RuleType,
+};
+use donat_schema::{
+    CompiledCommandCatalog, CompiledMultiSourceSchema, FinalizedCommandCatalog, PlanError,
+    ProcessEffectContractCatalog, compile_command_catalog, finalize_command_effects,
+};
 use serde_json::Value as Json;
 use tokio::sync::RwLock;
 
+const CLICKHOUSE_MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+const CLICKHOUSE_MAX_DATA_BYTES: usize = 64 * 1024 * 1024;
+
+/// A deploy-time connector configuration error. This intentionally remains
+/// separate from the future activity `ConnectorErrorClass`: a connector that
+/// cannot be configured never reaches activity execution or retry routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorConfigError {
+    pub path: String,
+    pub message: String,
+}
+
+impl ConnectorConfigError {
+    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectorConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.path, self.message)
+    }
+}
+
+impl std::error::Error for ConnectorConfigError {}
+
+/// A pre-listen connector failure. It exposes static metadata paths or the
+/// missing environment variable name, never a resolved environment value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectorStartupError {
+    Static(ConnectorConfigError),
+    MissingEnvironment { instance: String, variable: String },
+}
+
+impl std::fmt::Display for ConnectorStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(error) => error.fmt(formatter),
+            Self::MissingEnvironment { instance, variable } => write!(
+                formatter,
+                "connector instance `{instance}` requires environment variable `{variable}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectorStartupError {}
+
+/// Validate the connector declarations that are knowable from deploy-time
+/// metadata. This is deliberately not a registry or protocol validator: Task
+/// 2 owns compiled module definitions and Task 3 owns request templates.
+pub fn validate_connector_metadata(metadata: &Metadata) -> Vec<ConnectorConfigError> {
+    let mut errors = Vec::new();
+    let mut instance_names = HashSet::new();
+
+    for (index, connector) in metadata.connectors.iter().enumerate() {
+        let path = format!("connectors.yaml[{index}]");
+        if !instance_names.insert(connector.name.as_str()) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.name"),
+                format!("duplicate connector instance name `{}`", connector.name),
+            ));
+        }
+        if connector.name.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.name"),
+                "connector instance name is required",
+            ));
+        }
+
+        if !matches!(connector.module.as_str(), "http" | "stripe") {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.module"),
+                format!("unknown connector module `{}`", connector.module),
+            ));
+        }
+
+        validate_connector_config(connector, &path, &mut errors);
+        validate_connector_operations(connector, &path, &mut errors);
+    }
+
+    errors
+}
+
+/// Resolve the names declared by [`validate_connector_metadata`] immediately
+/// before the listener is bound. Values are inspected only for availability
+/// and discarded in place, so no resolved credential can be added to metadata,
+/// logs, or an activity error.
+pub fn validate_connector_startup(metadata: &Metadata) -> Result<(), ConnectorStartupError> {
+    if let Some(error) = validate_connector_metadata(metadata).into_iter().next() {
+        return Err(ConnectorStartupError::Static(error));
+    }
+
+    for connector in &metadata.connectors {
+        for (_, variable) in connector_environment_variables(&connector.config) {
+            let available = std::env::var_os(variable)
+                .is_some_and(|value| !value.as_encoded_bytes().is_empty());
+            if !available {
+                return Err(ConnectorStartupError::MissingEnvironment {
+                    instance: connector.name.clone(),
+                    variable: variable.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_connector_config(
+    connector: &ConnectorInstance,
+    path: &str,
+    errors: &mut Vec<ConnectorConfigError>,
+) {
+    let config = &connector.config;
+    if config.endpoint_identity.is_empty() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.endpoint_identity"),
+            "endpoint_identity is required and must be a non-secret label",
+        ));
+    }
+    if config.credential_identity.is_empty() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.credential_identity"),
+            "credential_identity is required and must be a non-secret label",
+        ));
+    }
+
+    match connector.module.as_str() {
+        "http" => {
+            if config.base_url.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.base_url"),
+                    "base_url is required for the http connector",
+                ));
+            }
+            if let Err(error) = crate::connectors::http::validate_http_config_metadata(config) {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.base_url"),
+                    error.to_string(),
+                ));
+            }
+        }
+        "stripe" => {
+            if config.secret_key.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.secret_key"),
+                    "secret_key is required for the stripe connector",
+                ));
+            }
+            if config.webhook_secret.is_none() {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.webhook_secret"),
+                    "webhook_secret is required for the stripe connector",
+                ));
+            }
+            if config.api_version.as_deref().is_none_or(str::is_empty) {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.config.api_version"),
+                    "api_version is required for the stripe connector",
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    for (field, variable) in connector_environment_variables(config) {
+        if !valid_environment_variable_name(variable) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.config.{field}"),
+                format!("value_from_env `{variable}` is not a valid environment variable name"),
+            ));
+        }
+    }
+}
+
+fn validate_connector_operations(
+    connector: &ConnectorInstance,
+    path: &str,
+    errors: &mut Vec<ConnectorConfigError>,
+) {
+    if connector.module == "http" {
+        if let Err(error) = crate::connectors::http::validate_http_instance_metadata(
+            &connector.config,
+            &connector.operations,
+        ) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.operations"),
+                error.to_string(),
+            ));
+        }
+        return;
+    }
+
+    if connector.module == "stripe" {
+        if let Err(error) = crate::connectors::stripe::validate_stripe_instance_metadata(
+            &connector.config,
+            &connector.operations,
+        ) {
+            errors.push(ConnectorConfigError::new(
+                format!("{path}.operations"),
+                error.to_string(),
+            ));
+        }
+        return;
+    }
+
+    for (index, operation) in connector.operations.iter().enumerate() {
+        let operation_path = format!("{path}.operations[{index}]");
+        if operation.name.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.name"),
+                "connector operation name is required",
+            ));
+        }
+        let Some(capacity) = operation.capacity.as_ref() else {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity"),
+                "capacity is required for every connector operation",
+            ));
+            continue;
+        };
+        if capacity.max_in_flight == 0 {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.max_in_flight"),
+                "max_in_flight must be greater than zero",
+            ));
+        }
+        if capacity.rate_limit.permits == 0 || capacity.rate_limit.burst == 0 {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.rate_limit"),
+                "rate_limit permits and burst must be greater than zero",
+            ));
+        }
+        if capacity.rate_limit.per.is_empty() {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.rate_limit.per"),
+                "rate_limit per is required",
+            ));
+        }
+        if capacity
+            .serialize_by
+            .as_ref()
+            .is_some_and(|serialize_by| serialize_by.input.is_empty())
+        {
+            errors.push(ConnectorConfigError::new(
+                format!("{operation_path}.capacity.serialize_by.input"),
+                "serialize_by input is required when configured",
+            ));
+        }
+    }
+}
+
+fn connector_environment_variables(config: &ConnectorConfig) -> impl Iterator<Item = (&str, &str)> {
+    let base_url = match config.base_url.as_ref() {
+        Some(ConnectorBaseUrl::FromEnv(reference)) => {
+            Some(("base_url", reference.value_from_env.as_str()))
+        }
+        _ => None,
+    };
+    base_url
+        .into_iter()
+        .chain(
+            config
+                .headers
+                .iter()
+                .map(|header| ("headers.value_from_env", header.value_from_env.as_str())),
+        )
+        .chain(
+            config
+                .secret_key
+                .iter()
+                .map(|reference| ("secret_key", reference.value_from_env.as_str())),
+        )
+        .chain(
+            config
+                .webhook_secret
+                .iter()
+                .map(|reference| ("webhook_secret", reference.value_from_env.as_str())),
+        )
+}
+
+fn valid_environment_variable_name(variable: &str) -> bool {
+    let mut chars = variable.chars();
+    matches!(chars.next(), Some(character) if character == '_' || character.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn trace_perf_phase(backend: &'static str, phase: &'static str, started: std::time::Instant) {
+    tracing::trace!(
+        target: "donat::perf",
+        backend,
+        phase,
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "request phase"
+    );
+}
+
+fn checkout_mysql_connection(
+    pool: &mysql::Pool,
+    pool_timeout_seconds: Option<u64>,
+) -> mysql::Result<mysql::PooledConn> {
+    match pool_timeout_seconds {
+        Some(seconds) => pool.try_get_conn(std::time::Duration::from_secs(seconds)),
+        None => pool.get_conn(),
+    }
+}
+
+async fn run_mysql_blocking<T, F>(
+    pool: mysql::Pool,
+    permits: Arc<tokio::sync::Semaphore>,
+    timeout_seconds: Option<u64>,
+    work: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(mysql::Pool) -> T + Send + 'static,
+{
+    let pool_started = std::time::Instant::now();
+    let acquire = permits.acquire_owned();
+    let permit = match timeout_seconds {
+        Some(seconds) => tokio::time::timeout(std::time::Duration::from_secs(seconds), acquire)
+            .await
+            .map_err(|_| "mysql pool wait timed out")?
+            .map_err(|_| "mysql pool closed")?,
+        None => acquire.await.map_err(|_| "mysql pool closed")?,
+    };
+    trace_perf_phase("mysql", "pool.wait", pool_started);
+    let database_started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        // Keep the admission permit with the blocking job: cancelling its
+        // async caller must not admit a replacement while checkout or the
+        // database call is still in progress.
+        let _permit = permit;
+        work(pool)
+    })
+    .await
+    .map_err(|error| format!("mysql task panicked: {error}"));
+    trace_perf_phase("mysql", "database.execute", database_started);
+    result
+}
+
 pub struct AppState {
-    /// One (url, pool) per Postgres source name; the pool is recreated when
-    /// the source's url changes (e.g. replace_metadata pointing 'default'
-    /// at a per-test database).
-    pub pools: RwLock<HashMap<String, (String, deadpool_postgres::Pool)>>,
-    /// One db path/url per SQLite source name. SQLite uses no pool: the
-    /// runtime opens a `rusqlite::Connection` per query inside
-    /// `spawn_blocking` (see `execute_query_json`).
-    pub sqlite_paths: RwLock<HashMap<String, String>>,
-    /// One connection url per MySQL source name. Like SQLite, MySQL uses no
-    /// pool: the runtime opens a `mysql::Conn` per query inside
-    /// `spawn_blocking` (see `execute_query_json`). The url carries the
-    /// database name, which is also the tracked schema.
-    pub mysql_urls: RwLock<HashMap<String, String>>,
-    pub engine: RwLock<Engine>,
+    pub engine: RwLock<EngineSnapshot>,
+    /// Fully validated, immutable deployment connector registry. It is built
+    /// before the HTTP listener is bound and has no runtime mutation surface.
+    #[allow(dead_code)] // Task 3 owns the first activity-dispatch consumer.
+    pub connectors: Arc<crate::connectors::ConnectorRegistry>,
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
     pub default_url: String,
     pub admin_secret: Option<String>,
-    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: role for requests without one.
+    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: fallback role only for untrusted
+    /// requests whose supplied identity cannot be accepted.
     pub unauthorized_role: Option<String>,
     /// --stringify-numeric-types
     pub stringify_numerics: bool,
@@ -44,30 +393,49 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// DONAT_GRAPHQL_ENABLE_ALLOWLIST: non-listed queries are rejected.
     pub allowlist_enabled: bool,
+    /// Process-wide admission control for active subscription tasks.
+    pub subscription_permits: Arc<tokio::sync::Semaphore>,
+    /// Process-wide admission control for individual subscription polls.
+    /// This is deliberately separate from the active-task limit: a long-lived
+    /// socket subscription must not reserve a database execution slot between
+    /// polls.
+    pub subscription_poll_permits: Arc<tokio::sync::Semaphore>,
+    /// File attachments (spec 008), resolved once before the listener binds.
+    /// Empty when no table declares a file column, and then nothing about the
+    /// feature is mounted.
+    pub storage: Arc<donat_storage::StorageRegistry>,
+    /// DONAT_EXTERNAL_URL: the absolute prefix for engine-served file URLs.
+    /// Empty means same-origin, which is what a browser needs by default.
+    pub external_base_url: String,
 }
 
 pub type SharedState = Arc<AppState>;
+pub type EngineSnapshot = Arc<Engine>;
 
 /// Failure of a backend read in `execute_query_json`. The caller maps each
 /// variant to the existing GraphQL error body so the Postgres path keeps
 /// byte-for-byte identical error shaping (`Postgres` carries the real
 /// `tokio_postgres::Error` for `db_error_json`).
+#[derive(Debug)]
 pub enum QueryError {
     NoDefaultSource,
     Pool(String),
     Decode(String),
     Postgres(tokio_postgres::Error),
     Sqlite(String),
+    Mysql(String),
+    Clickhouse(String),
 }
 
 /// Failure of a SQLite mutation in [`AppState::execute_sqlite_mutations`].
 /// The caller maps each variant to the GraphQL error body; `CheckViolation`
 /// reproduces the same `permission-error` shape the Postgres path emits.
 pub enum SqliteMutationError {
-    NoDefaultSource,
     /// A row failed its insert/update permission check; the transaction was
     /// rolled back. `path` is the GraphQL error path for the body.
-    CheckViolation { path: String },
+    CheckViolation {
+        path: String,
+    },
     Sqlite(String),
     Other(String),
 }
@@ -76,154 +444,1255 @@ pub enum SqliteMutationError {
 /// the SQLite variant, the caller maps each variant to the GraphQL error body;
 /// `CheckViolation` reproduces the same `permission-error` shape Postgres emits.
 pub enum MysqlMutationError {
-    NoDefaultSource,
     /// A row failed its insert/update permission check; the transaction was
     /// rolled back. `path` is the GraphQL error path for the body.
-    CheckViolation { path: String },
+    CheckViolation {
+        path: String,
+    },
     /// A MySQL driver / SQL error (mapped to `data-exception`).
     Mysql(String),
     Other(String),
 }
 
-pub struct Engine {
-    pub metadata: Metadata,
-    /// Catalog snapshot per source name.
-    pub catalogs: HashMap<String, Catalog>,
+#[derive(Clone)]
+pub enum SourceRuntime {
+    Postgres {
+        url: String,
+        pool: deadpool_postgres::Pool,
+        settings: RuntimePoolSettings,
+    },
+    Sqlite {
+        path: String,
+        pool: Arc<SqlitePool>,
+        settings: RuntimePoolSettings,
+    },
+    Mysql {
+        url: String,
+        pool: mysql::Pool,
+        permits: Arc<tokio::sync::Semaphore>,
+        settings: RuntimePoolSettings,
+    },
+    Clickhouse {
+        url: String,
+    },
 }
 
-impl Engine {
-    /// The catalog the GraphQL schema is built against: the "default"
-    /// source, or the first one.
-    pub fn default_catalog(&self) -> Catalog {
-        self.catalogs
-            .get("default")
-            .or_else(|| {
-                self.metadata
-                    .sources
-                    .first()
-                    .and_then(|s| self.catalogs.get(&s.name))
-            })
-            .cloned()
-            .unwrap_or_default()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimePoolSettings {
+    max_connections: usize,
+    pool_timeout_seconds: Option<u64>,
+}
+
+impl Default for RuntimePoolSettings {
+    fn default() -> Self {
+        Self {
+            max_connections: 16,
+            pool_timeout_seconds: None,
+        }
     }
 }
 
+fn runtime_pool_settings(source: &Source) -> RuntimePoolSettings {
+    let Some(settings) = source
+        .configuration
+        .connection_info
+        .as_ref()
+        .and_then(|connection| connection.pool_settings.as_ref())
+        .and_then(Json::as_object)
+    else {
+        return RuntimePoolSettings::default();
+    };
+    let max_connections = settings
+        .get("max_connections")
+        .and_then(Json::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RuntimePoolSettings::default().max_connections);
+    let pool_timeout_seconds = settings.get("pool_timeout").and_then(Json::as_u64);
+    RuntimePoolSettings {
+        max_connections,
+        pool_timeout_seconds,
+    }
+}
+
+pub struct SqlitePool {
+    path: String,
+    idle: std::sync::Mutex<Vec<rusqlite::Connection>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl SqlitePool {
+    pub fn new(path: String, max_connections: usize) -> Self {
+        let max_connections = if path == ":memory:" {
+            1
+        } else {
+            max_connections.max(1)
+        };
+        Self {
+            path,
+            idle: std::sync::Mutex::new(vec![]),
+            permits: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+        }
+    }
+
+    fn take(&self) -> rusqlite::Result<rusqlite::Connection> {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+            .map(Ok)
+            .unwrap_or_else(|| rusqlite::Connection::open(&self.path))
+    }
+
+    fn put(&self, connection: rusqlite::Connection) {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(connection);
+    }
+
+    async fn acquire(
+        &self,
+        timeout_seconds: Option<u64>,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+        let acquire = self.permits.clone().acquire_owned();
+        match timeout_seconds {
+            Some(seconds) => tokio::time::timeout(std::time::Duration::from_secs(seconds), acquire)
+                .await
+                .map_err(|_| "sqlite pool wait timed out")?
+                .map_err(|_| "sqlite pool closed"),
+            None => acquire.await.map_err(|_| "sqlite pool closed"),
+        }
+    }
+
+    async fn run_blocking<T, F>(
+        self: Arc<Self>,
+        timeout_seconds: Option<u64>,
+        work: F,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>) -> T + Send + 'static,
+    {
+        let pool_started = std::time::Instant::now();
+        let permit = self
+            .acquire(timeout_seconds)
+            .await
+            .map_err(str::to_string)?;
+        trace_perf_phase("sqlite", "pool.wait", pool_started);
+        let database_started = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            // The blocking job, rather than its cancellable async caller,
+            // owns the permit. Aborting a request therefore cannot admit a
+            // replacement connection while this job is still running.
+            let _permit = permit;
+            work(self)
+        })
+        .await
+        .map_err(|error| format!("sqlite task panicked: {error}"));
+        trace_perf_phase("sqlite", "database.execute", database_started);
+        result
+    }
+}
+
+impl SourceRuntime {
+    /// Construct the standard bounded Postgres runtime used by serving and
+    /// integration tests.
+    pub fn postgres(url: &str) -> anyhow::Result<Self> {
+        stage_postgres_runtime(url, RuntimePoolSettings::default(), None)
+    }
+
+    fn kind(&self) -> SourceKind {
+        match self {
+            Self::Postgres { .. } => SourceKind::Postgres,
+            Self::Sqlite { .. } => SourceKind::Sqlite,
+            Self::Mysql { .. } => SourceKind::Mysql,
+            Self::Clickhouse { .. } => SourceKind::Clickhouse,
+        }
+    }
+}
+
+pub struct Engine {
+    pub metadata: Metadata,
+    /// Typed, deploy-time-only rules for this immutable engine snapshot.
+    /// Request handlers never parse source text or mutate this catalog.
+    #[allow(dead_code)] // Commands and processes consume this in later slices.
+    pub rule_catalog: Arc<RuleCatalog>,
+    /// Catalog snapshot per source name.
+    pub catalogs: HashMap<String, Catalog>,
+    /// Pre-Process command descriptors retained for deployment verification.
+    pub command_catalog: Arc<CompiledCommandCatalog>,
+    /// The only command catalog accepted by request and Process execution.
+    pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
+    /// Current metadata Process definitions compiled before journal access.
+    pub process_catalog: Arc<crate::processes::CompiledProcessCatalog>,
+    /// Database-verified active plus live-retired executable revisions.
+    pub deployed_process_catalog: Arc<crate::processes::DeployedProcessCatalog>,
+    pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
+    pub runtimes: HashMap<String, SourceRuntime>,
+    /// Normalized documents admitted by the allowlist. This is compiled with
+    /// the immutable engine snapshot so request handling does one parse and an
+    /// O(1) lookup instead of reparsing every saved query.
+    pub allowed_queries: HashSet<String>,
+    /// Parsed saved queries used by RESTified endpoints.
+    pub(crate) rest_queries: crate::rest::CompiledRestQueries,
+    /// Parsed role permission SDLs for remote schemas.
+    pub(crate) remote_permission_schemas: crate::remote::CompiledRemoteSchemas,
+}
+
+/// Stages 1-7 of Process candidate construction. The value contains only
+/// immutable, deploy-time compiler output: no database client, journal,
+/// worker, connector executor, or resolved credential can enter it.
+pub struct PureEngineCandidate {
+    rule_catalog: Arc<RuleCatalog>,
+    pub command_catalog: Arc<CompiledCommandCatalog>,
+    pub finalized_command_catalog: Arc<FinalizedCommandCatalog>,
+    pub process_catalog: Arc<crate::processes::CompiledProcessCatalog>,
+    pub process_effects: Arc<ProcessEffectContractCatalog>,
+    pub compiled: Option<Arc<CompiledMultiSourceSchema>>,
+}
+
+impl PureEngineCandidate {
+    pub fn rule_catalog(&self) -> &RuleCatalog {
+        self.rule_catalog.as_ref()
+    }
+
+    pub fn rule_catalog_handle(&self) -> Arc<RuleCatalog> {
+        self.rule_catalog.clone()
+    }
+}
+
+/// Compile one all-or-nothing serving candidate in dependency order without
+/// touching a database or publishing mutable state.
+pub fn compile_pure_engine_candidate(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+    connectors: &crate::connectors::ConnectorRegistry,
+    infer_function_permissions: bool,
+) -> Result<PureEngineCandidate, PlanError> {
+    let rule_catalog = Arc::new(compile_rule_catalog(metadata)?);
+    let command_catalog = Arc::new(compile_command_catalog(
+        metadata,
+        catalogs,
+        rule_catalog.as_ref(),
+        infer_function_permissions,
+    )?);
+    let dependencies = crate::processes::ServerProcessDependencies::new(
+        metadata,
+        command_catalog.as_ref(),
+        rule_catalog.as_ref(),
+        connectors,
+    );
+    let process_catalog = Arc::new(crate::processes::compile_process_catalog(
+        metadata,
+        &dependencies,
+    )?);
+    let process_effects = Arc::new(crate::processes::build_process_effect_contract_catalog(
+        process_catalog.as_ref(),
+    )?);
+    let finalized_command_catalog = Arc::new(finalize_command_effects(
+        command_catalog.as_ref().clone(),
+        process_effects.as_ref(),
+    )?);
+    let compiled = Some(Arc::new(
+        CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects(
+            metadata,
+            catalogs,
+            rule_catalog.as_ref(),
+            finalized_command_catalog.as_ref(),
+            process_effects.as_ref(),
+            infer_function_permissions,
+        )?,
+    ));
+
+    Ok(PureEngineCandidate {
+        rule_catalog,
+        command_catalog,
+        finalized_command_catalog,
+        process_catalog,
+        process_effects,
+        compiled,
+    })
+}
+
+impl Engine {
+    #[allow(dead_code)] // Existing test helpers construct unconnected engines.
+    pub fn bootstrap(metadata: Metadata) -> Self {
+        Self::with_rule_catalog(metadata, RuleCatalog::default())
+    }
+
+    /// Build the initial, unconnected engine snapshot only after all
+    /// deploy-time rule metadata has compiled. The serving binary uses this
+    /// before opening a listener; test helpers may use [`Self::bootstrap`]
+    /// when they intentionally exercise a later candidate failure.
+    pub fn bootstrap_checked(metadata: Metadata) -> Result<Self, PlanError> {
+        let rule_catalog = compile_rule_catalog(&metadata)?;
+        Ok(Self::with_rule_catalog(metadata, rule_catalog))
+    }
+
+    fn with_rule_catalog(metadata: Metadata, rule_catalog: RuleCatalog) -> Self {
+        let allowed_queries = compile_allowed_queries(&metadata);
+        let rest_queries = crate::rest::compile_saved_queries(&metadata);
+        let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
+        Self {
+            metadata,
+            rule_catalog: Arc::new(rule_catalog),
+            catalogs: HashMap::new(),
+            command_catalog: Arc::new(CompiledCommandCatalog::default()),
+            finalized_command_catalog: Arc::new(FinalizedCommandCatalog::default()),
+            process_catalog: Arc::new(crate::processes::CompiledProcessCatalog::default()),
+            deployed_process_catalog: Arc::new(crate::processes::DeployedProcessCatalog::default()),
+            compiled: None,
+            runtimes: HashMap::new(),
+            allowed_queries,
+            rest_queries,
+            remote_permission_schemas,
+        }
+    }
+
+    pub fn compiled(
+        mut metadata: Metadata,
+        catalogs: HashMap<String, Catalog>,
+        runtimes: HashMap<String, SourceRuntime>,
+        infer_function_permissions: bool,
+    ) -> Result<Self, PlanError> {
+        normalize_metadata_sources(&mut metadata);
+        let rule_catalog = Arc::new(compile_rule_catalog(&metadata)?);
+        for source in &metadata.sources {
+            let runtime = runtimes.get(&source.name).ok_or_else(|| {
+                PlanError::new(
+                    "$",
+                    "not-found",
+                    format!("runtime for source '{}' not found", source.name),
+                )
+            })?;
+            if runtime.kind() != source.kind {
+                return Err(PlanError::new(
+                    "$",
+                    "unexpected",
+                    format!(
+                        "runtime for source '{}' is {:?}, metadata requires {:?}",
+                        source.name,
+                        runtime.kind(),
+                        source.kind
+                    ),
+                ));
+            }
+        }
+        let command_catalog = Arc::new(compile_command_catalog(
+            &metadata,
+            &catalogs,
+            &rule_catalog,
+            infer_function_permissions,
+        )?);
+        let finalized_command_catalog = Arc::new(finalize_command_effects(
+            command_catalog.as_ref().clone(),
+            &ProcessEffectContractCatalog::default(),
+        )?);
+        let compiled = Arc::new(CompiledMultiSourceSchema::compile_with_command_catalog(
+            &metadata,
+            &catalogs,
+            command_catalog.clone(),
+            infer_function_permissions,
+        )?);
+        let allowed_queries = compile_allowed_queries(&metadata);
+        let rest_queries = crate::rest::compile_saved_queries(&metadata);
+        let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
+        Ok(Self {
+            metadata,
+            rule_catalog,
+            catalogs,
+            command_catalog,
+            finalized_command_catalog,
+            process_catalog: Arc::new(crate::processes::CompiledProcessCatalog::default()),
+            deployed_process_catalog: Arc::new(crate::processes::DeployedProcessCatalog::default()),
+            compiled: Some(compiled),
+            runtimes,
+            allowed_queries,
+            rest_queries,
+            remote_permission_schemas,
+        })
+    }
+
+    fn from_pure_candidate(
+        metadata: Metadata,
+        catalogs: HashMap<String, Catalog>,
+        runtimes: HashMap<String, SourceRuntime>,
+        candidate: PureEngineCandidate,
+        deployed_process_catalog: crate::processes::DeployedProcessCatalog,
+    ) -> Self {
+        let allowed_queries = compile_allowed_queries(&metadata);
+        let rest_queries = crate::rest::compile_saved_queries(&metadata);
+        let remote_permission_schemas = crate::remote::compile_permission_schemas(&metadata);
+        Self {
+            metadata,
+            rule_catalog: candidate.rule_catalog,
+            catalogs,
+            command_catalog: candidate.command_catalog,
+            finalized_command_catalog: candidate.finalized_command_catalog,
+            process_catalog: candidate.process_catalog,
+            deployed_process_catalog: Arc::new(deployed_process_catalog),
+            compiled: candidate.compiled,
+            runtimes,
+            allowed_queries,
+            rest_queries,
+            remote_permission_schemas,
+        }
+    }
+}
+
+/// Translate the YAML metadata shape into the strict rules crate model and
+/// compile it before a candidate snapshot can publish.
+///
+/// The adapter resolves named declarations before compiling executable source.
+/// Unknown names are never silently widened to strings or JSON values.
+pub(crate) fn compile_rule_catalog(metadata: &Metadata) -> Result<RuleCatalog, PlanError> {
+    let declared_types = resolve_declared_rule_types(&metadata.rules.types)?;
+    let rules_and_contexts = metadata
+        .rules
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let path = format!("rules.yaml.rules[{index}]");
+            Ok((
+                RuleDefinition {
+                    name: definition.name.clone(),
+                    bindings: compile_rule_types(&definition.parameters, &declared_types, &path)?,
+                    result: parse_rule_type_ref(
+                        &definition.result,
+                        &declared_types,
+                        &format!("{path}.result"),
+                    )?,
+                    expression: definition.expression.clone(),
+                },
+                ExpressionContext {
+                    metadata_path: format!("{path}.expression"),
+                    expression_owner: ExpressionOwner::Rule {
+                        name: definition.name.clone(),
+                    },
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    let (rules, rule_contexts): (Vec<_>, Vec<_>) = rules_and_contexts.into_iter().unzip();
+    let tables_and_contexts = metadata
+        .rules
+        .decision_tables
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let path = format!("rules.yaml.decision_tables[{index}]");
+            let condition_contexts = definition
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(row_index, row)| {
+                    row.when
+                        .keys()
+                        .map(|input_name| {
+                            (
+                                input_name.clone(),
+                                ExpressionContext {
+                                    metadata_path: format!(
+                                        "{path}.rows[{row_index}].when.{input_name}"
+                                    ),
+                                    expression_owner: ExpressionOwner::DecisionCondition {
+                                        table_name: definition.name.clone(),
+                                        row_id: row.id.clone(),
+                                        input_name: input_name.clone(),
+                                    },
+                                },
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .collect::<Vec<_>>();
+            Ok((
+                RuleDecisionTableDefinition {
+                    name: definition.name.clone(),
+                    // The rules crate derives this deploy-time revision from
+                    // the complete canonical compiled definition; the legacy
+                    // field remains for its source-model compatibility only.
+                    revision: definition.name.clone(),
+                    inputs: compile_rule_types(
+                        &definition.inputs,
+                        &declared_types,
+                        &format!("{path}.inputs"),
+                    )?,
+                    output: compile_rule_types(
+                        &definition.output,
+                        &declared_types,
+                        &format!("{path}.output"),
+                    )?,
+                    hit_policy: HitPolicy::from_metadata(&definition.hit_policy),
+                    rows: definition
+                        .rows
+                        .iter()
+                        .map(|row| RuleDecisionRow {
+                            id: row.id.clone(),
+                            description: row.description.clone(),
+                            when: row.when.clone(),
+                            output: row.output.clone(),
+                        })
+                        .collect(),
+                    test_cases: definition
+                        .test_cases
+                        .iter()
+                        .map(|case| RuleDecisionTableTestCase {
+                            name: case.name.clone(),
+                            input: case.input.clone(),
+                            expect: RuleDecisionTestExpectation {
+                                output: case.expect.output.clone(),
+                                matched_row_id: case.expect.matched_row_id.clone(),
+                            },
+                        })
+                        .collect(),
+                },
+                condition_contexts,
+            ))
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    let (tables, decision_condition_contexts): (Vec<_>, Vec<_>) =
+        tables_and_contexts.into_iter().unzip();
+
+    let declaration_order = metadata
+        .rules
+        .types
+        .iter()
+        .map(|declaration| declaration.name.clone())
+        .collect::<Vec<_>>();
+    let catalog =
+        donat_rules::compile_catalog_with_declared_types_and_contexts_and_declaration_order(
+            &declared_types,
+            &declaration_order,
+            &rules,
+            &tables,
+            &rule_contexts,
+            &decision_condition_contexts,
+        )
+        .map_err(|error| {
+            if let Some(diagnostic) = error.diagnostic() {
+                PlanError::validation(
+                    &diagnostic.context.metadata_path,
+                    format!(
+                        "declarative rule validation failed for {} at bytes {}..{}: {}",
+                        render_expression_owner(&diagnostic.context.expression_owner),
+                        diagnostic.span.start,
+                        diagnostic.span.end,
+                        diagnostic.message
+                    ),
+                )
+            } else {
+                PlanError::validation(
+                    "rules.yaml",
+                    format!("declarative rule validation failed: {error}"),
+                )
+            }
+        })?;
+
+    for rule in &rules {
+        let compiled = catalog
+            .rule(&rule.name)
+            .expect("validated rule remains in the compiled catalog");
+        tracing::debug!(
+            rule = %compiled.name,
+            profile_version = compiled.artifact.profile_version,
+            source_sha256 = %compiled.artifact.source_sha256,
+            canonical_ast_sha256 = %compiled.artifact.canonical_ast_sha256,
+            "declarative rule profile artifact compiled"
+        );
+    }
+    for table in &tables {
+        let compiled = catalog
+            .decision_table(&table.name)
+            .expect("validated decision remains in the compiled catalog");
+        tracing::debug!(
+            table = %compiled.name,
+            revision = %compiled.revision.0,
+            "declarative decision revision compiled"
+        );
+    }
+    Ok(catalog)
+}
+
+fn render_expression_owner(owner: &ExpressionOwner) -> String {
+    match owner {
+        ExpressionOwner::Rule { name } => format!("rule `{name}`"),
+        ExpressionOwner::DecisionCondition {
+            table_name,
+            row_id,
+            input_name,
+        } => format!("decision table `{table_name}` row `{row_id}` condition `{input_name}`"),
+    }
+}
+
+fn compile_rule_types(
+    types: &BTreeMap<String, String>,
+    declared: &BTreeMap<String, RuleType>,
+    path: &str,
+) -> Result<BTreeMap<String, RuleType>, PlanError> {
+    types
+        .iter()
+        .map(|(name, type_)| {
+            parse_rule_type_ref(type_, declared, &format!("{path}.{name}"))
+                .map(|type_| (name.clone(), type_))
+        })
+        .collect()
+}
+
+fn parse_rule_type_ref(
+    source: &str,
+    declared: &BTreeMap<String, RuleType>,
+    path: &str,
+) -> Result<RuleType, PlanError> {
+    let (source, required) = source
+        .strip_suffix('!')
+        .map_or((source, false), |inner| (inner, true));
+    if source.is_empty() {
+        return Err(PlanError::validation(
+            path,
+            "rule type reference cannot be empty",
+        ));
+    }
+    let type_ = if source.starts_with('[') || source.ends_with(']') {
+        let Some(inner) = source
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return Err(PlanError::validation(
+                path,
+                format!("invalid rule type reference `{source}`"),
+            ));
+        };
+        RuleType::List(Box::new(parse_rule_type_ref(inner, declared, path)?))
+    } else {
+        match scalar_rule_type(source) {
+            Some(type_) => type_,
+            None => declared.get(source).cloned().ok_or_else(|| {
+                PlanError::validation(path, format!("unsupported rule type `{source}`"))
+            })?,
+        }
+    };
+    Ok(if required {
+        type_
+    } else {
+        RuleType::nullable(type_)
+    })
+}
+
+#[derive(Debug, Clone)]
+enum TypeResolution {
+    Visiting,
+    Resolved(RuleType),
+}
+
+fn resolve_declared_rule_types(
+    declarations: &[RuleTypeDeclaration],
+) -> Result<BTreeMap<String, RuleType>, PlanError> {
+    let mut positions = BTreeMap::new();
+    for (index, declaration) in declarations.iter().enumerate() {
+        let path = format!("rules.yaml.types[{index}]");
+        if declaration.name.is_empty() {
+            return Err(PlanError::validation(
+                &path,
+                "declared rule type name cannot be empty",
+            ));
+        }
+        if is_scalar_rule_type_name(&declaration.name) {
+            return Err(PlanError::validation(
+                &path,
+                format!(
+                    "declared rule type `{}` collides with scalar profile type",
+                    declaration.name
+                ),
+            ));
+        }
+        if positions.insert(declaration.name.clone(), index).is_some() {
+            return Err(PlanError::validation(
+                &path,
+                format!("duplicate declared rule type `{}`", declaration.name),
+            ));
+        }
+        let body_count = usize::from(declaration.object.is_some())
+            + usize::from(declaration.enum_values.is_some())
+            + usize::from(declaration.opaque_json.is_some());
+        if body_count != 1 {
+            return Err(PlanError::validation(
+                &path,
+                "a declared rule type requires exactly one of object, enum, or opaque_json",
+            ));
+        }
+    }
+
+    let mut resolved = BTreeMap::new();
+    for name in positions.keys() {
+        resolve_declared_rule_type(name, declarations, &positions, &mut resolved)?;
+    }
+    resolved
+        .into_iter()
+        .map(|(name, resolution)| match resolution {
+            TypeResolution::Resolved(type_) => Ok((name, type_)),
+            TypeResolution::Visiting => Err(PlanError::validation(
+                "rules.yaml.types",
+                "declared rule type resolution did not finish",
+            )),
+        })
+        .collect()
+}
+
+fn resolve_declared_rule_type(
+    name: &str,
+    declarations: &[RuleTypeDeclaration],
+    positions: &BTreeMap<String, usize>,
+    resolved: &mut BTreeMap<String, TypeResolution>,
+) -> Result<RuleType, PlanError> {
+    if let Some(resolution) = resolved.get(name) {
+        return match resolution {
+            TypeResolution::Resolved(type_) => Ok(type_.clone()),
+            TypeResolution::Visiting => Err(PlanError::validation(
+                "rules.yaml.types",
+                format!("declared rule type cycle includes `{name}`"),
+            )),
+        };
+    }
+    let index = *positions.get(name).ok_or_else(|| {
+        PlanError::validation(
+            "rules.yaml.types",
+            format!("unknown declared rule type `{name}`"),
+        )
+    })?;
+    let declaration = &declarations[index];
+    let path = format!("rules.yaml.types[{index}]");
+    resolved.insert(name.to_owned(), TypeResolution::Visiting);
+
+    let type_ = if let Some(symbols) = &declaration.enum_values {
+        if symbols.is_empty() || symbols.iter().any(String::is_empty) {
+            return Err(PlanError::validation(
+                &path,
+                "an enum declaration requires non-empty symbols",
+            ));
+        }
+        let unique = symbols.iter().collect::<HashSet<_>>();
+        if unique.len() != symbols.len() {
+            return Err(PlanError::validation(
+                &path,
+                "an enum declaration requires unique symbols",
+            ));
+        }
+        RuleType::Enum {
+            name: declaration.name.clone(),
+            symbols: symbols.clone(),
+        }
+    } else if let Some(fields) = &declaration.object {
+        if fields.is_empty() {
+            return Err(PlanError::validation(
+                &path,
+                "an object declaration requires at least one field",
+            ));
+        }
+        let fields = fields
+            .iter()
+            .map(|(field, source)| {
+                if field.is_empty() {
+                    return Err(PlanError::validation(
+                        &format!("{path}.object"),
+                        "an object field name cannot be empty",
+                    ));
+                }
+                resolve_declared_type_ref(
+                    source,
+                    declarations,
+                    positions,
+                    resolved,
+                    &format!("{path}.object.{field}"),
+                )
+                .map(|type_| (field.clone(), type_))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        RuleType::Object {
+            name: declaration.name.clone(),
+            fields,
+        }
+    } else if let Some(opaque) = &declaration.opaque_json {
+        if opaque.maximum_bytes == 0 || opaque.maximum_depth == 0 || opaque.maximum_nodes == 0 {
+            return Err(PlanError::validation(
+                &format!("{path}.opaque_json"),
+                "an opaque JSON declaration requires non-zero bounds",
+            ));
+        }
+        RuleType::OpaqueJson {
+            name: declaration.name.clone(),
+            maximum_bytes: opaque.maximum_bytes,
+            maximum_depth: opaque.maximum_depth,
+            maximum_nodes: opaque.maximum_nodes,
+        }
+    } else {
+        return Err(PlanError::validation(
+            &path,
+            "a declared rule type requires exactly one of object, enum, or opaque_json",
+        ));
+    };
+    resolved.insert(name.to_owned(), TypeResolution::Resolved(type_.clone()));
+    Ok(type_)
+}
+
+fn resolve_declared_type_ref(
+    source: &str,
+    declarations: &[RuleTypeDeclaration],
+    positions: &BTreeMap<String, usize>,
+    resolved: &mut BTreeMap<String, TypeResolution>,
+    path: &str,
+) -> Result<RuleType, PlanError> {
+    let (source, required) = source
+        .strip_suffix('!')
+        .map_or((source, false), |inner| (inner, true));
+    if source.is_empty() {
+        return Err(PlanError::validation(
+            path,
+            "rule type reference cannot be empty",
+        ));
+    }
+    let type_ = if source.starts_with('[') || source.ends_with(']') {
+        let Some(inner) = source
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return Err(PlanError::validation(
+                path,
+                format!("invalid rule type reference `{source}`"),
+            ));
+        };
+        RuleType::List(Box::new(resolve_declared_type_ref(
+            inner,
+            declarations,
+            positions,
+            resolved,
+            path,
+        )?))
+    } else if let Some(scalar) = scalar_rule_type(source) {
+        scalar
+    } else if positions.contains_key(source) {
+        resolve_declared_rule_type(source, declarations, positions, resolved)?
+    } else {
+        return Err(PlanError::validation(
+            path,
+            format!("unknown declared rule type `{source}`"),
+        ));
+    };
+    Ok(if required {
+        type_
+    } else {
+        RuleType::nullable(type_)
+    })
+}
+
+fn scalar_rule_type(source: &str) -> Option<RuleType> {
+    match source {
+        "bool" => Some(RuleType::Bool),
+        "string" => Some(RuleType::String),
+        "int" => Some(RuleType::Int),
+        "bigint" => Some(RuleType::Int64),
+        "decimal" => Some(RuleType::Decimal),
+        "uuid" => Some(RuleType::Uuid),
+        "date" => Some(RuleType::Date),
+        "timestamp" | "timestamptz" => Some(RuleType::Timestamp),
+        _ => None,
+    }
+}
+
+fn is_scalar_rule_type_name(source: &str) -> bool {
+    scalar_rule_type(source).is_some()
+}
+
+fn compile_allowed_queries(metadata: &Metadata) -> HashSet<String> {
+    metadata
+        .allowlist
+        .iter()
+        .flat_map(|entry| {
+            metadata
+                .query_collections
+                .iter()
+                .filter(move |collection| collection.name == entry.collection)
+                .flat_map(|collection| collection.definition.queries.iter())
+        })
+        .filter(|query| !crate::gql::query_too_deep(&query.query))
+        .filter_map(|query| graphql_parser::parse_query::<String>(&query.query).ok())
+        .map(|document| crate::gql::normalize_for_allowlist(&document.into_static()))
+        .collect()
+}
+
+#[allow(dead_code)] // Public library helper; the binary stages pools from metadata.
 pub fn make_pool(url: &str) -> anyhow::Result<deadpool_postgres::Pool> {
+    make_pool_with_settings(url, RuntimePoolSettings::default())
+}
+
+fn make_pool_with_settings(
+    url: &str,
+    settings: RuntimePoolSettings,
+) -> anyhow::Result<deadpool_postgres::Pool> {
     let mut config = deadpool_postgres::Config::new();
     config.url = Some(url.to_string());
+    let mut pool_config = deadpool_postgres::PoolConfig::new(settings.max_connections);
+    pool_config.timeouts.wait = settings
+        .pool_timeout_seconds
+        .map(std::time::Duration::from_secs);
+    config.pool = Some(pool_config);
     Ok(config.create_pool(
         Some(deadpool_postgres::Runtime::Tokio1),
         tokio_postgres::NoTls,
     )?)
 }
 
-fn resolve_source_url(source: &Source, default_url: &str) -> String {
-    match &source.configuration.connection_info.database_url {
-        DatabaseUrl::Url(url) => url.clone(),
-        DatabaseUrl::FromEnv { from_env } => {
-            std::env::var(from_env).unwrap_or_else(|_| default_url.to_string())
-        }
+fn stage_postgres_runtime(
+    url: &str,
+    settings: RuntimePoolSettings,
+    existing: Option<&SourceRuntime>,
+) -> anyhow::Result<SourceRuntime> {
+    if let Some(SourceRuntime::Postgres {
+        url: existing_url,
+        pool,
+        settings: existing_settings,
+    }) = existing
+        && existing_url == url
+        && *existing_settings == settings
+    {
+        return Ok(SourceRuntime::Postgres {
+            url: url.to_string(),
+            pool: pool.clone(),
+            settings,
+        });
+    }
+    Ok(SourceRuntime::Postgres {
+        url: url.to_string(),
+        pool: make_pool_with_settings(url, settings)?,
+        settings,
+    })
+}
+
+fn stage_mysql_runtime(
+    url: &str,
+    settings: RuntimePoolSettings,
+    existing: Option<&SourceRuntime>,
+) -> anyhow::Result<SourceRuntime> {
+    if let Some(SourceRuntime::Mysql {
+        url: existing_url,
+        pool,
+        permits,
+        settings: existing_settings,
+    }) = existing
+        && existing_url == url
+        && *existing_settings == settings
+    {
+        return Ok(SourceRuntime::Mysql {
+            url: url.to_string(),
+            pool: pool.clone(),
+            permits: permits.clone(),
+            settings,
+        });
+    }
+    let opts = mysql::Opts::from_url(url)?;
+    let constraints = mysql::PoolConstraints::new(0, settings.max_connections)
+        .expect("validated MySQL pool constraints");
+    let pool_opts = mysql::PoolOpts::default()
+        .with_constraints(constraints)
+        // Donat owns all session state and every mutation finishes its
+        // transaction. Avoid COM_RESET_CONNECTION so the initialization below
+        // remains effective and checkout adds no extra round trip.
+        .with_reset_connection(false);
+    let opts = mysql::OptsBuilder::from_opts(opts)
+        .init(vec![
+            "SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')",
+            "SET SESSION group_concat_max_len = 4294967295",
+        ])
+        .pool_opts(pool_opts);
+    Ok(SourceRuntime::Mysql {
+        url: url.to_string(),
+        pool: mysql::Pool::new(opts)?,
+        permits: Arc::new(tokio::sync::Semaphore::new(settings.max_connections)),
+        settings,
+    })
+}
+
+fn stage_sqlite_runtime(
+    path: &str,
+    settings: RuntimePoolSettings,
+    existing: Option<&SourceRuntime>,
+) -> SourceRuntime {
+    if let Some(SourceRuntime::Sqlite {
+        path: existing_path,
+        pool,
+        settings: existing_settings,
+    }) = existing
+        && existing_path == path
+        && *existing_settings == settings
+    {
+        return SourceRuntime::Sqlite {
+            path: path.to_string(),
+            pool: pool.clone(),
+            settings,
+        };
+    }
+    SourceRuntime::Sqlite {
+        path: path.to_string(),
+        pool: Arc::new(SqlitePool::new(path.to_string(), settings.max_connections)),
+        settings,
     }
 }
 
+fn normalize_metadata_sources(metadata: &mut Metadata) {
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut normalized = Vec::with_capacity(metadata.sources.len());
+    for source in std::mem::take(&mut metadata.sources) {
+        if let Some(index) = indexes.get(&source.name).copied() {
+            normalized[index] = source;
+        } else {
+            indexes.insert(source.name.clone(), normalized.len());
+            normalized.push(source);
+        }
+    }
+    metadata.sources = normalized;
+}
+
+fn resolve_source_url(source: &Source, default_url: &str) -> String {
+    if let Some(connection_info) = &source.configuration.connection_info {
+        return match &connection_info.database_url {
+            DatabaseUrl::Url(url) => url.clone(),
+            DatabaseUrl::FromEnv { from_env } => {
+                std::env::var(from_env).unwrap_or_else(|_| default_url.to_string())
+            }
+        };
+    }
+    if source.kind == SourceKind::Clickhouse
+        && let Some(url) = resolve_hasura_clickhouse_template(source)
+    {
+        return url;
+    }
+    default_url.to_string()
+}
+
+#[derive(serde::Deserialize)]
+struct HasuraClickhouseConfiguration {
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn resolve_hasura_clickhouse_template(source: &Source) -> Option<String> {
+    let template = source.configuration.extra.get("template")?.as_str()?;
+    let rendered = render_hasura_environment_template(template)?;
+    let configuration: HasuraClickhouseConfiguration = serde_json::from_value(rendered).ok()?;
+    let mut url = reqwest::Url::parse(&configuration.url).ok()?;
+    if let Some(username) = configuration.username {
+        url.set_username(&username).ok()?;
+    }
+    if let Some(password) = configuration.password {
+        url.set_password(Some(&password)).ok()?;
+    }
+    Some(url.to_string())
+}
+
+fn render_hasura_environment_template(template: &str) -> Option<serde_json::Value> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(start) = remaining.find("{{") {
+        rendered.push_str(&remaining[..start]);
+        let expression_start = start + 2;
+        let expression_end = remaining[expression_start..].find("}}")? + expression_start;
+        let expression = remaining[expression_start..expression_end].trim();
+        let argument = expression
+            .strip_prefix("getEnvironmentVariable(")?
+            .strip_suffix(')')?
+            .trim();
+        let variable: String = serde_json::from_str(argument).ok()?;
+        let value = std::env::var(variable).ok()?;
+        rendered.push_str(&serde_json::to_string(&value).ok()?);
+        remaining = &remaining[expression_end + 2..];
+    }
+    rendered.push_str(remaining);
+    serde_json::from_str(&rendered).ok()
+}
+
 impl AppState {
-    pub async fn default_pool(&self) -> Option<deadpool_postgres::Pool> {
-        let pools = self.pools.read().await;
-        pools
-            .get("default")
-            .or_else(|| pools.values().next())
-            .map(|(_, p)| p.clone())
+    pub async fn engine_snapshot(&self) -> EngineSnapshot {
+        self.engine.read().await.clone()
     }
 
-    /// The backend kind of the source the GraphQL schema is built against
-    /// (the "default" source, or the first one) — mirrors
-    /// `Engine::default_catalog`'s selection. Defaults to Postgres when no
-    /// source is declared.
-    pub async fn default_source_kind(&self) -> SourceKind {
-        let engine = self.engine.read().await;
+    /// The signing material one request plans against: the registry plus the
+    /// clock every URL in the response is signed for. `None` when the
+    /// deployment declares no attachments.
+    pub fn storage_request_context(&self) -> Option<donat_storage::RequestContext<'_>> {
+        (!self.storage.is_empty()).then(|| donat_storage::RequestContext {
+            registry: &self.storage,
+            now: chrono::Utc::now(),
+            fixed_upload_id: None,
+            external_base_url: self.external_base_url.clone(),
+        })
+    }
+
+    async fn publish_candidate(
+        &self,
+        candidate: Result<Engine, PlanError>,
+    ) -> Result<(), PlanError> {
+        let candidate = Arc::new(candidate?);
+        *self.engine.write().await = candidate;
+        Ok(())
+    }
+
+    async fn default_source_name(&self) -> Option<String> {
+        let engine = self.engine_snapshot().await;
         engine
             .metadata
             .sources
             .iter()
-            .find(|s| s.name == "default")
+            .find(|source| source.name == "default")
             .or_else(|| engine.metadata.sources.first())
-            .map(|s| s.kind)
-            .unwrap_or(SourceKind::Postgres)
+            .map(|source| source.name.clone())
     }
 
-    /// Run a planned read operation against the default source's backend and
-    /// return the assembled JSON `data` object. Dispatches on the source's
-    /// backend kind so the Postgres path is byte-for-byte identical to the
-    /// pre-multi-backend behavior (same SQL, same client call, same error
-    /// shaping — the caller maps `QueryError` back to the existing bodies).
-    pub async fn execute_query_json(&self, roots: &[RootField]) -> Result<Json, QueryError> {
-        match self.default_source_kind().await {
-            SourceKind::Postgres => {
+    pub async fn default_pool(&self) -> Option<deadpool_postgres::Pool> {
+        let source = self.default_source_name().await?;
+        self.source_pool(&source).await
+    }
+
+    pub async fn source_pool(&self, source_name: &str) -> Option<deadpool_postgres::Pool> {
+        match self.source_runtime(source_name).await {
+            Some(SourceRuntime::Postgres { pool, .. }) => Some(pool),
+            _ => None,
+        }
+    }
+
+    async fn source_runtime(&self, source_name: &str) -> Option<SourceRuntime> {
+        self.engine_snapshot()
+            .await
+            .runtimes
+            .get(source_name)
+            .cloned()
+    }
+
+    pub async fn execute_source_query_json(
+        &self,
+        source_name: &str,
+        roots: &[RootField],
+    ) -> Result<Json, QueryError> {
+        let runtime = self
+            .source_runtime(source_name)
+            .await
+            .ok_or(QueryError::NoDefaultSource)?;
+        self.execute_runtime_query_json(runtime, roots).await
+    }
+
+    pub(crate) async fn execute_runtime_query_json(
+        &self,
+        runtime: SourceRuntime,
+        roots: &[RootField],
+    ) -> Result<Json, QueryError> {
+        match runtime {
+            SourceRuntime::Postgres { pool, .. } => {
+                let sqlgen_started = std::time::Instant::now();
                 let sql = donat_sqlgen::operation_to_sql_opts(roots, self.stringify_numerics);
-                let pool = self
-                    .default_pool()
-                    .await
-                    .ok_or(QueryError::NoDefaultSource)?;
+                trace_perf_phase("postgres", "sql.generate", sqlgen_started);
+                let pool_started = std::time::Instant::now();
                 let client = pool
                     .get()
                     .await
                     .map_err(|e| QueryError::Pool(e.to_string()))?;
+                trace_perf_phase("postgres", "pool.wait", pool_started);
+                let database_started = std::time::Instant::now();
                 let row = client
                     .query_one(&sql, &[])
                     .await
                     .map_err(QueryError::Postgres)?;
-                row.try_get::<_, Json>(0)
-                    .map_err(|e| QueryError::Decode(e.to_string()))
+                let result = row
+                    .try_get::<_, Json>(0)
+                    .map_err(|e| QueryError::Decode(e.to_string()));
+                trace_perf_phase("postgres", "database.execute_decode", database_started);
+                result
             }
-            SourceKind::Sqlite => {
-                let sql =
-                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Sqlite(SqliteDialect));
-                let path = {
-                    let paths = self.sqlite_paths.read().await;
-                    paths
-                        .get("default")
-                        .or_else(|| paths.values().next())
-                        .cloned()
-                        .ok_or(QueryError::NoDefaultSource)?
-                };
-                let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
-                    let conn = rusqlite::Connection::open(&path)
-                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
-                    conn.query_row(&sql, [], |r| r.get::<_, String>(0))
-                        .map_err(|e| QueryError::Sqlite(e.to_string()))
-                })
-                .await
-                .map_err(|e| QueryError::Pool(format!("sqlite task panicked: {e}")))??;
-                serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
+            SourceRuntime::Sqlite { pool, settings, .. } => {
+                let sqlgen_started = std::time::Instant::now();
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
+                    roots,
+                    self.stringify_numerics,
+                    AnyDialect::Sqlite(SqliteDialect),
+                );
+                trace_perf_phase("sqlite", "sql.generate", sqlgen_started);
+                let blocking = pool.clone().run_blocking(
+                    settings.pool_timeout_seconds,
+                    move |pool| -> Result<String, QueryError> {
+                        let connection =
+                            pool.take().map_err(|e| QueryError::Sqlite(e.to_string()))?;
+                        let result = connection
+                            .query_row(&sql, [], |row| row.get::<_, String>(0))
+                            .map_err(|e| QueryError::Sqlite(e.to_string()));
+                        pool.put(connection);
+                        result
+                    },
+                );
+                let text = blocking.await.map_err(QueryError::Pool)??;
+                let decode_started = std::time::Instant::now();
+                let result =
+                    serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()));
+                trace_perf_phase("sqlite", "response.decode", decode_started);
+                result
             }
-            SourceKind::Mysql => {
+            SourceRuntime::Mysql {
+                pool,
+                permits,
+                settings,
+                ..
+            } => {
                 use mysql::prelude::Queryable;
 
-                let sql =
-                    donat_sqlgen::operation_to_sql_with(roots, AnyDialect::Mysql(MySqlDialect));
-                let url = {
-                    let urls = self.mysql_urls.read().await;
-                    urls.get("default")
-                        .or_else(|| urls.values().next())
-                        .cloned()
-                        .ok_or(QueryError::NoDefaultSource)?
-                };
-                let text = tokio::task::spawn_blocking(move || -> Result<String, QueryError> {
-                    let mut conn = mysql::Conn::new(url.as_str())
-                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
-                    // The engine emits Postgres-style `"ident"` quoting; MySQL
-                    // reads double quotes as string literals unless ANSI_QUOTES
-                    // is enabled for the session.
-                    conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
-                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
-                    let row: Option<String> = conn
-                        .query_first(&sql)
-                        .map_err(|e| QueryError::Sqlite(e.to_string()))?;
-                    row.ok_or_else(|| QueryError::Sqlite("mysql returned no rows".to_string()))
-                })
+                let sqlgen_started = std::time::Instant::now();
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
+                    roots,
+                    self.stringify_numerics,
+                    AnyDialect::Mysql(MySqlDialect),
+                );
+                trace_perf_phase("mysql", "sql.generate", sqlgen_started);
+                let text = run_mysql_blocking(
+                    pool,
+                    permits,
+                    settings.pool_timeout_seconds,
+                    move |pool| -> Result<String, QueryError> {
+                        let mut conn =
+                            checkout_mysql_connection(&pool, settings.pool_timeout_seconds)
+                                .map_err(|e| QueryError::Mysql(e.to_string()))?;
+                        let row: Option<String> = conn
+                            .query_first(&sql)
+                            .map_err(|e| QueryError::Mysql(e.to_string()))?;
+                        row.ok_or_else(|| QueryError::Mysql("mysql returned no rows".to_string()))
+                    },
+                )
                 .await
-                .map_err(|e| QueryError::Pool(format!("mysql task panicked: {e}")))??;
-                serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()))
+                .map_err(QueryError::Pool)??;
+                let decode_started = std::time::Instant::now();
+                let result =
+                    serde_json::from_str(&text).map_err(|e| QueryError::Decode(e.to_string()));
+                trace_perf_phase("mysql", "response.decode", decode_started);
+                result
+            }
+            SourceRuntime::Clickhouse { url } => {
+                let sqlgen_started = std::time::Instant::now();
+                let sql = donat_sqlgen::operation_to_sql_opts_with(
+                    roots,
+                    self.stringify_numerics,
+                    AnyDialect::Clickhouse(ClickhouseDialect),
+                );
+                trace_perf_phase("clickhouse", "sql.generate", sqlgen_started);
+                let database_started = std::time::Instant::now();
+                let text = clickhouse_post_data(
+                    &self.http,
+                    &url,
+                    &format!("{sql} FORMAT TabSeparatedRaw"),
+                )
+                .await
+                .map_err(QueryError::Clickhouse)?;
+                let result = serde_json::from_str(text.trim())
+                    .map_err(|e| QueryError::Decode(e.to_string()));
+                trace_perf_phase("clickhouse", "database.execute_decode", database_started);
+                result
             }
         }
     }
@@ -239,11 +1708,13 @@ impl AppState {
     /// can render the exact permission-error body. The check is computed in
     /// the same DML and the rollback is in the same transaction, so the
     /// permission is still enforced atomically (no bypass).
-    pub async fn execute_sqlite_mutations(
+    pub(crate) async fn execute_sqlite_mutations_at(
         &self,
+        pool: Arc<SqlitePool>,
+        settings: RuntimePoolSettings,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, SqliteMutationError> {
-        use donat_sqlgen::SqliteMutationPlan;
+        use donat_sqlgen::{MutationResponseSlot, SqliteMutationPlan};
 
         // Plan every root up front (alias + SQLite mutation plan), preserving
         // selection order for the response map.
@@ -255,95 +1726,106 @@ impl AppState {
                     | donat_ir::MutationRoot::Insert { alias, .. }
                     | donat_ir::MutationRoot::Update { alias, .. }
                     | donat_ir::MutationRoot::Delete { alias, .. }
+                    | donat_ir::MutationRoot::Command { alias, .. }
+                    | donat_ir::MutationRoot::RequestFileUpload { alias, .. }
                     | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                 };
                 (alias, donat_sqlgen::sqlite_mutation_plan(m))
             })
             .collect();
 
-        let path = {
-            let paths = self.sqlite_paths.read().await;
-            paths
-                .get("default")
-                .or_else(|| paths.values().next())
-                .cloned()
-                .ok_or(SqliteMutationError::NoDefaultSource)?
-        };
-
-        tokio::task::spawn_blocking(move || -> Result<Json, SqliteMutationError> {
-            let mut conn = rusqlite::Connection::open(&path)
-                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
-            let tx = conn
-                .transaction()
-                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
-
-            let mut data = serde_json::Map::new();
-            for (alias, plan) in &planned {
-                // A `__typename`-only mutation root has no DML.
-                if let Some((_, value)) = &plan.root_typename {
-                    data.insert(alias.clone(), Json::String(value.clone()));
-                    continue;
-                }
-
-                let mut returning: Vec<Json> = vec![];
-                let mut affected_rows: i64 = 0;
-                let mut violated = false;
-                {
-                    let mut stmt = tx
-                        .prepare(&plan.dml_sql)
+        pool.clone()
+            .run_blocking(settings.pool_timeout_seconds, move |pool| {
+                let mut connection = pool
+                    .take()
+                    .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                let result = (|| {
+                    let tx = connection
+                        .transaction()
                         .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
-                    let mut rows = stmt
-                        .query([])
-                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?
-                    {
-                        affected_rows += 1;
-                        let node_text: String = row
-                            .get("node")
-                            .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
-                        let flag: i64 = row
-                            .get("violated")
-                            .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
-                        if flag != 0 {
-                            violated = true;
+
+                    let mut data = serde_json::Map::new();
+                    for (alias, plan) in &planned {
+                        // A `__typename`-only mutation root has no DML.
+                        if let Some((_, value)) = &plan.root_typename {
+                            data.insert(alias.clone(), Json::String(value.clone()));
+                            continue;
                         }
-                        let node: Json = serde_json::from_str(&node_text)
-                            .map_err(|e| SqliteMutationError::Other(e.to_string()))?;
-                        returning.push(node);
+
+                        let mut returning: Vec<Json> = vec![];
+                        let mut affected_rows: i64 = 0;
+                        let mut violated = false;
+                        {
+                            let mut stmt = tx
+                                .prepare(&plan.dml_sql)
+                                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                            let mut rows = stmt
+                                .query([])
+                                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                            while let Some(row) = rows
+                                .next()
+                                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?
+                            {
+                                affected_rows += 1;
+                                let node_text: String = row
+                                    .get("node")
+                                    .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                                let flag: i64 = row
+                                    .get("violated")
+                                    .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                                if flag != 0 {
+                                    violated = true;
+                                }
+                                let node: Json = serde_json::from_str(&node_text)
+                                    .map_err(|e| SqliteMutationError::Other(e.to_string()))?;
+                                returning.push(node);
+                            }
+                        }
+
+                        if violated {
+                            // Drop without commit rolls the whole transaction back.
+                            let _ = tx.rollback();
+                            return Err(SqliteMutationError::CheckViolation {
+                                path: plan.check_path.clone(),
+                            });
+                        }
+
+                        if plan.single_row_output {
+                            data.insert(
+                                alias.clone(),
+                                returning.into_iter().next().unwrap_or(Json::Null),
+                            );
+                            continue;
+                        }
+
+                        // Assemble this root's response object in GraphQL selection order.
+                        let mut obj = serde_json::Map::new();
+                        let returning_value = Json::Array(returning);
+                        for slot in &plan.response_slots {
+                            match slot {
+                                MutationResponseSlot::Returning { alias } => {
+                                    obj.insert(alias.clone(), returning_value.clone());
+                                }
+                                MutationResponseSlot::AffectedRows { alias } => {
+                                    obj.insert(alias.clone(), Json::from(affected_rows));
+                                }
+                                MutationResponseSlot::Typename { alias, value } => {
+                                    obj.insert(alias.clone(), Json::String(value.clone()));
+                                }
+                            }
+                        }
+                        data.insert(alias.clone(), Json::Object(obj));
                     }
-                }
 
-                if violated {
-                    // Drop without commit rolls the whole transaction back.
-                    let _ = tx.rollback();
-                    return Err(SqliteMutationError::CheckViolation {
-                        path: plan.check_path.clone(),
-                    });
-                }
-
-                // Assemble this root's response object from the plan's aliases,
-                // mirroring the Postgres `Plan::Mutation` response shape.
-                let mut obj = serde_json::Map::new();
-                if let Some(ret_alias) = &plan.returning_alias {
-                    obj.insert(ret_alias.clone(), Json::Array(returning));
-                }
-                if let Some(ar_alias) = &plan.affected_rows_alias {
-                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
-                }
-                if let Some((tn_alias, tn_value)) = &plan.typename {
-                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
-                }
-                data.insert(alias.clone(), Json::Object(obj));
-            }
-
-            tx.commit()
-                .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
-            Ok(Json::Object(data))
-        })
-        .await
-        .map_err(|e| SqliteMutationError::Other(format!("sqlite task panicked: {e}")))?
+                    tx.commit()
+                        .map_err(|e| SqliteMutationError::Sqlite(e.to_string()))?;
+                    Ok(Json::Object(data))
+                })();
+                pool.put(connection);
+                result
+            })
+            .await
+            .map_err(SqliteMutationError::Other)?
     }
 
     /// Execute a planned mutation against the default MySQL source.
@@ -356,295 +1838,334 @@ impl AppState {
     /// rolls the whole transaction back and yields
     /// [`MysqlMutationError::CheckViolation`] — the same atomic enforcement the
     /// Postgres/SQLite paths give.
-    pub async fn execute_mysql_mutations(
+    pub(crate) async fn execute_mysql_mutations_at(
         &self,
+        primary_keys: HashMap<String, Vec<String>>,
+        pool: mysql::Pool,
+        permits: Arc<tokio::sync::Semaphore>,
+        settings: RuntimePoolSettings,
         roots: &[donat_ir::MutationRoot],
     ) -> Result<Json, MysqlMutationError> {
-        use donat_sqlgen::{MySqlMutationKind, MySqlMutationPlan};
+        use donat_sqlgen::{MutationResponseSlot, MySqlMutationKind, MySqlMutationPlan};
         use mysql::prelude::Queryable;
 
         // Plan every root up front (alias + MySQL mutation plan), resolving each
         // table's primary key from the catalog (the IR mutation does not carry
         // it, but the insert companion SELECT needs it for last_insert_id()
         // recovery / the supplied-PK predicate). Preserve selection order.
-        let planned: Vec<(String, MySqlMutationPlan)> = {
-            let engine = self.engine.read().await;
-            let catalog = engine.default_catalog();
-            let pk_of = |t: &donat_ir::Table| -> Vec<String> {
-                catalog
-                    .tables
-                    .get(&format!("{}.{}", t.schema, t.name))
-                    .map(|info| info.primary_key.clone())
-                    .unwrap_or_default()
-            };
-            roots
-                .iter()
-                .map(|m| {
-                    let (alias, pk) = match m {
-                        donat_ir::MutationRoot::Insert { alias, insert } => {
-                            (alias.clone(), pk_of(&insert.table))
-                        }
-                        donat_ir::MutationRoot::Update { alias, update } => {
-                            (alias.clone(), pk_of(&update.table))
-                        }
-                        donat_ir::MutationRoot::Delete { alias, delete } => {
-                            (alias.clone(), pk_of(&delete.table))
-                        }
-                        donat_ir::MutationRoot::FunctionCall { alias, .. }
-                        | donat_ir::MutationRoot::Typename { alias, .. } => {
-                            (alias.clone(), vec![])
-                        }
-                    };
-                    (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
-                })
-                .collect()
-        };
-
-        let url = {
-            let urls = self.mysql_urls.read().await;
-            urls.get("default")
-                .or_else(|| urls.values().next())
+        let pk_of = |t: &donat_ir::Table| -> Vec<String> {
+            primary_keys
+                .get(&format!("{}.{}", t.schema, t.name))
                 .cloned()
-                .ok_or(MysqlMutationError::NoDefaultSource)?
+                .unwrap_or_default()
         };
+        let planned: Vec<(String, MySqlMutationPlan)> = roots
+            .iter()
+            .map(|m| {
+                let (alias, pk) = match m {
+                    donat_ir::MutationRoot::Insert { alias, insert } => {
+                        (alias.clone(), pk_of(&insert.table))
+                    }
+                    donat_ir::MutationRoot::Update { alias, update } => {
+                        (alias.clone(), pk_of(&update.table))
+                    }
+                    donat_ir::MutationRoot::Delete { alias, delete } => {
+                        (alias.clone(), pk_of(&delete.table))
+                    }
+                    donat_ir::MutationRoot::FunctionCall { alias, .. }
+                    | donat_ir::MutationRoot::Command { alias, .. }
+                    | donat_ir::MutationRoot::RequestFileUpload { alias, .. }
+                    | donat_ir::MutationRoot::Typename { alias, .. } => (alias.clone(), vec![]),
+                };
+                (alias, donat_sqlgen::mysql_mutation_plan(m, &pk))
+            })
+            .collect();
 
-        tokio::task::spawn_blocking(move || -> Result<Json, MysqlMutationError> {
-            let mut conn = mysql::Conn::new(url.as_str())
-                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-            // The engine emits Postgres-style `"ident"` quoting in the few places
-            // that bypass the dialect; MySQL needs ANSI_QUOTES to read those.
-            // The mutation path itself renders backtick identifiers, but stay
-            // consistent with the read path's session setup.
-            conn.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')")
-                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-            let mut tx = conn
-                .start_transaction(mysql::TxOpts::default())
-                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+        run_mysql_blocking(
+            pool,
+            permits,
+            settings.pool_timeout_seconds,
+            move |pool| -> Result<Json, MysqlMutationError> {
+                let mut conn = checkout_mysql_connection(&pool, settings.pool_timeout_seconds)
+                    .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                let mut tx = conn
+                    .start_transaction(mysql::TxOpts::default())
+                    .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
 
-            let mut data = serde_json::Map::new();
-            for (alias, plan) in &planned {
-                // A `__typename`-only mutation root has no DML.
-                if let Some((_, value)) = &plan.root_typename {
-                    data.insert(alias.clone(), Json::String(value.clone()));
-                    continue;
-                }
+                let mut data = serde_json::Map::new();
+                for (alias, plan) in &planned {
+                    // A `__typename`-only mutation root has no DML.
+                    if let Some((_, value)) = &plan.root_typename {
+                        data.insert(alias.clone(), Json::String(value.clone()));
+                        continue;
+                    }
 
-                // Build the companion-SELECT WHERE + ordering of DML vs SELECT
-                // from the recovery strategy.
-                let (companion_sql, affected_rows): (Option<String>, i64) = match &plan.kind {
-                    MySqlMutationKind::Insert { pk_col, pk_in_predicate } => {
-                        // INSERT first, then recover the new rows.
-                        tx.query_drop(&plan.dml_sql)
-                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                        let affected = tx.affected_rows() as i64;
-                        let where_clause = match pk_in_predicate {
-                            // Supplied PK: restrict by the exact values.
-                            Some(pred) => pred.clone(),
-                            None => {
-                                // last_insert_id() recovery: requires a single
-                                // AUTO_INCREMENT PK. The N rows occupy
-                                // [last_id, last_id + affected - 1].
-                                let col = pk_col.as_ref().ok_or_else(|| {
-                                    MysqlMutationError::Other(
-                                        "mysql insert returning needs a single \
+                    // Build the companion-SELECT WHERE + ordering of DML vs SELECT
+                    // from the recovery strategy.
+                    let (companion_sql, affected_rows): (Option<String>, i64) = match &plan.kind {
+                        MySqlMutationKind::Insert {
+                            pk_col,
+                            pk_in_predicate,
+                        } => {
+                            // INSERT first, then recover the new rows.
+                            tx.query_drop(&plan.dml_sql)
+                                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                            let affected = tx.affected_rows() as i64;
+                            let where_clause = match pk_in_predicate {
+                                // Supplied PK: restrict by the exact values.
+                                Some(pred) => pred.clone(),
+                                None => {
+                                    // last_insert_id() recovery: requires a single
+                                    // AUTO_INCREMENT PK. The N rows occupy
+                                    // [last_id, last_id + affected - 1].
+                                    let col = pk_col.as_ref().ok_or_else(|| {
+                                        MysqlMutationError::Other(
+                                            "mysql insert returning needs a single \
                                          auto-increment primary key or supplied pk values"
-                                            .to_string(),
-                                    )
-                                })?;
-                                let last = tx.last_insert_id().unwrap_or(0) as i64;
-                                if affected <= 0 {
-                                    // Nothing inserted: an always-false restriction.
-                                    format!("{col} IS NULL AND {col} IS NOT NULL")
-                                } else {
-                                    let hi = last + affected - 1;
-                                    format!("{col} BETWEEN {last} AND {hi}")
+                                                .to_string(),
+                                        )
+                                    })?;
+                                    let last = tx.last_insert_id().unwrap_or(0) as i64;
+                                    if affected <= 0 {
+                                        // Nothing inserted: an always-false restriction.
+                                        format!("{col} IS NULL AND {col} IS NOT NULL")
+                                    } else {
+                                        let hi = last + affected - 1;
+                                        format!("{col} BETWEEN {last} AND {hi}")
+                                    }
                                 }
+                            };
+                            (
+                                Some(format!("{} WHERE {where_clause}", plan.companion_select)),
+                                affected,
+                            )
+                        }
+                        MySqlMutationKind::Update { where_clause } => {
+                            // UPDATE first, then re-select by the same predicate.
+                            tx.query_drop(&plan.dml_sql)
+                                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                            let affected = tx.affected_rows() as i64;
+                            let sql = match where_clause {
+                                Some(w) => format!("{} WHERE {w}", plan.companion_select),
+                                None => plan.companion_select.clone(),
+                            };
+                            (Some(sql), affected)
+                        }
+                        MySqlMutationKind::Delete { where_clause } => {
+                            // SELECT first (capture returning), then DELETE.
+                            let sql = match where_clause {
+                                Some(w) => format!("{} WHERE {w}", plan.companion_select),
+                                None => plan.companion_select.clone(),
+                            };
+                            (Some(sql), 0) // affected filled after the DELETE below.
+                        }
+                        MySqlMutationKind::Typename => (None, 0),
+                    };
+
+                    // Run the companion SELECT, folding node rows + violated flags.
+                    let mut returning: Vec<Json> = vec![];
+                    let mut violated = false;
+                    let mut captured_rows: i64 = 0;
+                    if let Some(sql) = &companion_sql {
+                        let rows = tx
+                            .query_iter(sql)
+                            .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                        for row in rows {
+                            let row = row.map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                            let (node_text, flag): (String, i64) = mysql::from_row_opt(row)
+                                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                            captured_rows += 1;
+                            if flag != 0 {
+                                violated = true;
                             }
-                        };
-                        (Some(format!("{} WHERE {where_clause}", plan.companion_select)), affected)
+                            let node: Json = serde_json::from_str(&node_text)
+                                .map_err(|e| MysqlMutationError::Other(e.to_string()))?;
+                            returning.push(node);
+                        }
                     }
-                    MySqlMutationKind::Update { where_clause } => {
-                        // UPDATE first, then re-select by the same predicate.
+
+                    // For delete, the DML runs AFTER the capturing SELECT.
+                    let affected_rows = if let MySqlMutationKind::Delete { .. } = &plan.kind {
                         tx.query_drop(&plan.dml_sql)
                             .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                        let affected = tx.affected_rows() as i64;
-                        let sql = match where_clause {
-                            Some(w) => format!("{} WHERE {w}", plan.companion_select),
-                            None => plan.companion_select.clone(),
-                        };
-                        (Some(sql), affected)
-                    }
-                    MySqlMutationKind::Delete { where_clause } => {
-                        // SELECT first (capture returning), then DELETE.
-                        let sql = match where_clause {
-                            Some(w) => format!("{} WHERE {w}", plan.companion_select),
-                            None => plan.companion_select.clone(),
-                        };
-                        (Some(sql), 0) // affected filled after the DELETE below.
-                    }
-                    MySqlMutationKind::Typename => (None, 0),
-                };
+                        tx.affected_rows() as i64
+                    } else {
+                        affected_rows
+                    };
+                    let _ = captured_rows;
 
-                // Run the companion SELECT, folding node rows + violated flags.
-                let mut returning: Vec<Json> = vec![];
-                let mut violated = false;
-                let mut captured_rows: i64 = 0;
-                if let Some(sql) = &companion_sql {
-                    let rows: Vec<(String, i64)> = tx
-                        .query(sql)
-                        .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                    for (node_text, flag) in rows {
-                        captured_rows += 1;
-                        if flag != 0 {
-                            violated = true;
+                    if violated {
+                        let _ = tx.rollback();
+                        return Err(MysqlMutationError::CheckViolation {
+                            path: plan.check_path.clone(),
+                        });
+                    }
+
+                    if plan.single_row_output {
+                        data.insert(
+                            alias.clone(),
+                            returning.into_iter().next().unwrap_or(Json::Null),
+                        );
+                        continue;
+                    }
+
+                    // Assemble this root's response object in GraphQL selection order.
+                    let mut obj = serde_json::Map::new();
+                    let returning_value = Json::Array(returning);
+                    for slot in &plan.response_slots {
+                        match slot {
+                            MutationResponseSlot::Returning { alias } => {
+                                obj.insert(alias.clone(), returning_value.clone());
+                            }
+                            MutationResponseSlot::AffectedRows { alias } => {
+                                obj.insert(alias.clone(), Json::from(affected_rows));
+                            }
+                            MutationResponseSlot::Typename { alias, value } => {
+                                obj.insert(alias.clone(), Json::String(value.clone()));
+                            }
                         }
-                        let node: Json = serde_json::from_str(&node_text)
-                            .map_err(|e| MysqlMutationError::Other(e.to_string()))?;
-                        returning.push(node);
                     }
+                    data.insert(alias.clone(), Json::Object(obj));
                 }
 
-                // For delete, the DML runs AFTER the capturing SELECT.
-                let affected_rows = if let MySqlMutationKind::Delete { .. } = &plan.kind {
-                    tx.query_drop(&plan.dml_sql)
-                        .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-                    tx.affected_rows() as i64
-                } else {
-                    affected_rows
-                };
-                let _ = captured_rows;
-
-                if violated {
-                    let _ = tx.rollback();
-                    return Err(MysqlMutationError::CheckViolation {
-                        path: plan.check_path.clone(),
-                    });
-                }
-
-                // Assemble this root's response object from the plan's aliases,
-                // mirroring the Postgres/SQLite `Plan::Mutation` response shape.
-                let mut obj = serde_json::Map::new();
-                if let Some(ret_alias) = &plan.returning_alias {
-                    obj.insert(ret_alias.clone(), Json::Array(returning));
-                }
-                if let Some(ar_alias) = &plan.affected_rows_alias {
-                    obj.insert(ar_alias.clone(), Json::from(affected_rows));
-                }
-                if let Some((tn_alias, tn_value)) = &plan.typename {
-                    obj.insert(tn_alias.clone(), Json::String(tn_value.clone()));
-                }
-                data.insert(alias.clone(), Json::Object(obj));
-            }
-
-            tx.commit()
-                .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
-            Ok(Json::Object(data))
-        })
+                tx.commit()
+                    .map_err(|e| MysqlMutationError::Mysql(e.to_string()))?;
+                Ok(Json::Object(data))
+            },
+        )
         .await
-        .map_err(|e| MysqlMutationError::Other(format!("mysql task panicked: {e}")))?
+        .map_err(MysqlMutationError::Other)?
     }
 
-    /// Reconcile pools and catalogs with the current metadata sources,
-    /// pruning metadata that refers to dropped objects (run_sql untracks
-    /// dropped tables/functions, like Donat).
+    /// Refresh source catalogs and rebuild one pure immutable candidate.
+    /// Runtime DDL and administrative metadata-mutation APIs do not exist.
     pub async fn sync_sources(&self) -> anyhow::Result<()> {
-        // Later same-named sources override earlier ones (the harness
-        // appends a second 'default' pointing at a per-test database).
-        let sources: Vec<(String, SourceKind, String)> = {
-            let engine = self.engine.read().await;
-            let mut resolved: Vec<(String, SourceKind, String)> = vec![];
-            for s in &engine.metadata.sources {
-                let url = resolve_source_url(s, &self.default_url);
-                match resolved.iter_mut().find(|(n, _, _)| n == &s.name) {
-                    Some(entry) => {
-                        entry.1 = s.kind;
-                        entry.2 = url;
+        let metadata = self.engine_snapshot().await.metadata.clone();
+        self.sync_candidate(metadata).await
+    }
+
+    async fn sync_candidate(&self, mut metadata: Metadata) -> anyhow::Result<()> {
+        normalize_metadata_sources(&mut metadata);
+        let existing_runtimes = self.engine_snapshot().await.runtimes.clone();
+        let sources: Vec<(String, SourceKind, String, Vec<String>, RuntimePoolSettings)> = metadata
+            .sources
+            .iter()
+            .map(|source| {
+                let url = resolve_source_url(source, &self.default_url);
+                let mut tracked_databases = Vec::new();
+                for table in &source.tables {
+                    let schema = table.table.schema().to_string();
+                    if !tracked_databases.contains(&schema) {
+                        tracked_databases.push(schema);
                     }
-                    None => resolved.push((s.name.clone(), s.kind, url)),
                 }
-            }
-            resolved
-        };
+                (
+                    source.name.clone(),
+                    source.kind,
+                    url,
+                    tracked_databases,
+                    runtime_pool_settings(source),
+                )
+            })
+            .collect();
 
         let mut new_catalogs = HashMap::new();
-        for (name, kind, url) in &sources {
-            let catalog = match kind {
+        let mut new_runtimes = HashMap::new();
+        for (name, kind, url, tracked_databases, pool_settings) in &sources {
+            let (catalog, runtime) = match kind {
                 SourceKind::Postgres => {
-                    let existing = {
-                        let pools = self.pools.read().await;
-                        pools
-                            .get(name)
-                            .filter(|(u, _)| u == url)
-                            .map(|(_, p)| p.clone())
-                    };
-                    let pool = match existing {
-                        Some(pool) => pool,
-                        None => {
-                            let pool = make_pool(url)?;
-                            self.pools
-                                .write()
-                                .await
-                                .insert(name.clone(), (url.clone(), pool.clone()));
-                            pool
-                        }
+                    let runtime =
+                        stage_postgres_runtime(url, *pool_settings, existing_runtimes.get(name))?;
+                    let SourceRuntime::Postgres { pool, .. } = &runtime else {
+                        unreachable!("PostgreSQL staging returned a non-PostgreSQL runtime")
                     };
                     let client = pool.get().await?;
-                    ensure_check_violation_helper(&client).await?;
-                    donat_catalog::introspect(&client).await?
+                    (donat_catalog::introspect(&client).await?, runtime)
                 }
                 SourceKind::Sqlite => {
-                    // SQLite uses no pool and no PL/pgSQL helper: introspect
-                    // once at boot via a blocking connection, then remember
-                    // the path for per-query connections in
-                    // `execute_query_json`.
-                    let path = url.clone();
-                    let catalog = tokio::task::spawn_blocking(
-                        move || -> anyhow::Result<Catalog> {
-                            let conn = rusqlite::Connection::open(&path)?;
-                            Ok(donat_catalog::sqlite_introspect(&conn)?)
-                        },
-                    )
-                    .await??;
-                    self.sqlite_paths
-                        .write()
+                    let runtime =
+                        stage_sqlite_runtime(url, *pool_settings, existing_runtimes.get(name));
+                    let SourceRuntime::Sqlite { pool, .. } = &runtime else {
+                        unreachable!("SQLite staging returned a non-SQLite runtime")
+                    };
+                    let pool = pool.clone();
+                    let catalog = pool
+                        .clone()
+                        .run_blocking(
+                            pool_settings.pool_timeout_seconds,
+                            move |pool| -> anyhow::Result<Catalog> {
+                                let connection = pool.take()?;
+                                let result = donat_catalog::sqlite_introspect(&connection);
+                                pool.put(connection);
+                                Ok(result?)
+                            },
+                        )
                         .await
-                        .insert(name.clone(), url.clone());
-                    catalog
+                        .map_err(anyhow::Error::msg)??;
+                    (catalog, runtime)
                 }
                 SourceKind::Mysql => {
-                    // MySQL uses no pool and no PL/pgSQL helper: introspect once
-                    // at boot via a blocking connection, then remember the url
-                    // for per-query connections in `execute_query_json`. The
-                    // tracked schema is the database name from the url.
+                    // Introspect through the same bounded pool used at runtime.
+                    // The tracked schema is the database name from the URL.
                     let conn_url = url.clone();
-                    let catalog = tokio::task::spawn_blocking(
-                        move || -> anyhow::Result<Catalog> {
+                    let runtime =
+                        stage_mysql_runtime(url, *pool_settings, existing_runtimes.get(name))?;
+                    let SourceRuntime::Mysql { pool, permits, .. } = &runtime else {
+                        unreachable!("MySQL staging returned a non-MySQL runtime")
+                    };
+                    let pool = pool.clone();
+                    let permits = permits.clone();
+                    let pool_timeout_seconds = pool_settings.pool_timeout_seconds;
+                    let catalog = run_mysql_blocking(
+                        pool,
+                        permits,
+                        pool_timeout_seconds,
+                        move |pool| -> anyhow::Result<Catalog> {
                             let opts = mysql::Opts::from_url(&conn_url)?;
-                            let db = opts
-                                .get_db_name()
-                                .map(|s| s.to_string())
-                                .ok_or_else(|| {
+                            let db =
+                                opts.get_db_name().map(|s| s.to_string()).ok_or_else(|| {
                                     anyhow::anyhow!(
                                         "mysql source url has no database name: {conn_url}"
                                     )
                                 })?;
-                            let mut conn = mysql::Conn::new(opts)?;
-                            Ok(donat_catalog::mysql_introspect(&mut conn, &db)?)
+                            let mut conn = checkout_mysql_connection(&pool, pool_timeout_seconds)?;
+                            Ok(donat_catalog::mysql_introspect(conn.as_mut(), &db)?)
                         },
                     )
-                    .await??;
-                    self.mysql_urls
-                        .write()
-                        .await
-                        .insert(name.clone(), url.clone());
-                    catalog
+                    .await
+                    .map_err(anyhow::Error::msg)??;
+                    (catalog, runtime)
+                }
+                SourceKind::Clickhouse => {
+                    let fallback_database = clickhouse_database(url)?;
+                    let databases = if tracked_databases.is_empty() {
+                        vec![fallback_database.clone()]
+                    } else {
+                        tracked_databases.clone()
+                    };
+                    let sql = "SELECT database, table, name, type, default_kind, is_in_primary_key \
+                               FROM system.columns \
+                               WHERE database IN {databases:Array(String)} \
+                               ORDER BY database, table, position \
+                               FORMAT JSONEachRow";
+                    let text =
+                        clickhouse_post_with_databases_param(&self.http, url, sql, &databases)
+                            .await
+                            .map_err(anyhow::Error::msg)?;
+                    (
+                        donat_catalog::clickhouse_catalog_from_json_each_row(
+                            &text,
+                            &fallback_database,
+                        )?,
+                        SourceRuntime::Clickhouse { url: url.clone() },
+                    )
                 }
             };
             new_catalogs.insert(name.clone(), catalog);
+            new_runtimes.insert(name.clone(), runtime);
         }
 
-        let mut engine = self.engine.write().await;
-        for source in &mut engine.metadata.sources {
+        for source in &mut metadata.sources {
             let Some(catalog) = new_catalogs.get(&source.name) else {
                 continue;
             };
@@ -667,30 +2188,991 @@ impl AppState {
                 });
             }
         }
-        engine.catalogs = new_catalogs;
+        let pure = compile_pure_engine_candidate(
+            &metadata,
+            &new_catalogs,
+            self.connectors.as_ref(),
+            self.infer_function_permissions,
+        )?;
+        let deployed_process_catalog = crate::processes::validate_serving_catalogs(
+            &new_runtimes,
+            &metadata,
+            pure.rule_catalog(),
+            pure.process_catalog.as_ref(),
+            pure.command_catalog.as_ref(),
+            self.connectors.as_ref(),
+        )
+        .await?;
+        let candidate = Engine::from_pure_candidate(
+            metadata,
+            new_catalogs,
+            new_runtimes,
+            pure,
+            deployed_process_catalog,
+        );
+        self.publish_candidate(Ok(candidate)).await?;
         Ok(())
     }
 }
 
-/// The helper raised by generated mutation SQL on permission-check
-/// violations (SQLSTATE 23514 with a JSON payload).
-pub async fn ensure_check_violation_helper(
-    client: &deadpool_postgres::Client,
-) -> anyhow::Result<()> {
-    client
-        .batch_execute(
-            r#"
-            CREATE SCHEMA IF NOT EXISTS donat;
-            CREATE OR REPLACE FUNCTION donat.check_violation(msg text)
-            RETURNS json AS $$
-            BEGIN
-                RAISE EXCEPTION USING message = msg, errcode = '23514';
-            END;
-            $$ LANGUAGE plpgsql;
-            "#,
-        )
-        .await?;
+fn clickhouse_database(url: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(url)?;
+    Ok(url
+        .query_pairs()
+        .find(|(key, _)| key == "database")
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_else(|| "default".to_string()))
+}
+
+async fn clickhouse_post(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    use futures_util::StreamExt;
+
+    let response = client
+        .post(url)
+        .body(sql.to_string())
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        append_clickhouse_chunk(&mut body, &chunk, max_bytes)?;
+    }
+    let body = String::from_utf8(body)
+        .map_err(|error| format!("ClickHouse returned non-UTF-8 data: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "ClickHouse returned {status}: {}",
+            body.chars().take(4096).collect::<String>()
+        ));
+    }
+    Ok(body)
+}
+
+fn append_clickhouse_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), String> {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(format!("ClickHouse response exceeds {max_bytes} bytes"));
+    }
+    body.extend_from_slice(chunk);
     Ok(())
+}
+
+async fn clickhouse_post_with_databases_param(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+    databases: &[String],
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    let databases = format!(
+        "[{}]",
+        databases
+            .iter()
+            .map(|database| ClickhouseDialect.quote_literal(database))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    url.query_pairs_mut()
+        .append_pair("param_databases", &databases);
+    clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_CATALOG_BYTES).await
+}
+
+async fn clickhouse_post_data(
+    client: &reqwest::Client,
+    url: &str,
+    sql: &str,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("enable_named_columns_in_function_tuple", "1")
+        .append_pair("allow_experimental_json_type", "1")
+        // Keep GraphQL numeric values numeric in the JSON assembled by
+        // toJSONString. ClickHouse quotes 64-bit integers by default.
+        .append_pair("output_format_json_quote_64bit_integers", "0");
+    clickhouse_post(client, url.as_str(), sql, CLICKHOUSE_MAX_DATA_BYTES).await
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+    use donat_metadata::{Metadata, SourceKind};
+    use donat_schema::{MultiSourcePlan, MultiSourcePlanner, Session};
+    use serde_json::{Map as JsonMap, json};
+    use tokio::sync::RwLock;
+
+    use super::{
+        AppState, Engine, RuntimePoolSettings, SourceRuntime, SqlitePool, compile_allowed_queries,
+        compile_rule_catalog, run_mysql_blocking, runtime_pool_settings, stage_mysql_runtime,
+        stage_postgres_runtime,
+    };
+
+    fn candidate(
+        root: &str,
+        path: &str,
+    ) -> (
+        Metadata,
+        HashMap<String, Catalog>,
+        HashMap<String, SourceRuntime>,
+    ) {
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "sqlite",
+                "configuration": {
+                    "connection_info": { "database_url": path }
+                },
+                "tables": [{
+                    "table": { "schema": "public", "name": "item" },
+                    "configuration": { "custom_name": root },
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "filter": {} }
+                    }],
+                    "insert_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "check": {} }
+                    }]
+                }]
+            }]
+        }))
+        .expect("metadata deserializes");
+        let catalog = Catalog {
+            tables: BTreeMap::from([(
+                "public.item".to_string(),
+                TableInfo {
+                    schema: "public".to_string(),
+                    name: "item".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
+                    columns: vec![ColumnInfo {
+                        name: "id".to_string(),
+                        pg_type: "int8".to_string(),
+                        pg_typmod: -1,
+                        native_type: None,
+                        nullable: false,
+                        has_default: false,
+                    }],
+                    primary_key: vec!["id".to_string()],
+                    unique_keys: vec![],
+                    foreign_keys: vec![],
+                },
+            )]),
+            functions: BTreeMap::new(),
+        };
+        (
+            metadata,
+            HashMap::from([("default".to_string(), catalog)]),
+            HashMap::from([(
+                "default".to_string(),
+                SourceRuntime::Sqlite {
+                    path: path.to_string(),
+                    pool: Arc::new(SqlitePool::new(path.to_string(), 8)),
+                    settings: RuntimePoolSettings::default(),
+                },
+            )]),
+        )
+    }
+
+    fn state(engine: Engine) -> AppState {
+        AppState {
+            engine: RwLock::new(Arc::new(engine)),
+            connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
+            default_url: "sqlite::memory:".to_string(),
+            admin_secret: None,
+            unauthorized_role: None,
+            stringify_numerics: false,
+            infer_function_permissions: true,
+            jwt: None,
+            auth_hook: None,
+            http: reqwest::Client::new(),
+            allowlist_enabled: false,
+            subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+            subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+            storage: Arc::new(donat_storage::StorageRegistry::default()),
+            external_base_url: String::new(),
+        }
+    }
+
+    fn user_session() -> Session {
+        Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        }
+    }
+
+    #[test]
+    fn duplicate_source_uses_last_definition_for_query_and_mutation() {
+        let (first, catalogs, _) = candidate("old_item", "/tmp/old.sqlite");
+        let (last, _, runtimes) = candidate("new_item", "/tmp/new.sqlite");
+        let mut metadata = first;
+        metadata.sources[0].kind = SourceKind::Postgres;
+        metadata.sources.extend(last.sources);
+
+        let engine = Engine::compiled(metadata, catalogs, runtimes, true)
+            .expect("the last same-named source wins");
+        assert_eq!(engine.metadata.sources.len(), 1);
+        assert_eq!(engine.metadata.sources[0].kind, SourceKind::Sqlite);
+        let compiled = engine.compiled.as_deref().expect("compiled snapshot");
+        let planner =
+            MultiSourcePlanner::from_compiled(&engine.metadata, &engine.catalogs, compiled)
+                .expect("planner constructs from normalized snapshot");
+
+        let query = graphql_parser::parse_query::<String>("{ new_item { id } }")
+            .expect("query parses")
+            .into_static();
+        let MultiSourcePlan::Query { sources, .. } = planner
+            .plan(&query, None, &JsonMap::new(), &user_session())
+            .expect("last source query plans")
+        else {
+            panic!("query plan expected");
+        };
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source, "default");
+
+        let mutation = graphql_parser::parse_query::<String>(
+            "mutation { insert_new_item_one(object: { id: 1 }) { id } }",
+        )
+        .expect("mutation parses")
+        .into_static();
+        let MultiSourcePlan::Mutation { source, .. } = planner
+            .plan(&mutation, None, &JsonMap::new(), &user_session())
+            .expect("last source mutation plans")
+        else {
+            panic!("mutation plan expected");
+        };
+        assert_eq!(source.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn compiled_engine_rejects_missing_or_mismatched_runtime() {
+        let (metadata, catalogs, _) = candidate("item", "/tmp/item.sqlite");
+        let missing = Engine::compiled(metadata.clone(), catalogs.clone(), HashMap::new(), true)
+            .err()
+            .expect("a source without a runtime is rejected");
+        assert!(
+            missing
+                .message
+                .contains("runtime for source 'default' not found")
+        );
+
+        let runtimes = HashMap::from([(
+            "default".to_string(),
+            stage_mysql_runtime("mysql://unused/item", RuntimePoolSettings::default(), None)
+                .expect("lazy MySQL runtime constructs"),
+        )]);
+        let mismatched = Engine::compiled(metadata, catalogs, runtimes, true)
+            .err()
+            .expect("a runtime with the wrong backend kind is rejected");
+        assert!(mismatched.message.contains("metadata requires Sqlite"));
+    }
+
+    #[test]
+    fn compiled_engine_rejects_invalid_rules_before_publishing_a_snapshot() {
+        let (mut metadata, catalogs, runtimes) = candidate("item", "/tmp/item.sqlite");
+        metadata.rules = serde_json::from_value(json!({
+            "rules": [
+                {"name": "duplicate", "result": "bool!", "expression": "true"},
+                {"name": "duplicate", "result": "bool!", "expression": "false"}
+            ]
+        }))
+        .expect("rules metadata deserializes");
+
+        let Err(error) = Engine::bootstrap_checked(metadata.clone()) else {
+            panic!("invalid rules are rejected before the server listens");
+        };
+        assert_eq!(error.path, "rules.yaml");
+        assert!(error.message.contains("duplicate rule name `duplicate`"));
+
+        let Err(error) = Engine::compiled(metadata, catalogs, runtimes, true) else {
+            panic!("candidate with duplicate rules is rejected before publishing");
+        };
+        assert_eq!(error.path, "rules.yaml");
+        assert!(error.message.contains("duplicate rule name `duplicate`"));
+    }
+
+    #[test]
+    fn compiled_engine_rejects_invalid_commands_before_publishing_a_snapshot() {
+        let (mut metadata, catalogs, runtimes) = candidate("item", "/tmp/item.sqlite");
+        metadata.commands = serde_json::from_value(json!([
+            {
+                "name": "create_item",
+                "source": "default",
+                "permissions": [{ "role": "user" }],
+                "arguments": [],
+                "steps": [],
+                "result": {}
+            }
+        ]))
+        .expect("command metadata deserializes");
+
+        let Err(error) = Engine::compiled(metadata, catalogs, runtimes, true) else {
+            panic!("candidate with a non-Postgres command source is rejected before publishing");
+        };
+        assert_eq!(error.path, "commands[0]");
+        assert!(error.message.contains("requires a Postgres source"));
+    }
+
+    #[tokio::test]
+    async fn failed_out_of_range_command_literal_preserves_the_published_snapshot() {
+        let (mut metadata, catalogs, _) = candidate("item", "/tmp/item.sqlite");
+        metadata.sources[0].kind = SourceKind::Postgres;
+        let runtimes = HashMap::from([(
+            "default".to_string(),
+            stage_postgres_runtime(
+                "postgres://unused/command-literal",
+                RuntimePoolSettings::default(),
+                None,
+            )
+            .expect("unconnected Postgres runtime stages"),
+        )]);
+        let engine = Engine::compiled(metadata.clone(), catalogs.clone(), runtimes.clone(), true)
+            .expect("published snapshot without commands compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
+
+        metadata.commands = serde_json::from_value(json!([{
+            "name": "create_item",
+            "source": "default",
+            "permissions": [{ "role": "user" }],
+            "steps": [{
+                "name": "item",
+                "insert": {
+                    "table": { "schema": "public", "name": "item" },
+                    "object": { "id": { "literal": "9223372036854775808" } },
+                    "returning": ["id"]
+                }
+            }],
+            "result": { "id": { "step": "item", "column": "id" } }
+        }]))
+        .expect("invalid command metadata deserializes");
+
+        let error = state
+            .publish_candidate(Engine::compiled(metadata, catalogs, runtimes, true))
+            .await
+            .expect_err("out-of-range int8 command literal rejects candidate");
+        assert_eq!(error.path, "commands[0].steps[0]");
+        assert!(error.message.contains("int8"));
+        assert!(error.message.contains("out of range"));
+
+        let current = state.engine_snapshot().await;
+        assert!(Arc::ptr_eq(
+            &old_compiled,
+            current
+                .compiled
+                .as_ref()
+                .expect("unchanged compiled snapshot"),
+        ));
+    }
+
+    #[test]
+    fn postgres_runtime_reuses_pool_only_for_the_same_url() {
+        let first = stage_postgres_runtime(
+            "postgres://localhost/first",
+            RuntimePoolSettings::default(),
+            None,
+        )
+        .expect("first runtime stages");
+        let same = stage_postgres_runtime(
+            "postgres://localhost/first",
+            RuntimePoolSettings::default(),
+            Some(&first),
+        )
+        .expect("same-url runtime stages");
+        let changed = stage_postgres_runtime(
+            "postgres://localhost/second",
+            RuntimePoolSettings::default(),
+            Some(&same),
+        )
+        .expect("changed-url runtime stages");
+
+        let SourceRuntime::Postgres {
+            pool: first_pool, ..
+        } = &first
+        else {
+            panic!("postgres runtime expected");
+        };
+        let SourceRuntime::Postgres {
+            pool: same_pool, ..
+        } = &same
+        else {
+            panic!("postgres runtime expected");
+        };
+        let SourceRuntime::Postgres {
+            pool: changed_pool, ..
+        } = &changed
+        else {
+            panic!("postgres runtime expected");
+        };
+        assert!(std::ptr::eq(first_pool.manager(), same_pool.manager()));
+        assert!(!std::ptr::eq(same_pool.manager(), changed_pool.manager()));
+    }
+
+    #[test]
+    fn mysql_runtime_reuses_admission_permits_only_for_same_settings() {
+        let first =
+            stage_mysql_runtime("mysql://unused/item", RuntimePoolSettings::default(), None)
+                .expect("first runtime stages");
+        let same = stage_mysql_runtime(
+            "mysql://unused/item",
+            RuntimePoolSettings::default(),
+            Some(&first),
+        )
+        .expect("same runtime stages");
+        let changed = stage_mysql_runtime(
+            "mysql://unused/item",
+            RuntimePoolSettings {
+                max_connections: 2,
+                pool_timeout_seconds: None,
+            },
+            Some(&same),
+        )
+        .expect("changed runtime stages");
+
+        let SourceRuntime::Mysql {
+            permits: first_permits,
+            ..
+        } = &first
+        else {
+            panic!("mysql runtime expected");
+        };
+        let SourceRuntime::Mysql {
+            permits: same_permits,
+            ..
+        } = &same
+        else {
+            panic!("mysql runtime expected");
+        };
+        let SourceRuntime::Mysql {
+            permits: changed_permits,
+            ..
+        } = &changed
+        else {
+            panic!("mysql runtime expected");
+        };
+        assert!(Arc::ptr_eq(first_permits, same_permits));
+        assert!(!Arc::ptr_eq(same_permits, changed_permits));
+    }
+
+    #[test]
+    fn pool_settings_control_capacity_and_runtime_reuse() {
+        let source: donat_metadata::Source = serde_json::from_value(json!({
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": {
+                    "database_url": "postgres://localhost/db",
+                    "pool_settings": { "max_connections": 3, "pool_timeout": 2 }
+                }
+            },
+            "tables": []
+        }))
+        .expect("source deserializes");
+        let settings = runtime_pool_settings(&source);
+        assert_eq!(settings.max_connections, 3);
+        assert_eq!(settings.pool_timeout_seconds, Some(2));
+
+        let first = stage_postgres_runtime("postgres://localhost/db", settings, None)
+            .expect("runtime stages");
+        let SourceRuntime::Postgres { pool, .. } = &first else {
+            unreachable!()
+        };
+        assert_eq!(pool.status().max_size, 3);
+
+        let changed = stage_postgres_runtime(
+            "postgres://localhost/db",
+            RuntimePoolSettings {
+                max_connections: 4,
+                pool_timeout_seconds: Some(2),
+            },
+            Some(&first),
+        )
+        .expect("changed settings stage a new runtime");
+        let SourceRuntime::Postgres {
+            pool: changed_pool, ..
+        } = &changed
+        else {
+            unreachable!()
+        };
+        assert!(!std::ptr::eq(pool.manager(), changed_pool.manager()));
+        assert_eq!(changed_pool.status().max_size, 4);
+    }
+
+    #[test]
+    fn sqlite_pool_reuses_the_same_in_memory_connection() {
+        let pool = SqlitePool::new(":memory:".to_string(), 8);
+        let connection = pool.take().expect("open connection");
+        connection
+            .execute_batch("CREATE TABLE item(id INTEGER); INSERT INTO item VALUES (1);")
+            .expect("initialize in-memory database");
+        pool.put(connection);
+
+        let connection = pool.take().expect("reuse connection");
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM item", [], |row| row.get(0))
+            .expect("in-memory database survived checkout");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_pool_keeps_permit_until_cancelled_blocking_job_finishes() {
+        let pool = Arc::new(SqlitePool::new(":memory:".to_string(), 1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let task = tokio::spawn(pool.clone().run_blocking(None, move |_| {
+            let _ = started_tx.send(());
+            release_rx.recv().expect("test releases blocking job");
+        }));
+        started_rx.await.expect("blocking job started");
+        task.abort();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), pool.acquire(None),)
+                .await
+                .is_err(),
+            "cancelling the async caller must not release the blocking job's permit"
+        );
+
+        release_tx.send(()).expect("release blocking job");
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire(None))
+            .await
+            .expect("permit becomes available after blocking job finishes")
+            .expect("sqlite pool remains open");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn mysql_pool_keeps_permit_until_cancelled_blocking_job_finishes() {
+        let runtime = stage_mysql_runtime(
+            "mysql://unused/item",
+            RuntimePoolSettings {
+                max_connections: 1,
+                pool_timeout_seconds: None,
+            },
+            None,
+        )
+        .expect("lazy mysql runtime constructs");
+        let SourceRuntime::Mysql { pool, permits, .. } = runtime else {
+            panic!("mysql runtime expected");
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let task = tokio::spawn(run_mysql_blocking(pool, permits.clone(), None, move |_| {
+            let _ = started_tx.send(());
+            release_rx.recv().expect("test releases blocking job");
+        }));
+        started_rx.await.expect("blocking job started");
+        task.abort();
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                permits.clone().acquire_owned(),
+            )
+            .await
+            .is_err(),
+            "cancelling the async caller must not release the blocking job's permit"
+        );
+
+        release_tx.send(()).expect("release blocking job");
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            permits.clone().acquire_owned(),
+        )
+        .await
+        .expect("permit becomes available after blocking job finishes")
+        .expect("mysql pool remains open");
+        drop(permit);
+    }
+
+    #[test]
+    fn engine_snapshot_precompiles_request_metadata() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "query_collections": [{
+                "name": "allowed",
+                "definition": { "queries": [{
+                    "name": "items",
+                    "query": "query Items($limit: Int) { items(limit: $limit) { id } }"
+                }]}
+            }],
+            "allowlist": [{ "collection": "allowed" }],
+            "rest_endpoints": [{
+                "name": "items",
+                "url": "items",
+                "methods": ["GET"],
+                "definition": { "query": {
+                    "collection_name": "allowed", "query_name": "items"
+                }}
+            }],
+            "remote_schemas": [{
+                "name": "remote",
+                "definition": { "url": "http://example.invalid/graphql" },
+                "permissions": [{
+                    "role": "user",
+                    "definition": { "schema": "type Query { ping: String }" }
+                }]
+            }]
+        }))
+        .expect("metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        assert_eq!(engine.allowed_queries.len(), 1);
+        assert!(
+            engine
+                .rest_queries
+                .contains_key(&("allowed".into(), "items".into()))
+        );
+        assert!(
+            engine
+                .remote_permission_schemas
+                .contains_key(&("remote".into(), "user".into()))
+        );
+    }
+
+    #[test]
+    fn compiles_closed_opaque_json_rule_type_from_metadata() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "rules": {
+                "types": [{
+                    "name": "BoundedProviderEvidence",
+                    "opaque_json": {
+                        "maximum_bytes": 4096,
+                        "maximum_depth": 8,
+                        "maximum_nodes": 128
+                    }
+                }],
+                "rules": [{
+                    "name": "retain_evidence",
+                    "parameters": {
+                        "evidence": "BoundedProviderEvidence!"
+                    },
+                    "result": "BoundedProviderEvidence!",
+                    "expression": "evidence"
+                }]
+            }
+        }))
+        .expect("opaque JSON metadata deserializes");
+
+        let catalog =
+            compile_rule_catalog(&metadata).expect("opaque JSON declaration compiles at boot");
+        assert!(catalog.rule("retain_evidence").is_some());
+    }
+
+    #[test]
+    fn compiles_every_active_petshop_builtin_rule_scalar() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "rules": {
+                "rules": [
+                    {
+                        "name": "round_trip_bool",
+                        "parameters": { "value": "bool!" },
+                        "result": "bool!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_string",
+                        "parameters": { "value": "string!" },
+                        "result": "string!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_int",
+                        "parameters": { "value": "int!" },
+                        "result": "int!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_bigint",
+                        "parameters": { "value": "bigint!" },
+                        "result": "bigint!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_uuid",
+                        "parameters": { "value": "uuid!" },
+                        "result": "uuid!",
+                        "expression": "value"
+                    },
+                    {
+                        "name": "round_trip_timestamptz",
+                        "parameters": { "value": "timestamptz!" },
+                        "result": "timestamptz!",
+                        "expression": "value"
+                    }
+                ]
+            }
+        }))
+        .expect("active Petshop scalar metadata deserializes");
+
+        let catalog =
+            compile_rule_catalog(&metadata).expect("every active Petshop scalar compiles");
+        let bigint: donat_rules::RuleType = serde_json::from_value(json!("Int64"))
+            .expect("the closed bigint rule type deserializes");
+        for (rule, expected) in [
+            ("round_trip_bool", donat_rules::RuleType::Bool),
+            ("round_trip_string", donat_rules::RuleType::String),
+            ("round_trip_int", donat_rules::RuleType::Int),
+            ("round_trip_bigint", bigint),
+            ("round_trip_uuid", donat_rules::RuleType::Uuid),
+            ("round_trip_timestamptz", donat_rules::RuleType::Timestamp),
+        ] {
+            assert_eq!(
+                catalog.rule(rule).expect("compiled scalar rule").result,
+                expected,
+                "{rule} maps to its closed Rule scalar"
+            );
+        }
+    }
+
+    #[test]
+    fn over_depth_allowlist_query_is_skipped_before_parsing() {
+        let query = format!(
+            "{}{}",
+            "{ field ".repeat(crate::gql::MAX_QUERY_DEPTH + 1),
+            "}".repeat(crate::gql::MAX_QUERY_DEPTH + 1),
+        );
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "query_collections": [{
+                "name": "allowed",
+                "definition": { "queries": [{ "name": "deep", "query": query }] }
+            }],
+            "allowlist": [{ "collection": "allowed" }]
+        }))
+        .expect("metadata deserializes");
+
+        assert!(compile_allowed_queries(&metadata).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_sync_preserves_the_published_engine_snapshot() {
+        let (metadata, catalogs, runtimes) = candidate("old_item", "/tmp/old.sqlite");
+        let engine =
+            Engine::compiled(metadata, catalogs, runtimes, true).expect("old engine compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
+        let (candidate, _, _) =
+            candidate("new_item", "/definitely/missing/donat-parent/new.sqlite");
+
+        state
+            .sync_candidate(candidate)
+            .await
+            .expect_err("candidate sync fails during SQLite introspection");
+
+        let engine = state.engine_snapshot().await;
+        assert_eq!(
+            engine.metadata.sources[0].tables[0]
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.custom_name.as_deref()),
+            Some("old_item")
+        );
+        assert!(Arc::ptr_eq(
+            engine.compiled.as_ref().expect("compiled snapshot"),
+            &old_compiled
+        ));
+        assert!(matches!(
+            engine.runtimes.get("default"),
+            Some(SourceRuntime::Sqlite { path, .. }) if path == "/tmp/old.sqlite"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_preserves_entire_engine_snapshot() {
+        let (metadata, catalogs, runtimes) = candidate("old_item", "/tmp/old.sqlite");
+        let engine =
+            Engine::compiled(metadata, catalogs, runtimes, true).expect("old engine compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
+
+        let (metadata, _, runtimes) = candidate("new_item", "/tmp/new.sqlite");
+        let invalid = Engine::compiled(metadata, HashMap::new(), runtimes, true);
+        state
+            .publish_candidate(invalid)
+            .await
+            .expect_err("missing candidate catalog is rejected");
+        let engine = state.engine_snapshot().await;
+
+        assert_eq!(
+            engine.metadata.sources[0].tables[0]
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.custom_name.as_deref()),
+            Some("old_item")
+        );
+        assert!(engine.catalogs.contains_key("default"));
+        assert!(Arc::ptr_eq(
+            engine.compiled.as_ref().expect("compiled snapshot"),
+            &old_compiled
+        ));
+        assert!(matches!(
+            engine.runtimes.get("default"),
+            Some(SourceRuntime::Sqlite { path, .. }) if path == "/tmp/old.sqlite"
+        ));
+    }
+
+    #[tokio::test]
+    async fn valid_candidate_publishes_entire_engine_snapshot() {
+        let (metadata, catalogs, runtimes) = candidate("old_item", "/tmp/old.sqlite");
+        let engine =
+            Engine::compiled(metadata, catalogs, runtimes, true).expect("old engine compiles");
+        let old_compiled = engine.compiled.as_ref().expect("compiled snapshot").clone();
+        let state = state(engine);
+        let (metadata, catalogs, runtimes) = candidate("new_item", "/tmp/new.sqlite");
+        let replacement = Engine::compiled(metadata, catalogs, runtimes, true);
+
+        state
+            .publish_candidate(replacement)
+            .await
+            .expect("candidate publishes");
+        let engine = state.engine_snapshot().await;
+
+        assert_eq!(
+            engine.metadata.sources[0].tables[0]
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.custom_name.as_deref()),
+            Some("new_item")
+        );
+        assert!(engine.catalogs.contains_key("default"));
+        assert!(!Arc::ptr_eq(
+            engine.compiled.as_ref().expect("compiled snapshot"),
+            &old_compiled
+        ));
+        assert!(matches!(
+            engine.runtimes.get("default"),
+            Some(SourceRuntime::Sqlite { path, .. }) if path == "/tmp/new.sqlite"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod clickhouse_transport_tests {
+    use super::*;
+    use axum::Router;
+    use axum::extract::{Query, State};
+    use axum::routing::post;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn resolves_hasura_clickhouse_template_configuration() {
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "name": "clickhouse",
+            "kind": "clickhouse",
+            "configuration": {
+                "template": r#"{
+                    "url": {{getEnvironmentVariable("DONAT_TEST_CLICKHOUSE_URL")}},
+                    "username": {{getEnvironmentVariable("DONAT_TEST_CLICKHOUSE_USERNAME")}},
+                    "password": {{getEnvironmentVariable("DONAT_TEST_CLICKHOUSE_PASSWORD")}}
+                }"#,
+                "timeout": null,
+                "value": {}
+            },
+            "tables": []
+        }))
+        .expect("Hasura ClickHouse source should deserialize");
+
+        unsafe {
+            std::env::set_var(
+                "DONAT_TEST_CLICKHOUSE_URL",
+                "http://clickhouse:8123?database=logs",
+            );
+            std::env::set_var("DONAT_TEST_CLICKHOUSE_USERNAME", "clickhouse");
+            std::env::set_var("DONAT_TEST_CLICKHOUSE_PASSWORD", "secret");
+        }
+
+        let resolved = resolve_source_url(&source, "postgres://postgres:5432/tandt");
+
+        unsafe {
+            std::env::remove_var("DONAT_TEST_CLICKHOUSE_URL");
+            std::env::remove_var("DONAT_TEST_CLICKHOUSE_USERNAME");
+            std::env::remove_var("DONAT_TEST_CLICKHOUSE_PASSWORD");
+        }
+        assert_eq!(
+            resolved,
+            "http://clickhouse:secret@clickhouse:8123/?database=logs"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct QueryState(Arc<Mutex<Option<HashMap<String, String>>>>);
+
+    async fn capture_query(
+        State(state): State<QueryState>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> &'static str {
+        *state.0.lock().await = Some(query);
+        "{}"
+    }
+
+    #[test]
+    fn clickhouse_response_limit_rejects_the_chunk_that_crosses_it() {
+        let mut body = Vec::new();
+        append_clickhouse_chunk(&mut body, b"1234", 5).unwrap();
+        let error = append_clickhouse_chunk(&mut body, b"56", 5).unwrap_err();
+        assert_eq!(error, "ClickHouse response exceeds 5 bytes");
+        assert_eq!(body, b"1234");
+    }
+
+    #[tokio::test]
+    async fn clickhouse_data_request_keeps_64_bit_json_numbers_unquoted() {
+        let state = QueryState::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(capture_query))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("query capture server");
+        });
+
+        clickhouse_post_data(
+            &reqwest::Client::new(),
+            &format!("http://{address}/"),
+            "SELECT 1",
+        )
+        .await
+        .expect("ClickHouse request succeeds");
+
+        let query = state
+            .0
+            .lock()
+            .await
+            .clone()
+            .expect("query parameters captured");
+        assert_eq!(
+            query.get("output_format_json_quote_64bit_integers"),
+            Some(&"0".to_string())
+        );
+        server.abort();
+    }
 }
 
 /// Make sure the metadata has at least one (default) source so that

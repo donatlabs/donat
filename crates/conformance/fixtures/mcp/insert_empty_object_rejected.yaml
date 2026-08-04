@@ -1,0 +1,23 @@
+description: >
+  insert.objects row objects must not be empty. MCP rejects default-only insert
+  rows before GraphQL execution so mutation calls carry explicit writable data.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 71
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: pet
+      objects:
+      - {}
+response:
+  jsonrpc: "2.0"
+  id: 71
+  result:
+    isError: true

@@ -1,0 +1,24 @@
+description: A permitted command creates an order and returns its declared result.
+url: /v1/graphql
+status: 200
+headers:
+  X-Donat-Role: customer
+query:
+  query: |
+    mutation CreateOrder {
+      create_order(
+        id: "550e8400-e29b-41d4-a716-446655440000"
+        customer_id: "550e8400-e29b-41d4-a716-446655440001"
+        status: "draft"
+        quantity: 2
+        request_id: "550e8400-e29b-41d4-a716-446655440002"
+      ) {
+        order_id
+        status
+      }
+    }
+response:
+  data:
+    create_order:
+      order_id: "550e8400-e29b-41d4-a716-446655440000"
+      status: draft

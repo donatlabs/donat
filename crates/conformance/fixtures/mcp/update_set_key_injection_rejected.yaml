@@ -1,0 +1,27 @@
+description: >
+  A GraphQL-looking key inside update.set is rejected before GraphQL execution.
+  The update tool treats set keys as column names and validates them as plain
+  GraphQL identifiers from tracked catalog metadata.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 35
+  method: tools/call
+  params:
+    name: update
+    arguments:
+      table: pet
+      where:
+        id:
+          _eq: 1
+      set:
+        "name } query x { pet { id } }": Rexx
+response:
+  jsonrpc: "2.0"
+  id: 35
+  result:
+    isError: true

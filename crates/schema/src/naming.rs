@@ -5,10 +5,10 @@ use donat_metadata::{QualifiedTable, TableEntry};
 /// The base GraphQL name of a table: `custom_name`/custom root field if set,
 /// otherwise `<name>` for the `public` schema and `<schema>_<name>` else.
 pub fn table_base_name(entry: &TableEntry) -> String {
-    if let Some(config) = &entry.configuration {
-        if let Some(custom) = &config.custom_name {
-            return custom.clone();
-        }
+    if let Some(config) = &entry.configuration
+        && let Some(custom) = &config.custom_name
+    {
+        return custom.clone();
     }
     default_base_name(&entry.table)
 }
@@ -20,6 +20,70 @@ pub fn default_base_name(table: &QualifiedTable) -> String {
     }
 }
 
+/// Stable Pascal-case component used by generated command result and row type
+/// names. Command root fields themselves intentionally retain their metadata
+/// spelling; only the generated object type names use this transformation.
+pub(crate) fn command_pascal_case(name: &str) -> String {
+    let mut output = String::new();
+    let mut capitalize = true;
+    for character in name.chars() {
+        if character == '_' || character == '-' {
+            capitalize = true;
+        } else if capitalize {
+            output.extend(character.to_uppercase());
+            capitalize = false;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+/// GraphQL-visible column field name for a physical database column.
+///
+/// Hasura metadata supports both the v2 `custom_column_names` map and the
+/// older `column_config.<column>.custom_name` shape. Prefer the explicit v2
+/// map, then fall back to `column_config`, then to the database column name.
+pub fn column_graphql_name(entry: &TableEntry, db_name: &str) -> String {
+    let Some(config) = &entry.configuration else {
+        return db_name.to_string();
+    };
+    if let Some(custom) = config.custom_column_names.get(db_name) {
+        return custom.clone();
+    }
+    if let Some(custom) = config
+        .column_config
+        .get(db_name)
+        .and_then(|c| c.custom_name.clone())
+    {
+        return custom;
+    }
+    db_name.to_string()
+}
+
+/// Resolve a GraphQL-visible column name back to its physical database column.
+pub fn column_db_name(entry: &TableEntry, graphql_name: &str) -> String {
+    let Some(config) = &entry.configuration else {
+        return graphql_name.to_string();
+    };
+    if let Some((db, _)) = config
+        .custom_column_names
+        .iter()
+        .find(|(_, custom)| custom.as_str() == graphql_name)
+    {
+        return db.clone();
+    }
+    if let Some((db, _)) = config.column_config.iter().find(|(_, column)| {
+        column
+            .custom_name
+            .as_deref()
+            .is_some_and(|custom| custom == graphql_name)
+    }) {
+        return db.clone();
+    }
+    graphql_name.to_string()
+}
+
 pub struct RootNames {
     pub select: String,
     pub select_by_pk: String,
@@ -28,15 +92,10 @@ pub struct RootNames {
 
 pub fn root_names(entry: &TableEntry) -> RootNames {
     let base = table_base_name(entry);
-    let custom = entry
-        .configuration
-        .as_ref()
-        .map(|c| &c.custom_root_fields);
+    let custom = entry.configuration.as_ref().map(|c| &c.custom_root_fields);
 
     let get = |key: &str, default: String| -> String {
-        custom
-            .and_then(|m| m.get(key).cloned())
-            .unwrap_or(default)
+        custom.and_then(|m| m.get(key).cloned()).unwrap_or(default)
     };
 
     RootNames {
@@ -116,7 +175,10 @@ mod tests {
             "author"
         );
         // Bare names default to the public schema.
-        assert_eq!(default_base_name(&QualifiedTable::Name("author".into())), "author");
+        assert_eq!(
+            default_base_name(&QualifiedTable::Name("author".into())),
+            "author"
+        );
     }
 
     #[test]
@@ -155,6 +217,31 @@ mod tests {
         assert_eq!(names.select, "author");
         assert_eq!(names.select_by_pk, "author_by_pk");
         assert_eq!(names.select_aggregate, "author_aggregate");
+    }
+
+    #[test]
+    fn column_names_prefer_custom_column_names() {
+        let e = entry(serde_json::json!({
+            "table": "author",
+            "configuration": {
+                "custom_column_names": { "display_name": "displayName" },
+                "column_config": { "display_name": { "custom_name": "legacyDisplayName" } },
+            },
+        }));
+        assert_eq!(column_graphql_name(&e, "display_name"), "displayName");
+        assert_eq!(column_db_name(&e, "displayName"), "display_name");
+    }
+
+    #[test]
+    fn column_names_fallback_to_column_config_custom_name() {
+        let e = entry(serde_json::json!({
+            "table": "author",
+            "configuration": {
+                "column_config": { "display_name": { "custom_name": "displayName" } },
+            },
+        }));
+        assert_eq!(column_graphql_name(&e, "display_name"), "displayName");
+        assert_eq!(column_db_name(&e, "displayName"), "display_name");
     }
 
     #[test]

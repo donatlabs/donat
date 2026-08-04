@@ -1,0 +1,1 @@
+{"data":{"logs_l2_job_events":[{"event_time":"2026-06-05 10:00:00.000","event_type":"completed","job_id":"job-1","work_order_id":"WO-1","equipment_id":"EQ-1","gtin":"04600000000001","produced_count":98,"rejected_count":2,"target_quantity":100,"reason":"","trace_id":"trace-job","event_id":"job-event-2"}],"logs_l2_job_events_aggregate":{"aggregate":{"count":2}}}}

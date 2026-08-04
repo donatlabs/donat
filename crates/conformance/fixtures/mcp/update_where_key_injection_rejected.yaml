@@ -1,0 +1,27 @@
+description: >
+  A GraphQL-looking key inside update.where is rejected before GraphQL
+  execution, so injected selection or mutation text cannot become part of the
+  generated operation.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 42
+  method: tools/call
+  params:
+    name: update
+    arguments:
+      table: pet
+      where:
+        "name } query x { pet { id } }":
+          _eq: Rex
+      set:
+        status: sold
+response:
+  jsonrpc: "2.0"
+  id: 42
+  result:
+    isError: true

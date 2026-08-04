@@ -1,0 +1,19 @@
+description: >
+  tools/list rejects a string cursor that was not issued by this server. The
+  current server returns the full tool list without nextCursor, so any supplied
+  cursor is invalid instead of silently replaying the first page.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 85
+  method: tools/list
+  params:
+    cursor: opaque
+response:
+  jsonrpc: "2.0"
+  id: 85
+  error:
+    code: -32602
+    message: "invalid cursor"

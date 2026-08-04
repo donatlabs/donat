@@ -1,0 +1,24 @@
+- name: create_order
+  source: default
+  permissions:
+    - role: customer
+  arguments:
+    - name: id
+      type: uuid!
+    - name: customer_id
+      type: uuid!
+    - name: status
+      type: String!
+  steps:
+    - name: order
+      insert:
+        table:
+          schema: public
+          name: orders
+        object:
+          id: {arg: id}
+          customer_id: {arg: customer_id}
+          status: {arg: status}
+        returning: [id]
+  result:
+    order_id: {step: order, column: id}

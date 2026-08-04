@@ -1,0 +1,20 @@
+description: >
+  initialize clientInfo must match the MCP Implementation shape. Non-object
+  clientInfo values are rejected at the method boundary.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 80
+  method: initialize
+  params:
+    protocolVersion: "2025-06-18"
+    capabilities: {}
+    clientInfo: client
+response:
+  jsonrpc: "2.0"
+  id: 80
+  error:
+    code: -32602
+    message: "'clientInfo' must be an object"

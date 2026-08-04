@@ -1,0 +1,6 @@
+trigger:
+  kind: webhook
+  value:
+    selected_headers: []
+    raw_body_max_bytes: null
+    timestamp_window_ms: null

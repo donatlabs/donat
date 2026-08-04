@@ -1,0 +1,73 @@
+name: create_subscription_order
+source: default
+permissions:
+  - role: subscription_worker
+arguments:
+  - name: subscription_id
+    type: uuid!
+  - name: cron_occurrence
+    type: timestamptz!
+steps:
+  # `subscription_id` plus this scheduled occurrence is the business key.
+  # The future catalog also enforces it with a unique renewal row.
+  - name: subscription
+    update:
+      table: public.subscription
+      where:
+        id: { arg: subscription_id }
+        status: { literal: active }
+      set:
+        status: { literal: payment_due }
+      returning: [id, customer_id, variant_id, quantity, unit_price_minor, line_total_minor, currency, status]
+      require_affected: true
+  - name: renewal
+    insert:
+      table: public.subscription_renewal
+      object:
+        subscription_id: { step: subscription, column: id }
+        cron_occurrence: { arg: cron_occurrence }
+        status: { literal: payment_due }
+      returning: [id, subscription_id, cron_occurrence, status]
+  - name: order
+    insert:
+      table: public.orders
+      object:
+        customer_id: { step: subscription, column: customer_id }
+        subscription_renewal_id: { step: renewal, column: id }
+        order_status: { literal: checkout_started }
+        total_minor: { step: subscription, column: line_total_minor }
+        currency: { step: subscription, column: currency }
+      returning: [id, customer_id, subscription_renewal_id, order_status, total_minor, currency]
+  - name: order_line
+    insert:
+      table: public.order_line
+      object:
+        order_id: { step: order, column: id }
+        variant_id: { step: subscription, column: variant_id }
+        quantity: { step: subscription, column: quantity }
+        unit_price_minor: { step: subscription, column: unit_price_minor }
+        currency: { step: subscription, column: currency }
+        line_total_minor: { step: subscription, column: line_total_minor }
+      returning: [id, order_id, variant_id, quantity, unit_price_minor, currency, line_total_minor]
+  - name: payment
+    insert:
+      table: public.payment
+      object:
+        order_id: { step: order, column: id }
+        status: { literal: pending }
+        amount_minor: { step: order, column: total_minor }
+        currency: { step: order, column: currency }
+      returning: [id, order_id, status, amount_minor, currency]
+result:
+  subscription_id: { step: subscription, column: id }
+  renewal_id: { step: renewal, column: id }
+  cron_occurrence: { step: renewal, column: cron_occurrence }
+  order_id: { step: order, column: id }
+  payment_id: { step: payment, column: id }
+  amount_minor: { step: payment, column: amount_minor }
+  currency: { step: payment, column: currency }
+idempotency:
+  key: { argument: cron_occurrence }
+  scope:
+    - { argument: subscription_id }
+  retention: 365d

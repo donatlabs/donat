@@ -1,0 +1,47 @@
+description: >
+  describe_table for an inherited role with two select parents must disclose the
+  union of selectable columns. `viewer` grants id/name and `status_viewer`
+  grants status; the inherited role has no direct permission.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: viewer_status
+body:
+  jsonrpc: "2.0"
+  id: 28
+  method: tools/call
+  params:
+    name: describe_table
+    arguments:
+      table: pet
+response:
+  jsonrpc: "2.0"
+  id: 28
+  result:
+    isError: false
+    structuredContent:
+      name: pet
+      schema: public
+      columns:
+      - name: id
+        type: int4
+        nullable: false
+        description: null
+      - name: name
+        type: text
+        nullable: false
+        description: null
+      - name: status
+        type: text
+        nullable: false
+        description: Availability status of the pet
+      object_relationships: []
+      array_relationships: []
+      selectable_columns:
+      - id
+      - name
+      - status
+      select_limit: null
+      insertable_columns: null
+      updatable_columns: null

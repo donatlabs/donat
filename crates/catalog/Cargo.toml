@@ -7,6 +7,12 @@ description = "Postgres introspection: tables, columns, types, PKs and FKs from 
 
 [dependencies]
 donat-catalog-types = { path = "../catalog-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio-postgres = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }

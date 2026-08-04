@@ -1,0 +1,20 @@
+description: A distinct command generation uses the same Process semantic key.
+url: /v1/graphql
+status: 200
+headers:
+  X-Donat-Role: customer
+query:
+  query: |
+    mutation StartCheckoutAgain {
+      enqueue_checkout(
+        order_id: "550e8400-e29b-41d4-a716-446655440110"
+        request_id: "550e8400-e29b-41d4-a716-446655440113"
+        semantic_key: "550e8400-e29b-41d4-a716-446655440112"
+      ) {
+        order_id
+      }
+    }
+response:
+  data:
+    enqueue_checkout:
+      order_id: "550e8400-e29b-41d4-a716-446655440110"

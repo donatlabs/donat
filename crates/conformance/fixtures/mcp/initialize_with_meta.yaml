@@ -1,0 +1,28 @@
+description: >
+  initialize accepts MCP request metadata when _meta is an object and ignores it
+  for the normal handshake response.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: 82
+  method: initialize
+  params:
+    protocolVersion: "2025-06-18"
+    capabilities: {}
+    clientInfo:
+      name: conformance
+      version: "0"
+    _meta:
+      trace: abc
+response:
+  jsonrpc: "2.0"
+  id: 82
+  result:
+    protocolVersion: "2025-06-18"
+    capabilities:
+      tools: {}
+    serverInfo:
+      name: donat
+      version: "0.1.0"

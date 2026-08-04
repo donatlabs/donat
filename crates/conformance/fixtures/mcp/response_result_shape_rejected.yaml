@@ -1,0 +1,16 @@
+description: >
+  Incoming JSON-RPC success responses must carry an MCP Result object before
+  the Streamable HTTP transport accepts them.
+url: /mcp
+method: POST
+status: 400
+body:
+  jsonrpc: "2.0"
+  id: "server-request-3"
+  result: []
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "'result' must be an object"

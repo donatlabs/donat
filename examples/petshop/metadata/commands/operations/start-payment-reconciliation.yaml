@@ -1,0 +1,53 @@
+# Operations entry point for payment reconciliation. The expectations the
+# Process compares against the provider are read from the payment row here, so
+# an operator cannot start a reconciliation against fabricated expectations.
+name: start_payment_reconciliation
+source: default
+permissions:
+  - role: reconciliation_worker
+arguments:
+  - name: payment_id
+    type: uuid!
+  - name: provider_event_id
+    type: string!
+  - name: expected_status
+    type: PaymentState!
+  - name: request_id
+    type: uuid!
+steps:
+  - name: payment
+    select_one:
+      table: public.payment_reconciliation_candidate
+      by:
+        payment_id: { arg: payment_id }
+      returning: [payment_id, status, amount_minor, currency, provider_reference]
+      require_found: true
+  # The operator states the status it is reconciling against, and this assert
+  # proves it is the status this store actually recorded.
+  - name: expected_status_is_recorded
+    assert:
+      rule: recorded_payment_state_matches
+      with:
+        recorded_state: { step: payment, column: status }
+        expected_state: { arg: expected_status }
+result:
+  payment_id: { step: payment, column: payment_id }
+  expected_amount_minor: { step: payment, column: amount_minor }
+  expected_currency: { step: payment, column: currency }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: payment_id }
+  retention: 365d
+effects:
+  - start_process:
+      process: payment_reconciliation
+      input:
+        payment_id: { step: payment, column: payment_id }
+        provider_event_id: { arg: provider_event_id }
+        expected_amount_minor: { step: payment, column: amount_minor }
+        expected_currency: { step: payment, column: currency }
+        expected_status: { arg: expected_status }
+        expected_provider_reference: { step: payment, column: provider_reference }
+        request_id: { arg: request_id }
+      idempotency_key: { argument: request_id }

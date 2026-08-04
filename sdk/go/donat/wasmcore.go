@@ -2,6 +2,7 @@ package donat
 
 import (
 	"context"
+	"crypto/rand"
 	_ "embed"
 	"fmt"
 
@@ -28,8 +29,44 @@ type wasmCore struct {
 	compileFn api.Function
 }
 
+// hostModuleName is the wasm import module the core resolves its host
+// capabilities through. It must match `wasm_import_module` in
+// crates/wasm-core/src/rng.rs.
+const hostModuleName = "donat_host"
+
+// randomBytes fills len bytes of the instance's linear memory at ptr with
+// cryptographically secure randomness, returning 0 on success.
+//
+// The core needs entropy because planning a file upload mints the object key
+// that the presigned signature covers, and it must do so while it signs.
+// wasm32-unknown-unknown has no OS to ask, so the host supplies it here and
+// the planner keeps calling Uuid::new_v4() exactly as the native engine does.
+func randomBytes(_ context.Context, mod api.Module, ptr, size uint32) uint32 {
+	if size == 0 {
+		return 0
+	}
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		// Reporting failure makes the core error out rather than sign a key
+		// derived from whatever the buffer happened to hold.
+		return 1
+	}
+	if !mod.Memory().Write(ptr, buf) {
+		return 1
+	}
+	return 0
+}
+
 func newWasmCore(ctx context.Context) (*wasmCore, error) {
 	rt := wazero.NewRuntime(ctx)
+	if _, err := rt.NewHostModuleBuilder(hostModuleName).
+		NewFunctionBuilder().
+		WithFunc(randomBytes).
+		Export("random_bytes").
+		Instantiate(ctx); err != nil {
+		_ = rt.Close(ctx)
+		return nil, fmt.Errorf("instantiate %s host module: %w", hostModuleName, err)
+	}
 	mod, err := rt.Instantiate(ctx, coreWasm)
 	if err != nil {
 		_ = rt.Close(ctx)

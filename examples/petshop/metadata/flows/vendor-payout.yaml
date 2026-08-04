@@ -1,0 +1,148 @@
+name: vendor_payout
+kind: process
+version: 1
+source: default
+permissions:
+  - role: marketplace_worker
+input:
+  - { name: payout_cycle_id, type: uuid! }
+  - { name: request_id, type: uuid! }
+output:
+  - { name: payout_cycle_id, type: uuid! }
+  - { name: payouts, type: "[VendorPayoutOutcome!]!" }
+  - { name: failures, type: "[ItemFailure!]!" }
+idempotency:
+  key: { input: request_id }
+  scope:
+    - { input: payout_cycle_id }
+start_at: create_payout_candidates
+states:
+  - id: create_payout_candidates
+    command:
+      name: create_vendor_payout
+      run_as: marketplace_worker
+      arguments:
+        payout_cycle_id: { input: payout_cycle_id }
+        request_id: { input: request_id }
+      next: request_payouts
+
+  - id: request_payouts
+    for_each:
+      input: { state: create_payout_candidates, field: payouts }
+      item_key: vendor_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      request:
+        connector: mock_payout
+        operation: create_payout
+        input:
+          payout_id: { item: id }
+          payout_key: { item: payout_key }
+          vendor_id: { item: vendor_id }
+          amount_minor: { item: net_minor }
+          currency: { item: currency }
+        idempotency_key:
+          stable: { run: id, state: request_payouts, item_key: vendor_id }
+        timeout:
+          schedule_to_start: 5s
+          start_to_close: 7s
+        retry:
+          retry_on: [transport, timeout, http_429, http_5xx]
+          max_attempts: 4
+          initial_interval: 250ms
+          max_interval: 2s
+          jitter: deterministic_full
+        on_error:
+          routes:
+            - { kinds: [authentication, validation], next: reconcile_payout_requests }
+            - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_payout_requests }
+          fallback: { next: reconcile_payout_requests }
+      next: reconcile_payout_requests
+
+  - id: reconcile_payout_requests
+    for_each:
+      input: { state: request_payouts, field: failed_items }
+      item_key: vendor_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      preserve_input: true
+      request:
+        connector: mock_payout
+        operation: lookup_payout
+        input:
+          payout_id: { item: id }
+          payout_key: { item: payout_key }
+          activity_key: { item: activity_key }
+        timeout:
+          schedule_to_start: 5s
+          start_to_close: 6s
+        retry:
+          retry_on: [transport, timeout, http_429, http_5xx]
+          max_attempts: 3
+          initial_interval: 100ms
+          max_interval: 1s
+          jitter: deterministic_full
+        on_error:
+          routes:
+            - { kinds: [authentication, validation], next: record_payout_outcomes }
+            - { kinds: [permanent, invariant, timeout, retry_exhausted], next: record_payout_outcomes }
+          fallback: { next: record_payout_outcomes }
+      next: record_payout_outcomes
+
+  - id: record_payout_outcomes
+    for_each:
+      input: { state: request_payouts, field: successful_items }
+      item_key: vendor_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: record_payout_outcome
+        run_as: payout_worker
+        arguments:
+          payout_id: { item: payout_id }
+          provider_payout_id: { item: provider_payout_id }
+          provider_event_id: { item: provider_event_id }
+          outcome: { item: outcome }
+          payload: { item: normalized_payload }
+      next: record_reconciled_payout_outcomes
+
+  - id: record_reconciled_payout_outcomes
+    for_each:
+      input: { state: reconcile_payout_requests, field: successful_items }
+      item_key: vendor_id
+      max_items: 64
+      max_concurrency: 8
+      completion: collect
+      command:
+        name: record_payout_outcome
+        run_as: payout_worker
+        arguments:
+          payout_id: { item: payout_id }
+          provider_payout_id: { item: provider_payout_id }
+          provider_event_id: { item: provider_event_id }
+          outcome: { item: outcome }
+          payload: { item: normalized_payload }
+      next: settled
+
+  - id: settled
+    output:
+      values:
+        payout_cycle_id: { input: payout_cycle_id }
+        payouts:
+          bounded_concat:
+            inputs:
+              - { state: record_payout_outcomes, field: ordered_results }
+              - { state: record_reconciled_payout_outcomes, field: ordered_results }
+            maximum_lists: 2
+            maximum_items: 64
+        failures:
+          bounded_concat:
+            inputs:
+              - { state: reconcile_payout_requests, field: failed_items }
+              - { state: record_payout_outcomes, field: failed_items }
+              - { state: record_reconciled_payout_outcomes, field: failed_items }
+            maximum_lists: 3
+            maximum_items: 64

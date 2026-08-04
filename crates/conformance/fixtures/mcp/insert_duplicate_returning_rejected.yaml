@@ -1,0 +1,27 @@
+description: >
+  Duplicate insert.returning entries are rejected before GraphQL generation.
+  Returning selection is set-like and repeated fields are unnecessary parser
+  work for MCP clients.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 54
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: pet
+      objects:
+      - id: 120
+        name: Duplicate
+        status: available
+      returning: [id, id]
+response:
+  jsonrpc: "2.0"
+  id: 54
+  result:
+    isError: true

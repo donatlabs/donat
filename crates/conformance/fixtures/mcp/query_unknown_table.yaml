@@ -21,3 +21,6 @@ response:
   id: 23
   result:
     isError: true
+    content:
+    - type: text
+      text: "unknown table"

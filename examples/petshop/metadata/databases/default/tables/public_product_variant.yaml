@@ -1,0 +1,147 @@
+table:
+  name: product_variant
+  schema: public
+object_relationships:
+  - name: product
+    using:
+      foreign_key_constraint_on: product_id
+  - name: stock
+    using:
+      foreign_key_constraint_on:
+        table:
+          name: inventory_stock
+          schema: public
+        column: variant_id
+array_relationships:
+  - name: cart_lines
+    using:
+      foreign_key_constraint_on:
+        column: variant_id
+        table:
+          name: cart_line
+          schema: public
+  - name: order_lines
+    using:
+      foreign_key_constraint_on:
+        column: variant_id
+        table:
+          name: order_line
+          schema: public
+select_permissions:
+  - role: anonymous
+    permission:
+      columns:
+        - id
+        - product_id
+        - sku
+        - title
+        - price_minor
+        - currency
+        - active
+      filter:
+        _and:
+          - active:
+              _eq: true
+          - product:
+              status:
+                _eq: published
+  - role: customer
+    permission:
+      columns:
+        - id
+        - product_id
+        - sku
+        - title
+        - price_minor
+        - currency
+        - active
+      filter:
+        _and:
+          - active:
+              _eq: true
+          - product:
+              status:
+                _eq: published
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: staff
+    permission:
+      check:
+        _and:
+          - active:
+              _eq: true
+          - product:
+              status:
+                _eq: published
+      columns:
+        - product_id
+        - sku
+        - title
+        - price_minor
+        - currency
+        - active
+        - quality_grade
+      # `check` answers "may this role write this row" — it is a predicate over
+      # the session and the row, and it may traverse relationships. `validate`
+      # answers a different question, "is this value acceptable", over the row
+      # as written: after presets and after column defaults, because the gate
+      # reads the rows the statement returns rather than the input object.
+      #
+      # quality_grade is nullable in the catalogue and stays that way: a
+      # database CHECK would bind every writer, including the migrations that
+      # left older variants ungraded. This binds one role.
+      #
+      # Entries run in document order and the first violated entry is the
+      # error the caller sees. A validator passes only on TRUE, so an unknown
+      # value never satisfies one — the runtime would refuse a null here even
+      # if nothing said so. What `not_null` adds is that the metadata says so:
+      # it names the real cause in the message, and it is what makes the
+      # comparison below typeable, since the rule profile refuses to read a
+      # nullable value and has no flow-sensitive refinement to find the guard
+      # on its own.
+      validate:
+        - not_null: quality_grade
+          message: quality_grade cannot be null
+        - expression: "quality_grade > 3"
+          message: quality_grade must be greater than 3
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - product_id
+        - sku
+        - title
+        - price_minor
+        - currency
+        - active
+        - quality_grade
+      filter: {}
+      check:
+        _and:
+          - active:
+              _eq: true
+          - product:
+              status:
+                _eq: published
+      # The same declaration as insert, and not by copy-paste discipline: a
+      # bare `quality_grade > 3` here would not compile at all, because the
+      # column is nullable and the rule profile refuses to read a nullable
+      # value. Presence is declared or the deployment is refused.
+      #
+      # The list reads the updated row, so renaming an ungraded legacy variant
+      # fails until the same statement grades it. That is a real consequence
+      # of validating the written row rather than the submitted fields, and it
+      # is asserted in fixtures/petshop/validation.yaml rather than left to be
+      # discovered in production.
+      validate:
+        - not_null: quality_grade
+          message: quality_grade cannot be null
+        - expression: "quality_grade > 3"
+          message: quality_grade must be greater than 3
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}

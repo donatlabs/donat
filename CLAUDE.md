@@ -18,6 +18,7 @@ conformance harness (`crates/conformance`).
 | `crates/schema` | Per-role GraphQL schema generation, introspection |
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement (insta snapshot tests) |
+| `crates/storage` | File attachments: the resolved S3-compatible store and the URL signing shared by planner and server |
 | `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
@@ -82,17 +83,13 @@ code written without this are invalid and must be redone. After work with
 meaningful trade-offs, capture an ADR (template:
 `knowledgebase/_templates/decision.md`).
 
-## BLOCKING RULE: Judge Review After Every Commit
+## Quality Review at Feature Completion
 
-After EVERY `git commit`, dispatch the judge agent before starting the next
-task. Not optional; "simple change" is not an excuse.
-
-```
-Agent(subagent_type="judge", run_in_background=true, prompt="REVIEW TASK: ...")
-```
-
-Input format in `.claude/agents/judge.md`. Continue only after ACCEPT; on
-REJECT fix the issues first.
+There is no per-commit review gate. Each TDD slice must still have its focused
+test evidence and the required suite verification. Run one independent code
+review for the complete, cohesive feature range before it is merged, handed
+off, or declared ready. Address material findings with a regression test and
+fresh verification before completion.
 
 ## Essential Rules
 
@@ -122,7 +119,5 @@ REJECT fix the issues first.
 
 ## Agents
 
-- `.claude/agents/judge.md` — two-stage quality gate (spec compliance →
-  code quality → fresh verification). Mandatory after every commit.
 - `.claude/agents/spec-writer.md` — researches the codebase + conformance
   fixtures and writes specs to `specs/NNN-<slug>.md`.

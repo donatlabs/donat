@@ -1,0 +1,30 @@
+# The MCP publication layer. A tracked table or a saved GraphQL operation is
+# not agent-visible unless it is listed here.
+tools:
+  - name: catalogue.search
+    title: Search the catalogue
+    description: List currently visible pets in catalogue order.
+    source:
+      saved_query:
+        collection: agent
+        query: AvailablePets
+    permissions: [anonymous, customer, staff]
+    arguments:
+      limit: Maximum number of catalogue items to return.
+
+table_tools:
+  - table: { schema: public, name: pet }
+    description: Staff inventory operations.
+    operations:
+      - operation: query
+        name: inventory.lookup
+        description: Search the inventory with a filter and order.
+        permissions: [staff]
+      - operation: insert
+        name: inventory.create
+        description: Create an inventory item.
+        permissions: [staff]
+      - operation: update
+        name: inventory.update
+        description: Update matching inventory items.
+        permissions: [staff]

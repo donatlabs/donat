@@ -11,8 +11,8 @@
 //!     the PK is auto-increment and the insert omitted it) or by supplied PK;
 //!   - update: UPDATE ... WHERE <pred>, then re-SELECT WHERE <pred>;
 //!   - delete: SELECT WHERE <pred> first, then DELETE ... WHERE <pred>.
-//! Any violated permission CHECK rolls the whole transaction back and surfaces
-//! the same `permission-error` body as Postgres/SQLite.
+//!     Any violated permission CHECK rolls the whole transaction back and surfaces
+//!     the same `permission-error` body as Postgres/SQLite.
 //!
 //! The test is skipped (passes trivially) when no MySQL server is reachable so
 //! the crate's suite stays green in environments without the container.
@@ -26,21 +26,39 @@ use donat_schema::Session;
 use donat_server::gql;
 use donat_server::state::{AppState, Engine};
 use mysql::prelude::Queryable;
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
-const MYSQL_URL: &str = "mysql://root:root@127.0.0.1:13306/donat";
+const DEFAULT_MYSQL_URL: &str = "mysql://root:root@127.0.0.1:13306/donat";
+
+fn mysql_url() -> String {
+    std::env::var("MYSQL_URL").unwrap_or_else(|_| DEFAULT_MYSQL_URL.to_string())
+}
+
+fn external_tests_required() -> bool {
+    std::env::var_os("DONAT_EXTERNAL_DB_TESTS").is_some() || std::env::var_os("MYSQL_URL").is_some()
+}
 
 /// Open a MySQL connection with a short retry loop (the container may still be
-/// starting). Returns `None` if MySQL never becomes reachable, so the test can
-/// skip rather than fail in an environment without the container.
+/// starting). Strict compose-backed runs fail when the service is absent;
+/// ordinary local unit runs make one quick probe and take the no-service path.
 fn connect_with_retry() -> Option<mysql::Conn> {
-    for _ in 0..30 {
-        match mysql::Conn::new(MYSQL_URL) {
+    let url = mysql_url();
+    let attempts = if external_tests_required() { 30 } else { 1 };
+    for attempt in 0..attempts {
+        match mysql::Conn::new(url.as_str()) {
             Ok(conn) => return Some(conn),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+            Err(_) if attempt + 1 < attempts => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(error) => {
+                if external_tests_required() {
+                    panic!("MySQL is required at {url}, but connection failed: {error}");
+                }
+                return None;
+            }
         }
     }
-    None
+    unreachable!("MySQL connection loop always returns")
 }
 
 /// Drop and recreate `note` so re-runs start from a clean slate. `id` is an
@@ -110,13 +128,8 @@ fn session() -> Session {
 
 fn app_state(db_url: &str) -> Arc<AppState> {
     Arc::new(AppState {
-        pools: tokio::sync::RwLock::new(HashMap::new()),
-        sqlite_paths: tokio::sync::RwLock::new(HashMap::new()),
-        mysql_urls: tokio::sync::RwLock::new(HashMap::new()),
-        engine: tokio::sync::RwLock::new(Engine {
-            metadata: metadata(db_url),
-            catalogs: HashMap::new(),
-        }),
+        engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata(db_url)))),
+        connectors: Arc::new(donat_server::connectors::ConnectorRegistry::empty()),
         default_url: "postgres://unused".to_string(),
         admin_secret: None,
         unauthorized_role: None,
@@ -126,6 +139,10 @@ fn app_state(db_url: &str) -> Arc<AppState> {
         auth_hook: None,
         http: reqwest::Client::new(),
         allowlist_enabled: false,
+        subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+        subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(donat_storage::StorageRegistry::default()),
+        external_base_url: String::new(),
     })
 }
 
@@ -142,14 +159,15 @@ async fn run(state: &Arc<AppState>, query: &str) -> (StatusCode, Json) {
 
 #[tokio::test]
 async fn mysql_mutations_through_runtime() {
+    let url = mysql_url();
     let Some(mut conn) = connect_with_retry() else {
-        eprintln!("MySQL not reachable at {MYSQL_URL}; skipping");
+        eprintln!("skipping MySQL mutation test: MySQL is not configured at {url}");
         return;
     };
     seed_db(&mut conn);
     drop(conn);
 
-    let state = app_state(MYSQL_URL);
+    let state = app_state(&url);
     state
         .sync_sources()
         .await
@@ -164,7 +182,7 @@ async fn mysql_mutations_through_runtime() {
             insert_note(objects: [
                 { body: "first", owner: "alice" },
                 { body: "second", owner: "alice" }
-            ]) { affected_rows returning { id body } }
+            ]) { returning { id body __typename } __typename affected_rows }
         }"#,
     )
     .await;
@@ -172,16 +190,47 @@ async fn mysql_mutations_through_runtime() {
     assert_eq!(
         body,
         json!({ "data": { "insert_note": {
-            "affected_rows": 2,
             "returning": [
-                { "id": 1, "body": "first" },
-                { "id": 2, "body": "second" }
-            ]
+                { "id": 1, "body": "first", "__typename": "note" },
+                { "id": 2, "body": "second", "__typename": "note" }
+            ],
+            "__typename": "note_mutation_response",
+            "affected_rows": 2
         }}}),
         "unexpected insert body: {body}"
     );
+    assert_eq!(
+        body["data"]["insert_note"]
+            .as_object()
+            .expect("insert response object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["returning", "__typename", "affected_rows"]
+    );
 
-    // 2. Violating insert (owner != session var) -> permission error, and the
+    // 2. Single-row mutation output uses the same ordered node assembler and
+    //    must serialize __typename as a JSON string.
+    let (status, body) = run(
+        &state,
+        r#"mutation {
+            insert_note_one(object: { body: "single", owner: "alice" }) {
+                body __typename
+            }
+        }"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body,
+        json!({ "data": { "insert_note_one": {
+            "body": "single",
+            "__typename": "note"
+        }}}),
+        "unexpected single-row insert body: {body}"
+    );
+
+    // 3. Violating insert (owner != session var) -> permission error, and the
     //    row must NOT persist (transaction rolled back).
     let (status, body) = run(
         &state,
@@ -217,7 +266,7 @@ async fn mysql_mutations_through_runtime() {
         "violating insert must not have persisted: {body}"
     );
 
-    // 3. Update by predicate; re-select returns the edited row.
+    // 4. Update by predicate; re-select returns the edited row.
     let (status, body) = run(
         &state,
         r#"mutation {
@@ -237,7 +286,7 @@ async fn mysql_mutations_through_runtime() {
         "unexpected update body: {body}"
     );
 
-    // 4. Delete by predicate; the companion SELECT (run BEFORE the DELETE)
+    // 5. Delete by predicate; the companion SELECT (run BEFORE the DELETE)
     //    captures the returning row.
     let (status, body) = run(
         &state,
@@ -258,7 +307,7 @@ async fn mysql_mutations_through_runtime() {
         "unexpected delete body: {body}"
     );
 
-    // Final state: only the (edited) row 1 remains.
+    // Final state: the edited row 1 and single-row insert remain.
     let (_status, body) = run(
         &state,
         "query { note(order_by: { id: asc }) { id body owner } }",
@@ -267,7 +316,8 @@ async fn mysql_mutations_through_runtime() {
     assert_eq!(
         body,
         json!({ "data": { "note": [
-            { "id": 1, "body": "edited", "owner": "alice" }
+            { "id": 1, "body": "edited", "owner": "alice" },
+            { "id": 3, "body": "single", "owner": "alice" }
         ]}}),
         "unexpected final state: {body}"
     );

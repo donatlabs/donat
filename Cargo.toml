@@ -1,8 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/value-contract",
+    "crates/connector-abi",
+    "crates/connector-catalog",
     "crates/metadata",
     "crates/catalog-types",
+    "crates/storage",
+    "crates/rules",
     "crates/catalog",
     "crates/schema",
     "crates/ir",
@@ -35,7 +40,7 @@ insta = { version = "1", features = ["yaml", "json"] }
 base64 = "0.22"
 jsonwebtoken = "9"
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 clap = { version = "4", features = ["derive", "env"] }
 tungstenite = "0.24"
 postgres = "0.19"
@@ -45,3 +50,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 croner = "3"
 uuid = "1"
+sha2 = "0.10"
+ryu-js = "=1.0.2"

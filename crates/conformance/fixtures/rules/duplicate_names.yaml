@@ -1,0 +1,7 @@
+rules:
+  - name: duplicate
+    result: bool!
+    expression: "true"
+  - name: duplicate
+    result: bool!
+    expression: "false"

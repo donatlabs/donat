@@ -1,0 +1,28 @@
+description: >
+  A `returning` entry carrying GraphQL selection syntax is rejected before the
+  MCP tool builds a GraphQL document or runs a mutation. MCP `returning`
+  values are plain tracked-table column names, not raw selection-set fragments.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 26
+  method: tools/call
+  params:
+    name: insert
+    arguments:
+      table: pet
+      objects:
+      - id: 99
+        name: Invalid
+        status: available
+      returning:
+      - "id } query x { pet { id } }"
+response:
+  jsonrpc: "2.0"
+  id: 26
+  result:
+    isError: true

@@ -1,0 +1,24 @@
+description: >
+  describe_table rejects an unknown but GraphQL-valid table name without
+  reflecting the requested identifier into the MCP tool response.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 80
+  method: tools/call
+  params:
+    name: describe_table
+    arguments:
+      table: no_such_table
+response:
+  jsonrpc: "2.0"
+  id: 80
+  result:
+    isError: true
+    content:
+    - type: text
+      text: "unknown table"

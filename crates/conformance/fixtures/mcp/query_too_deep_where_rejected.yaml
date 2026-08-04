@@ -1,0 +1,34 @@
+description: >
+  A deeply nested query.where boolean expression is rejected before GraphQL
+  execution. MCP bounds recursive filters to reduce parser/planner DoS risk.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: user
+body:
+  jsonrpc: "2.0"
+  id: 51
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      columns: [id]
+      where:
+        _not:
+          _not:
+            _not:
+              _not:
+                _not:
+                  _not:
+                    _not:
+                      _not:
+                        _not:
+                          name:
+                            _eq: Rex
+response:
+  jsonrpc: "2.0"
+  id: 51
+  result:
+    isError: true

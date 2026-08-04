@@ -1,0 +1,95 @@
+table:
+  name: cart_line
+  schema: public
+object_relationships:
+  - name: cart
+    using:
+      foreign_key_constraint_on: cart_id
+  - name: variant
+    using:
+      foreign_key_constraint_on: variant_id
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        cart:
+          customer_id:
+            _eq: X-Donat-User-Id
+insert_permissions:
+  - role: customer
+    permission:
+      check:
+        _and:
+          - cart:
+              customer_id:
+                _eq: X-Donat-User-Id
+          - cart:
+              status:
+                _eq: cart_open
+          - variant:
+              active:
+                _eq: true
+          - variant:
+              product:
+                status:
+                  _eq: published
+      columns:
+        - cart_id
+        - variant_id
+        - quantity
+      # The database already refuses a non-positive quantity, for every
+      # writer, and that stays where it is. The ceiling is a different kind of
+      # rule: it binds the customer role and nothing else. A subscription or
+      # a wholesale command writing the same table is not a shopper putting
+      # 500 bags of kibble in a basket, and must not inherit the shopper's
+      # limit.
+      #
+      # quantity is NOT NULL in the catalogue, so nothing here has to say
+      # anything about nulls: the expression is total by construction.
+      validate:
+        - expression: 'quantity <= 20'
+          message: a cart line is limited to 20 units
+update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - variant_id
+        - quantity
+      validate:
+        - expression: 'quantity <= 20'
+          message: a cart line is limited to 20 units
+      filter:
+        _and:
+          - cart:
+              customer_id:
+                _eq: X-Donat-User-Id
+          - cart:
+              status:
+                _eq: cart_open
+      check:
+        _and:
+          - cart:
+              customer_id:
+                _eq: X-Donat-User-Id
+          - cart:
+              status:
+                _eq: cart_open
+          - variant:
+              active:
+                _eq: true
+          - variant:
+              product:
+                status:
+                  _eq: published
+delete_permissions:
+  - role: customer
+    permission:
+      filter:
+        _and:
+          - cart:
+              customer_id:
+                _eq: X-Donat-User-Id
+          - cart:
+              status:
+                _eq: cart_open

@@ -92,3 +92,57 @@ fn graphql_introspection() {
 
     s.teardown_v1q(&format!("{INTROSPECTION}/teardown.yaml"));
 }
+
+/// The filter surface a client can discover has to be the filter surface the
+/// engine accepts. `_ilike` is how every search box over this API is written —
+/// a schema that omits it tells generated clients, IDEs and agents that the
+/// store cannot be searched, while the engine answers the query perfectly well.
+#[test]
+fn text_filters_the_engine_accepts_are_published_by_introspection() {
+    let s = Suite::new("introspection_text_filters").start();
+    s.setup_v1q(&format!("{INTROSPECTION}/setup.yaml"));
+
+    let (status, body) = s.post(
+        "/v1/graphql",
+        &serde_json::json!({
+            "query": "query { \
+                text: __type(name: \"String_comparison_exp\") { inputFields { name } } \
+                number: __type(name: \"Int_comparison_exp\") { inputFields { name } } \
+            }"
+        }),
+        &[("X-Donat-Role".to_owned(), "user".to_owned())],
+    );
+    assert_eq!(status, 200, "introspection status: {body}");
+
+    let names = |field: &str| -> Vec<String> {
+        body["data"][field]["inputFields"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} is an input object: {body}"))
+            .iter()
+            .map(|input| input["name"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let text = names("text");
+    // Postgres has a regex engine, so the operations built on it are part of
+    // what a client may discover here too.
+    for operator in [
+        "_eq", "_in", "_is_null", "_like", "_nlike", "_ilike", "_nilike",
+        "_similar", "_nsimilar", "_regex", "_iregex", "_nregex", "_niregex",
+    ] {
+        assert!(
+            text.contains(&operator.to_owned()),
+            "String_comparison_exp must publish {operator}: {text:?}"
+        );
+    }
+    // A pattern operator on a number is not a filter the engine can honour, so
+    // it is not one the schema may offer.
+    let number = names("number");
+    for operator in ["_like", "_ilike", "_regex"] {
+        assert!(
+            !number.contains(&operator.to_owned()),
+            "Int_comparison_exp must not publish {operator}: {number:?}"
+        );
+    }
+
+    s.teardown_v1q(&format!("{INTROSPECTION}/teardown.yaml"));
+}

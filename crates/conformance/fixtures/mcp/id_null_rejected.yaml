@@ -1,0 +1,16 @@
+description: >
+  MCP JSON-RPC requests must use a string or integer id. A present null id is
+  rejected as invalid-request instead of being accepted as a request id.
+url: /mcp
+method: POST
+status: 200
+body:
+  jsonrpc: "2.0"
+  id: null
+  method: tools/list
+response:
+  jsonrpc: "2.0"
+  id: null
+  error:
+    code: -32600
+    message: "'id' must be a string or integer"

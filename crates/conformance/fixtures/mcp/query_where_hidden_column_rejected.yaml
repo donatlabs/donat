@@ -1,0 +1,28 @@
+description: >
+  A column-restricted role cannot use a hidden physical column in query.where.
+  Otherwise MCP would expose a side-channel by returning visible columns only
+  for rows matching an unreadable value.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: viewer
+body:
+  jsonrpc: "2.0"
+  id: 46
+  method: tools/call
+  params:
+    name: query
+    arguments:
+      table: pet
+      where:
+        status:
+          _eq: available
+response:
+  jsonrpc: "2.0"
+  id: 46
+  result:
+    isError: true
+    content:
+    - type: text
+      text: "'where' contains non-selectable column"

@@ -1,11 +1,36 @@
 //! /v1/graphql execution: headers -> session, plan -> SQL -> one row.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use axum::http::HeaderMap;
+use futures_util::future::join_all;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use donat_schema::{Planner, Session};
+use donat_schema::{
+    MultiSourcePlan, MultiSourcePlanner, PlanError, QueryResponseSlot, Session, SourceQueryPlan,
+};
 
-use crate::state::{QueryError, SharedState};
+use crate::state::{AppState, Engine, QueryError, SharedState, SourceRuntime};
+
+struct ParsedRequest<'a> {
+    body: &'a Json,
+    headers: &'a HeaderMap,
+    doc: &'a graphql_parser::query::Document<'static, String>,
+    variables: JsonMap<String, Json>,
+    operation_name: Option<&'a str>,
+}
+
+fn trace_perf_phase(phase: &'static str, started: std::time::Instant) {
+    tracing::trace!(
+        target: "donat::perf",
+        phase,
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "request phase"
+    );
+}
 
 /// Maximum bracket-nesting depth accepted in a query. `graphql-parser` and
 /// the planner both recurse on nesting, so an unbounded query would overflow
@@ -13,6 +38,154 @@ use crate::state::{QueryError, SharedState};
 /// handful of levels; this cap is far above legitimate use and far below the
 /// overflow threshold.
 pub const MAX_QUERY_DEPTH: usize = 100;
+
+/// Exact-source query execution boundary. Composite orchestration passes the
+/// complete root slice for a source in one call and exposes no default-source
+/// fallback.
+pub trait SourceQueryExecutor {
+    fn execute_source_query<'a>(
+        &'a self,
+        source: &'a str,
+        roots: &'a [donat_ir::RootField],
+    ) -> Pin<Box<dyn Future<Output = Result<Json, QueryError>> + Send + 'a>>;
+}
+
+impl SourceQueryExecutor for AppState {
+    fn execute_source_query<'a>(
+        &'a self,
+        source: &'a str,
+        roots: &'a [donat_ir::RootField],
+    ) -> Pin<Box<dyn Future<Output = Result<Json, QueryError>> + Send + 'a>> {
+        Box::pin(self.execute_source_query_json(source, roots))
+    }
+}
+
+struct SnapshotSourceQueryExecutor<'a> {
+    state: &'a AppState,
+    runtimes: HashMap<String, SourceRuntime>,
+}
+
+impl SourceQueryExecutor for SnapshotSourceQueryExecutor<'_> {
+    fn execute_source_query<'a>(
+        &'a self,
+        source: &'a str,
+        roots: &'a [donat_ir::RootField],
+    ) -> Pin<Box<dyn Future<Output = Result<Json, QueryError>> + Send + 'a>> {
+        let runtime = self.runtimes.get(source).cloned();
+        Box::pin(async move {
+            let runtime = runtime.ok_or(QueryError::NoDefaultSource)?;
+            self.state.execute_runtime_query_json(runtime, roots).await
+        })
+    }
+}
+
+fn planner_from_snapshot(engine: &Engine) -> Result<MultiSourcePlanner<'_>, PlanError> {
+    let compiled = engine.compiled.as_deref().ok_or_else(|| {
+        PlanError::new(
+            "$",
+            "unexpected",
+            "engine schema snapshot is not initialized",
+        )
+    })?;
+    MultiSourcePlanner::from_compiled(&engine.metadata, &engine.catalogs, compiled)
+}
+
+pub async fn execute_source_query_plans<E: SourceQueryExecutor + Sync>(
+    executor: &E,
+    plans: &[SourceQueryPlan],
+) -> Result<Vec<Json>, QueryError> {
+    join_all(
+        plans
+            .iter()
+            .map(|plan| executor.execute_source_query(&plan.source, &plan.roots)),
+    )
+    .await
+    .into_iter()
+    .collect()
+}
+
+fn assemble_multi_source_response(
+    response: &[QueryResponseSlot],
+    source_data: impl IntoIterator<Item = Json>,
+) -> Json {
+    let mut values = std::collections::HashMap::new();
+    for data in source_data {
+        if let Json::Object(data) = data {
+            values.extend(data);
+        }
+    }
+    let mut ordered = JsonMap::new();
+    for slot in response {
+        match slot {
+            QueryResponseSlot::SourceField { key } => {
+                ordered.insert(key.clone(), values.remove(key).unwrap_or(Json::Null));
+            }
+            QueryResponseSlot::LocalTypename { key, value } => {
+                ordered.insert(key.clone(), Json::String(value.clone()));
+            }
+        }
+    }
+    Json::Object(ordered)
+}
+
+/// A planner should never put a command on a non-Postgres source, but this
+/// transport-side guard keeps manually constructed or future IR from reaching
+/// a backend renderer that has no command semantics.
+fn command_backend_rejection(roots: &[donat_ir::MutationRoot], backend: &str) -> Option<Json> {
+    roots
+        .iter()
+        .any(|root| matches!(root, donat_ir::MutationRoot::Command { .. }))
+        .then(|| {
+            error_json(
+                "unexpected",
+                format!("commands require a Postgres source and cannot execute on {backend}"),
+            )
+        })
+}
+
+/// The full SQL text of a command contains resolved input and idempotency
+/// values. Keep command execution observable without putting those values in
+/// the `donat::sql` log target.
+fn trace_mutation_sql(root: &donat_ir::MutationRoot, sql: &str) {
+    match root {
+        donat_ir::MutationRoot::Command { command, .. } => {
+            tracing::trace!(
+                target: "donat::sql",
+                command = %command.name,
+                statement = "command",
+                "executing command mutation"
+            );
+        }
+        // The statement carries a day-scoped signing key and a finished
+        // signed URL. Neither belongs in a log that a request can grow.
+        donat_ir::MutationRoot::RequestFileUpload { request, .. } => {
+            tracing::trace!(
+                target: "donat::sql",
+                attachment = %request.attachment,
+                statement = "file upload request",
+                "executing file upload request"
+            );
+        }
+        donat_ir::MutationRoot::FunctionCall { .. }
+        | donat_ir::MutationRoot::Insert { .. }
+        | donat_ir::MutationRoot::Update { .. }
+        | donat_ir::MutationRoot::Delete { .. }
+        | donat_ir::MutationRoot::Typename { .. } => {
+            // A mutation that returns a file column carries the day-scoped
+            // signing key in its statement, so that one is described rather
+            // than printed. Everything else logs in full, as before.
+            if sql.contains("donat.s3_presigned_url(") {
+                tracing::trace!(
+                    target: "donat::sql",
+                    statement = "mutation returning a file column",
+                    "executing mutation"
+                );
+            } else {
+                tracing::trace!(target: "donat::sql", %sql, "executing mutation");
+            }
+        }
+    }
+}
 
 /// Cheap pre-parse guard: reject a query whose `{`/`(`/`[` nesting exceeds
 /// [`MAX_QUERY_DEPTH`], before the recursive parser runs. Counting raw
@@ -45,6 +218,14 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+fn is_session_header(name: &str) -> bool {
+    name.starts_with("x-donat-") || name.starts_with("x-hasura-")
+}
+
+fn is_reserved_session_secret(name: &str) -> bool {
+    name == "x-donat-admin-secret" || name == "x-hasura-admin-secret"
 }
 
 /// A planning-level GraphQL error (shared with remote validation).
@@ -80,16 +261,19 @@ pub fn session_from_headers(
             })),
         };
     }
-    let mut role = None;
+    let mut donat_role = None;
+    let mut hasura_role = None;
     let mut vars = std::collections::HashMap::new();
     for (name, value) in headers {
         let name = name.as_str().to_ascii_lowercase();
-        if !name.starts_with("x-donat-") || name == "x-donat-admin-secret" {
+        if !is_session_header(&name) || is_reserved_session_secret(&name) {
             continue;
         }
         let Ok(value) = value.to_str() else { continue };
         if name == "x-donat-role" {
-            role = Some(value.to_string());
+            donat_role = Some(value.to_string());
+        } else if name == "x-hasura-role" {
+            hasura_role = Some(value.to_string());
         }
         vars.insert(name, value.to_string());
     }
@@ -110,12 +294,16 @@ pub fn session_from_headers(
     };
     // No admin role: a trusted request must name an explicit role (an
     // unauthorized-role fallback applies only to the untrusted branch above).
-    match role.or_else(|| unauthorized_role.map(str::to_string)) {
-        Some(role) => Ok(Session {
-            role,
-            vars,
-            backend_request,
-        }),
+    match donat_role.or(hasura_role) {
+        Some(role) => {
+            vars.insert("x-donat-role".to_string(), role.clone());
+            vars.insert("x-hasura-role".to_string(), role.clone());
+            Ok(Session {
+                role,
+                vars,
+                backend_request,
+            })
+        }
         None => Err(json!({
             "errors": [{
                 "extensions": { "path": "$", "code": "access-denied" },
@@ -190,6 +378,7 @@ pub async fn resolve_session(
         };
         let requested = headers
             .get("x-donat-role")
+            .or_else(|| headers.get("x-hasura-role"))
             .and_then(|v| v.to_str().ok());
         let backend = headers
             .get("x-donat-use-backend-only-permissions")
@@ -292,7 +481,7 @@ async fn webhook_session(
     if let Some(map) = vars_raw.as_object() {
         for (k, v) in map {
             let key = k.to_ascii_lowercase();
-            if !key.starts_with("x-donat-") {
+            if !is_session_header(&key) || is_reserved_session_secret(&key) {
                 continue;
             }
             let value = match v {
@@ -302,7 +491,11 @@ async fn webhook_session(
             vars.insert(key, value);
         }
     }
-    let Some(role) = vars.get("x-donat-role").cloned() else {
+    let Some(role) = vars
+        .get("x-donat-role")
+        .or_else(|| vars.get("x-hasura-role"))
+        .cloned()
+    else {
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
@@ -313,13 +506,14 @@ async fn webhook_session(
             }),
         ));
     };
+    vars.insert("x-donat-role".to_string(), role.clone());
+    vars.insert("x-hasura-role".to_string(), role.clone());
     Ok(Session {
         role,
         vars,
         backend_request: false,
     })
 }
-
 
 pub async fn execute(
     state: &SharedState,
@@ -346,12 +540,20 @@ pub async fn execute_full(
     headers: &axum::http::HeaderMap,
 ) -> (axum::http::StatusCode, Json) {
     let Some(query) = body.get("query").and_then(Json::as_str) else {
-        return ok(error_json("validation-failed", "the key 'query' is missing"));
+        return ok(error_json(
+            "validation-failed",
+            "the key 'query' is missing",
+        ));
     };
     let variables: JsonMap<String, Json> = match body.get("variables") {
         Some(Json::Object(map)) => map.clone(),
         Some(Json::Null) | None => JsonMap::new(),
-        Some(_) => return ok(error_json("validation-failed", "variables must be an object")),
+        Some(_) => {
+            return ok(error_json(
+                "validation-failed",
+                "variables must be an object",
+            ));
+        }
     };
     let operation_name = body.get("operationName").and_then(Json::as_str);
 
@@ -361,30 +563,105 @@ pub async fn execute_full(
             format!("query exceeds maximum nesting depth of {MAX_QUERY_DEPTH}"),
         ));
     }
+    let parse_started = std::time::Instant::now();
     let doc = match graphql_parser::parse_query::<String>(query) {
         Ok(doc) => doc.into_static(),
-        Err(e) => return ok(error_json("validation-failed", format!("not a valid graphql query: {e}"))),
+        Err(e) => {
+            return ok(error_json(
+                "validation-failed",
+                format!("not a valid graphql query: {e}"),
+            ));
+        }
     };
+    trace_perf_phase("graphql.parse", parse_started);
 
-    let engine = state.engine.read().await;
+    execute_parsed_full(
+        state,
+        session,
+        relay,
+        ParsedRequest {
+            body,
+            headers,
+            doc: &doc,
+            variables,
+            operation_name,
+        },
+    )
+    .await
+}
+
+/// Execute a document compiled into the current immutable engine snapshot.
+/// REST endpoints use this path so their saved query is not reparsed for every
+/// request. The caller is responsible for applying textual limits while
+/// compiling the document.
+pub(crate) async fn execute_preparsed_full(
+    state: &SharedState,
+    session: &Session,
+    body: &Json,
+    relay: bool,
+    headers: &axum::http::HeaderMap,
+    doc: &graphql_parser::query::Document<'static, String>,
+) -> (axum::http::StatusCode, Json) {
+    let variables: JsonMap<String, Json> = match body.get("variables") {
+        Some(Json::Object(map)) => map.clone(),
+        Some(Json::Null) | None => JsonMap::new(),
+        Some(_) => {
+            return ok(error_json(
+                "validation-failed",
+                "variables must be an object",
+            ));
+        }
+    };
+    let operation_name = body.get("operationName").and_then(Json::as_str);
+    execute_parsed_full(
+        state,
+        session,
+        relay,
+        ParsedRequest {
+            body,
+            headers,
+            doc,
+            variables,
+            operation_name,
+        },
+    )
+    .await
+}
+
+async fn execute_parsed_full(
+    state: &SharedState,
+    session: &Session,
+    relay: bool,
+    request: ParsedRequest<'_>,
+) -> (axum::http::StatusCode, Json) {
+    let ParsedRequest {
+        body,
+        headers,
+        doc,
+        variables,
+        operation_name,
+    } = request;
+    let routing_started = std::time::Instant::now();
+    let engine = state.engine_snapshot().await;
     // Remote schema routing: operations aimed entirely at a permitted
     // remote schema are validated against the role's SDL and forwarded.
     let mut remote_variables = variables.clone();
-    if let Some(result) =
-        crate::remote::match_remote(&engine.metadata, session, &doc, &mut remote_variables)
+    if let Some(result) = crate::remote::match_remote(&engine, session, doc, &mut remote_variables)
     {
+        trace_perf_phase("graphql.route", routing_started);
         return match result {
             Ok(target) => {
                 if target.has_introspection {
                     // Answer introspection locally, forward the rest,
                     // merge in the original selection order.
-                    let order: Vec<(String, bool)> = top_level_fields(&doc);
+                    let order: Vec<(String, bool)> = top_level_fields(doc);
                     let mut intro_doc = doc.clone();
                     crate::remote::keep_introspection_roots(&mut intro_doc);
-                    let catalog = engine.default_catalog();
-                    let mut planner = Planner::new(&engine.metadata, &catalog);
-                    planner.infer_function_permissions = state.infer_function_permissions;
-                    let intro_data = match donat_schema::execute_introspection(
+                    let planner = match planner_from_snapshot(&engine) {
+                        Ok(planner) => planner,
+                        Err(error) => return ok(error.to_graphql()),
+                    };
+                    let intro_data = match donat_schema::execute_multi_source_introspection(
                         &planner,
                         session,
                         &intro_doc,
@@ -425,11 +702,11 @@ pub async fn execute_full(
                 remote_body["variables"] = Json::Object(remote_variables);
                 let (status, mut resp) =
                     crate::remote::forward(state, &target, &remote_body, headers).await;
-                if let Some(ns) = &target.namespace {
-                    if resp.get("errors").is_none() {
-                        let data = resp.get("data").cloned().unwrap_or(Json::Null);
-                        resp["data"] = json!({ ns: data });
-                    }
+                if let Some(ns) = &target.namespace
+                    && resp.get("errors").is_none()
+                {
+                    let data = resp.get("data").cloned().unwrap_or(Json::Null);
+                    resp["data"] = json!({ ns: data });
                 }
                 (status, resp)
             }
@@ -443,52 +720,57 @@ pub async fn execute_full(
     }
     // Action routing: an operation whose top-level fields are actions is
     // resolved by calling the action's HTTP handler, not by SQL planning.
-    if let Some(ctx) = crate::action::match_action(&engine.metadata, &doc, operation_name) {
-        drop(engine);
+    if let Some(ctx) = crate::action::match_action(&engine.metadata, doc, operation_name) {
+        trace_perf_phase("graphql.route", routing_started);
         return crate::action::resolve(
             state,
+            engine,
             session,
             &ctx,
-            &doc,
-            &variables,
-            operation_name,
-            headers,
+            crate::action::ActionRequest {
+                doc,
+                variables: &variables,
+                operation_name,
+                headers,
+            },
         )
         .await;
     }
+    trace_perf_phase("graphql.route", routing_started);
     // Allowlist gate: the query must structurally match a listed one
     // (__typename selections are ignored, like Donat).
     if state.allowlist_enabled {
-        let normalized = normalize_for_allowlist(&doc);
-        let allowed = engine.metadata.allowlist.iter().any(|entry| {
-            engine
-                .metadata
-                .query_collections
-                .iter()
-                .filter(|c| c.name == entry.collection)
-                .flat_map(|c| c.definition.queries.iter())
-                .any(|q| {
-                    graphql_parser::parse_query::<String>(&q.query)
-                        .map(|d| normalize_for_allowlist(&d.into_static()) == normalized)
-                        .unwrap_or(false)
-                })
-        });
-        if !allowed {
+        let allowlist_started = std::time::Instant::now();
+        let normalized = normalize_for_allowlist(doc);
+        if !engine.allowed_queries.contains(&normalized) {
             return ok(error_json("validation-failed", "query is not allowed"));
         }
+        trace_perf_phase("graphql.allowlist", allowlist_started);
     }
-    let catalog = engine.default_catalog();
-    tracing::debug!(role = %session.role, sources = engine.metadata.sources.len(),
-        tables = engine.metadata.sources.first().map(|s| s.tables.len()).unwrap_or(0),
-        catalog_tables = catalog.tables.len(), "graphql request");
-    let mut planner = Planner::new(&engine.metadata, &catalog);
-    planner.infer_function_permissions = state.infer_function_permissions;
-    planner.relay = relay;
+    tracing::trace!(role = %session.role, sources = engine.metadata.sources.len(),
+        tables = engine.metadata.sources.iter().map(|source| source.tables.len()).sum::<usize>(),
+        catalog_tables = engine.catalogs.values().map(|catalog| catalog.tables.len()).sum::<usize>(),
+        "graphql request");
+    let planning_started = std::time::Instant::now();
+    let mut planner = match planner_from_snapshot(&engine) {
+        Ok(planner) => planner,
+        Err(error) => return ok(error.to_graphql()),
+    };
+    if let Err(error) = planner.set_relay(relay) {
+        return ok(error.to_graphql());
+    }
+    // File attachments: the request's clock and signing material. Every URL in
+    // this response is signed against them, so they are resolved once here and
+    // never per row.
+    let storage_context = state.storage_request_context();
+    if let Some(storage) = storage_context.as_ref() {
+        planner.set_storage(storage);
+    }
     // Introspection operations are answered from the type system directly.
-    if let Some(result) = donat_schema::execute_introspection(
+    if let Some(result) = donat_schema::execute_multi_source_introspection(
         &planner,
         session,
-        &doc,
+        doc,
         operation_name,
         &variables,
     ) {
@@ -497,74 +779,188 @@ pub async fn execute_full(
             Err(e) => ok(e.to_graphql()),
         };
     }
-    let plan = match planner.plan(&doc, operation_name, &variables, session) {
+    let plan = match planner.plan(doc, operation_name, &variables, session) {
         Ok(plan) => plan,
         Err(e) => return ok(e.to_graphql()),
     };
+    trace_perf_phase("graphql.plan", planning_started);
 
     match plan {
-        donat_schema::Plan::Query(roots) => {
-            // Dispatch on the default source's backend kind. For Postgres the
-            // dispatch renders and runs exactly the same SQL as before; the
-            // error variants below reproduce the previous bodies verbatim.
-            drop(engine);
-            match state.execute_query_json(&roots).await {
-                Ok(mut data) => {
-                    for root in &roots {
-                        if let donat_ir::RootField::Select { alias, query } = root {
+        MultiSourcePlan::Query { sources, response } => {
+            let mut runtimes = HashMap::with_capacity(sources.len());
+            for source in &sources {
+                let Some(runtime) = engine.runtimes.get(&source.source).cloned() else {
+                    return ok(error_json(
+                        "unexpected",
+                        format!("runtime for source '{}' not found", source.source),
+                    ));
+                };
+                runtimes.insert(source.source.clone(), runtime);
+            }
+            let executor = SnapshotSourceQueryExecutor {
+                state: state.as_ref(),
+                runtimes,
+            };
+            match execute_source_query_plans(&executor, &sources).await {
+                Ok(mut source_data) => {
+                    // Source reads have completed. Remote joins rooted at
+                    // separate response fields are independent too, so move
+                    // each JSON subtree out, resolve it concurrently, then
+                    // restore the result in plan order. One shared semaphore
+                    // keeps all roots within this operation's upstream batch
+                    // limit rather than multiplying the limit per root.
+                    let mut remote_roots = vec![];
+                    for (source_index, (source_plan, data)) in
+                        sources.iter().zip(&mut source_data).enumerate()
+                    {
+                        for root in &source_plan.roots {
+                            let donat_ir::RootField::Select { alias, query } = root else {
+                                continue;
+                            };
                             if let Some(node) = data.get_mut(alias.as_str()) {
-                                if let Err(e) = resolve_remote_joins(
-                                    state,
-                                    session,
-                                    &query.fields,
-                                    node,
-                                    &format!("$.selectionSet.{alias}"),
-                                )
-                                .await
-                                {
-                                    return ok(e);
-                                }
+                                remote_roots.push((
+                                    source_index,
+                                    alias.clone(),
+                                    query.fields.clone(),
+                                    format!("$.selectionSet.{alias}"),
+                                    std::mem::take(node),
+                                ));
                             }
                         }
                     }
+                    let remote_batch_permits = Arc::new(tokio::sync::Semaphore::new(
+                        REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+                    ));
+                    let resolved = join_all(remote_roots.into_iter().map(
+                        |(source_index, alias, fields, path, mut node)| {
+                            let engine = engine.clone();
+                            let batch_permits = remote_batch_permits.clone();
+                            async move {
+                                let result = resolve_remote_joins_with_permits(
+                                    state,
+                                    engine.as_ref(),
+                                    session,
+                                    &fields,
+                                    &mut node,
+                                    &path,
+                                    batch_permits,
+                                )
+                                .await;
+                                (source_index, alias, node, result)
+                            }
+                        },
+                    ))
+                    .await;
+                    for (source_index, alias, node, result) in resolved {
+                        if let Some(slot) = source_data[source_index].get_mut(alias.as_str()) {
+                            *slot = node;
+                        }
+                        if let Err(error) = result {
+                            return ok(error);
+                        }
+                    }
+                    let data = assemble_multi_source_response(&response, source_data);
                     ok(json!({ "data": data }))
                 }
                 Err(e) => ok(query_error_json(e)),
             }
         }
-        donat_schema::Plan::Mutation(roots) => {
-            // SQLite can't run the Postgres CTE-wrapped, in-DB-assembled
-            // mutation (DML in a CTE/subquery is forbidden), so it has its own
-            // executor: one top-level DML per root, response folded in Rust,
-            // rollback on a permission-check violation (see ADR 003). The
-            // Postgres path below is unchanged (byte-identical SQL + tx).
-            if matches!(
-                state.default_source_kind().await,
-                donat_metadata::SourceKind::Sqlite
-            ) {
+        MultiSourcePlan::Mutation {
+            source,
+            roots,
+            response,
+        } => {
+            let Some(source) = source else {
                 drop(engine);
-                return match state.execute_sqlite_mutations(&roots).await {
-                    Ok(data) => ok(json!({ "data": data })),
-                    Err(e) => ok(sqlite_mutation_error_json(e)),
-                };
-            }
-            // MySQL has no `RETURNING` and read-only CTEs, so it has its own
-            // executor too: each root runs a DML plus a COMPANION SELECT in one
-            // transaction to recover `returning`, rolling back on a check
-            // violation (see ADR 004). The Postgres path below is unchanged.
-            if matches!(
-                state.default_source_kind().await,
-                donat_metadata::SourceKind::Mysql
-            ) {
-                drop(engine);
-                return match state.execute_mysql_mutations(&roots).await {
-                    Ok(data) => ok(json!({ "data": data })),
-                    Err(e) => ok(mysql_mutation_error_json(e)),
-                };
-            }
+                let data = assemble_multi_source_response(&response, std::iter::empty());
+                return ok(json!({ "data": data }));
+            };
+            let Some(runtime) = engine.runtimes.get(&source).cloned() else {
+                return ok(error_json(
+                    "unexpected",
+                    format!("runtime for source '{source}' not found"),
+                ));
+            };
+            let pool = match runtime {
+                SourceRuntime::Sqlite { pool, settings, .. } => {
+                    if let Some(error) = command_backend_rejection(&roots, "SQLite") {
+                        return ok(error);
+                    }
+                    drop(engine);
+                    return match state
+                        .execute_sqlite_mutations_at(pool, settings, &roots)
+                        .await
+                    {
+                        Ok(data) => ok(json!({
+                            "data": assemble_multi_source_response(&response, [data])
+                        })),
+                        Err(e) => ok(sqlite_mutation_error_json(e)),
+                    };
+                }
+                SourceRuntime::Mysql {
+                    pool,
+                    permits,
+                    settings,
+                    ..
+                } => {
+                    if let Some(error) = command_backend_rejection(&roots, "MySQL") {
+                        return ok(error);
+                    }
+                    let Some(catalog) = engine.catalogs.get(&source) else {
+                        return ok(error_json(
+                            "unexpected",
+                            format!("catalog for source '{source}' not found"),
+                        ));
+                    };
+                    let primary_keys: std::collections::HashMap<String, Vec<String>> = roots
+                        .iter()
+                        .filter_map(|root| {
+                            let table = match root {
+                                donat_ir::MutationRoot::Insert { insert, .. } => &insert.table,
+                                donat_ir::MutationRoot::Update { update, .. } => &update.table,
+                                donat_ir::MutationRoot::Delete { delete, .. } => &delete.table,
+                                donat_ir::MutationRoot::FunctionCall { .. }
+                                | donat_ir::MutationRoot::Command { .. }
+                                | donat_ir::MutationRoot::RequestFileUpload { .. }
+                                | donat_ir::MutationRoot::Typename { .. } => return None,
+                            };
+                            let key = format!("{}.{}", table.schema, table.name);
+                            let primary_key = catalog
+                                .tables
+                                .get(&key)
+                                .map(|info| info.primary_key.clone())
+                                .unwrap_or_default();
+                            Some((key, primary_key))
+                        })
+                        .collect();
+                    drop(engine);
+                    return match state
+                        .execute_mysql_mutations_at(primary_keys, pool, permits, settings, &roots)
+                        .await
+                    {
+                        Ok(data) => ok(json!({
+                            "data": assemble_multi_source_response(&response, [data])
+                        })),
+                        Err(e) => ok(mysql_mutation_error_json(e)),
+                    };
+                }
+                SourceRuntime::Clickhouse { .. } => {
+                    if let Some(error) = command_backend_rejection(&roots, "ClickHouse") {
+                        return ok(error);
+                    }
+                    return ok(error_json(
+                        "unexpected",
+                        format!("mutations are not supported for source '{source}'"),
+                    ));
+                }
+                SourceRuntime::Postgres { pool, .. } => pool,
+            };
             // Pre-compute the per-field SQL and response keys, then run
             // everything inside one transaction.
-            let fields: Vec<(String, String)> = roots
+            let has_command_root = roots
+                .iter()
+                .any(|root| matches!(root, donat_ir::MutationRoot::Command { .. }));
+            let fields: Vec<(&donat_ir::MutationRoot, String, String)> = roots
                 .iter()
                 .map(|root| {
                     let alias = match root {
@@ -572,27 +968,40 @@ pub async fn execute_full(
                         | donat_ir::MutationRoot::Insert { alias, .. }
                         | donat_ir::MutationRoot::Update { alias, .. }
                         | donat_ir::MutationRoot::Delete { alias, .. }
+                        | donat_ir::MutationRoot::Command { alias, .. }
+                        | donat_ir::MutationRoot::RequestFileUpload { alias, .. }
                         | donat_ir::MutationRoot::Typename { alias, .. } => alias.clone(),
                     };
-                    (alias, donat_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics))
+                    (
+                        root,
+                        alias,
+                        donat_sqlgen::mutation_to_sql_opts(root, state.stringify_numerics),
+                    )
                 })
                 .collect();
             drop(engine);
-
-            let Some(pool) = state.default_pool().await else {
-                return ok(error_json("unexpected", "no default source"));
-            };
             let mut client = match pool.get().await {
                 Ok(c) => c,
-                Err(e) => return ok(error_json("unexpected", format!("connection pool error: {e}"))),
+                Err(e) => {
+                    return ok(error_json(
+                        "unexpected",
+                        format!("connection pool error: {e}"),
+                    ));
+                }
             };
             let tx = match client.transaction().await {
                 Ok(tx) => tx,
-                Err(e) => return ok(db_error_json(&e)),
+                Err(e) => {
+                    return ok(if has_command_root {
+                        command_db_error_json(&e)
+                    } else {
+                        db_error_json(&e)
+                    });
+                }
             };
             let mut data = serde_json::Map::new();
-            for (alias, sql) in fields {
-                tracing::debug!(%sql, "executing mutation");
+            for (root, alias, sql) in fields {
+                trace_mutation_sql(root, &sql);
                 match tx.query_one(&sql, &[]).await {
                     Ok(row) => {
                         // Typename roots produce text, everything else json.
@@ -600,13 +1009,21 @@ pub async fn execute_full(
                         // the update/delete permission filter) yields a SQL
                         // NULL in column 0 — decode as Option so it becomes a
                         // JSON null, not a decode error.
-                        let value = row
-                            .try_get::<_, Option<Json>>(0)
-                            .map(|o| o.unwrap_or(Json::Null))
-                            .or_else(|_| {
-                                row.try_get::<_, Option<String>>(0)
-                                    .map(|o| o.map(Json::String).unwrap_or(Json::Null))
-                            });
+                        let value = match root {
+                            donat_ir::MutationRoot::Command { command, .. }
+                                if command.idempotency.is_some() =>
+                            {
+                                crate::commands::decode_command_execution_result(&row)
+                                    .map(|result| result.result_json)
+                            }
+                            _ => row
+                                .try_get::<_, Option<Json>>(0)
+                                .map(|o| o.unwrap_or(Json::Null))
+                                .or_else(|_| {
+                                    row.try_get::<_, Option<String>>(0)
+                                        .map(|o| o.map(Json::String).unwrap_or(Json::Null))
+                                }),
+                        };
                         match value {
                             Ok(v) => {
                                 data.insert(alias, v);
@@ -619,12 +1036,23 @@ pub async fn execute_full(
                             }
                         }
                     }
-                    Err(e) => return ok(db_error_json(&e)),
+                    Err(e) => {
+                        return ok(if matches!(root, donat_ir::MutationRoot::Command { .. }) {
+                            command_db_error_json(&e)
+                        } else {
+                            db_error_json(&e)
+                        });
+                    }
                 }
             }
             if let Err(e) = tx.commit().await {
-                return ok(db_error_json(&e));
+                return ok(if has_command_root {
+                    command_db_error_json(&e)
+                } else {
+                    db_error_json(&e)
+                });
             }
+            let data = assemble_multi_source_response(&response, [Json::Object(data)]);
             ok(json!({ "data": data }))
         }
     }
@@ -634,8 +1062,45 @@ pub async fn execute_full(
 /// `data` object on success or a GraphQL error body on failure. Used to
 /// resolve action output-object relationships into tracked tables (the target
 /// is queried under the same session, so the role's permissions apply).
+fn plan_internal_select_from_snapshot(
+    engine: &Engine,
+    session: &Session,
+    doc: &graphql_parser::query::Document<'static, String>,
+    variables: &JsonMap<String, Json>,
+) -> Result<(String, Vec<donat_ir::RootField>, SourceRuntime), Json> {
+    let compiled = engine
+        .compiled
+        .as_deref()
+        .ok_or_else(|| error_json("unexpected", "engine schema snapshot is not initialized"))?;
+    let source = engine
+        .metadata
+        .sources
+        .iter()
+        .find(|source| source.name == "default")
+        .or_else(|| engine.metadata.sources.first())
+        .ok_or_else(|| error_json("unexpected", "no default source"))?;
+    let planner = compiled
+        .source_planner(&engine.metadata, &engine.catalogs, &source.name)
+        .map_err(|error| error.to_graphql())?;
+    let plan = planner
+        .plan(doc, None, variables, session)
+        .map_err(|error| error.to_graphql())?;
+    let roots = match plan {
+        donat_schema::Plan::Query(roots) => roots,
+        _ => return Err(error_json("unexpected", "internal query must be a select")),
+    };
+    let runtime = engine.runtimes.get(&source.name).cloned().ok_or_else(|| {
+        error_json(
+            "unexpected",
+            format!("runtime for source '{}' not found", source.name),
+        )
+    })?;
+    Ok((source.name.clone(), roots, runtime))
+}
+
 pub(crate) async fn execute_select_internal(
     state: &SharedState,
+    engine: &Engine,
     session: &Session,
     query: &str,
     variables: &JsonMap<String, Json>,
@@ -644,24 +1109,11 @@ pub(crate) async fn execute_select_internal(
         .map_err(|e| error_json("unexpected", format!("internal query parse error: {e}")))?
         .into_static();
 
-    let engine = state.engine.read().await;
-    let catalog = engine.default_catalog();
-    let mut planner = Planner::new(&engine.metadata, &catalog);
-    planner.infer_function_permissions = state.infer_function_permissions;
-    let plan = planner
-        .plan(&doc, None, variables, session)
-        .map_err(|e| e.to_graphql())?;
-    let roots = match plan {
-        donat_schema::Plan::Query(roots) => roots,
-        _ => return Err(error_json("unexpected", "internal query must be a select")),
+    let (_, roots, runtime) = plan_internal_select_from_snapshot(engine, session, &doc, variables)?;
+    let SourceRuntime::Postgres { pool, .. } = runtime else {
+        return Err(error_json("unexpected", "no default source"));
     };
     let sql = donat_sqlgen::operation_to_sql_opts(&roots, state.stringify_numerics);
-    drop(engine);
-
-    let pool = state
-        .default_pool()
-        .await
-        .ok_or_else(|| error_json("unexpected", "no default source"))?;
     let client = pool
         .get()
         .await
@@ -674,29 +1126,31 @@ pub(crate) async fn execute_select_internal(
         .try_get::<_, Json>(0)
         .map_err(|e| error_json("unexpected", format!("cannot decode result: {e}")))?;
     for root in &roots {
-        if let donat_ir::RootField::Select { alias, query } = root {
-            if let Some(node) = data.get_mut(alias.as_str()) {
-                resolve_remote_joins(
-                    state,
-                    session,
-                    &query.fields,
-                    node,
-                    &format!("$.selectionSet.{alias}"),
-                )
-                .await?;
-            }
+        if let donat_ir::RootField::Select { alias, query } = root
+            && let Some(node) = data.get_mut(alias.as_str())
+        {
+            resolve_remote_joins(
+                state,
+                engine,
+                session,
+                &query.fields,
+                node,
+                &format!("$.selectionSet.{alias}"),
+            )
+            .await?;
         }
     }
     Ok(data)
 }
 
 /// Render a document with every __typename selection removed.
-fn normalize_for_allowlist(doc: &graphql_parser::query::Document<'static, String>) -> String {
+pub(crate) fn normalize_for_allowlist(
+    doc: &graphql_parser::query::Document<'static, String>,
+) -> String {
     use graphql_parser::query::{Definition, Selection};
     fn strip(set: &mut graphql_parser::query::SelectionSet<'static, String>) {
-        set.items.retain(|item| {
-            !matches!(item, Selection::Field(f) if f.name == "__typename")
-        });
+        set.items
+            .retain(|item| !matches!(item, Selection::Field(f) if f.name == "__typename"));
         for item in &mut set.items {
             match item {
                 Selection::Field(f) => strip(&mut f.selection_set),
@@ -737,9 +1191,8 @@ fn top_level_fields(doc: &graphql_parser::query::Document<'static, String>) -> V
             for item in &set.items {
                 if let Selection::Field(f) = item {
                     let alias = f.alias.clone().unwrap_or_else(|| f.name.clone());
-                    let is_intro = f.name == "__schema"
-                        || f.name == "__type"
-                        || f.name == "__typename";
+                    let is_intro =
+                        f.name == "__schema" || f.name == "__type" || f.name == "__typename";
                     out.push((alias, is_intro));
                 }
             }
@@ -748,119 +1201,595 @@ fn top_level_fields(doc: &graphql_parser::query::Document<'static, String>) -> V
     out
 }
 
-/// Fill RemoteJoin placeholders by querying the remote schema per row
-/// and strip the hidden "__rr__" columns.
+struct RemoteJoinEntry {
+    object_pointer: String,
+    variables: JsonMap<String, Json>,
+}
+
+struct RemoteJoinGroup<'a> {
+    spec: &'a donat_ir::RemoteJoinSpec,
+    client_field_path: String,
+    field_alias: String,
+    entries: Vec<RemoteJoinEntry>,
+}
+
+struct PreparedRemoteJoin {
+    target: crate::remote::RemoteTarget,
+    query: String,
+    variables: JsonMap<String, Json>,
+}
+
+const REMOTE_JOIN_BATCH_SIZE: usize = 100;
+const REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES: usize = 4;
+
+fn pointer_child(base: &str, segment: &str) -> String {
+    let escaped = segment.replace('~', "~0").replace('/', "~1");
+    format!("{base}/{escaped}")
+}
+
+fn collect_remote_join_groups<'a>(
+    fields: &'a [donat_ir::OutputField],
+    node: &Json,
+    object_pointer: &str,
+    path: &str,
+    groups: &mut Vec<RemoteJoinGroup<'a>>,
+) {
+    match node {
+        Json::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_remote_join_groups(
+                    fields,
+                    item,
+                    &pointer_child(object_pointer, &index.to_string()),
+                    path,
+                    groups,
+                );
+            }
+        }
+        Json::Object(map) => {
+            for field in fields {
+                match &field.value {
+                    donat_ir::FieldValue::Object { query, .. }
+                    | donat_ir::FieldValue::Array { query, .. } => {
+                        if let Some(child) = map.get(field.alias.as_str()) {
+                            collect_remote_join_groups(
+                                &query.fields,
+                                child,
+                                &pointer_child(object_pointer, &field.alias),
+                                &format!("{path}.selectionSet.{}", field.alias),
+                                groups,
+                            );
+                        }
+                    }
+                    donat_ir::FieldValue::RemoteJoin { spec } => {
+                        let client_field_path = format!("{path}.selectionSet.{}", field.alias);
+                        let variables = spec
+                            .variables
+                            .iter()
+                            .map(|(variable, hidden)| {
+                                (
+                                    variable.clone(),
+                                    map.get(hidden.as_str()).cloned().unwrap_or(Json::Null),
+                                )
+                            })
+                            .collect();
+                        if let Some(group) = groups.iter_mut().find(|group| {
+                            group.client_field_path == client_field_path
+                                && group.spec.query == spec.query
+                                && group.spec.schema == spec.schema
+                        }) {
+                            group.entries.push(RemoteJoinEntry {
+                                object_pointer: object_pointer.to_string(),
+                                variables,
+                            });
+                        } else {
+                            groups.push(RemoteJoinGroup {
+                                spec,
+                                client_field_path,
+                                field_alias: field.alias.clone(),
+                                entries: vec![RemoteJoinEntry {
+                                    object_pointer: object_pointer.to_string(),
+                                    variables,
+                                }],
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_query_value_variables(
+    value: &mut graphql_parser::query::Value<'static, String>,
+    names: &std::collections::HashMap<String, String>,
+) {
+    use graphql_parser::query::Value;
+    match value {
+        Value::Variable(name) => {
+            if let Some(replacement) = names.get(name) {
+                *name = replacement.clone();
+            }
+        }
+        Value::List(items) => {
+            for item in items {
+                rename_query_value_variables(item, names);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                rename_query_value_variables(value, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_query_directive_variables(
+    directives: &mut [graphql_parser::query::Directive<'static, String>],
+    names: &std::collections::HashMap<String, String>,
+) {
+    for directive in directives {
+        for (_, value) in &mut directive.arguments {
+            rename_query_value_variables(value, names);
+        }
+    }
+}
+
+fn rename_selection_variables(
+    selection_set: &mut graphql_parser::query::SelectionSet<'static, String>,
+    names: &std::collections::HashMap<String, String>,
+) {
+    use graphql_parser::query::Selection;
+    for selection in &mut selection_set.items {
+        match selection {
+            Selection::Field(field) => {
+                for (_, value) in &mut field.arguments {
+                    rename_query_value_variables(value, names);
+                }
+                rename_query_directive_variables(&mut field.directives, names);
+                rename_selection_variables(&mut field.selection_set, names);
+            }
+            Selection::InlineFragment(fragment) => {
+                rename_query_directive_variables(&mut fragment.directives, names);
+                rename_selection_variables(&mut fragment.selection_set, names);
+            }
+            Selection::FragmentSpread(fragment) => {
+                rename_query_directive_variables(&mut fragment.directives, names);
+            }
+        }
+    }
+}
+
+fn build_remote_join_batch(
+    prepared: &[PreparedRemoteJoin],
+) -> Option<(String, JsonMap<String, Json>)> {
+    use graphql_parser::query::{Definition, OperationDefinition, Selection};
+
+    let mut combined_doc = None;
+    let mut combined_variables = JsonMap::new();
+    let mut variable_definitions = vec![];
+    let mut selections = vec![];
+
+    for (index, request) in prepared.iter().enumerate() {
+        let mut doc = graphql_parser::parse_query::<String>(&request.query)
+            .ok()?
+            .into_static();
+        if doc
+            .definitions
+            .iter()
+            .any(|definition| matches!(definition, Definition::Fragment(_)))
+        {
+            return None;
+        }
+        let query = doc.definitions.iter_mut().find_map(|definition| {
+            let Definition::Operation(OperationDefinition::Query(query)) = definition else {
+                return None;
+            };
+            Some(query)
+        })?;
+        if query.selection_set.items.len() != 1 {
+            return None;
+        }
+
+        let names: std::collections::HashMap<_, _> = query
+            .variable_definitions
+            .iter()
+            .map(|definition| {
+                (
+                    definition.name.clone(),
+                    format!("__donat_rr_{index}_{}", definition.name),
+                )
+            })
+            .collect();
+        for definition in &mut query.variable_definitions {
+            definition.name = names.get(&definition.name)?.clone();
+        }
+        rename_selection_variables(&mut query.selection_set, &names);
+        let Selection::Field(field) = query.selection_set.items.first_mut()? else {
+            return None;
+        };
+        field.alias = Some(format!("__donat_rr_{index}"));
+
+        for (name, value) in &request.variables {
+            combined_variables.insert(names.get(name)?.clone(), value.clone());
+        }
+        variable_definitions.extend(query.variable_definitions.clone());
+        selections.extend(query.selection_set.items.clone());
+        if combined_doc.is_none() {
+            combined_doc = Some(doc);
+        }
+    }
+
+    let mut combined_doc = combined_doc?;
+    let combined_query = combined_doc.definitions.iter_mut().find_map(|definition| {
+        let Definition::Operation(OperationDefinition::Query(query)) = definition else {
+            return None;
+        };
+        Some(query)
+    })?;
+    combined_query.variable_definitions = variable_definitions;
+    combined_query.selection_set.items = selections;
+    Some((format!("{combined_doc}"), combined_variables))
+}
+
+async fn execute_remote_join_sequential(
+    state: &SharedState,
+    prepared: &[PreparedRemoteJoin],
+    root_field: &str,
+    batch_permits: &Arc<tokio::sync::Semaphore>,
+) -> Result<Vec<Json>, Json> {
+    let mut values = Vec::with_capacity(prepared.len());
+    for request in prepared {
+        let body = json!({
+            "query": request.query,
+            "variables": request.variables,
+        });
+        let permit = batch_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("remote batch semaphore is never closed");
+        let (_, response) =
+            crate::remote::forward(state, &request.target, &body, &HeaderMap::new()).await;
+        drop(permit);
+        if let Some(errors) = response.get("errors") {
+            return Err(json!({ "errors": errors }));
+        }
+        values.push(
+            response
+                .pointer(&format!("/data/{root_field}"))
+                .cloned()
+                .unwrap_or(Json::Null),
+        );
+    }
+    Ok(values)
+}
+
+async fn execute_remote_join_chunk(
+    state: &SharedState,
+    prepared: &[PreparedRemoteJoin],
+    root_field: &str,
+    batch_permits: Arc<tokio::sync::Semaphore>,
+) -> Result<Vec<Json>, Json> {
+    if prepared.len() == 1 {
+        return execute_remote_join_sequential(state, prepared, root_field, &batch_permits).await;
+    }
+    let Some((query, variables)) = build_remote_join_batch(prepared) else {
+        return execute_remote_join_sequential(state, prepared, root_field, &batch_permits).await;
+    };
+    let first = prepared.first().expect("non-empty remote join batch");
+    let target = crate::remote::RemoteTarget {
+        url: first.target.url.clone(),
+        forward_client_headers: first.target.forward_client_headers,
+        rewritten_query: Some(query.clone()),
+        has_introspection: false,
+        namespace: None,
+        timeout_seconds: first.target.timeout_seconds,
+    };
+    let body = json!({ "query": query, "variables": variables });
+    let permit = batch_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("remote batch semaphore is never closed");
+    let (_, response) = crate::remote::forward(state, &target, &body, &HeaderMap::new()).await;
+    drop(permit);
+    if let Some(errors) = response.get("errors") {
+        if remote_batch_is_validation_error(errors) {
+            return execute_remote_join_sequential(state, prepared, root_field, &batch_permits)
+                .await;
+        }
+        // Transport failures, timeouts, and resolver errors must not fan out
+        // into N retries. Only a recognized GraphQL validation rejection says
+        // that the upstream cannot execute our aliased batch shape.
+        return Err(json!({
+            "errors": restore_remote_join_error_paths(errors, root_field)
+        }));
+    }
+    Ok((0..prepared.len())
+        .map(|index| {
+            response
+                .pointer(&format!("/data/__donat_rr_{index}"))
+                .cloned()
+                .unwrap_or(Json::Null)
+        })
+        .collect())
+}
+
+fn restore_remote_join_error_paths(errors: &Json, root_field: &str) -> Json {
+    let mut restored = errors.clone();
+    let Some(items) = restored.as_array_mut() else {
+        return restored;
+    };
+    for error in items {
+        let Some(error) = error.as_object_mut() else {
+            continue;
+        };
+        if let Some(path) = error.get_mut("path").and_then(Json::as_array_mut)
+            && path
+                .first()
+                .and_then(Json::as_str)
+                .is_some_and(|segment| segment.starts_with("__donat_rr_"))
+        {
+            path[0] = Json::String(root_field.to_string());
+        }
+        let extension_path = error
+            .get("extensions")
+            .and_then(Json::as_object)
+            .and_then(|extensions| extensions.get("path"))
+            .and_then(Json::as_str)
+            .map(str::to_string);
+        if let Some(path) = extension_path
+            && let Some(start) = path.find("__donat_rr_")
+        {
+            let end = path[start..]
+                .find(['.', '['])
+                .map(|offset| start + offset)
+                .unwrap_or(path.len());
+            if let Some(extensions) = error.get_mut("extensions").and_then(Json::as_object_mut) {
+                extensions.insert(
+                    "path".to_string(),
+                    Json::String(format!("{}{}{}", &path[..start], root_field, &path[end..])),
+                );
+            }
+        }
+    }
+    restored
+}
+
+fn remote_batch_is_validation_error(errors: &Json) -> bool {
+    let Some(errors) = errors.as_array() else {
+        return false;
+    };
+    !errors.is_empty()
+        && errors.iter().all(|error| {
+            let Some(code) = error.pointer("/extensions/code").and_then(Json::as_str) else {
+                return false;
+            };
+            matches!(
+                code.to_ascii_lowercase().as_str(),
+                "validation-failed"
+                    | "validation_failed"
+                    | "graphql_validation_failed"
+                    | "graphql_validation_error"
+            )
+        })
+}
+
+async fn resolve_remote_join_group(
+    state: &SharedState,
+    engine: &Engine,
+    session: &Session,
+    group: &RemoteJoinGroup<'_>,
+    batch_permits: Arc<tokio::sync::Semaphore>,
+) -> Result<Vec<Json>, Json> {
+    let doc = graphql_parser::parse_query::<String>(&group.spec.query)
+        .map_err(|error| error_json("unexpected", format!("bad remote join: {error}")))?
+        .into_static();
+
+    let mut unique_variables: Vec<JsonMap<String, Json>> = vec![];
+    let mut unique_indexes: HashMap<String, usize> = HashMap::new();
+    let mut entry_to_unique = Vec::with_capacity(group.entries.len());
+    for entry in &group.entries {
+        let key = serde_json::to_string(&entry.variables)
+            .expect("remote relationship variables always serialize");
+        if let Some(index) = unique_indexes.get(&key).copied() {
+            entry_to_unique.push(index);
+        } else {
+            let index = unique_variables.len();
+            unique_indexes.insert(key, index);
+            entry_to_unique.push(index);
+            unique_variables.push(entry.variables.clone());
+        }
+    }
+
+    let mut prepared = Vec::with_capacity(unique_variables.len());
+    for mut variables in unique_variables {
+        let matched = crate::remote::match_remote_with(engine, session, &doc, &mut variables, true);
+        let target = match matched {
+            Some(Ok(target)) => target,
+            Some(Err(error)) => {
+                let server_root = format!("$.selectionSet.{}", group.spec.root_field);
+                let rewritten = match error.path.strip_prefix(&server_root) {
+                    Some(rest) => format!("{}{rest}", group.client_field_path),
+                    None => group.client_field_path.clone(),
+                };
+                return Err(json!({
+                    "errors": [{
+                        "extensions": { "path": rewritten, "code": error.code },
+                        "message": error.message,
+                    }]
+                }));
+            }
+            None => return Ok(vec![Json::Null; group.entries.len()]),
+        };
+        let query = target
+            .rewritten_query
+            .clone()
+            .unwrap_or_else(|| group.spec.query.clone());
+        prepared.push(PreparedRemoteJoin {
+            target,
+            query,
+            variables,
+        });
+    }
+
+    let mut unique_values = Vec::with_capacity(prepared.len());
+    let window_size = REMOTE_JOIN_BATCH_SIZE * REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES;
+    for window in prepared.chunks(window_size) {
+        let results = join_all(window.chunks(REMOTE_JOIN_BATCH_SIZE).map(|chunk| {
+            execute_remote_join_chunk(state, chunk, &group.spec.root_field, batch_permits.clone())
+        }))
+        .await;
+        for result in results {
+            unique_values.extend(result?);
+        }
+    }
+
+    Ok(entry_to_unique
+        .into_iter()
+        .map(|index| unique_values[index].clone())
+        .collect())
+}
+
+fn strip_remote_join_hidden_fields(fields: &[donat_ir::OutputField], node: &mut Json) {
+    match node {
+        Json::Array(items) => {
+            for item in items {
+                strip_remote_join_hidden_fields(fields, item);
+            }
+        }
+        Json::Object(map) => {
+            for field in fields {
+                match &field.value {
+                    donat_ir::FieldValue::Object { query, .. }
+                    | donat_ir::FieldValue::Array { query, .. } => {
+                        if let Some(child) = map.get_mut(field.alias.as_str()) {
+                            strip_remote_join_hidden_fields(&query.fields, child);
+                        }
+                    }
+                    donat_ir::FieldValue::Nodes { fields } => {
+                        if let Some(child) = map.get_mut(field.alias.as_str()) {
+                            strip_remote_join_hidden_fields(fields, child);
+                        }
+                    }
+                    donat_ir::FieldValue::NestedConnection { conn } => {
+                        if let Some(child) = map.get_mut(field.alias.as_str()) {
+                            strip_remote_join_hidden_connection(conn, child);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            map.retain(|key, _| !key.starts_with("__rr__"));
+        }
+        _ => {}
+    }
+}
+
+fn strip_remote_join_hidden_connection(conn: &donat_ir::Connection, node: &mut Json) {
+    match node {
+        Json::Array(items) => {
+            for item in items {
+                strip_remote_join_hidden_connection(conn, item);
+            }
+        }
+        Json::Object(map) => {
+            for field in &conn.fields {
+                let donat_ir::ConnectionField::Edges { alias, fields } = field else {
+                    continue;
+                };
+                if let Some(edges) = map.get_mut(alias) {
+                    strip_remote_join_hidden_edges(&conn.query.fields, fields, edges);
+                }
+            }
+            map.retain(|key, _| !key.starts_with("__rr__"));
+        }
+        _ => {}
+    }
+}
+
+fn strip_remote_join_hidden_edges(
+    node_fields: &[donat_ir::OutputField],
+    edge_fields: &[donat_ir::EdgeField],
+    node: &mut Json,
+) {
+    match node {
+        Json::Array(items) => {
+            for item in items {
+                strip_remote_join_hidden_edges(node_fields, edge_fields, item);
+            }
+        }
+        Json::Object(map) => {
+            for field in edge_fields {
+                let donat_ir::EdgeField::Node { alias } = field else {
+                    continue;
+                };
+                if let Some(child) = map.get_mut(alias) {
+                    strip_remote_join_hidden_fields(node_fields, child);
+                }
+            }
+            map.retain(|key, _| !key.starts_with("__rr__"));
+        }
+        _ => {}
+    }
+}
+
+/// Fill RemoteJoin placeholders with one upstream GraphQL operation per
+/// relationship selection, deduplicating repeated join keys, then strip the
+/// hidden "__rr__" columns.
 fn resolve_remote_joins<'a>(
     state: &'a SharedState,
+    engine: &'a Engine,
     session: &'a Session,
     fields: &'a [donat_ir::OutputField],
     node: &'a mut Json,
     path: &'a str,
 ) -> futures_util::future::BoxFuture<'a, Result<(), Json>> {
+    resolve_remote_joins_with_permits(
+        state,
+        engine,
+        session,
+        fields,
+        node,
+        path,
+        Arc::new(tokio::sync::Semaphore::new(
+            REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+        )),
+    )
+}
+
+fn resolve_remote_joins_with_permits<'a>(
+    state: &'a SharedState,
+    engine: &'a Engine,
+    session: &'a Session,
+    fields: &'a [donat_ir::OutputField],
+    node: &'a mut Json,
+    path: &'a str,
+    batch_permits: Arc<tokio::sync::Semaphore>,
+) -> futures_util::future::BoxFuture<'a, Result<(), Json>> {
     Box::pin(async move {
-        match node {
-            Json::Array(items) => {
-                for item in items {
-                    resolve_remote_joins(state, session, fields, item, path).await?;
+        let mut groups = vec![];
+        collect_remote_join_groups(fields, node, "", path, &mut groups);
+        for window in groups.chunks(REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES) {
+            let resolved = join_all(window.iter().map(|group| {
+                resolve_remote_join_group(state, engine, session, group, batch_permits.clone())
+            }))
+            .await;
+            for (group, values) in window.iter().zip(resolved) {
+                for (entry, value) in group.entries.iter().zip(values?) {
+                    let Some(Json::Object(object)) = node.pointer_mut(&entry.object_pointer) else {
+                        continue;
+                    };
+                    object.insert(group.field_alias.clone(), value);
                 }
-                Ok(())
             }
-            Json::Object(_) => {
-                for field in fields {
-                    match &field.value {
-                        donat_ir::FieldValue::Object { query, .. }
-                        | donat_ir::FieldValue::Array { query, .. } => {
-                            if let Some(child) = node.get_mut(field.alias.as_str()) {
-                                resolve_remote_joins(
-                                    state,
-                                    session,
-                                    &query.fields,
-                                    child,
-                                    &format!("{path}.selectionSet.{}", field.alias),
-                                )
-                                .await?;
-                            }
-                        }
-                        donat_ir::FieldValue::RemoteJoin { spec } => {
-                            // Variables from the row's hidden columns.
-                            let mut vars = serde_json::Map::new();
-                            for (var, hidden) in &spec.variables {
-                                vars.insert(
-                                    var.clone(),
-                                    node.get(hidden.as_str()).cloned().unwrap_or(Json::Null),
-                                );
-                            }
-                            let doc = graphql_parser::parse_query::<String>(&spec.query)
-                                .map_err(|e| {
-                                    error_json("unexpected", format!("bad remote join: {e}"))
-                                })?
-                                .into_static();
-                            let engine = state.engine.read().await;
-                            let mut varmap = vars.clone();
-                            let matched = crate::remote::match_remote_with(
-                                &engine.metadata,
-                                session,
-                                &doc,
-                                &mut varmap,
-                                true,
-                            );
-                            drop(engine);
-                            let value = match matched {
-                                Some(Ok(target)) => {
-                                    let body = json!({
-                                        "query": target
-                                            .rewritten_query
-                                            .clone()
-                                            .unwrap_or_else(|| spec.query.clone()),
-                                        "variables": varmap,
-                                    });
-                                    let (_, resp) = crate::remote::forward(
-                                        state,
-                                        &target,
-                                        &body,
-                                        &axum::http::HeaderMap::new(),
-                                    )
-                                    .await;
-                                    if let Some(errors) = resp.get("errors") {
-                                        return Err(json!({ "errors": errors }));
-                                    }
-                                    resp.pointer(&format!("/data/{}", spec.root_field))
-                                        .cloned()
-                                        .unwrap_or(Json::Null)
-                                }
-                                Some(Err(e)) => {
-                                    // Validation errors for the server-built
-                                    // join query are reported at the client's
-                                    // field path, not the join root's.
-                                    let client_field =
-                                        format!("{path}.selectionSet.{}", field.alias);
-                                    let server_root =
-                                        format!("$.selectionSet.{}", spec.root_field);
-                                    let rewritten = match e.path.strip_prefix(&server_root) {
-                                        Some(rest) => format!("{client_field}{rest}"),
-                                        None => client_field,
-                                    };
-                                    return Err(json!({
-                                        "errors": [{
-                                            "extensions": { "path": rewritten, "code": e.code },
-                                            "message": e.message,
-                                        }]
-                                    }));
-                                }
-                                None => Json::Null,
-                            };
-                            node[field.alias.as_str()] = value;
-                        }
-                        _ => {}
-                    }
-                }
-                if let Json::Object(map) = node {
-                    map.retain(|k, _| !k.starts_with("__rr__"));
-                }
-                Ok(())
-            }
-            _ => Ok(()),
         }
+        strip_remote_join_hidden_fields(fields, node);
+        Ok(())
     })
 }
 
@@ -879,34 +1808,110 @@ fn query_error_json(e: QueryError) -> Json {
         QueryError::Decode(msg) => error_json("unexpected", format!("cannot decode result: {msg}")),
         QueryError::Postgres(err) => db_error_json(&err),
         QueryError::Sqlite(msg) => error_json("data-exception", msg),
+        QueryError::Mysql(msg) => error_json("data-exception", msg),
+        QueryError::Clickhouse(msg) => error_json("data-exception", msg),
     }
 }
+
+fn command_business_rejection_json(rejection: &crate::commands::CommandBusinessRejection) -> Json {
+    json!({
+        "errors": [{
+            "extensions": {
+                "path": rejection.path,
+                "code": rejection.code,
+            },
+            "message": rejection.message,
+        }]
+    })
+}
+
+fn permission_error_json(message: &str) -> Option<Json> {
+    let Json::Object(payload) = serde_json::from_str::<Json>(message).ok()? else {
+        return None;
+    };
+    let (Some(path), Some(message)) = (
+        payload.get("path").and_then(Json::as_str),
+        payload.get("message").and_then(Json::as_str),
+    ) else {
+        return None;
+    };
+    Some(json!({
+        "errors": [{
+            "extensions": { "path": path, "code": "permission-error" },
+            "message": message,
+        }]
+    }))
+}
+
+/// Command statements can carry only the dedicated, validated business-error
+/// envelope or the established permission-check envelope. Every other driver
+/// error is deliberately opaque: command SQL embeds request values and a
+/// PostgreSQL primary message can disclose them alongside relation details.
+fn command_db_error_json(e: &tokio_postgres::Error) -> Json {
+    let Some(db) = e.as_db_error() else {
+        return error_json("data-exception", "command database error");
+    };
+    if db.code().code() == "P0D01" {
+        return crate::commands::decode_command_business_rejection(e)
+            .as_ref()
+            .map(command_business_rejection_json)
+            .unwrap_or_else(|| error_json("data-exception", "command database error"));
+    }
+    if db.code().code() == "23514"
+        && let Some(body) = permission_error_json(db.message())
+    {
+        return body;
+    }
+    // The response stays opaque, but an operator still needs the cause. The
+    // log is the only place it may appear, so record it there rather than
+    // leaving a bare "command database error" with nothing behind it.
+    //
+    // This is the primary message, never `detail()`. A primary message can
+    // still quote one offending literal ("invalid input syntax for type
+    // integer: \"abc\""), which is why it is not returned to the caller;
+    // `detail()` goes further and prints whole key tuples, so it stays out of
+    // the log as well.
+    tracing::warn!(
+        sqlstate = db.code().code(),
+        message = db.message(),
+        constraint = db.constraint().unwrap_or_default(),
+        table = db.table().unwrap_or_default(),
+        "command statement failed"
+    );
+    error_json("data-exception", "command database error")
+}
+
 fn db_error_json(e: &tokio_postgres::Error) -> Json {
     let Some(db) = e.as_db_error() else {
         return error_json("unexpected", e.to_string());
     };
+    if db.code().code() == "P0D01" {
+        return crate::commands::decode_command_business_rejection(e)
+            .as_ref()
+            .map(command_business_rejection_json)
+            .unwrap_or_else(|| error_json("data-exception", "database error"));
+    }
     // Our check_violation() raises 23514 with a JSON payload carrying the
     // GraphQL error path.
-    if db.code().code() == "23514" {
-        if let Ok(payload) = serde_json::from_str::<Json>(db.message()) {
-            if let (Some(path), Some(message)) = (
-                payload.get("path").and_then(Json::as_str),
-                payload.get("message").and_then(Json::as_str),
-            ) {
-                return json!({
-                    "errors": [{
-                        "extensions": { "path": path, "code": "permission-error" },
-                        "message": message,
-                    }]
-                });
-            }
-        }
+    if db.code().code() == "23514"
+        && let Some(body) = permission_error_json(db.message())
+    {
+        return body;
     }
     let (code, message) = match db.code().code() {
         "23514" => ("permission-error", db.message().to_string()),
-        "23505" => ("constraint-violation", format!("Uniqueness violation. {}", db.message())),
-        "23503" => ("constraint-violation", format!("Foreign key violation. {}", db.message())),
-        "23502" => ("constraint-violation", format!("Not-NULL violation. {}", db.message())),
+        "23505" => (
+            "constraint-violation",
+            format!("Uniqueness violation. {}", db.message()),
+        ),
+        "23503" => (
+            "constraint-violation",
+            format!("Foreign key violation. {}", db.message()),
+        ),
+        "23502" => (
+            "constraint-violation",
+            format!("Not-NULL violation. {}", db.message()),
+        ),
         _ => ("data-exception", db.message().to_string()),
     };
     json!({
@@ -924,7 +1929,6 @@ fn db_error_json(e: &tokio_postgres::Error) -> Json {
 fn sqlite_mutation_error_json(e: crate::state::SqliteMutationError) -> Json {
     use crate::state::SqliteMutationError as E;
     match e {
-        E::NoDefaultSource => error_json("unexpected", "no default source"),
         E::CheckViolation { path } => json!({
             "errors": [{
                 "extensions": { "path": path, "code": "permission-error" },
@@ -942,7 +1946,6 @@ fn sqlite_mutation_error_json(e: crate::state::SqliteMutationError) -> Json {
 fn mysql_mutation_error_json(e: crate::state::MysqlMutationError) -> Json {
     use crate::state::MysqlMutationError as E;
     match e {
-        E::NoDefaultSource => error_json("unexpected", "no default source"),
         E::CheckViolation { path } => json!({
             "errors": [{
                 "extensions": { "path": path, "code": "permission-error" },
@@ -965,7 +1968,13 @@ fn error_json(code: &str, message: impl Into<String>) -> Json {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use tokio_postgres::NoTls;
 
     #[test]
     fn query_depth_guard() {
@@ -988,6 +1997,37 @@ mod tests {
         assert!(ct_eq(b"", b""));
     }
 
+    #[test]
+    fn command_roots_fail_closed_before_non_postgres_execution() {
+        let roots = vec![donat_ir::MutationRoot::Command {
+            alias: "submitted".to_string(),
+            command: donat_ir::CommandMutation {
+                identity: donat_ir::CommandIdentity {
+                    source: "default".to_string(),
+                    name: "create_order".to_string(),
+                    role: "customer".to_string(),
+                },
+                name: "create_order".to_string(),
+                steps: vec![],
+                guards: vec![],
+                result: vec![],
+                idempotency: None,
+                effects: vec![],
+                selection: vec![],
+            },
+        }];
+
+        let error = command_backend_rejection(&roots, "SQLite")
+            .expect("a command must never reach a non-Postgres executor");
+        assert_eq!(error["errors"][0]["extensions"]["code"], "unexpected");
+        assert!(
+            error["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("require a Postgres source")),
+            "unexpected error: {error:#}"
+        );
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
@@ -1000,7 +2040,9 @@ mod tests {
     }
 
     fn parse(q: &str) -> graphql_parser::query::Document<'static, String> {
-        graphql_parser::parse_query::<String>(q).unwrap().into_static()
+        graphql_parser::parse_query::<String>(q)
+            .unwrap()
+            .into_static()
     }
 
     #[test]
@@ -1014,7 +2056,10 @@ mod tests {
     #[test]
     fn untrusted_request_without_unauthorized_role_is_denied() {
         let e = session_from_headers(&HeaderMap::new(), None, false).unwrap_err();
-        assert_eq!(e.pointer("/errors/0/extensions/code"), Some(&json!("access-denied")));
+        assert_eq!(
+            e.pointer("/errors/0/extensions/code"),
+            Some(&json!("access-denied"))
+        );
         assert_eq!(
             e.pointer("/errors/0/message"),
             Some(&json!("x-donat-admin-secret required, but not found"))
@@ -1038,22 +2083,65 @@ mod tests {
     }
 
     #[test]
-    fn trusted_request_requires_a_role() {
-        // No admin role: a trusted request with no X-Donat-Role is denied.
-        let e = session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true)
-            .unwrap_err();
+    fn trusted_request_collects_x_hasura_vars() {
+        let h = headers(&[
+            ("X-Hasura-Role", "editor"),
+            ("X-Hasura-User-Id", "7"),
+            ("X-Hasura-Admin-Secret", "ignored"),
+        ]);
+        let s = session_from_headers(&h, None, true).unwrap();
+        assert_eq!(s.role, "editor");
         assert_eq!(
-            e.pointer("/errors/0/message"),
-            Some(&json!("x-donat-role header is required (this engine has no admin role)"))
+            s.vars.get("x-hasura-user-id").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            s.vars.get("x-hasura-role").map(String::as_str),
+            Some("editor")
+        );
+        assert_eq!(
+            s.vars.get("x-donat-role").map(String::as_str),
+            Some("editor")
+        );
+        assert!(!s.vars.contains_key("x-donat-admin-secret"));
+        assert!(!s.vars.contains_key("x-hasura-admin-secret"));
+    }
+
+    #[test]
+    fn x_donat_role_wins_over_x_hasura_role() {
+        let h = headers(&[
+            ("X-Hasura-Role", "hasura_user"),
+            ("X-Donat-Role", "donat_user"),
+        ]);
+        let s = session_from_headers(&h, None, true).unwrap();
+        assert_eq!(s.role, "donat_user");
+        assert_eq!(
+            s.vars.get("x-hasura-role").map(String::as_str),
+            Some("donat_user")
         );
     }
 
+    #[test]
+    fn trusted_request_requires_a_role() {
+        // No admin role: a trusted request with no X-Donat-Role is denied.
+        let e =
+            session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true).unwrap_err();
+        assert_eq!(
+            e.pointer("/errors/0/message"),
+            Some(&json!(
+                "x-donat-role header is required (this engine has no admin role)"
+            ))
+        );
+    }
 
     #[test]
     fn backend_only_permissions_header_parsing() {
         let with = |v: &str| {
             session_from_headers(
-                &headers(&[("x-donat-role", "u"), ("x-donat-use-backend-only-permissions", v)]),
+                &headers(&[
+                    ("x-donat-role", "u"),
+                    ("x-donat-use-backend-only-permissions", v),
+                ]),
                 None,
                 true,
             )
@@ -1061,18 +2149,22 @@ mod tests {
         assert!(with("YES").unwrap().backend_request);
         assert!(!with("f").unwrap().backend_request);
         let e = with("maybe").unwrap_err();
-        assert_eq!(e.pointer("/errors/0/extensions/code"), Some(&json!("bad-request")));
+        assert_eq!(
+            e.pointer("/errors/0/extensions/code"),
+            Some(&json!("bad-request"))
+        );
         assert_eq!(
             e.pointer("/errors/0/message"),
-            Some(&json!("x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive"))
+            Some(&json!(
+                "x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive"
+            ))
         );
     }
 
     #[test]
     fn allowlist_comparison_ignores_typename_only() {
         let listed = parse("query getAuthors { author { id name } }");
-        let with_typename =
-            parse("query getAuthors { __typename author { id __typename name } }");
+        let with_typename = parse("query getAuthors { __typename author { id __typename name } }");
         let different = parse("query getAuthors { author { id } }");
         assert_eq!(
             normalize_for_allowlist(&with_typename),
@@ -1098,6 +2190,181 @@ mod tests {
     }
 
     #[test]
+    fn remote_join_cleanup_keeps_json_keys_outside_planner_rows() {
+        use donat_ir::{FieldValue, OutputField};
+
+        let fields = vec![OutputField {
+            alias: "payload".to_string(),
+            value: FieldValue::Column {
+                column: "payload".to_string(),
+                pg_type: "jsonb".to_string(),
+            },
+        }];
+        let mut node = json!({
+            "__rr__id": 7,
+            "payload": { "__rr__user_key": "preserve" }
+        });
+
+        strip_remote_join_hidden_fields(&fields, &mut node);
+
+        assert_eq!(
+            node,
+            json!({
+                "payload": { "__rr__user_key": "preserve" }
+            })
+        );
+    }
+
+    #[test]
+    fn remote_join_cleanup_traverses_aggregate_nodes() {
+        use donat_ir::{FieldValue, OutputField};
+
+        let fields = vec![OutputField {
+            alias: "nodes".to_string(),
+            value: FieldValue::Nodes {
+                fields: vec![
+                    OutputField {
+                        alias: "__rr__id".to_string(),
+                        value: FieldValue::Column {
+                            column: "id".to_string(),
+                            pg_type: "int4".to_string(),
+                        },
+                    },
+                    OutputField {
+                        alias: "payload".to_string(),
+                        value: FieldValue::Column {
+                            column: "payload".to_string(),
+                            pg_type: "jsonb".to_string(),
+                        },
+                    },
+                ],
+            },
+        }];
+        let mut node = json!({
+            "nodes": [{
+                "__rr__id": 7,
+                "payload": { "__rr__user_key": "preserve" }
+            }]
+        });
+
+        strip_remote_join_hidden_fields(&fields, &mut node);
+
+        assert_eq!(
+            node,
+            json!({
+                "nodes": [{ "payload": { "__rr__user_key": "preserve" } }]
+            })
+        );
+    }
+
+    #[test]
+    fn remote_join_cleanup_traverses_relay_connection_nodes() {
+        use donat_ir::{
+            Connection, ConnectionField, EdgeField, FieldValue, FromSource, OutputField,
+            SelectQuery, Table,
+        };
+
+        let node_fields = vec![
+            OutputField {
+                alias: "__rr__id".to_string(),
+                value: FieldValue::Column {
+                    column: "id".to_string(),
+                    pg_type: "int4".to_string(),
+                },
+            },
+            OutputField {
+                alias: "payload".to_string(),
+                value: FieldValue::Column {
+                    column: "payload".to_string(),
+                    pg_type: "jsonb".to_string(),
+                },
+            },
+        ];
+        let fields = vec![OutputField {
+            alias: "messages".to_string(),
+            value: FieldValue::NestedConnection {
+                conn: Box::new(Connection {
+                    query: SelectQuery {
+                        from: FromSource::Table(Table {
+                            schema: "public".to_string(),
+                            name: "message".to_string(),
+                        }),
+                        fields: node_fields,
+                        predicate: None,
+                        order_by: vec![],
+                        limit: None,
+                        nodes_limit: None,
+                        offset: None,
+                        distinct_on: vec![],
+                        single: false,
+                    },
+                    join: vec![],
+                    pk: vec![],
+                    schema: "public".to_string(),
+                    table: "message".to_string(),
+                    fields: vec![ConnectionField::Edges {
+                        alias: "edges".to_string(),
+                        fields: vec![EdgeField::Node {
+                            alias: "node".to_string(),
+                        }],
+                    }],
+                    page: None,
+                }),
+            },
+        }];
+        let mut node = json!({
+            "messages": {
+                "edges": [{
+                    "node": {
+                        "__rr__id": 7,
+                        "payload": { "__rr__user_key": "preserve" }
+                    }
+                }]
+            }
+        });
+
+        strip_remote_join_hidden_fields(&fields, &mut node);
+
+        assert_eq!(
+            node,
+            json!({
+                "messages": {
+                    "edges": [{
+                        "node": { "payload": { "__rr__user_key": "preserve" } }
+                    }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn remote_batch_errors_restore_original_root_paths() {
+        let restored = restore_remote_join_error_paths(
+            &json!([{
+                "path": ["__donat_rr_1", "name"],
+                "extensions": {
+                    "path": "$.selectionSet.__donat_rr_1.selectionSet.name",
+                    "code": "unexpected"
+                },
+                "message": "remote resolver failed"
+            }]),
+            "message",
+        );
+
+        assert_eq!(
+            restored,
+            json!([{
+                "path": ["message", "name"],
+                "extensions": {
+                    "path": "$.selectionSet.message.selectionSet.name",
+                    "code": "unexpected"
+                },
+                "message": "remote resolver failed"
+            }])
+        );
+    }
+
+    #[test]
     fn error_json_shape() {
         assert_eq!(
             error_json("validation-failed", "boom"),
@@ -1106,5 +2373,1372 @@ mod tests {
                 "message": "boom",
             }] })
         );
+    }
+
+    #[derive(Clone)]
+    struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceCapture {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace capture lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn command_mutation_trace_omits_rendered_sql_and_idempotency_values() {
+        const KEY: &str = "trace-idempotency-key-sentinel";
+        const SESSION_SCOPE: &str = "trace-session-scope-sentinel";
+        const INPUT: &str = "trace-input-sentinel";
+
+        let root = donat_ir::MutationRoot::Command {
+            alias: "submit".to_owned(),
+            command: donat_ir::CommandMutation {
+                identity: donat_ir::CommandIdentity {
+                    source: "default".to_owned(),
+                    name: "create_order".to_owned(),
+                    role: "customer".to_owned(),
+                },
+                name: "create_order".to_owned(),
+                steps: vec![],
+                guards: vec![],
+                result: vec![],
+                idempotency: Some(donat_ir::CommandIdempotency {
+                    key: donat_ir::Scalar::Json(json!(KEY)),
+                    scope: vec![donat_ir::CommandExecutionValue::Scalar {
+                        value: donat_ir::Scalar::Json(json!(SESSION_SCOPE)),
+                        pg_type: "text".to_owned(),
+                    }],
+                    input: donat_ir::Scalar::Json(json!({ "status": INPUT })),
+                    retention_seconds: None,
+                    error_path: "$.selectionSet.submit".to_owned(),
+                }),
+                effects: vec![],
+                selection: vec![],
+            },
+        };
+        let sql = donat_sqlgen::mutation_to_sql(&root);
+        for sentinel in [KEY, SESSION_SCOPE, INPUT] {
+            assert!(
+                sql.contains(sentinel),
+                "the SQL fixture must contain the sensitive sentinel {sentinel:?}"
+            );
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceCapture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            trace_mutation_sql(&root, &sql);
+        });
+
+        let trace = String::from_utf8(bytes.lock().expect("trace capture lock").clone())
+            .expect("trace output is utf-8");
+        assert!(
+            trace.contains("executing command mutation") && trace.contains("command=create_order"),
+            "command execution must retain a safe trace event: {trace}"
+        );
+        assert!(
+            !trace.contains(&sql),
+            "command trace must not contain the rendered SQL: {trace}"
+        );
+        for sentinel in [KEY, SESSION_SCOPE, INPUT] {
+            assert!(
+                !trace.contains(sentinel),
+                "command trace leaked {sentinel:?}: {trace}"
+            );
+        }
+    }
+
+    async fn database_error_from(sql: &str) -> tokio_postgres::Error {
+        let url = std::env::var("PG_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:postgres@127.0.0.1:15433/postgres".to_string()
+        });
+        let (client, connection) = tokio_postgres::connect(&url, NoTls)
+            .await
+            .expect("isolated Postgres is available");
+        let connection = tokio::spawn(connection);
+        let error = client
+            .batch_execute(sql)
+            .await
+            .expect_err("the SQL must raise a database error");
+        connection.abort();
+        error
+    }
+
+    #[tokio::test]
+    async fn graphql_error_payloads_use_the_reserved_envelope_and_preserve_permission_checks() {
+        let structured = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"donat.graphql-error.v1","code":"validation-failed","path":"$.selectionSet.create_order","message":"customer is not allowed to order"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&structured),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.create_order",
+                    "code": "validation-failed",
+                },
+                "message": "customer is not allowed to order",
+            }] })
+        );
+        assert_eq!(
+            command_db_error_json(&structured),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.create_order",
+                    "code": "validation-failed",
+                },
+                "message": "customer is not allowed to order",
+            }] })
+        );
+
+        let permission = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = '23514',
+                   MESSAGE = '{"path":"$.selectionSet.insert_author.args.objects","message":"check constraint of an insert/update permission has failed"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&permission),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.insert_author.args.objects",
+                    "code": "permission-error",
+                },
+                "message": "check constraint of an insert/update permission has failed",
+            }] })
+        );
+        assert_eq!(
+            command_db_error_json(&permission),
+            json!({ "errors": [{
+                "extensions": {
+                    "path": "$.selectionSet.insert_author.args.objects",
+                    "code": "permission-error",
+                },
+                "message": "check constraint of an insert/update permission has failed",
+            }] })
+        );
+
+        let malformed = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"donat.graphql-error.v1","code":"validation-failed"} private Postgres detail';
+               END;
+               $$;"#,
+        )
+        .await;
+        let malformed_body = db_error_json(&malformed);
+        assert_eq!(
+            malformed_body,
+            error_json("data-exception", "database error")
+        );
+        assert_eq!(
+            command_db_error_json(&malformed),
+            error_json("data-exception", "command database error")
+        );
+        assert!(
+            !malformed_body
+                .to_string()
+                .contains("private Postgres detail"),
+            "a malformed reserved envelope must not expose PostgreSQL text"
+        );
+
+        let unrecognized = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = 'P0D01',
+                   MESSAGE = '{"kind":"untrusted-error","code":"validation-failed","path":"$.selectionSet.create_order","message":"private Postgres detail"}';
+               END;
+               $$;"#,
+        )
+        .await;
+        let unrecognized_body = db_error_json(&unrecognized);
+        assert_eq!(
+            unrecognized_body,
+            error_json("data-exception", "database error")
+        );
+        assert_eq!(
+            command_db_error_json(&unrecognized),
+            error_json("data-exception", "command database error")
+        );
+        assert!(
+            !unrecognized_body
+                .to_string()
+                .contains("private Postgres detail"),
+            "an unrecognized reserved envelope must not expose PostgreSQL text"
+        );
+
+        let ordinary_unique = database_error_from(
+            r#"DO $$
+               BEGIN
+                 RAISE EXCEPTION USING
+                   ERRCODE = '23505',
+                   MESSAGE = 'private ordinary CRUD constraint detail';
+               END;
+               $$;"#,
+        )
+        .await;
+        assert_eq!(
+            db_error_json(&ordinary_unique),
+            error_json(
+                "constraint-violation",
+                "Uniqueness violation. private ordinary CRUD constraint detail",
+            ),
+            "ordinary CRUD errors retain their established database contract"
+        );
+        assert_eq!(
+            command_db_error_json(&ordinary_unique),
+            error_json("data-exception", "command database error"),
+            "the same PostgreSQL primary message is opaque for a command root"
+        );
+    }
+
+    #[test]
+    fn internal_action_select_reuses_the_compiled_default_source() {
+        use std::collections::{BTreeMap, HashMap};
+
+        use crate::state::{Engine, SourceRuntime};
+        use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+        use donat_metadata::Metadata;
+
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "sqlite",
+                "configuration": {
+                    "connection_info": { "database_url": "/tmp/action.sqlite" }
+                },
+                "tables": [{
+                    "table": { "schema": "public", "name": "item" },
+                    "configuration": { "custom_name": "public_item" },
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "filter": {} }
+                    }]
+                }]
+            }]
+        }))
+        .expect("metadata deserializes");
+        let catalog = Catalog {
+            tables: BTreeMap::from([(
+                "public.item".to_string(),
+                TableInfo {
+                    schema: "public".to_string(),
+                    name: "item".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
+                    columns: vec![ColumnInfo {
+                        name: "id".to_string(),
+                        pg_type: "int8".to_string(),
+                        pg_typmod: -1,
+                        native_type: None,
+                        nullable: false,
+                        has_default: false,
+                    }],
+                    primary_key: vec!["id".to_string()],
+                    unique_keys: vec![],
+                    foreign_keys: vec![],
+                },
+            )]),
+            functions: BTreeMap::new(),
+        };
+        let engine = Engine::compiled(
+            metadata,
+            HashMap::from([("default".to_string(), catalog)]),
+            HashMap::from([(
+                "default".to_string(),
+                SourceRuntime::Sqlite {
+                    path: "/tmp/action.sqlite".to_string(),
+                    pool: Arc::new(crate::state::SqlitePool::new(
+                        "/tmp/action.sqlite".to_string(),
+                        8,
+                    )),
+                    settings: crate::state::RuntimePoolSettings::default(),
+                },
+            )]),
+            true,
+        )
+        .expect("engine compiles");
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+
+        for _ in 0..2 {
+            let (source, roots, runtime) = plan_internal_select_from_snapshot(
+                &engine,
+                &session,
+                &parse("{ public_item { id } }"),
+                &JsonMap::new(),
+            )
+            .expect("internal action select plans from the snapshot");
+            assert_eq!(source, "default");
+            assert_eq!(roots.len(), 1);
+            assert!(matches!(runtime, SourceRuntime::Sqlite { .. }));
+        }
+    }
+
+    fn shared_state(engine: Arc<Engine>) -> SharedState {
+        Arc::new(AppState {
+            engine: tokio::sync::RwLock::new(engine),
+            connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
+            default_url: "postgres://unused".to_string(),
+            admin_secret: None,
+            unauthorized_role: None,
+            stringify_numerics: false,
+            infer_function_permissions: true,
+            jwt: None,
+            auth_hook: None,
+            http: reqwest::Client::new(),
+            allowlist_enabled: false,
+            subscription_permits: Arc::new(tokio::sync::Semaphore::new(1_000)),
+            subscription_poll_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+            storage: Arc::new(donat_storage::StorageRegistry::default()),
+            external_base_url: String::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn public_actions_execute_for_an_explicit_role_and_restricted_actions_stay_hidden() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind action server");
+        let address = listener.local_addr().expect("action server address");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async { axum::Json(json!("called")) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("action server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "actions": [
+                {
+                    "name": "public_action",
+                    "definition": {
+                        "type": "query",
+                        "handler": format!("http://{address}/"),
+                        "output_type": "String"
+                    },
+                    "permissions": []
+                },
+                {
+                    "name": "restricted_action",
+                    "definition": {
+                        "type": "query",
+                        "handler": format!("http://{address}/"),
+                        "output_type": "String"
+                    },
+                    "permissions": [{ "role": "owner" }]
+                }
+            ]
+        }))
+        .expect("action metadata deserializes");
+        let state = shared_state(Arc::new(Engine::bootstrap(metadata)));
+        let customer = Session {
+            role: "customer".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+
+        let (_, public) = execute(
+            &state,
+            &customer,
+            &json!({
+                "query": "query { public_action }"
+            }),
+        )
+        .await;
+        assert_eq!(public, json!({ "data": { "public_action": "called" } }));
+
+        let (_, restricted) = execute(
+            &state,
+            &customer,
+            &json!({
+                "query": "query { restricted_action }"
+            }),
+        )
+        .await;
+        assert_eq!(
+            restricted["errors"][0]["message"],
+            json!("field \"restricted_action\" not found in type: 'query_root'")
+        );
+
+        let no_role = session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true)
+            .expect_err("a public action never supplies a missing classic role");
+        assert_eq!(
+            no_role["errors"][0]["message"],
+            json!("x-donat-role header is required (this engine has no admin role)")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn trusted_request_without_role_is_denied_before_public_action_even_with_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind action server");
+        let address = listener.local_addr().expect("action server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |axum::extract::State(calls): axum::extract::State<Arc<AtomicUsize>>| async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!("called"))
+                    },
+                ),
+            )
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("action server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "actions": [{
+                "name": "public_action",
+                "definition": {
+                    "type": "query",
+                    "handler": format!("http://{address}/"),
+                    "output_type": "String"
+                },
+                "permissions": []
+            }]
+        }))
+        .expect("action metadata deserializes");
+        let mut state = shared_state(Arc::new(Engine::bootstrap(metadata)));
+        Arc::get_mut(&mut state)
+            .expect("state is not shared before test setup")
+            .unauthorized_role = Some("anonymous".to_string());
+
+        let roleless_headers = HeaderMap::new();
+        let roleless = resolve_session(&state, &roleless_headers).await;
+        if let Ok(session) = &roleless {
+            let (status, response) = execute_full(
+                &state,
+                session,
+                &json!({ "query": "query { public_action }" }),
+                false,
+                &roleless_headers,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(response, json!({ "data": { "public_action": "called" } }));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a trusted request without an explicit role must be denied before a public Action webhook can run"
+        );
+        let (status, response) = roleless.expect_err("a trusted request without a role is denied");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            response,
+            json!({
+                "errors": [{
+                    "extensions": { "path": "$", "code": "access-denied" },
+                    "message": "x-donat-role header is required (this engine has no admin role)"
+                }]
+            })
+        );
+
+        let customer_headers = headers(&[("x-donat-role", "customer")]);
+        let customer = resolve_session(&state, &customer_headers)
+            .await
+            .expect("an explicit role resolves even when a fallback is configured");
+        let (status, response) = execute_full(
+            &state,
+            &customer,
+            &json!({ "query": "query { public_action }" }),
+            false,
+            &customer_headers,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(response, json!({ "data": { "public_action": "called" } }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    fn empty_metadata() -> donat_metadata::Metadata {
+        serde_json::from_value(json!({ "version": 3, "sources": [] }))
+            .expect("empty metadata deserializes")
+    }
+
+    #[tokio::test]
+    async fn remote_join_uses_request_snapshot_after_publication() {
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async {
+                axum::Json(json!({ "data": { "message": { "name": "old" } } }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let old_metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let request_snapshot = Arc::new(Engine::bootstrap(old_metadata));
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields = vec![OutputField {
+            alias: "joined".to_string(),
+            value: FieldValue::RemoteJoin {
+                spec: RemoteJoinSpec {
+                    schema: "messages".to_string(),
+                    query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                    variables: vec![("v0".to_string(), "__rr__id".to_string())],
+                    root_field: "message".to_string(),
+                },
+            },
+        }];
+        let mut node = json!({ "__rr__id": 7, "joined": null });
+
+        resolve_remote_joins(
+            &state,
+            request_snapshot.as_ref(),
+            &session,
+            &fields,
+            &mut node,
+            "$.selectionSet.item",
+        )
+        .await
+        .expect("remote join resolves from request snapshot");
+
+        assert_eq!(node, json!({ "joined": { "name": "old" } }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_join_batches_rows_and_deduplicates_join_keys() {
+        use axum::extract::State;
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |State(requests): State<Arc<AtomicUsize>>,
+                     axum::Json(body): axum::Json<Json>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let query = body.get("query").and_then(Json::as_str).unwrap_or_default();
+                        if query.contains("__donat_rr_0") {
+                            axum::Json(json!({
+                                "data": {
+                                    "__donat_rr_0": { "name": "seven" },
+                                    "__donat_rr_1": { "name": "eight" }
+                                }
+                            }))
+                        } else {
+                            let id = body.pointer("/variables/v0").and_then(Json::as_i64);
+                            let name = if id == Some(7) { "seven" } else { "eight" };
+                            axum::Json(json!({ "data": { "message": { "name": name } } }))
+                        }
+                    },
+                ),
+            )
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields = vec![OutputField {
+            alias: "joined".to_string(),
+            value: FieldValue::RemoteJoin {
+                spec: RemoteJoinSpec {
+                    schema: "messages".to_string(),
+                    query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                    variables: vec![("v0".to_string(), "__rr__id".to_string())],
+                    root_field: "message".to_string(),
+                },
+            },
+        }];
+        let mut node = json!([
+            { "__rr__id": 7, "joined": null },
+            { "__rr__id": 7, "joined": null },
+            { "__rr__id": 8, "joined": null }
+        ]);
+
+        resolve_remote_joins(
+            &state,
+            &engine,
+            &session,
+            &fields,
+            &mut node,
+            "$.selectionSet.items",
+        )
+        .await
+        .expect("remote joins resolve");
+
+        assert_eq!(
+            node,
+            json!([
+                { "joined": { "name": "seven" } },
+                { "joined": { "name": "seven" } },
+                { "joined": { "name": "eight" } }
+            ])
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_join_groups_share_a_global_batch_limit() {
+        use axum::extract::State;
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |State((active, maximum, requests)): State<(
+                        Arc<AtomicUsize>,
+                        Arc<AtomicUsize>,
+                        Arc<AtomicUsize>,
+                    )>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        axum::Json(json!({ "data": {} }))
+                    },
+                ),
+            )
+            .with_state((active, maximum.clone(), requests.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields: Vec<OutputField> = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|alias| OutputField {
+                alias: alias.to_string(),
+                value: FieldValue::RemoteJoin {
+                    spec: RemoteJoinSpec {
+                        schema: "messages".to_string(),
+                        query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                        variables: vec![("v0".to_string(), format!("__rr__{alias}"))],
+                        root_field: "message".to_string(),
+                    },
+                },
+            })
+            .collect();
+        let mut node = Json::Array(
+            (0..=REMOTE_JOIN_BATCH_SIZE)
+                .map(|id| {
+                    json!({
+                        "__rr__one": id,
+                        "__rr__two": id,
+                        "__rr__three": id,
+                        "__rr__four": id,
+                    })
+                })
+                .collect(),
+        );
+
+        resolve_remote_joins(
+            &state,
+            &engine,
+            &session,
+            &fields,
+            &mut node,
+            "$.selectionSet.items",
+        )
+        .await
+        .expect("remote joins resolve");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 8);
+        assert!(
+            maximum.load(Ordering::SeqCst) <= REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+            "all relationship groups share the same remote batch limit"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn top_level_remote_join_roots_share_permits_and_preserve_plan_order() {
+        use std::collections::BTreeMap;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        use axum::extract::State;
+        use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+        use donat_metadata::Metadata;
+
+        const ROOTS: [(&str, &str, &str); 5] = [
+            ("zeta", "remote_zeta", "zetaRemote"),
+            ("alpha", "remote_alpha", "alphaRemote"),
+            ("gamma", "remote_gamma", "gammaRemote"),
+            ("beta", "remote_beta", "betaRemote"),
+            ("delta", "remote_delta", "deltaRemote"),
+        ];
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let fail_roots = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |State((active, maximum, fail_roots)): State<(
+                        Arc<AtomicUsize>,
+                        Arc<AtomicUsize>,
+                        Arc<std::sync::atomic::AtomicBool>,
+                    )>,
+                     axum::Json(body): axum::Json<Json>| async move {
+                        let query = body.get("query").and_then(Json::as_str).unwrap_or_default();
+                        let (label, root) = ROOTS
+                            .iter()
+                            .find(|(_, _, root)| query.contains(*root))
+                            .map(|(label, _, root)| (*label, *root))
+                            .expect("remote join query identifies its root");
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        let failing = fail_roots.load(Ordering::SeqCst);
+                        let delay = if failing && label == "zeta" {
+                            Duration::from_millis(40)
+                        } else if failing && label == "alpha" {
+                            Duration::from_millis(5)
+                        } else {
+                            Duration::from_millis(20)
+                        };
+                        tokio::time::sleep(delay).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+
+                        if failing && matches!(label, "zeta" | "alpha") {
+                            return axum::Json(json!({
+                                "errors": [{ "message": format!("{label} remote failure") }]
+                            }));
+                        }
+                        let mut data = JsonMap::new();
+                        data.insert(root.to_string(), json!({ "name": label }));
+                        axum::Json(json!({ "data": data }))
+                    },
+                ),
+            )
+            .with_state((active, maximum.clone(), fail_roots.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let database_path = std::env::temp_dir().join(format!(
+            "donat-gql-remote-roots-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open test sqlite");
+            for (_, table, _) in ROOTS {
+                connection
+                    .execute_batch(&format!(
+                        "CREATE TABLE {table} (id INTEGER PRIMARY KEY); INSERT INTO {table} VALUES (1);"
+                    ))
+                    .expect("seed test table");
+            }
+        }
+        let database_path = database_path.to_string_lossy().into_owned();
+        let tables = ROOTS
+            .iter()
+            .map(|(root, table, remote_root)| {
+                let remote_field = Json::Object(JsonMap::from_iter([(
+                    remote_root.to_string(),
+                    json!({ "arguments": { "id": "$id" } }),
+                )]));
+                json!({
+                    "table": { "schema": "main", "name": table },
+                    "configuration": { "custom_name": root },
+                    "remote_relationships": [{
+                        "name": "joined",
+                        "donat_fields": ["id"],
+                        "remote_schema": "messages",
+                        "remote_field": remote_field,
+                    }],
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "filter": {} }
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let remote_fields = ROOTS
+            .iter()
+            .map(|(_, _, remote_root)| format!("{remote_root}(id: Int!): Message"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "sqlite",
+                "configuration": {
+                    "connection_info": { "database_url": database_path }
+                },
+                "tables": tables,
+            }],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": format!("type Query {{ {remote_fields} }} type Message {{ name: String }}")
+                    }
+                }]
+            }]
+        }))
+        .expect("metadata deserializes");
+        let catalog = Catalog {
+            tables: ROOTS
+                .iter()
+                .map(|(_, table, _)| {
+                    (
+                        format!("main.{table}"),
+                        TableInfo {
+                            schema: "main".to_string(),
+                            name: table.to_string(),
+                            relation_kind: donat_catalog::RelationKind::Table,
+                            columns: vec![ColumnInfo {
+                                name: "id".to_string(),
+                                pg_type: "int4".to_string(),
+                                pg_typmod: -1,
+                                native_type: None,
+                                nullable: false,
+                                has_default: false,
+                            }],
+                            primary_key: vec!["id".to_string()],
+                            unique_keys: vec![],
+                            foreign_keys: vec![],
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+            functions: BTreeMap::new(),
+        };
+        let runtime = SourceRuntime::Sqlite {
+            path: database_path.clone(),
+            pool: Arc::new(crate::state::SqlitePool::new(database_path.clone(), 8)),
+            settings: crate::state::RuntimePoolSettings::default(),
+        };
+        let engine = Arc::new(
+            Engine::compiled(
+                metadata,
+                HashMap::from([("default".to_string(), catalog)]),
+                HashMap::from([("default".to_string(), runtime)]),
+                true,
+            )
+            .expect("engine compiles"),
+        );
+        let state = shared_state(engine);
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let query = format!(
+            "{{ {} }}",
+            ROOTS
+                .iter()
+                .map(|(root, _, _)| format!("{root} {{ id joined {{ name }} }}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let document = parse(&query);
+
+        let (status, response) = execute_preparsed_full(
+            &state,
+            &session,
+            &json!({ "query": query }),
+            false,
+            &HeaderMap::new(),
+            &document,
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let keys = response
+            .pointer("/data")
+            .and_then(Json::as_object)
+            .unwrap_or_else(|| panic!("successful response has data: {response}"))
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            ROOTS
+                .iter()
+                .map(|(root, _, _)| root.to_string())
+                .collect::<Vec<_>>(),
+            "source response is reassembled in GraphQL plan order"
+        );
+        for (root, _, _) in ROOTS {
+            assert_eq!(
+                response.pointer(&format!("/data/{root}/0/joined/name")),
+                Some(&Json::String(root.to_string()))
+            );
+        }
+        assert!(
+            maximum.load(Ordering::SeqCst) >= 2,
+            "independent top-level remote joins begin concurrently"
+        );
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            REMOTE_JOIN_MAX_IN_FLIGHT_BATCHES,
+            "one semaphore limits batches across all top-level roots"
+        );
+
+        fail_roots.store(true, Ordering::SeqCst);
+        let (_, failure) = execute_preparsed_full(
+            &state,
+            &session,
+            &json!({ "query": query }),
+            false,
+            &HeaderMap::new(),
+            &document,
+        )
+        .await;
+        assert_eq!(
+            failure.pointer("/errors/0/message"),
+            Some(&Json::String("zeta remote failure".to_string())),
+            "the first planned root wins even when a later root fails sooner"
+        );
+
+        server.abort();
+        std::fs::remove_file(database_path).expect("remove test sqlite");
+    }
+
+    #[tokio::test]
+    async fn remote_join_batch_timeout_does_not_retry_each_key() {
+        use axum::extract::State;
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(|State(requests): State<Arc<AtomicUsize>>| async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    axum::Json(json!({ "data": { "message": null } }))
+                }),
+            )
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": {
+                    "url": format!("http://{address}/"),
+                    "timeout_seconds": 1
+                },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields = vec![OutputField {
+            alias: "joined".to_string(),
+            value: FieldValue::RemoteJoin {
+                spec: RemoteJoinSpec {
+                    schema: "messages".to_string(),
+                    query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                    variables: vec![("v0".to_string(), "__rr__id".to_string())],
+                    root_field: "message".to_string(),
+                },
+            },
+        }];
+        let mut node = json!([
+            { "__rr__id": 7, "joined": null },
+            { "__rr__id": 8, "joined": null }
+        ]);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            resolve_remote_joins(
+                &state,
+                &engine,
+                &session,
+                &fields,
+                &mut node,
+                "$.selectionSet.items",
+            ),
+        )
+        .await
+        .expect("timeout response must not trigger sequential retries");
+
+        assert!(result.is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_join_batch_validation_error_falls_back_sequentially() {
+        use axum::extract::State;
+        use donat_ir::{FieldValue, OutputField, RemoteJoinSpec};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote server");
+        let address = listener.local_addr().expect("remote server address");
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(
+                    |State(requests): State<Arc<AtomicUsize>>,
+                     axum::Json(body): axum::Json<Json>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let query = body.get("query").and_then(Json::as_str).unwrap_or_default();
+                        if query.contains("__donat_rr_0") {
+                            return axum::Json(json!({
+                                "errors": [{
+                                    "extensions": { "code": "GRAPHQL_VALIDATION_FAILED" },
+                                    "message": "aliased batches are not supported"
+                                }]
+                            }));
+                        }
+                        let id = body.pointer("/variables/v0").and_then(Json::as_i64);
+                        let name = if id == Some(7) { "seven" } else { "eight" };
+                        axum::Json(json!({ "data": { "message": { "name": name } } }))
+                    },
+                ),
+            )
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("remote server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [],
+            "remote_schemas": [{
+                "name": "messages",
+                "definition": { "url": format!("http://{address}/") },
+                "permissions": [{
+                    "role": "user",
+                    "definition": {
+                        "schema": "type Query { message(id: Int!): Message } type Message { name: String }"
+                    }
+                }]
+            }]
+        }))
+        .expect("remote metadata deserializes");
+        let engine = Engine::bootstrap(metadata);
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+        let fields = vec![OutputField {
+            alias: "joined".to_string(),
+            value: FieldValue::RemoteJoin {
+                spec: RemoteJoinSpec {
+                    schema: "messages".to_string(),
+                    query: "query($v0: Int!) { message(id: $v0) { name } }".to_string(),
+                    variables: vec![("v0".to_string(), "__rr__id".to_string())],
+                    root_field: "message".to_string(),
+                },
+            },
+        }];
+        let mut node = json!([
+            { "__rr__id": 7, "joined": null },
+            { "__rr__id": 8, "joined": null }
+        ]);
+
+        resolve_remote_joins(
+            &state,
+            &engine,
+            &session,
+            &fields,
+            &mut node,
+            "$.selectionSet.items",
+        )
+        .await
+        .expect("recognized validation error falls back");
+
+        assert_eq!(
+            node,
+            json!([
+                { "joined": { "name": "seven" } },
+                { "joined": { "name": "eight" } }
+            ])
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn action_relationship_uses_request_snapshot_after_publication() {
+        use std::collections::BTreeMap;
+
+        use donat_catalog::{Catalog, ColumnInfo, TableInfo};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind action server");
+        let address = listener.local_addr().expect("action server address");
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async { axum::Json(json!({ "id": 7 })) }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("action server");
+        });
+
+        let metadata = serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "postgres",
+                "configuration": {
+                    "connection_info": {
+                        "database_url": "postgres://postgres:postgres@127.0.0.1:1/unused"
+                    }
+                },
+                "tables": [{
+                    "table": { "schema": "public", "name": "user" },
+                    "select_permissions": [{
+                        "role": "user",
+                        "permission": { "columns": ["id"], "filter": {} }
+                    }]
+                }]
+            }],
+            "actions": [{
+                "name": "lookup",
+                "definition": {
+                    "kind": "synchronous",
+                    "type": "query",
+                    "handler": format!("http://{address}/"),
+                    "output_type": "Lookup"
+                },
+                "permissions": [{ "role": "user" }]
+            }],
+            "custom_types": {
+                "objects": [{
+                    "name": "Lookup",
+                    "fields": [{ "name": "id", "type": "Int!" }],
+                    "relationships": [{
+                        "name": "user",
+                        "type": "object",
+                        "remote_table": { "schema": "public", "name": "user" },
+                        "field_mapping": { "id": "id" }
+                    }]
+                }]
+            }
+        }))
+        .expect("action metadata deserializes");
+        let catalog = Catalog {
+            tables: BTreeMap::from([(
+                "public.user".to_string(),
+                TableInfo {
+                    schema: "public".to_string(),
+                    name: "user".to_string(),
+                    relation_kind: donat_catalog::RelationKind::Table,
+                    columns: vec![ColumnInfo {
+                        name: "id".to_string(),
+                        pg_type: "int8".to_string(),
+                        pg_typmod: -1,
+                        native_type: None,
+                        nullable: false,
+                        has_default: false,
+                    }],
+                    primary_key: vec!["id".to_string()],
+                    unique_keys: vec![],
+                    foreign_keys: vec![],
+                },
+            )]),
+            functions: BTreeMap::new(),
+        };
+        let pool = crate::state::make_pool(
+            "postgres://postgres:postgres@127.0.0.1:1/unused?connect_timeout=1",
+        )
+        .expect("pool constructs");
+        let request_snapshot = Arc::new(
+            Engine::compiled(
+                metadata,
+                HashMap::from([("default".to_string(), catalog)]),
+                HashMap::from([(
+                    "default".to_string(),
+                    SourceRuntime::Postgres {
+                        url: "postgres://postgres:postgres@127.0.0.1:1/unused".to_string(),
+                        pool,
+                        settings: crate::state::RuntimePoolSettings::default(),
+                    },
+                )]),
+                true,
+            )
+            .expect("action snapshot compiles"),
+        );
+        let state = shared_state(Arc::new(Engine::bootstrap(empty_metadata())));
+        let doc = parse("{ lookup { id user { id } } }");
+        let ctx = crate::action::match_action(&request_snapshot.metadata, &doc, None)
+            .expect("action matches old snapshot");
+        let session = Session {
+            role: "user".to_string(),
+            vars: HashMap::new(),
+            backend_request: false,
+        };
+
+        let (_, body) = crate::action::resolve(
+            &state,
+            request_snapshot,
+            &session,
+            &ctx,
+            crate::action::ActionRequest {
+                doc: &doc,
+                variables: &JsonMap::new(),
+                operation_name: None,
+                headers: &HeaderMap::new(),
+            },
+        )
+        .await;
+
+        assert!(
+            body.pointer("/errors/0/message")
+                .and_then(Json::as_str)
+                .is_some_and(|message| message.starts_with("connection pool error:")),
+            "unexpected body: {body}"
+        );
+        server.abort();
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "donat-value-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Closed SQL-free value contracts shared by commands, processes, and connectors"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = { workspace = true }

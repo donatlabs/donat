@@ -1,0 +1,65 @@
+name: reject_return
+source: default
+permissions:
+  - role: support
+arguments:
+  - name: return_id
+    type: uuid!
+  - name: reason
+    type: string!
+  - name: decision_id
+    type: uuid!
+steps:
+  - name: return_request
+    select_one:
+      table: { schema: public, name: return_request }
+      by: { id: { arg: return_id } }
+      returning: [id, order_id, status]
+      require_found: true
+  - name: transition_is_allowed
+    assert:
+      rule: can_transition_return
+      with:
+        current: { step: return_request, column: status }
+        next: { literal: rejected }
+  - name: rejection_audit
+    insert:
+      table: { schema: public, name: return_event }
+      object:
+        return_request_id: { step: return_request, column: id }
+        event_type: { literal: rejected }
+        actor_role: { literal: support }
+        request_id: { arg: decision_id }
+        reason: { arg: reason }
+      returning: [id, return_request_id, event_type, request_id, reason]
+  - name: rejected_return
+    update:
+      table: { schema: public, name: return_request }
+      where:
+        id: { step: return_request, column: id }
+        status: { step: return_request, column: status }
+      set: { status: { literal: rejected } }
+      returning: [id, order_id, status]
+      require_affected: true
+result:
+  return_id: { step: rejected_return, column: id }
+  order_id: { step: rejected_return, column: order_id }
+  status: { step: rejected_return, column: status }
+  audit: { step: rejection_audit }
+idempotency:
+  key: { argument: decision_id }
+  scope:
+    - { argument: return_id }
+  retention: 365d
+effects:
+  - signal_process:
+      process: return_refund
+      signal: return_decision_recorded
+      correlate:
+        return_id: { step: rejected_return, column: id }
+      payload:
+        decision: { literal: rejected }
+        status: { literal: rejected }
+        approved_quantity: { literal: 0 }
+        public_reason_code: { literal: return_rejected }
+      idempotency_key: { argument: decision_id }

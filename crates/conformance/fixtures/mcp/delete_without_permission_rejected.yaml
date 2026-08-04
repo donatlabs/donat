@@ -1,0 +1,25 @@
+description: >
+  A role with select permission but no delete permission cannot call the MCP
+  delete tool. The tool rejects the call at the MCP permission boundary before
+  constructing or executing a GraphQL delete mutation.
+url: /mcp
+method: POST
+status: 200
+headers:
+  X-Donat-Role: viewer
+body:
+  jsonrpc: "2.0"
+  id: 76
+  method: tools/call
+  params:
+    name: delete
+    arguments:
+      table: pet
+      where:
+        id:
+          _eq: 1
+response:
+  jsonrpc: "2.0"
+  id: 76
+  result:
+    isError: true

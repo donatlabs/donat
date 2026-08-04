@@ -1,0 +1,615 @@
+types:
+  - name: PaymentOutcome
+    enum: [authorized, declined, failed, challenged, captured, voided, refunded, chargeback]
+  - name: ApprovalDecision
+    enum: [approved, rejected, escalated]
+  - name: InspectionDecision
+    enum: [accepted, restock, exchange, rejected]
+  - name: ReturnDecision
+    enum: [approved, rejected]
+  - name: BookingOutcome
+    enum: [confirmed, cancelled, no_show, expired]
+  - name: ReconciliationDecision
+    enum: [matched, manual_review, resolved]
+  - name: CheckoutState
+    enum: [cart_open, checkout_started, authorized, cancellation_requested, cancelled, expired]
+  - name: PaymentState
+    enum: [pending, cancellation_requested, authorized, void_in_progress, captured, voided, refunded, failed, chargeback]
+  - name: ShipmentState
+    enum: [unallocated, allocated, packed, shipped, delivered, cancelled]
+  - name: ReturnState
+    enum: [requested, approved, rejected, received, inspected, refunded, exchanged]
+  - name: SubscriptionState
+    enum: [active, payment_due, paused, cancelled]
+  - name: ApprovalState
+    enum: [submitted, awaiting_approver, awaiting_finance, approved, rejected]
+  - name: PayoutState
+    enum: [pending, paid, failed, reconciled]
+  - name: ProviderPayoutOutcome
+    enum: [paid, failed]
+  - name: ProviderLookupResolution
+    enum: [mutation_found, terminal_absence]
+  - name: CarrierLabelTerminalOutcome
+    enum: [label_created, label_not_created]
+  - name: RenewalState
+    enum: [payment_due, dunning, confirmed]
+  - name: BookingState
+    enum: [held, confirmed, cancelled, no_show, expired]
+  - name: PrescriptionState
+    enum: [submitted, approved, rejected, expired, released]
+  - name: FraudState
+    enum: [clear, review_required, approved, rejected]
+  - name: ReconciliationState
+    enum: [pending, matched, review_required, resolved]
+  - name: ReturnApprovalLine
+    object:
+      return_item_id: uuid!
+      approved_quantity: int!
+  - name: ReturnReceiptLine
+    object:
+      return_item_id: uuid!
+      received_quantity: int!
+  - name: ReturnInspectionLine
+    object:
+      return_item_id: uuid!
+      inspected_quantity: int!
+  - name: ReturnRequestLine
+    object:
+      order_line_id: uuid!
+      requested_quantity: int!
+  - name: ReturnAddress
+    object:
+      recipient_name: string!
+      address_line_1: string!
+      address_line_2: string
+      city: string!
+      region: string!
+      postal_code: string!
+      country_code: string!
+  - name: ReturnCarrierItem
+    object:
+      return_item_id: uuid!
+      order_line_id: uuid!
+      requested_quantity: int!
+  - name: AllocationItem
+    object:
+      order_line_id: uuid!
+      variant_id: bigint!
+      quantity: int!
+      unit_price_minor: bigint!
+      currency: string!
+  - name: TaxableLine
+    object:
+      # The quote these lines belong to. The tax operation already receives it
+      # as its own input field; declaring it here keeps the row contract equal
+      # to what the command's projection actually returns.
+      checkout_quote_id: uuid!
+      variant_id: bigint!
+      quantity: int!
+      taxable_category: string!
+      tax_code: string!
+      tax_bps: int!
+      unit_price_minor: bigint!
+      line_subtotal_minor: bigint!
+      discount_minor: bigint!
+      taxable_minor: bigint!
+      currency: string!
+  # One planned line as the allocation planner emits it. A group carries the
+  # planner's own line rows, which are wider than the carrier-facing
+  # `AllocationItem`: they still name the stock they came from, because the
+  # reservation and shipment steps are driven from the same rows.
+  - name: AllocationPlanItem
+    object:
+      allocation_id: uuid!
+      order_id: uuid!
+      order_line_id: uuid!
+      line_sequence: int!
+      variant_id: bigint!
+      location_code: string!
+      inventory_level_id: uuid!
+      requested_quantity: int!
+      quantity: int!
+      unit_price_minor: bigint!
+      currency: string!
+  - name: AllocationGroup
+    object:
+      allocation_id: uuid!
+      order_id: uuid!
+      first_line_sequence: int!
+      allocation_rank: int!
+      location_code: string!
+      currency: string!
+      items: "[AllocationPlanItem!]!"
+  - name: Backorder
+    object:
+      id: uuid!
+      order_line_id: uuid!
+      backordered_quantity: int!
+      status: string!
+  - name: ShipmentOutcome
+    object:
+      shipment_id: uuid!
+      allocation_id: uuid!
+      outcome: string!
+      tracking_number: string
+      failure_code: string
+      requires_reconciliation: bool!
+  - name: PaymentCaptureOutcome
+    object:
+      shipment_id: uuid!
+      payment_id: uuid!
+      capture_id: uuid
+      amount_minor: bigint!
+      status: PaymentState!
+      requires_reconciliation: bool!
+  - name: PaymentCaptureClaimInput
+    object:
+      shipment_id: uuid!
+      amount_minor: bigint!
+      currency: string!
+  - name: CaptureLookupCaptured
+    object:
+      shipment_id: uuid!
+      provider_capture_id: string!
+      provider_event_id: string!
+      amount_minor: bigint!
+      outcome: PaymentOutcome!
+      normalized_payload: BoundedProviderEvidence!
+  - name: CaptureLookupAbsence
+    object:
+      shipment_id: uuid!
+      provider_absence_id: string!
+      amount_minor: bigint!
+      normalized_payload: BoundedProviderEvidence!
+  - name: ItemFailure
+    object:
+      item_key: string!
+      stage: string!
+      code: string!
+      safe_message: string!
+      requires_reconciliation: bool!
+  - name: VendorPayoutCandidate
+    object:
+      id: uuid!
+      payout_cycle_id: uuid!
+      vendor_id: uuid!
+      payout_key: string!
+      net_minor: bigint!
+      currency: string!
+      status: PayoutState!
+  - name: VendorPayoutOutcome
+    object:
+      payout_id: uuid!
+      vendor_id: uuid!
+      provider_payout_id: string
+      outcome: PayoutState!
+      requires_reconciliation: bool!
+  - name: BoundedProviderEvidence
+    opaque_json:
+      maximum_bytes: 4096
+      maximum_depth: 8
+      maximum_nodes: 128
+
+rules:
+  - name: can_reserve_stock
+    parameters: { on_hand: int!, reserved: int!, requested: int! }
+    result: bool!
+    expression: "requested > 0 && reserved + requested <= on_hand"
+  - name: add_int
+    parameters: { left: int!, right: int! }
+    result: int!
+    expression: "left + right"
+  - name: is_single_currency
+    parameters: { currency_count: bigint! }
+    result: bool!
+    expression: "currency_count == 1"
+  - name: subtract_int
+    parameters: { left: int!, right: int! }
+    result: int!
+    expression: "left - right"
+  - name: subtract_minor
+    parameters: { left: bigint!, right: bigint! }
+    result: bigint!
+    expression: "left - right"
+  - name: add_minor
+    parameters: { left: bigint!, right: bigint! }
+    result: bigint!
+    expression: "left + right"
+  - name: basis_points_amount
+    parameters: { amount_minor: bigint!, basis_points: int! }
+    result: bigint!
+    expression: "(amount_minor * basis_points) / 10000"
+  - name: checkout_total_is_nonnegative
+    parameters: { subtotal_minor: bigint!, discount_minor: bigint!, shipping_minor: bigint! }
+    result: bool!
+    expression: "subtotal_minor > 0 && discount_minor >= 0 && discount_minor <= subtotal_minor && shipping_minor >= 0"
+  - name: tax_quote_matches_checkout
+    parameters: { expected_quote_id: uuid!, actual_quote_id: uuid!, expected_currency: string!, actual_currency: string!, tax_minor: bigint! }
+    result: bool!
+    expression: "expected_quote_id == actual_quote_id && expected_currency == actual_currency && tax_minor >= 0"
+  - name: can_release_stock
+    parameters: { reserved: int!, releasing: int! }
+    result: bool!
+    expression: "reserved >= 0 && releasing > 0 && releasing <= reserved"
+  - name: payment_was_authorized
+    parameters: { outcome: PaymentOutcome! }
+    result: bool!
+    expression: "outcome == PaymentOutcome::authorized"
+  - name: payment_was_declined
+    parameters: { outcome: PaymentOutcome! }
+    result: bool!
+    expression: "outcome == PaymentOutcome::declined || outcome == PaymentOutcome::failed"
+  - name: payment_outcome_is
+    parameters: { actual: PaymentOutcome!, expected: PaymentOutcome! }
+    result: bool!
+    expression: "actual == expected"
+  - name: normalize_payment_outcome_state
+    parameters: { outcome: PaymentOutcome! }
+    result: PaymentState!
+    expression: "outcome == PaymentOutcome::authorized ? PaymentState::authorized : outcome == PaymentOutcome::challenged ? PaymentState::pending : outcome == PaymentOutcome::captured ? PaymentState::captured : outcome == PaymentOutcome::voided ? PaymentState::voided : outcome == PaymentOutcome::refunded ? PaymentState::refunded : outcome == PaymentOutcome::chargeback ? PaymentState::chargeback : PaymentState::failed"
+  - name: normalize_payment_state_text
+    parameters: { state: string! }
+    result: PaymentState!
+    expression: "state == \"pending\" ? PaymentState::pending : state == \"cancellation_requested\" ? PaymentState::cancellation_requested : state == \"authorized\" ? PaymentState::authorized : state == \"void_in_progress\" ? PaymentState::void_in_progress : state == \"captured\" ? PaymentState::captured : state == \"voided\" ? PaymentState::voided : state == \"refunded\" ? PaymentState::refunded : state == \"chargeback\" ? PaymentState::chargeback : PaymentState::failed"
+  - name: recorded_payment_state_matches
+    parameters: { recorded_state: string!, expected_state: PaymentState! }
+    result: bool!
+    expression: "(expected_state == PaymentState::pending && recorded_state == \"pending\") || (expected_state == PaymentState::cancellation_requested && recorded_state == \"cancellation_requested\") || (expected_state == PaymentState::authorized && recorded_state == \"authorized\") || (expected_state == PaymentState::void_in_progress && recorded_state == \"void_in_progress\") || (expected_state == PaymentState::captured && recorded_state == \"captured\") || (expected_state == PaymentState::voided && recorded_state == \"voided\") || (expected_state == PaymentState::refunded && recorded_state == \"refunded\") || (expected_state == PaymentState::chargeback && recorded_state == \"chargeback\") || (expected_state == PaymentState::failed && recorded_state == \"failed\")"
+  - name: can_authorize_payment_amount
+    parameters: { current_state: string!, payment_amount_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "current_state == \"pending\" && payment_amount_minor > 0 && requested_amount_minor == payment_amount_minor"
+  - name: can_capture_payment_amount
+    parameters: { authorization_state: string!, authorized_minor: bigint!, captured_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "authorization_state == \"authorized\" && authorized_minor > 0 && captured_minor >= 0 && requested_amount_minor > 0 && captured_minor + requested_amount_minor <= authorized_minor"
+  - name: can_reserve_capture_amount
+    parameters: { authorization_state: string!, authorized_minor: bigint!, captured_minor: bigint!, capture_reserved_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "authorization_state == \"authorized\" && authorized_minor > 0 && captured_minor >= 0 && capture_reserved_minor >= 0 && requested_amount_minor >= 0 && captured_minor + capture_reserved_minor + requested_amount_minor <= authorized_minor"
+  - name: can_complete_claimed_capture
+    parameters: { authorization_state: string!, authorized_minor: bigint!, captured_minor: bigint!, capture_reserved_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "authorization_state == \"authorized\" && authorized_minor > 0 && captured_minor >= 0 && capture_reserved_minor >= requested_amount_minor && requested_amount_minor > 0 && captured_minor + requested_amount_minor <= authorized_minor"
+  - name: can_release_capture_claim
+    parameters: { authorization_state: string!, capture_reserved_minor: bigint!, claim_amount_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "authorization_state == \"authorized\" && claim_amount_minor > 0 && requested_amount_minor == claim_amount_minor && capture_reserved_minor >= claim_amount_minor"
+  - name: can_void_authorization
+    parameters: { payment_state: string!, authorization_state: string!, authorized_minor: bigint!, captured_minor: bigint!, capture_reserved_minor: bigint! }
+    result: bool!
+    expression: "payment_state == \"void_in_progress\" && authorization_state == \"void_in_progress\" && authorized_minor > 0 && captured_minor == 0 && capture_reserved_minor == 0"
+  - name: can_claim_authorization_void
+    parameters: { payment_state: string!, authorization_state: string!, authorized_minor: bigint!, captured_minor: bigint!, capture_reserved_minor: bigint! }
+    result: bool!
+    expression: "payment_state == \"authorized\" && authorization_state == \"authorized\" && authorized_minor > 0 && captured_minor == 0 && capture_reserved_minor == 0"
+  - name: can_materialize_cancellation_authorization
+    parameters: { payment_state: string!, payment_amount_minor: bigint!, provider_amount_minor: bigint! }
+    result: bool!
+    expression: "payment_state == \"cancellation_requested\" && payment_amount_minor > 0 && payment_amount_minor == provider_amount_minor"
+  - name: can_refund_payment_amount
+    parameters: { payment_state: string!, captured_minor: bigint!, refunded_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "(payment_state == \"captured\" || payment_state == \"refunded\") && captured_minor > 0 && refunded_minor >= 0 && requested_amount_minor > 0 && refunded_minor + requested_amount_minor <= captured_minor"
+  - name: can_record_chargeback_amount
+    parameters: { payment_state: string!, captured_minor: bigint!, chargeback_minor: bigint!, requested_amount_minor: bigint! }
+    result: bool!
+    expression: "(payment_state == \"captured\" || payment_state == \"refunded\" || payment_state == \"chargeback\") && captured_minor > 0 && chargeback_minor >= 0 && requested_amount_minor > 0 && chargeback_minor + requested_amount_minor <= captured_minor"
+  - name: reconciliation_state_for_decision
+    parameters: { decision: ReconciliationDecision! }
+    result: ReconciliationState!
+    expression: "decision == ReconciliationDecision::matched ? ReconciliationState::matched : decision == ReconciliationDecision::manual_review ? ReconciliationState::review_required : ReconciliationState::resolved"
+  - name: can_transition_checkout
+    parameters: { current: string!, next: CheckoutState! }
+    result: bool!
+    expression: "(current == \"cart_open\" && next == CheckoutState::checkout_started) || (current == \"checkout_started\" && (next == CheckoutState::authorized || next == CheckoutState::cancellation_requested || next == CheckoutState::expired)) || (current == \"authorized\" && next == CheckoutState::cancellation_requested) || (current == \"cancellation_requested\" && next == CheckoutState::cancelled)"
+  - name: can_transition_payment
+    parameters: { current: string!, next: PaymentState! }
+    result: bool!
+    expression: "(current == \"pending\" && (next == PaymentState::cancellation_requested || next == PaymentState::authorized || next == PaymentState::failed)) || (current == \"cancellation_requested\" && (next == PaymentState::void_in_progress || next == PaymentState::failed)) || (current == \"authorized\" && (next == PaymentState::void_in_progress || next == PaymentState::captured || next == PaymentState::failed)) || (current == \"void_in_progress\" && next == PaymentState::voided) || (current == \"captured\" && (next == PaymentState::refunded || next == PaymentState::chargeback))"
+  - name: can_transition_shipment
+    parameters: { current: string!, next: ShipmentState! }
+    result: bool!
+    expression: "(current == \"unallocated\" && (next == ShipmentState::allocated || next == ShipmentState::cancelled)) || (current == \"allocated\" && (next == ShipmentState::packed || next == ShipmentState::cancelled)) || (current == \"packed\" && next == ShipmentState::shipped) || (current == \"shipped\" && next == ShipmentState::delivered)"
+  - name: can_transition_return
+    parameters: { current: string!, next: ReturnState! }
+    result: bool!
+    # A return may also be refused at the two stages where a deadline can pass
+    # with nothing having happened: approved but never sent back, and received
+    # but never inspected. Both refusals cost the shopper their request, so both
+    # deadlines are long and both write a `return_event` naming the cause.
+    expression: "(current == \"requested\" && (next == ReturnState::approved || next == ReturnState::rejected)) || (current == \"approved\" && (next == ReturnState::received || next == ReturnState::rejected)) || (current == \"received\" && (next == ReturnState::inspected || next == ReturnState::rejected)) || (current == \"inspected\" && (next == ReturnState::refunded || next == ReturnState::exchanged || next == ReturnState::rejected))"
+  - name: return_approval_matches_request
+    parameters: { lines: "[ReturnApprovalLine!]!" }
+    result: bool!
+    expression: "size(lines) > 0 && size(lines) <= 256"
+  - name: return_approved_quantity_is_bounded
+    parameters: { requested_quantity: int!, approved_quantity: int! }
+    result: bool!
+    expression: "requested_quantity > 0 && approved_quantity > 0 && approved_quantity <= requested_quantity"
+  - name: return_receipt_matches_approval
+    parameters: { lines: "[ReturnReceiptLine!]!" }
+    result: bool!
+    expression: "size(lines) > 0 && size(lines) <= 256"
+  - name: return_received_quantity_is_bounded
+    parameters: { approved_quantity: int!, received_quantity: int! }
+    result: bool!
+    expression: "approved_quantity > 0 && received_quantity > 0 && received_quantity <= approved_quantity"
+  - name: return_inspection_matches_receipt
+    parameters: { lines: "[ReturnInspectionLine!]!" }
+    result: bool!
+    expression: "size(lines) > 0 && size(lines) <= 256"
+  - name: return_inspected_quantity_is_bounded
+    parameters: { received_quantity: int!, inspected_quantity: int! }
+    result: bool!
+    expression: "received_quantity > 0 && inspected_quantity > 0 && inspected_quantity <= received_quantity"
+  - name: return_refund_amount_is_bounded
+    parameters: { inspection: InspectionDecision!, requested_amount_minor: bigint!, eligible_refund_minor: bigint! }
+    result: bool!
+    expression: "(inspection == InspectionDecision::accepted && eligible_refund_minor > 0 && requested_amount_minor > 0 && requested_amount_minor <= eligible_refund_minor) || (inspection != InspectionDecision::accepted && requested_amount_minor == 0)"
+  - name: approved_refund_matches_provider
+    parameters: { approved_amount_minor: bigint!, approved_currency: string!, provider_amount_minor: bigint!, provider_currency: string! }
+    result: bool!
+    expression: "approved_amount_minor > 0 && approved_amount_minor == provider_amount_minor && approved_currency == provider_currency"
+  - name: return_is_exchange_eligible
+    parameters: { replacement_requested: bool! }
+    result: bool!
+    expression: "replacement_requested"
+  - name: return_decision_was_approved
+    parameters: { decision: ReturnDecision! }
+    result: bool!
+    expression: "decision == ReturnDecision::approved"
+  - name: can_transition_subscription
+    parameters: { current: string!, next: SubscriptionState! }
+    result: bool!
+    expression: "(current == \"active\" && (next == SubscriptionState::payment_due || next == SubscriptionState::paused || next == SubscriptionState::cancelled)) || (current == \"payment_due\" && (next == SubscriptionState::active || next == SubscriptionState::paused || next == SubscriptionState::cancelled)) || (current == \"paused\" && next == SubscriptionState::active)"
+  - name: can_transition_approval
+    parameters: { current: string!, next: ApprovalState! }
+    result: bool!
+    expression: "(current == \"submitted\" && (next == ApprovalState::awaiting_approver || next == ApprovalState::approved || next == ApprovalState::rejected)) || (current == \"awaiting_approver\" && (next == ApprovalState::awaiting_finance || next == ApprovalState::approved || next == ApprovalState::rejected)) || (current == \"awaiting_finance\" && (next == ApprovalState::approved || next == ApprovalState::rejected))"
+  - name: approval_was_approved
+    parameters: { decision: ApprovalDecision! }
+    result: bool!
+    expression: "decision == ApprovalDecision::approved"
+  - name: approval_was_rejected
+    parameters: { decision: ApprovalDecision! }
+    result: bool!
+    expression: "decision == ApprovalDecision::rejected"
+  - name: can_consume_credit
+    parameters: { available_credit_minor: bigint!, requested_minor: bigint! }
+    result: bool!
+    expression: "available_credit_minor >= 0 && requested_minor > 0 && requested_minor <= available_credit_minor"
+  - name: can_transition_payout
+    parameters: { current: string!, next: PayoutState! }
+    result: bool!
+    expression: "(current == \"pending\" && (next == PayoutState::paid || next == PayoutState::failed)) || (current == \"failed\" && next == PayoutState::reconciled)"
+  - name: can_record_provider_payout_outcome
+    parameters: { current: string!, next: ProviderPayoutOutcome! }
+    result: bool!
+    expression: "current == \"pending\" && (next == ProviderPayoutOutcome::paid || next == ProviderPayoutOutcome::failed)"
+  - name: payout_state_for_provider_outcome
+    parameters: { outcome: ProviderPayoutOutcome! }
+    result: PayoutState!
+    expression: "outcome == ProviderPayoutOutcome::paid ? PayoutState::paid : PayoutState::failed"
+  - name: renewal_state_for_outcome
+    parameters: { outcome: PaymentOutcome! }
+    result: RenewalState!
+    expression: "outcome == PaymentOutcome::authorized ? RenewalState::confirmed : RenewalState::dunning"
+  - name: bounded_fan_out_count
+    parameters: { item_count: bigint!, maximum_items: bigint! }
+    result: bool!
+    expression: "item_count >= 0 && maximum_items > 0 && item_count <= maximum_items"
+  - name: booking_hold_deadline_is_valid
+    parameters: { database_time: timestamptz!, hold_expires_at: timestamptz!, starts_at: timestamptz! }
+    result: bool!
+    expression: "database_time < hold_expires_at && hold_expires_at < starts_at"
+  - name: booking_outcome_is
+    parameters: { actual: BookingOutcome!, expected: BookingOutcome! }
+    result: bool!
+    expression: "actual == expected"
+  - name: payment_lookup_confirms_refund
+    parameters: { found: bool!, outcome: PaymentOutcome! }
+    result: bool!
+    expression: "found && outcome == PaymentOutcome::refunded"
+  - name: can_transition_booking
+    parameters: { current: string!, next: BookingState! }
+    result: bool!
+    expression: "(current == \"held\" && (next == BookingState::confirmed || next == BookingState::cancelled || next == BookingState::expired)) || (current == \"confirmed\" && (next == BookingState::cancelled || next == BookingState::no_show))"
+  - name: can_transition_prescription
+    parameters: { current: string!, next: PrescriptionState! }
+    result: bool!
+    expression: "(current == \"submitted\" && (next == PrescriptionState::approved || next == PrescriptionState::rejected || next == PrescriptionState::expired)) || (current == \"approved\" && next == PrescriptionState::released)"
+  - name: can_transition_fraud
+    parameters: { current: string!, next: FraudState! }
+    result: bool!
+    expression: "(current == \"clear\" && next == FraudState::review_required) || (current == \"review_required\" && (next == FraudState::approved || next == FraudState::rejected))"
+  - name: fraud_state_for_route
+    parameters: { hold: bool! }
+    result: FraudState!
+    expression: "hold ? FraudState::review_required : FraudState::clear"
+  - name: can_transition_reconciliation
+    parameters: { current: string!, next: ReconciliationState! }
+    result: bool!
+    expression: "(current == \"pending\" && (next == ReconciliationState::matched || next == ReconciliationState::review_required)) || (current == \"review_required\" && next == ReconciliationState::resolved)"
+  - name: payment_reconciliation_supports_decision
+    parameters: { local_amount_minor: bigint!, local_currency: string!, local_status: string!, local_provider_reference: string, provider_amount_minor: bigint!, provider_currency: string!, provider_status: PaymentState!, provider_reference: string!, decision: ReconciliationDecision! }
+    result: bool!
+    expression: "(decision == ReconciliationDecision::matched && local_amount_minor == provider_amount_minor && local_currency == provider_currency && ((local_status == \"pending\" && provider_status == PaymentState::pending) || (local_status == \"cancellation_requested\" && provider_status == PaymentState::cancellation_requested) || (local_status == \"authorized\" && provider_status == PaymentState::authorized) || (local_status == \"void_in_progress\" && provider_status == PaymentState::void_in_progress) || (local_status == \"captured\" && provider_status == PaymentState::captured) || (local_status == \"voided\" && provider_status == PaymentState::voided) || (local_status == \"refunded\" && provider_status == PaymentState::refunded) || (local_status == \"failed\" && provider_status == PaymentState::failed) || (local_status == \"chargeback\" && provider_status == PaymentState::chargeback)) && !is_null(local_provider_reference)) || (decision == ReconciliationDecision::manual_review && (local_amount_minor != provider_amount_minor || local_currency != provider_currency || !((local_status == \"pending\" && provider_status == PaymentState::pending) || (local_status == \"cancellation_requested\" && provider_status == PaymentState::cancellation_requested) || (local_status == \"authorized\" && provider_status == PaymentState::authorized) || (local_status == \"void_in_progress\" && provider_status == PaymentState::void_in_progress) || (local_status == \"captured\" && provider_status == PaymentState::captured) || (local_status == \"voided\" && provider_status == PaymentState::voided) || (local_status == \"refunded\" && provider_status == PaymentState::refunded) || (local_status == \"failed\" && provider_status == PaymentState::failed) || (local_status == \"chargeback\" && provider_status == PaymentState::chargeback)) || is_null(local_provider_reference)))"
+
+decision_tables:
+  - name: price_list_route
+    inputs: { customer_tier: string!, sales_channel: string! }
+    output: { price_list_code: string! }
+    hit_policy: first
+    rows:
+      - id: wholesale_online
+        when: { customer_tier: "customer_tier == 'wholesale'", sales_channel: "sales_channel == 'online'" }
+        output: { price_list_code: wholesale_usd }
+      - id: default_retail
+        when: { customer_tier: "true", sales_channel: "true" }
+        output: { price_list_code: retail_usd }
+    test_cases:
+      - name: wholesale online price list
+        input: { customer_tier: wholesale, sales_channel: online }
+        expect:
+          output: { price_list_code: wholesale_usd }
+          matched_row_id: wholesale_online
+  - name: promotion_route
+    inputs: { coupon_present: bool!, order_total_minor: bigint! }
+    output: { promotion_code: string!, discount_bps: int! }
+    hit_policy: first
+    rows:
+      - id: coupon_over_threshold
+        when: { coupon_present: "coupon_present", order_total_minor: "order_total_minor >= 5000" }
+        output: { promotion_code: cart_coupon, discount_bps: 1000 }
+      - id: default_no_promotion
+        when: { coupon_present: "true", order_total_minor: "true" }
+        output: { promotion_code: none, discount_bps: 0 }
+    test_cases:
+      - name: eligible coupon discount
+        input: { coupon_present: true, order_total_minor: 5000 }
+        expect:
+          output: { promotion_code: cart_coupon, discount_bps: 1000 }
+          matched_row_id: coupon_over_threshold
+  - name: tax_route
+    inputs: { country_code: string!, taxable_category: string! }
+    output: { tax_code: string!, tax_bps: int! }
+    hit_policy: first
+    rows:
+      - id: us_standard_goods
+        when: { country_code: "country_code == 'US'", taxable_category: "taxable_category == 'goods'" }
+        output: { tax_code: us_standard, tax_bps: 750 }
+      - id: default_zero_tax
+        when: { country_code: "true", taxable_category: "true" }
+        output: { tax_code: zero_rated, tax_bps: 0 }
+    test_cases:
+      - name: United States standard goods tax
+        input: { country_code: US, taxable_category: goods }
+        expect:
+          output: { tax_code: us_standard, tax_bps: 750 }
+          matched_row_id: us_standard_goods
+  - name: shipping_service_route
+    inputs: { country_code: string!, order_total_minor: bigint! }
+    output: { service_code: string!, shipping_minor: bigint! }
+    hit_policy: first
+    rows:
+      - id: us_free_shipping
+        when: { country_code: "country_code == 'US'", order_total_minor: "order_total_minor >= 5000" }
+        output: { service_code: ground, shipping_minor: 0 }
+      - id: default_standard_shipping
+        when: { country_code: "true", order_total_minor: "true" }
+        output: { service_code: standard, shipping_minor: 799 }
+    test_cases:
+      - name: United States free shipping threshold
+        input: { country_code: US, order_total_minor: 5000 }
+        expect:
+          output: { service_code: ground, shipping_minor: 0 }
+          matched_row_id: us_free_shipping
+  - name: inventory_location_route
+    inputs: { region: string!, location_code: string! }
+    output: { allocation_rank: int! }
+    hit_policy: first
+    rows:
+      - id: northeast_primary_location
+        when: { region: "region == 'northeast'", location_code: "location_code == 'east-1'" }
+        output: { allocation_rank: 1 }
+      - id: default_location_rank
+        when: { region: "true", location_code: "true" }
+        output: { allocation_rank: 100 }
+    test_cases:
+      - name: northeast primary location ranks first
+        input: { region: northeast, location_code: east-1 }
+        expect:
+          output: { allocation_rank: 1 }
+          matched_row_id: northeast_primary_location
+  - name: b2b_approval_route
+    inputs: { amount_minor: bigint!, available_credit_minor: bigint! }
+    output: { decision: ApprovalDecision!, route: string! }
+    hit_policy: first
+    rows:
+      - id: automatic_within_credit
+        when: { amount_minor: "amount_minor <= 10000", available_credit_minor: "available_credit_minor >= amount_minor" }
+        output: { decision: approved, route: automatic }
+      - id: default_finance_review
+        when: { amount_minor: "true", available_credit_minor: "true" }
+        output: { decision: escalated, route: finance_review }
+    test_cases:
+      - name: credit-covered small purchase is automatic
+        input: { amount_minor: 7500, available_credit_minor: 7500 }
+        expect:
+          output: { decision: approved, route: automatic }
+          matched_row_id: automatic_within_credit
+  - name: marketplace_commission_route
+    inputs: { gross_minor: bigint!, product_category: string! }
+    output: { commission_bps: int!, commission_tier: string! }
+    hit_policy: first
+    rows:
+      - id: services_commission
+        when: { gross_minor: "gross_minor > 0", product_category: "product_category == 'services'" }
+        output: { commission_bps: 1500, commission_tier: services }
+      - id: default_goods_commission
+        when: { gross_minor: "true", product_category: "true" }
+        output: { commission_bps: 1000, commission_tier: goods }
+    test_cases:
+      - name: services commission
+        input: { gross_minor: 20000, product_category: services }
+        expect:
+          output: { commission_bps: 1500, commission_tier: services }
+          matched_row_id: services_commission
+  - name: return_disposition_route
+    inputs: { inspection: InspectionDecision!, replacement_requested: bool! }
+    output: { disposition: string! }
+    hit_policy: first
+    rows:
+      - id: accepted_exchange
+        when: { inspection: "inspection == InspectionDecision::exchange", replacement_requested: "replacement_requested" }
+        output: { disposition: exchange }
+      - id: accepted_refund
+        when: { inspection: "inspection == InspectionDecision::accepted", replacement_requested: "true" }
+        output: { disposition: refund }
+      - id: default_reject
+        when: { inspection: "true", replacement_requested: "true" }
+        output: { disposition: reject }
+    test_cases:
+      - name: accepted inspection receives refund
+        input: { inspection: accepted, replacement_requested: false }
+        expect:
+          output: { disposition: refund }
+          matched_row_id: accepted_refund
+  - name: dunning_schedule
+    inputs: { attempt: int! }
+    output: { delay_seconds: int!, terminal: bool! }
+    hit_policy: first
+    rows:
+      - id: first_retry
+        when: { attempt: "attempt == 1" }
+        output: { delay_seconds: 86400, terminal: false }
+      - id: second_retry
+        when: { attempt: "attempt == 2" }
+        output: { delay_seconds: 259200, terminal: false }
+      - id: default_pause
+        when: { attempt: "true" }
+        output: { delay_seconds: 0, terminal: true }
+    test_cases:
+      - name: first dunning retry waits one day
+        input: { attempt: 1 }
+        expect:
+          output: { delay_seconds: 86400, terminal: false }
+          matched_row_id: first_retry
+  - name: fraud_route
+    inputs: { payment_outcome: PaymentOutcome!, score: int! }
+    output: { hold: bool!, route: string! }
+    hit_policy: first
+    rows:
+      - id: high_score_review
+        when: { payment_outcome: "payment_outcome == PaymentOutcome::authorized", score: "score >= 80" }
+        output: { hold: true, route: manual_review }
+      - id: default_clear
+        when: { payment_outcome: "true", score: "true" }
+        output: { hold: false, route: clear }
+    test_cases:
+      - name: high score authorization requires review
+        input: { payment_outcome: authorized, score: 90 }
+        expect:
+          output: { hold: true, route: manual_review }
+          matched_row_id: high_score_review
