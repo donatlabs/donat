@@ -154,7 +154,9 @@ For focused surfaces, see [REST-only](examples/petshop-rest) and
 [MCP-only](examples/petshop-mcp).
 
 To embed the engine **inside a Go application** instead of running it beside
-one, see [lending-golang](examples/lending-golang): a small library whose
+one, start with the [Go SDK](sdk/go) — it documents where your code plugs in,
+and what the embedded host deliberately does not do. The worked example is
+[lending-golang](examples/lending-golang): a small library whose
 lending decisions are declared in YAML and compiled into single statements,
 whose side effects are ordinary Go functions called in-process, and which
 serves GraphQL from the same binary with no cgo. Its

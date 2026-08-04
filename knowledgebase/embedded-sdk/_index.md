@@ -28,6 +28,7 @@ reasoning never has to be reconstructed.
 - [[decisions/006-cron-triggers-yaml-only]] — cron lives in YAML and stays multi-instance-safe through the Postgres journal
 - [[decisions/007-event-triggers-yaml-and-deploy-time-ddl]] — table event triggers: YAML metadata plus deploy-time trigger DDL
 - [[decisions/008-the-embedded-core-compiles-its-own-snapshot]] — the core compiles rules and commands at `core_init`; a command's hooks come from its resolved steps
+- [[decisions/009-connectors-are-not-a-go-extension-point]] — connectors are unreachable without the Process runtime, and would break the reviewed factory boundary even with it
 
 ## Architecture Overview (leading candidate)
 
