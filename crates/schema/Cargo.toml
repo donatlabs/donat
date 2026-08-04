@@ -21,6 +21,9 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+# `tracing` is used only for diagnostics in the rule-catalog adapter; it is
+# a facade with a no-op default subscriber, so it compiles to wasm cleanly.
+tracing = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

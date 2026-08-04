@@ -19,6 +19,7 @@ mod plan;
 mod plan_mutation;
 mod predicate;
 mod process_effects;
+mod rule_catalog;
 mod v1;
 mod validators;
 
@@ -34,6 +35,7 @@ pub use multi_source::{
 };
 pub use naming::{CrudRoots, crud_roots, table_base_name};
 pub use plan::{Plan, PlanError, Planner, Session};
+pub use rule_catalog::compile_rule_catalog;
 pub use process_effects::{
     FinalizedCommandCatalog, FinalizedCommandEffect, FinalizedCompiledCommand,
     FinalizedSignalProcessEffect, FinalizedSourceCommandCatalog, FinalizedStartProcessEffect,
