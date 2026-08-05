@@ -15,7 +15,11 @@
 //	donat --database-url <url> migrate --migrations-dir <repo>/migrations
 //	donat --database-url <url> migrate --migrations-dir migrations
 //	donat --database-url <url> dump-core-config --metadata-dir metadata
-//	DONAT_DATABASE_URL=<url> go run .
+//	DONAT_DATABASE_URL=<url> DONAT_CORE_CONFIG=core-config.json go run .
+//
+// The snapshot is a build output, not source: generating it needs a database
+// and running the app needs one too, so there is nothing a committed copy
+// would save — only a file that goes stale while still looking valid.
 //
 // docker-compose.yml wires the same flow: postgres → two one-shot migrates →
 // app.
@@ -32,23 +36,8 @@
 // three.
 package main
 
-import (
-	_ "embed"
-
-	"github.com/donatlabs/donat/sdk/go/donat"
-)
-
-// coreConfig is the {"metadata":…, "catalog":…} snapshot written by
-// `donat dump-core-config`. The wasm core compiles it at startup, so metadata
-// that does not compile fails the boot rather than the first request that
-// touches it. Regenerate after any schema or metadata change — and check it in
-// CI, because a stale snapshot is still a valid one:
-//
-//	donat --database-url <url> dump-core-config --metadata-dir metadata --check
-//
-//go:embed core-config.json
-var coreConfig []byte
+import "github.com/donatlabs/donat/sdk/go/donat"
 
 func main() {
-	donat.Main(donat.WithMetadata(coreConfig))
+	donat.Main()
 }

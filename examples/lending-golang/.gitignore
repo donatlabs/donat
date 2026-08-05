@@ -1,0 +1,4 @@
+
+# The compiled {metadata, catalog} snapshot is a build output: tests-system-lending
+# regenerates it before every run, so a committed copy is only ever stale.
+/core-config.json

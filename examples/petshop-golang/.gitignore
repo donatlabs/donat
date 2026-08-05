@@ -1,2 +1,5 @@
 # `go build` in a main package writes the executable beside the source.
 /petshop-golang
+# The compiled {metadata, catalog} snapshot is a build output: producing it
+# needs a migrated database, so it is generated at deploy time, never committed.
+/core-config.json

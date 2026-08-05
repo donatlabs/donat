@@ -4,15 +4,13 @@ A Donat API served from a Go binary, in as little Go as it takes. The whole
 program:
 
 ```go
-//go:embed core-config.json
-var coreConfig []byte
-
 func main() {
-    donat.Main(donat.WithMetadata(coreConfig))
+    donat.Main()
 }
 ```
 
-That is not an abridged listing — it is `main.go`. The behaviour lives in
+That is not an abridged listing — it is `main.go`. The database and the
+compiled snapshot come from the environment; the behaviour lives in
 `metadata/`; the pool, the mux, the listener and the graceful shutdown are what
 `donat.Main` does. No cgo: the Rust core is compiled to `wasm32` and driven
 through [wazero](https://wazero.io), so the binary is static and the module is
@@ -27,7 +25,8 @@ Start here when you want a Donat API inside your own process. Go to
 docker compose up --build
 ```
 
-That is postgres → two one-shot migrates → the app. Then:
+That is postgres → two one-shot migrates → a one-shot snapshot compile →
+the app. Then:
 
 ```bash
 curl -s localhost:8080/v1/graphql \
@@ -49,7 +48,7 @@ way the standalone engine deploys:
 donat --database-url "$URL" migrate --migrations-dir ../../migrations
 donat --database-url "$URL" migrate --migrations-dir migrations
 donat --database-url "$URL" dump-core-config --metadata-dir metadata
-DONAT_DATABASE_URL="$URL" go run .
+DONAT_DATABASE_URL="$URL" DONAT_CORE_CONFIG=core-config.json go run .
 ```
 
 `--help` lists what `main` reads from the environment; `--version` reports the
@@ -63,13 +62,17 @@ recognises.
 
 ## The snapshot
 
-`core-config.json` is `{metadata, catalog}` — the metadata directory plus the
-live catalog, compiled by the core at startup. Metadata that does not compile
-fails the boot rather than the first request that touches it.
+`core-config.json` is `{metadata, catalog}` — the metadata directory compiled
+against the live catalog. The core compiles it at startup, so metadata that
+does not compile fails the boot rather than the first request that touches it.
 
-It is generated and then committed, so it goes stale the moment the metadata or
-the schema changes, and the engine cannot notice: a stale snapshot is a
-perfectly valid one. Check it in CI:
+It is **not in the repository**, and deliberately so: producing it needs a
+migrated database, and running the app needs one too, so a committed copy would
+save nobody a step — it would only be a file that goes stale while still
+looking perfectly valid. `docker compose` generates it in a one-shot service
+between the migrations and the app, which is the same order a real deploy uses.
+
+If you do vendor one for your own reasons, check it:
 
 ```bash
 donat --database-url "$URL" dump-core-config --metadata-dir metadata --check
@@ -81,10 +84,9 @@ donat --database-url "$URL" dump-core-config --metadata-dir metadata --check
 | --- | --- |
 | `metadata/` | Tables, per-role permissions, relationships. The behaviour. |
 | `migrations/` | This application's own schema and demo seed. The platform's catalog is not copied here; it is applied from the engine's own `migrations/`. |
-| `core-config.json` | The compiled snapshot the binary embeds. |
-| `main.go` | Which snapshot to serve. |
+| `main.go` | Three lines: hand control to the SDK. |
 | `Dockerfile` | Multi-stage, `CGO_ENABLED=0`, distroless final image. |
-| `docker-compose.yml` | `db` → two one-shot migrates → `app`. |
+| `docker-compose.yml` | `db` → two one-shot migrates → one-shot snapshot → `app`. |
 | `go.mod` | Module with a `replace` to the in-repo SDK. |
 
 ## What you add next
@@ -98,10 +100,7 @@ Declare an action in the metadata *without* a `handler`, which is what makes it
 resolved in this process, and write the body:
 
 ```go
-donat.Main(
-    donat.WithMetadata(coreConfig),
-    donat.WithFunction("render_invoice_pdf", renderInvoicePDF),
-)
+donat.Main(donat.WithFunction("render_invoice_pdf", renderInvoicePDF))
 ```
 
 The engine refuses to start if a declared action has no function, or if the Go

@@ -242,6 +242,18 @@ jobs:
         env:
           URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
           DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      # The snapshot the example embeds is a build output, not source: it is
+      # the metadata directory compiled against the live catalog, so it can
+      # only be produced once the database is migrated. Committing it would
+      # mean shipping a file that goes stale while still looking valid.
+      - name: Compile the core snapshot
+        run: |
+          ./target/debug/donat --database-url "$URL" dump-core-config \
+            --metadata-dir examples/lending-golang/metadata \
+            --out examples/lending-golang/core-config.json
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+          DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
       - name: Test
         run: CGO_ENABLED=0 go test ./...
         working-directory: examples/lending-golang
