@@ -12,9 +12,21 @@ test:
 # Rebuild the wasm core the Go SDK embeds. The blob is committed so that
 # `go get` works without a Rust toolchain, so it must be regenerated here
 # whenever any crate below `donat-wasm-core` changes.
+# The path remapping is what makes the blob reproducible across machines, and
+# that is what lets CI check the committed one against its sources: without it
+# the wasm carries the builder's absolute paths in panic messages, so two
+# correct builds differ and a byte comparison proves nothing. It also keeps a
+# developer's home directory out of a shipped artifact. RUSTFLAGS replaces the
+# config.toml rustflags rather than adding to them, so the getrandom backend
+# has to be repeated here.
+WASM_RUSTFLAGS = --cfg getrandom_backend="custom" \
+	--remap-path-prefix=$(CURDIR)=/donat \
+	--remap-path-prefix=$(HOME)/.cargo=/cargo
+
 wasm-core:
 	rustup target add wasm32-unknown-unknown
-	cargo build -p donat-wasm-core --target wasm32-unknown-unknown --release
+	RUSTFLAGS='$(WASM_RUSTFLAGS)' cargo build -p donat-wasm-core \
+		--target wasm32-unknown-unknown --release
 	cp target/wasm32-unknown-unknown/release/donat_wasm_core.wasm sdk/go/donat/wasm/core.wasm
 
 # The Go host's own suite. CGO stays off: the SDK is `go get`-able and

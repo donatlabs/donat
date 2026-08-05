@@ -194,6 +194,16 @@ jobs:
           cache-dependency-path: sdk/go/go.sum
       - name: Rebuild the embedded core
         run: make wasm-core
+      # The build is path-remapped and therefore reproducible, so a byte
+      # comparison is meaningful: a difference means someone changed a crate
+      # below the core and did not regenerate the blob, and every consumer of
+      # the SDK would silently keep the old behaviour.
+      - name: The committed core must match its sources
+        run: |
+          if ! git diff --quiet -- sdk/go/donat/wasm/core.wasm; then
+            echo "::error::sdk/go/donat/wasm/core.wasm is stale. Run 'make wasm-core' and commit it."
+            exit 1
+          fi
       - name: Test the Go host against the freshly built core
         run: CGO_ENABLED=0 go test ./...
         working-directory: sdk/go

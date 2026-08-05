@@ -1,0 +1,79 @@
+name: Release the Go SDK
+
+# Go has no artifact upload: `go get` fetches the repository tree at a tag from
+# the module proxy. So publishing the SDK means creating a tag — and because
+# the module lives in a subdirectory, Go only recognises one named
+# `sdk/go/vX.Y.Z`. Without such a tag the module can only be installed by
+# pseudo-version from a branch, which is what it was until this workflow.
+#
+# The tag is created from a release tag on the root module (`vX.Y.Z`), so the
+# engine and the SDK it embeds carry the same version and cannot be paired
+# wrongly by accident.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Tag sdk/go/${{ github.event.inputs.version || github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+
+      # The blob is committed so `go get` needs no Rust toolchain, which means
+      # a release can ship a core built from sources nobody has looked at since.
+      # The build is path-remapped and therefore reproducible, so this compares
+      # bytes: if they differ, the committed core is stale and the release would
+      # publish behaviour that is not in this tag.
+      - name: The committed core must match its sources
+        run: |
+          make wasm-core
+          if ! git diff --quiet -- sdk/go/donat/wasm/core.wasm; then
+            echo "::error::sdk/go/donat/wasm/core.wasm is stale. Run 'make wasm-core' and commit it."
+            git diff --stat -- sdk/go/donat/wasm/core.wasm
+            exit 1
+          fi
+
+      - name: The module must build and pass its tests
+        run: CGO_ENABLED=0 go test ./...
+        working-directory: sdk/go
+
+      # A module that cannot be fetched from a clean cache is not published,
+      # whatever the tag says.
+      - name: The module must be self-contained
+        run: |
+          CGO_ENABLED=0 go build ./...
+          go mod verify
+        working-directory: sdk/go
+
+      - name: Tag the module
+        env:
+          VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          tag="sdk/go/$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::$tag already exists; a published version is never moved."
+            exit 1
+          fi
+          git tag -a "$tag" -m "Go SDK $VERSION"
+          git push origin "$tag"
+          echo "Published: go get github.com/donatlabs/donat/sdk/go@$VERSION" >> "$GITHUB_STEP_SUMMARY"

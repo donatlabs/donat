@@ -33,6 +33,15 @@ mux.Handle("/v1/graphql", eng.Handler())
 `CGO_ENABLED=0` throughout: the SDK is `go get`-able and builds a static
 binary.
 
+```bash
+go get github.com/donatlabs/donat/sdk/go@v0.1.0
+```
+
+The module lives in a subdirectory, so its versions are tagged `sdk/go/vX.Y.Z`
+rather than `vX.Y.Z`; `go get` takes the plain version and finds them. Releases
+are cut by `.github/workflows/release-go-sdk.yml` from a root release tag, so
+the engine and the core the SDK embeds always carry the same version.
+
 ## Where your code plugs in
 
 There are five extension points, and it is worth being clear about which one
@@ -278,8 +287,10 @@ It exits non-zero when the committed file is not what would be written now.
 
 ## Regenerating the core
 
-The wasm blob is committed so `go get` needs no Rust toolchain, which means
-nothing notices when a crate below it changes:
+The blob is committed so `go get` needs no Rust toolchain — which is also how
+it silently goes stale when a crate below it changes. The build is
+path-remapped and therefore reproducible, so CI compares bytes and fails on a
+difference; regenerate with:
 
 ```bash
 make wasm-core      # rebuilds sdk/go/donat/wasm/core.wasm
