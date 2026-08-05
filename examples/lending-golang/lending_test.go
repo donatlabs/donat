@@ -68,6 +68,11 @@ func newService(t *testing.T) *service {
 		return nil
 	})
 
+	coreConfig, err := loadCoreConfig()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
 	eng, err := donat.New(ctx, donat.Config{
 		Backend:  donat.Postgres(pool),
 		Metadata: coreConfig,

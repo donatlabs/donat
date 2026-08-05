@@ -47,31 +47,28 @@ package main
 
 import (
 	"context"
-	_ "embed"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/donatlabs/donat/sdk/go/donat"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// coreConfig is the serialised {"metadata":..., "catalog":...} snapshot
-// produced by `donat dump-core-config`. The wasm core loads it at startup via
-// core_init, which is also where the declarative metadata is compiled — a
-// command that does not compile fails the boot rather than the first request.
-// Regenerate after a schema or metadata change:
-//
-//	donat --database-url <url> dump-core-config --metadata-dir metadata --out core-config.json
-//
-//go:embed core-config.json
-var coreConfig []byte
-
 func main() {
-	cfg := LoadConfig()
 	ctx := context.Background()
+	databaseURL := env("DONAT_DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:15432/lending")
+	addr := ":" + env("DONAT_PORT", "8080")
 
-	// The engine never opens connections itself; you supply the pool.
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	coreConfig, err := loadCoreConfig()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	// The engine opens no connections of its own; the application supplies the
+	// pool, which is what makes ExecuteTx possible (audit.go).
+	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		log.Fatalf("pgxpool.New: %v", err)
 	}
@@ -84,16 +81,40 @@ func main() {
 		Backend:  donat.Postgres(pool),
 		Metadata: coreConfig,
 		Registry: reg,
-		PoolSize: cfg.PoolSize,
 	})
 	if err != nil {
 		log.Fatalf("donat.New: %v", err)
 	}
 
-	mux := NewMux(eng)
-	log.Printf("lending-golang listening on %s", cfg.Addr)
-	log.Printf("  GraphQL:  POST %s/v1/graphql  (header: X-Donat-Role: member)", cfg.Addr)
-	log.Printf("  Healthz:  GET  %s/healthz", cfg.Addr)
-	log.Printf("  Handlers: %v (fire in-process, no webhook)", reg.Names())
-	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
+	// The engine's handler is an ordinary http.Handler, mounted beside the
+	// application's own routes in the application's own mux.
+	mux := http.NewServeMux()
+	mux.Handle("/v1/graphql", eng.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"status":"ok"}`)
+	})
+
+	log.Printf("lending-golang on %s; handlers: %v", addr, reg.Names())
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+// loadCoreConfig reads the `donat dump-core-config` snapshot: the metadata
+// directory compiled against the live catalog. It is a build output rather
+// than source — producing it needs a migrated database — so it is generated at
+// deploy time and read here instead of embedded.
+func loadCoreConfig() ([]byte, error) {
+	path := env("DONAT_CORE_CONFIG", "core-config.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading the core config %s: %w", path, err)
+	}
+	return raw, nil
+}
+
+func env(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
 }

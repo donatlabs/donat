@@ -127,7 +127,8 @@ cmd_up() {
   echo $! >"$engine_pid"
 
   echo "==> serving the Go host on $GO_PORT"
-  DATABASE_URL="$go_url" ADDR=":$GO_PORT" \
+  DONAT_DATABASE_URL="$go_url" DONAT_PORT="$GO_PORT" \
+  DONAT_CORE_CONFIG="$example/core-config.json" \
     nohup "$state/lending-golang" >"$go_log" 2>&1 &
   echo $! >"$go_pid"
 

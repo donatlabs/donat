@@ -55,6 +55,23 @@ services:
       - ./migrations:/migrations:ro
     restart: "no"
 
+  # One-shot: compile the metadata directory against the live catalog into the
+  # snapshot the app reads. A build output, not source — it needs the migrated
+  # database, which is why it is produced here and not committed.
+  dump-core-config:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command:
+      ["dump-core-config", "--metadata-dir", "/metadata", "--out", "/snapshot/core-config.json"]
+    depends_on:
+      migrate-domain:
+        condition: service_completed_successfully
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
+    volumes:
+      - ./metadata:/metadata:ro
+      - snapshot:/snapshot
+    restart: "no"
+
   app:
     # Build context is the repo root so Docker can see both sdk/go and
     # examples/lending-golang (the module uses a replace directive).
@@ -62,9 +79,16 @@ services:
       context: ../..
       dockerfile: examples/lending-golang/Dockerfile
     depends_on:
-      migrate-domain:
+      dump-core-config:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
+      DONAT_DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
+      DONAT_CORE_CONFIG: /snapshot/core-config.json
+    volumes:
+      - snapshot:/snapshot:ro
     ports:
       - "8080:8080"
+
+volumes:
+  # The compiled snapshot, handed from the one-shot generator to the app.
+  snapshot:
