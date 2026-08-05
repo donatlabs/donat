@@ -625,3 +625,149 @@ fn an_attachment_compiles_but_its_field_cannot_be_selected() {
         other => panic!("expected selecting a file column to fail, got {other:?}"),
     }
 }
+
+// -----------------------------------------------------------------------
+// Actions: custom logic the engine does not resolve from SQL
+// -----------------------------------------------------------------------
+
+/// The fixture, plus a handler-less action returning a declared object type.
+fn metadata_with_action() -> Metadata {
+    let mut value = serde_json::to_value(metadata()).expect("fixture metadata serializes");
+    value["custom_types"] = serde_json::json!({
+        "objects": [{
+            "name": "InvoicePdf",
+            "fields": [
+                { "name": "url",   "type": "String!" },
+                { "name": "bytes", "type": "Int!" }
+            ]
+        }]
+    });
+    value["actions"] = serde_json::json!([{
+        "name": "render_invoice_pdf",
+        "definition": {
+            "type": "mutation",
+            "arguments": [{ "name": "invoice_id", "type": "String!" }],
+            "output_type": "InvoicePdf"
+        },
+        "permissions": [{ "role": "user" }]
+    }]);
+    serde_json::from_value(value).expect("metadata with an action deserializes")
+}
+
+fn render_input(query: &str) -> CompileInput {
+    CompileInput {
+        query: query.to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: session_vars("user"),
+        stringify_numerics: false,
+        dialect: None,
+    }
+}
+
+/// An action operation must never reach the planner: there is no table behind
+/// it, so it would fail as an unknown root field. It becomes a plan describing
+/// the call the host has to make.
+#[test]
+fn an_action_operation_plans_a_call_rather_than_sql() {
+    let state = state_of(metadata_with_action());
+    let input =
+        render_input(r#"mutation { render_invoice_pdf(invoice_id: "inv-1") { url bytes } }"#);
+
+    match compile(&state, &input) {
+        PlanV1::Action(body) => {
+            assert!(!body.is_query, "a mutation action is not a query");
+            assert_eq!(body.items.len(), 1);
+            let json = serde_json::to_value(&body.items[0]).expect("the item serializes");
+            assert_eq!(json["kind"], "call");
+            assert_eq!(json["name"], "render_invoice_pdf");
+            assert_eq!(json["input"]["invoice_id"], "inv-1");
+            assert_eq!(json["session_variables"]["x-donat-role"], "user");
+            assert!(
+                json["handler"].is_null(),
+                "a handler-less action is resolved in the host: {json}"
+            );
+        }
+        other => panic!("expected an action plan, got {other:?}"),
+    }
+}
+
+/// The host's result is shaped by the core, not trusted as-is: the same
+/// `validate` the standalone server applies to a webhook response.
+#[test]
+fn the_core_shapes_what_the_host_returned() {
+    let state = state_of(metadata_with_action());
+    let query = r#"mutation { render_invoice_pdf(invoice_id: "inv-1") { url } }"#;
+    let shaped = donat_wasm_core::compile::shape(
+        &state,
+        &donat_wasm_core::compile::ShapeInput {
+            query: query.to_string(),
+            operation_name: None,
+            variables: Default::default(),
+            session_vars: session_vars("user"),
+            // `bytes` was returned but not selected, so it must be dropped.
+            results: serde_json::from_value(serde_json::json!({
+                "render_invoice_pdf": { "url": "https://s3/x.pdf", "bytes": 12 }
+            }))
+            .expect("results"),
+        },
+    );
+    let json = serde_json::to_value(&shaped).expect("the result serializes");
+    assert_eq!(json["kind"], "data");
+    assert_eq!(
+        json["data"]["render_invoice_pdf"]["url"],
+        "https://s3/x.pdf"
+    );
+    assert!(
+        json["data"]["render_invoice_pdf"].get("bytes").is_none(),
+        "a field the client did not select must not appear: {json}"
+    );
+}
+
+/// A Go function returning null for a `String!` must fail here rather than
+/// reach the client, or the same declaration would answer differently on the
+/// two hosts.
+#[test]
+fn a_host_result_violating_the_declared_type_is_refused() {
+    let state = state_of(metadata_with_action());
+    let query = r#"mutation { render_invoice_pdf(invoice_id: "inv-1") { url } }"#;
+    let shaped = donat_wasm_core::compile::shape(
+        &state,
+        &donat_wasm_core::compile::ShapeInput {
+            query: query.to_string(),
+            operation_name: None,
+            variables: Default::default(),
+            session_vars: session_vars("user"),
+            results: serde_json::from_value(serde_json::json!({
+                "render_invoice_pdf": { "url": null }
+            }))
+            .expect("results"),
+        },
+    );
+    let json = serde_json::to_value(&shaped).expect("the result serializes");
+    assert_eq!(json["kind"], "error", "{json}");
+    assert!(
+        json["message"].as_str().unwrap_or_default().contains("url"),
+        "the failure must name the offending field: {json}"
+    );
+}
+
+/// A role outside the action's permission list is told the field does not
+/// exist, so the schema cannot be enumerated through permission errors.
+#[test]
+fn an_action_is_invisible_to_a_role_it_does_not_name() {
+    let state = state_of(metadata_with_action());
+    let mut input = render_input(r#"mutation { render_invoice_pdf(invoice_id: "inv-1") { url } }"#);
+    input.session_vars = session_vars("nopk");
+
+    match compile(&state, &input) {
+        PlanV1::Error(body) => {
+            assert_eq!(body.code, "validation-failed");
+            assert!(
+                body.message.contains("not found in type: 'mutation_root'"),
+                "{body:?}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}

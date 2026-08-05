@@ -9,7 +9,21 @@ use serde::Serialize;
 pub enum PlanV1 {
     Query(PlanBody),
     Mutation(PlanBody),
+    /// An operation whose top-level fields are actions: custom logic the
+    /// engine does not resolve from SQL. The host calls each item and then
+    /// asks the core to shape the results, so the binding and the shaping stay
+    /// the engine's regardless of which host is serving.
+    Action(ActionPlanBody),
     Error(PlanErrorBody),
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActionPlanBody {
+    pub version: u32, // always crate::plan::PLAN_VERSION
+    /// Query actions may run concurrently; mutation actions must not, because
+    /// a client that ordered two writes in one operation gets that order.
+    pub is_query: bool,
+    pub items: Vec<donat_action::ActionItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,23 +101,31 @@ pub const PLAN_VERSION: u32 = 1;
 /// stays unchanged) without the cost of rebuilding on every compile.
 use std::sync::LazyLock;
 
-static ERROR_MAP: LazyLock<std::collections::BTreeMap<String, String>> =
-    LazyLock::new(|| {
-        use std::collections::BTreeMap;
-        let mut m = BTreeMap::new();
-        // 23514: check_violation — our donat.check_violation() stores a JSON
-        // payload { "path": ..., "message": ... } in the PG error message.
-        m.insert("23514".into(), "permission-error-from-payload".into());
-        // 23505: unique_violation
-        m.insert("23505".into(), "constraint-violation:Uniqueness violation. ".into());
-        // 23503: foreign_key_violation
-        m.insert("23503".into(), "constraint-violation:Foreign key violation. ".into());
-        // 23502: not_null_violation
-        m.insert("23502".into(), "constraint-violation:Not-NULL violation. ".into());
-        // All other SQLSTATE codes → data-exception (matches the `_` arm in gql.rs)
-        m.insert("default".into(), "data-exception".into());
-        m
-    });
+static ERROR_MAP: LazyLock<std::collections::BTreeMap<String, String>> = LazyLock::new(|| {
+    use std::collections::BTreeMap;
+    let mut m = BTreeMap::new();
+    // 23514: check_violation — our donat.check_violation() stores a JSON
+    // payload { "path": ..., "message": ... } in the PG error message.
+    m.insert("23514".into(), "permission-error-from-payload".into());
+    // 23505: unique_violation
+    m.insert(
+        "23505".into(),
+        "constraint-violation:Uniqueness violation. ".into(),
+    );
+    // 23503: foreign_key_violation
+    m.insert(
+        "23503".into(),
+        "constraint-violation:Foreign key violation. ".into(),
+    );
+    // 23502: not_null_violation
+    m.insert(
+        "23502".into(),
+        "constraint-violation:Not-NULL violation. ".into(),
+    );
+    // All other SQLSTATE codes → data-exception (matches the `_` arm in gql.rs)
+    m.insert("default".into(), "data-exception".into());
+    m
+});
 
 pub fn default_error_map() -> std::collections::BTreeMap<String, String> {
     ERROR_MAP.clone()

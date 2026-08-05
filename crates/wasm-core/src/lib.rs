@@ -21,7 +21,7 @@ mod rng;
 
 use std::cell::RefCell;
 
-pub use compile::{compile, CompileInput, CoreState};
+pub use compile::{CompileInput, CoreState, compile};
 
 /// Bump on any breaking ABI/PlanV1-major change. The Go mirror asserts this.
 pub const ABI_VERSION: i32 = 1;
@@ -153,6 +153,31 @@ pub extern "C" fn core_compile(ptr: *mut u8, len: i32) -> i64 {
             Some(state) => match serde_json::from_slice::<compile::CompileInput>(bytes) {
                 Ok(input) => serde_json::to_vec(&compile::compile(state, &input))
                     .unwrap_or_else(|_| err_json("validation-failed", "plan serialize failed")),
+                Err(e) => err_json("validation-failed", &e.to_string()),
+            },
+        }
+    });
+    pack_output(out)
+}
+
+/// Shape the results of an action operation, once the host has called every
+/// action the plan named.
+///
+/// A separate entry point rather than part of `core_compile`, because the
+/// results do not exist yet when the plan is made: the host has to call the
+/// functions in between. The request is repeated instead of remembered so that
+/// an instance is not pinned to one in-flight operation.
+#[unsafe(no_mangle)]
+pub extern "C" fn core_shape_action(ptr: *mut u8, len: i32) -> i64 {
+    // SAFETY: ptr/len originate from core_alloc; host wrote len initialised bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let out = STATE.with(|s| {
+        let borrow = s.borrow();
+        match borrow.as_ref() {
+            None => err_json("validation-failed", "core not initialized"),
+            Some(state) => match serde_json::from_slice::<compile::ShapeInput>(bytes) {
+                Ok(input) => serde_json::to_vec(&compile::shape(state, &input))
+                    .unwrap_or_else(|_| err_json("validation-failed", "shape serialize failed")),
                 Err(e) => err_json("validation-failed", &e.to_string()),
             },
         }

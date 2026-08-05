@@ -10,7 +10,7 @@ use donat_schema::{
     compile_rule_catalog, finalize_command_effects,
 };
 
-use crate::plan::{PlanBody, PlanErrorBody, PlanV1, ResponseSlot, Statement, PLAN_VERSION};
+use crate::plan::{PLAN_VERSION, PlanBody, PlanErrorBody, PlanV1, ResponseSlot, Statement};
 
 /// Compiled engine state held per wasm instance.
 ///
@@ -70,7 +70,9 @@ fn response_slots(slots: &[QueryResponseSlot]) -> Vec<ResponseSlot> {
     slots
         .iter()
         .map(|slot| match slot {
-            QueryResponseSlot::SourceField { key } => ResponseSlot::SourceField { key: key.clone() },
+            QueryResponseSlot::SourceField { key } => {
+                ResponseSlot::SourceField { key: key.clone() }
+            }
             QueryResponseSlot::LocalTypename { key, value } => ResponseSlot::LocalTypename {
                 key: key.clone(),
                 value: value.clone(),
@@ -180,6 +182,15 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
     };
 
     // 3. Plan (permissions woven in, session vars substituted). The
+    //    Actions come first: they are custom GraphQL fields the engine never
+    //    resolves from SQL, so an action operation must not reach the planner
+    //    at all — there it would fail as an unknown root field.
+    if let Some(ctx) =
+        donat_action::match_action(&state.metadata, &doc, input.operation_name.as_deref())
+    {
+        return action_plan(&ctx, &session, &doc, input);
+    }
+
     //    multi-source planner is what knows about declarative commands: the
     //    single-source `Planner` constructor hardcodes `commands: None`, so a
     //    command root would not exist in the schema it compiles.
@@ -191,11 +202,15 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
         Ok(p) => p,
         Err(e) => return error_plan(&e),
     };
-    let plan =
-        match planner.plan(&doc, input.operation_name.as_deref(), &input.variables, &session) {
-            Ok(p) => p,
-            Err(e) => return error_plan(&e),
-        };
+    let plan = match planner.plan(
+        &doc,
+        input.operation_name.as_deref(),
+        &input.variables,
+        &session,
+    ) {
+        Ok(p) => p,
+        Err(e) => return error_plan(&e),
+    };
 
     // 3b. Resolve the SQL dialect for this request.
     let dialect = dialect_of(input.dialect.as_deref());
@@ -235,7 +250,11 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                         }
                         _ => donat_sqlgen::operation_to_sql_with(&plan.roots, dialect),
                     };
-                    vec![Statement { alias: "data".into(), sql, params: vec![] }]
+                    vec![Statement {
+                        alias: "data".into(),
+                        sql,
+                        params: vec![],
+                    }]
                 }
             };
             PlanV1::Query(PlanBody {
@@ -249,7 +268,9 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
         }
 
         // 4b. Mutation: one statement per root, wrapped in a transaction.
-        MultiSourcePlan::Mutation { roots, response, .. } => {
+        MultiSourcePlan::Mutation {
+            roots, response, ..
+        } => {
             let mut statements = Vec::new();
             let mut hooks = Vec::new();
             for root in &roots {
@@ -269,7 +290,11 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                     }
                     _ => donat_sqlgen::mutation_to_sql_with(root, dialect),
                 };
-                statements.push(Statement { alias, sql, params: vec![] });
+                statements.push(Statement {
+                    alias,
+                    sql,
+                    params: vec![],
+                });
                 hooks.extend(hooks_for_root(root, &state.metadata));
             }
             PlanV1::Mutation(PlanBody {
@@ -394,4 +419,177 @@ fn collect_hooks(
             }
         }
     }
+}
+
+/// Build the plan for an operation whose top-level fields are actions.
+///
+/// Every item is resolved to either a literal `__typename` or one call the host
+/// must make. Nothing here knows how the call travels: a handler-less action is
+/// one the host resolves in its own process, and one with a handler is a
+/// webhook, which is the host's decision to make and the core's to describe.
+fn action_plan(
+    ctx: &donat_action::ActionContext,
+    session: &Session,
+    doc: &graphql_parser::query::Document<'static, String>,
+    input: &CompileInput,
+) -> PlanV1 {
+    let items = match donat_action::selection_items(doc, input.operation_name.as_deref()) {
+        Ok(items) => items,
+        Err(e) => return action_error_plan(&e),
+    };
+    let mut planned = Vec::with_capacity(items.len());
+    for item in items {
+        match donat_action::plan_item(ctx, &session.role, &session.vars, item, &input.variables) {
+            Ok(planned_item) => planned.push(planned_item),
+            Err(e) => return action_error_plan(&e),
+        }
+    }
+    PlanV1::Action(crate::plan::ActionPlanBody {
+        version: PLAN_VERSION,
+        is_query: ctx.is_query(),
+        items: planned,
+    })
+}
+
+fn action_error_plan(e: &donat_action::ActionError) -> PlanV1 {
+    PlanV1::Error(PlanErrorBody {
+        version: PLAN_VERSION,
+        code: e.code.clone(),
+        path: e.path.clone(),
+        message: e.message.clone(),
+    })
+}
+
+/// What the host sends back once it has called every action in the plan.
+///
+/// The core is stateless between calls, so the request is repeated rather than
+/// remembered: shaping needs the selection set, and holding it across an
+/// arbitrary host call would make one instance unusable for anything else while
+/// a handler was in flight.
+#[derive(Deserialize)]
+pub struct ShapeInput {
+    pub query: String,
+    #[serde(default)]
+    pub operation_name: Option<String>,
+    #[serde(default)]
+    pub variables: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub session_vars: HashMap<String, String>,
+    /// What each action returned, keyed by the plan's response alias.
+    #[serde(default)]
+    pub results: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The shaped response, or the error that shaping produced.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ShapeResult {
+    Data {
+        data: serde_json::Map<String, serde_json::Value>,
+    },
+    Error(PlanErrorBody),
+}
+
+/// Shape the results of an action operation against its declared output types
+/// and the caller's selection set.
+///
+/// This is the same `validate` the standalone server applies to a webhook
+/// response. An embedded host that skipped it would return whatever a Go
+/// function happened to produce, so a field declared `String!` could answer
+/// `null` on one host and error on the other.
+pub fn shape(state: &CoreState, input: &ShapeInput) -> ShapeResult {
+    let session = match session_from(&input.session_vars) {
+        Ok(s) => s,
+        Err(e) => return shape_error(&e.path, &e.code, &e.message),
+    };
+    let doc = match graphql_parser::parse_query::<String>(&input.query) {
+        Ok(d) => d.into_static(),
+        Err(e) => return shape_error("$", "validation-failed", &e.to_string()),
+    };
+    let Some(ctx) =
+        donat_action::match_action(&state.metadata, &doc, input.operation_name.as_deref())
+    else {
+        return shape_error("$", "unexpected", "this operation does not target actions");
+    };
+    let items = match donat_action::selection_items(&doc, input.operation_name.as_deref()) {
+        Ok(items) => items,
+        Err(e) => return shape_error(&e.path, &e.code, &e.message),
+    };
+
+    let mut data = serde_json::Map::new();
+    for item in items {
+        let planned = match donat_action::plan_item(
+            &ctx,
+            &session.role,
+            &session.vars,
+            item,
+            &input.variables,
+        ) {
+            Ok(planned) => planned,
+            Err(e) => return shape_error(&e.path, &e.code, &e.message),
+        };
+        match planned {
+            donat_action::ActionItem::Typename { alias, value } => {
+                data.insert(alias, serde_json::Value::String(value));
+            }
+            donat_action::ActionItem::Call(call) => {
+                // The host is expected to answer every call the plan named; a
+                // missing one is a host bug, and treating it as `null` would
+                // hide it behind a nullability error somewhere else.
+                let Some(raw) = input.results.get(&call.alias) else {
+                    return shape_error(
+                        "$",
+                        "unexpected",
+                        &format!("the host returned no result for action '{}'", call.name),
+                    );
+                };
+                let Some(action) = ctx.find(&call.name) else {
+                    return shape_error(
+                        "$",
+                        "unexpected",
+                        &format!(
+                            "action '{}' vanished between planning and shaping",
+                            call.name
+                        ),
+                    );
+                };
+                let Some(field) = action_field(item) else {
+                    return shape_error("$", "unexpected", "an action item lost its field");
+                };
+                let ty = donat_action::parse_type(&action.definition.output_type);
+                match donat_action::validate(
+                    ctx.custom_types(),
+                    &ty,
+                    raw,
+                    &field.selection_set.items,
+                ) {
+                    Ok(shaped) => {
+                        data.insert(call.alias, shaped);
+                    }
+                    // Output-shape errors are reported at the top level, as the
+                    // standalone server reports them.
+                    Err(message) => return shape_error("$", "unexpected", &message),
+                }
+            }
+        }
+    }
+    ShapeResult::Data { data }
+}
+
+fn action_field<'a>(
+    item: &'a graphql_parser::query::Selection<'static, String>,
+) -> Option<&'a graphql_parser::query::Field<'static, String>> {
+    match item {
+        graphql_parser::query::Selection::Field(f) => Some(f),
+        _ => None,
+    }
+}
+
+fn shape_error(path: &str, code: &str, message: &str) -> ShapeResult {
+    ShapeResult::Error(PlanErrorBody {
+        version: PLAN_VERSION,
+        code: code.to_string(),
+        path: path.to_string(),
+        message: message.to_string(),
+    })
 }

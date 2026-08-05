@@ -834,6 +834,7 @@ dependencies = [
 name = "donat-wasm-core"
 version = "0.1.0"
 dependencies = [
+ "donat-action",
  "donat-backend",
  "donat-catalog-types",
  "donat-ir",
