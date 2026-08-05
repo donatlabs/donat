@@ -130,6 +130,26 @@ func WithRegistry(r *Registry) Option {
 	return func(c *Config) { c.Registry = r }
 }
 
+// WithSecrets supplies the values the metadata's storage configuration
+// references by `value_from_env`. They are passed here rather than written
+// into the committed snapshot, which ships inside the binary.
+func WithSecrets(secrets map[string]string) Option {
+	return func(c *Config) {
+		if c.Secrets == nil {
+			c.Secrets = make(map[string]string, len(secrets))
+		}
+		for k, v := range secrets {
+			c.Secrets[k] = v
+		}
+	}
+}
+
+// WithExternalBaseURL sets the absolute prefix for engine-served URLs, e.g.
+// "https://api.example.com". Empty means same-origin.
+func WithExternalBaseURL(base string) Option {
+	return func(c *Config) { c.ExternalBaseURL = base }
+}
+
 func env(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
