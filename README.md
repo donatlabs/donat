@@ -174,6 +174,45 @@ make run
 Run the compatibility suite with `make conformance`; add
 `make conformance-matrix` for the preview backend contract matrix.
 
+### The crates
+
+One line divides this workspace: whether a crate can reach the outside world.
+Everything that turns a request into SQL is pure, so it compiles to `wasm32`
+and can run inside a host that is not Rust. Everything that opens a socket
+stays behind that line. That is what lets the same planner serve both the
+standalone binary and an embedded Go host without either forking its
+behaviour — the SQL is the same SQL because it is the same code.
+
+**The compile path** — pure, no I/O, all of it reaches wasm:
+
+| Crate | What it owns |
+| --- | --- |
+| [`metadata`](crates/metadata) | The Donat v2 metadata types and the YAML directory loader, `!include` included. The format is the compatibility surface: an export from an existing project must load unconverted. |
+| [`catalog-types`](crates/catalog-types) | The catalog snapshot as plain serde types — tables, columns, keys. Split out from `catalog` precisely so the planner could reach wasm without the drivers behind it. |
+| [`rules`](crates/rules) | The restricted CEL-inspired expression language a declaration uses for its arithmetic and thresholds, so a business rule is data rather than code. |
+| [`value-contract`](crates/value-contract) | The closed, SQL-free value types shared by commands, processes and connectors. One owner, so those three cannot drift apart on what a value is. |
+| [`action`](crates/action) | Actions minus their transport: routing an operation, checking role visibility, binding arguments, shaping the result. Shared so a webhook and an in-process Go function answer identically. |
+| [`schema`](crates/schema) | The planner. GraphQL + metadata + catalog → IR, with permissions woven in rather than checked afterwards. The largest of the pure crates, and the one that decides what a role may see. |
+| [`ir`](crates/ir) | The SQL-free boundary: a validated, permission-resolved plan. Everything upstream is about meaning; everything downstream is about syntax. |
+| [`backend`](crates/backend) | What differs between databases — logical scalar types, capability descriptors, dialect rendering — kept in one place so `sqlgen` is written once. |
+| [`sqlgen`](crates/sqlgen) | IR → **one** statement that returns the finished JSON. The response is assembled in the database, never row by row in Rust. |
+| [`storage`](crates/storage) | File attachments: the resolved store and the URL signing the planner and the server share. Its secrets are a caller's argument, which is what lets it work off-host. |
+| [`wasm-core`](crates/wasm-core) | The above, compiled to `wasm32` behind a memory ABI: `(query, vars, session) → PlanV1`. The blob the Go SDK embeds. |
+
+**The host path** — opens sockets, so it stops at the line:
+
+| Crate | What it owns |
+| --- | --- |
+| [`catalog`](crates/catalog) | Reading `pg_catalog`. The only place that talks to it; everything downstream takes the snapshot. |
+| [`connector-abi`](crates/connector-abi) | Neutral IDs, bounded envelopes and host traits for compiled connectors. |
+| [`connector-catalog`](crates/connector-catalog) | Reviewed source records and the checked-in static catalog. Connectors are a deploy-time artifact — nothing is loaded at runtime. |
+| [`server`](crates/server) | The axum binary: `/v1/graphql` (+ws), Relay, `/api/rest`, `/mcp`, cron, durable processes, plus `migrate`, `validate` and `codegen`. There is no admin API; configuration is deploy-time. |
+| [`conformance`](crates/conformance) | The harness and its fixtures — the executable source of truth. It builds and spawns the engine itself. |
+
+The Go host lives in [`sdk/go`](sdk/go/README.md): it embeds `core.wasm`,
+drives it through wazero with no cgo, and owns the pool, the HTTP surface and
+the functions you write for logic no declaration can express.
+
 ## Designed to be operated, not bypassed
 
 <p align="center">
