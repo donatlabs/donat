@@ -16,7 +16,9 @@ func main() {
 ```
 
 That is the whole program. `Main` reads its database URL and snapshot from the
-environment, serves `/v1/graphql`, and shuts down on a signal.
+environment and serves `/v1/graphql` — and nothing else. A probe endpoint,
+metrics, middleware or a shutdown sequence is a deployment's own choice, and a
+program that wants any of them uses `New` instead.
 
 A program that needs to own its lifecycle — its own mux, pool and shutdown —
 builds the same thing explicitly and keeps every registration it already wrote:

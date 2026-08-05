@@ -11,8 +11,8 @@ func main() {
 
 That is not an abridged listing — it is `main.go`. The database and the
 compiled snapshot come from the environment; the behaviour lives in
-`metadata/`; the pool, the mux, the listener and the graceful shutdown are what
-`donat.Main` does. No cgo: the Rust core is compiled to `wasm32` and driven
+`metadata/`; the pool, the mux and the listener are what `donat.Main` does. It
+serves `/v1/graphql` and nothing else. No cgo: the Rust core is compiled to `wasm32` and driven
 through [wazero](https://wazero.io), so the binary is static and the module is
 `go get`-able.
 
@@ -50,9 +50,6 @@ donat --database-url "$URL" migrate --migrations-dir migrations
 donat --database-url "$URL" dump-core-config --metadata-dir metadata
 DONAT_DATABASE_URL="$URL" DONAT_CORE_CONFIG=core-config.json go run .
 ```
-
-`--help` lists what `main` reads from the environment; `--version` reports the
-core ABI the binary carries.
 
 Do not copy the platform's own migrations into this directory. The helper
 functions they install are an internal protocol that the GraphQL error decoder

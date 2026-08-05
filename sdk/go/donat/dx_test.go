@@ -129,12 +129,3 @@ func TestTestEngineExplainsThatItHasNoDatabase(t *testing.T) {
 		t.Fatalf("a table read must explain what is missing: %s", body)
 	}
 }
-
-// An operator whose snapshot and binary disagree needs to know what this build
-// speaks.
-func TestVersionReportsTheABIAndCoreSize(t *testing.T) {
-	v := Version()
-	if !strings.Contains(v, "ABI 1") || !strings.Contains(v, "core.wasm") {
-		t.Fatalf("unexpected version string: %q", v)
-	}
-}

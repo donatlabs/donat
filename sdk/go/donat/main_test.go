@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 // The same metadata must work on either host. An action naming a webhook is
@@ -90,37 +89,6 @@ func TestAFailingWebhookBecomesAGraphQLError(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "invoice has no lines") {
 		t.Fatalf("the handler's reason must reach the client: %s", body)
-	}
-}
-
-// Run is Main without the exit. It must serve and then come down cleanly when
-// its context is cancelled, or Main would be a thing nobody can test.
-func TestRunServesAndShutsDownCleanly(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Setenv("DONAT_PORT", "0") // the OS picks a free port
-	done := make(chan error, 1)
-
-	go func() {
-		done <- Run(ctx,
-			WithBackend(Postgres(nil)),
-			WithMetadata(fixtureWithAction(t)),
-			WithFunction("render_invoice_pdf", func(_ context.Context, _ pdfArgs) (pdfOut, error) {
-				return pdfOut{URL: "x", Bytes: 1}, nil
-			}),
-		)
-	}()
-
-	// Give the listener a moment to bind before asking it to stop.
-	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run: %v", err)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("Run did not return after its context was cancelled")
 	}
 }
 
