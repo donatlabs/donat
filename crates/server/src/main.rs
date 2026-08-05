@@ -512,6 +512,16 @@ async fn main() -> anyhow::Result<()> {
     let mut metadata = match &args.metadata_dir {
         Some(dir) if dir.exists() => {
             let md = donat_metadata::load_metadata_dir(dir)?;
+            let in_process = donat_server::action::actions_without_a_handler(&md);
+            if !in_process.is_empty() {
+                anyhow::bail!(
+                    "actions {:?} declare no handler. A handler-less action is resolved \
+                     in-process by an embedded host that registers a function for it, and \
+                     this server has no such registry — give each one a `handler`, or serve \
+                     the metadata from an embedded host",
+                    in_process
+                );
+            }
             tracing::info!(dir = %dir.display(), "metadata loaded");
             md
         }

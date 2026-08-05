@@ -1926,7 +1926,15 @@ pub struct ActionDefinition {
     #[serde(default = "default_action_output_type")]
     pub output_type: String,
     /// Webhook URL ({{ENV}} templates allowed).
-    pub handler: String,
+    ///
+    /// Absent means the action is resolved **in-process** by a function the
+    /// embedding host registered under the action's name. Which host is
+    /// serving decides whether that is satisfiable, so neither can accept the
+    /// declaration silently: `donat-server` has no way to call an in-process
+    /// function and refuses such an action at boot, and an embedded host
+    /// refuses one whose function nobody registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<String>,
     #[serde(default)]
     pub forward_client_headers: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

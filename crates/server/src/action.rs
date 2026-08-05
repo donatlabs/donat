@@ -32,6 +32,21 @@ fn is_session_header(name: &str) -> bool {
     name.starts_with("x-donat-") || name.starts_with("x-hasura-")
 }
 
+/// The actions this binary cannot serve: those declaring no handler.
+///
+/// An absent handler means "resolved in-process by the embedding host", which
+/// is a thing an embedded Go host can do and this binary cannot. Accepting the
+/// declaration and failing per request would leave an operator with a field
+/// that exists in the schema and never works, so `main` refuses to start.
+pub fn actions_without_a_handler(metadata: &Metadata) -> Vec<&str> {
+    metadata
+        .actions
+        .iter()
+        .filter(|action| action.definition.handler.is_none())
+        .map(|action| action.name.as_str())
+        .collect()
+}
+
 /// Cloned slice of metadata needed to resolve an action operation after the
 /// engine read-lock is dropped.
 pub struct ActionContext {
@@ -263,7 +278,22 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
         "session_variables": session_vars,
     });
 
-    let url = resolve_url_template(&action.definition.handler);
+    // A handler-less action is resolved in-process by an embedded host. This
+    // binary has no such registry, so there is nothing to call. `main` refuses
+    // the declaration at boot; this is the guard for a snapshot that reached a
+    // request some other way.
+    let Some(handler) = action.definition.handler.as_deref() else {
+        return Err(err(
+            &path,
+            "unexpected",
+            format!(
+                "action '{}' declares no handler, so it runs only in an embedded host \
+                 that registers a function for it",
+                action.name
+            ),
+        ));
+    };
+    let url = resolve_url_template(handler);
     let mut req = state.http.post(&url).json(&payload);
     if let Some(seconds) = action.definition.timeout {
         req = req.timeout(std::time::Duration::from_secs(seconds));
@@ -1485,5 +1515,56 @@ mod tests {
         )
         .await;
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    /// An action with a `handler` is what every existing exported metadata
+    /// carries, and it must keep loading and keep being servable here — making
+    /// the field optional widens what deserializes, it does not change what a
+    /// v2 export means.
+    #[test]
+    fn an_action_with_a_handler_is_servable() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "actions": [{
+                "name": "send_email",
+                "definition": { "handler": "https://example.test/hook" }
+            }]
+        }))
+        .expect("metadata with a handler deserializes");
+        assert!(actions_without_a_handler(&metadata).is_empty());
+    }
+
+    /// The declaration this server cannot satisfy. It must be reported by name,
+    /// because the operator's next move is to decide per action whether it gets
+    /// a handler or moves to an embedded host.
+    #[test]
+    fn an_action_without_a_handler_is_reported_by_name() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "actions": [
+                { "name": "render_pdf", "definition": {} },
+                { "name": "send_email",
+                  "definition": { "handler": "https://example.test/hook" } }
+            ]
+        }))
+        .expect("metadata without a handler deserializes");
+        assert_eq!(actions_without_a_handler(&metadata), vec!["render_pdf"]);
+    }
+
+    /// A handler-less action must still route *as an action*. If it fell
+    /// through to table planning instead, the request would fail as an unknown
+    /// field and never reach the guard that explains the real cause.
+    #[test]
+    fn a_handler_less_action_still_routes_as_an_action() {
+        let metadata: Metadata = serde_json::from_value(json!({
+            "version": 3,
+            "actions": [{ "name": "render_pdf", "definition": {} }]
+        }))
+        .expect("metadata deserializes");
+        let doc = graphql_parser::parse_query::<String>("mutation { render_pdf }")
+            .expect("query parses")
+            .into_static();
+        let ctx = match_action(&metadata, &doc, None).expect("the operation is an action");
+        assert!(ctx.find("render_pdf").is_some());
     }
 }
