@@ -1,0 +1,2 @@
+# `go build` in a main package writes the executable beside the source.
+/petshop-golang

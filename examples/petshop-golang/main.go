@@ -1,98 +1,54 @@
-// Command petshop-golang is a boilerplate for embedding the Donat engine
-// IN-PROCESS in a Go application via the Go SDK.
+// Command petshop-golang is the smallest thing that serves a Donat API from a
+// Go binary.
 //
-// Architecture (in-memory, no webhook):
+// There is no wiring to read, because there is none to write: the behaviour is
+// in metadata/, and this file only says which snapshot to serve. Everything a
+// program normally spells out — the pool, the mux, the listener, the graceful
+// shutdown — is what donat.Main does.
 //
-//	┌─────────────────────────────────────────────────────────┐
-//	│  Go process (single binary, CGO_ENABLED=0)              │
-//	│                                                         │
-//	│  net/http mux            (server.go)                    │
-//	│    /v1/graphql  ──►  donat.Engine.Handler()             │
-//	│    /healthz     ──►  your own handler (composability)   │
-//	│                           │                             │
-//	│                    wazero (wasm runtime)                │
-//	│                    ┌──────────────┐                     │
-//	│                    │  core.wasm   │ ← Rust engine       │
-//	│                    │  (embedded)  │   compiled to wasm  │
-//	│                    └──────┬───────┘                     │
-//	│                           │ SQL                         │
-//	│                       pgxpool ──► Postgres              │
-//	│                           │                             │
-//	│   post-commit hooks, in-process   (handlers.go)         │
-//	│   donat.Registry: on_order_placed, on_pet_status        │
-//	└─────────────────────────────────────────────────────────┘
+//	metadata/      tables, permissions, relationships
+//	migrations/    the schema, applied out-of-band (the engine never runs DDL)
+//	main.go        this
 //
-// Use it as a template. The pieces you edit are split by concern:
-//
-//	config.go    — environment configuration
-//	handlers.go  — your event-trigger handlers (the business logic)
-//	server.go    — your HTTP routes, mounted next to the engine
-//	main.go      — wiring (this file)
-//
-// Schema is applied OUT-OF-BAND with `donat migrate` (the project's deploy
-// model — the engine never runs DDL). The platform's own deploy-time catalog
-// comes from the engine's migrations, not from a copy in this directory, so
-// the helper functions the error decoder pins cannot drift:
+// Deploy-time, exactly as the standalone engine is deployed:
 //
 //	donat --database-url <url> migrate --migrations-dir <repo>/migrations
 //	donat --database-url <url> migrate --migrations-dir migrations
-//	go run .                                                          # serve
+//	donat --database-url <url> dump-core-config --metadata-dir metadata
+//	DONAT_DATABASE_URL=<url> go run .
 //
-// docker-compose.yml wires the same flow: postgres → one-shot migrate → app.
+// docker-compose.yml wires the same flow: postgres → two one-shot migrates →
+// app.
+//
+// What to add next, and where it goes:
+//
+//   - logic no declaration can express (rendering a file, calling a library):
+//     donat.WithFunction, against an action declared in the metadata
+//   - work that runs after a write commits: donat.WithRegistry
+//   - your own routes, middleware or auth: build the engine with donat.New and
+//     mount eng.Handler() in your own mux
+//
+// [`examples/lending-golang`](../lending-golang) is the worked version of all
+// three.
 package main
 
 import (
-	"context"
 	_ "embed"
-	"log"
-	"net/http"
 
 	"github.com/donatlabs/donat/sdk/go/donat"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// coreConfig is the serialised {"metadata":..., "catalog":...} snapshot
-// produced by `donat dump-core-config`. The wasm engine loads it at startup via
-// core_init — no Rust binary is needed at runtime. Regenerate after a schema
-// change:
+// coreConfig is the {"metadata":…, "catalog":…} snapshot written by
+// `donat dump-core-config`. The wasm core compiles it at startup, so metadata
+// that does not compile fails the boot rather than the first request that
+// touches it. Regenerate after any schema or metadata change — and check it in
+// CI, because a stale snapshot is still a valid one:
 //
-//	donat dump-core-config --metadata-dir metadata --database-url <url> --out core-config.json
+//	donat --database-url <url> dump-core-config --metadata-dir metadata --check
 //
 //go:embed core-config.json
 var coreConfig []byte
 
 func main() {
-	cfg := LoadConfig()
-	ctx := context.Background()
-
-	// The engine never opens connections itself; you supply the pool
-	// (composability). The schema must already be migrated (`donat migrate`).
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
-	if err != nil {
-		log.Fatalf("pgxpool.New: %v", err)
-	}
-	defer pool.Close()
-
-	// Register your in-process event-trigger handlers (handlers.go).
-	reg := donat.NewRegistry()
-	RegisterHandlers(reg)
-
-	// Build the embedded engine over your pool + the serialised config.
-	eng, err := donat.New(ctx, donat.Config{
-		Backend:  donat.Postgres(pool),
-		Metadata: coreConfig,
-		Registry: reg,
-		PoolSize: cfg.PoolSize,
-	})
-	if err != nil {
-		log.Fatalf("donat.New: %v", err)
-	}
-
-	// Build the HTTP router (server.go) and serve.
-	mux := NewMux(eng)
-	log.Printf("petshop-golang listening on %s", cfg.Addr)
-	log.Printf("  GraphQL:  POST %s/v1/graphql  (header: X-Donat-Role: staff)", cfg.Addr)
-	log.Printf("  Healthz:  GET  %s/healthz", cfg.Addr)
-	log.Printf("  Handlers: %v (fire in-process, no webhook)", reg.Names())
-	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
+	donat.Main(donat.WithMetadata(coreConfig))
 }

@@ -52,17 +52,3 @@ delete_permissions:
 # Native Go handler: fires on every insert and on status changes. Delivered
 # to the `handler` service (see docker-compose.yml); the name must match the
 # donat.On(reg, "on_order_placed", ...) registration in main.go.
-event_triggers:
-  - name: on_order_placed
-    definition:
-      enable_manual: false
-      insert:
-        columns: "*"
-      update:
-        columns:
-          - status
-    retry_conf:
-      num_retries: 3
-      interval_sec: 5
-      timeout_sec: 60
-    webhook: http://handler:8081/events

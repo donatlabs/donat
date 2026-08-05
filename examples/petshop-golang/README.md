@@ -1,266 +1,121 @@
-# petshop-golang — standalone in-memory embedded engine
+# petshop-golang — the minimal embedded host
 
-A self-contained petshop demo that runs the Donat GraphQL engine **in-process**
-inside a single Go binary. The Rust engine executes as a WebAssembly module via
-[wazero](https://wazero.io) — no cgo, no shared libraries, no Rust binary
-needed at runtime. Event triggers fire **registered Go handlers in-process**,
-not over an HTTP webhook.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Go process (CGO_ENABLED=0, single static binary)           │
-│                                                             │
-│  net/http mux                                               │
-│    /v1/graphql  ──►  donat.Engine.Handler()                 │
-│    /healthz     ──►  your own handler  (composability)      │
-│                           │                                 │
-│                    wazero (wasm runtime, pure Go)           │
-│                    ┌──────────────┐                         │
-│                    │  core.wasm   │  ←  Rust engine         │
-│                    │  (embedded)  │     compiled to wasm    │
-│                    └──────┬───────┘                         │
-│                           │ SQL                             │
-│                       pgxpool ──► Postgres                  │
-│                           │                                 │
-│              post-commit hooks (in-process, no webhook)     │
-│              ┌─────────────────────────────┐               │
-│              │  donat.Registry              │               │
-│              │  "on_order_placed" handler   │               │
-│              │  "on_pet_status"   handler   │               │
-│              └─────────────────────────────┘               │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Key difference from the old webhook model:** previously, the engine POSTed
-event envelopes to a separate HTTP handler service; the Go process received
-them over the network. Here the engine embeds the Rust core as wasm, and after
-each mutation commits, the in-process registry dispatches to your Go handlers
-directly — no HTTP round-trip, no separate handler service, no retry queue.
-
-The `webhook:` fields that remain in `metadata/**/*.yaml` are placeholders kept
-for schema compatibility. They are never contacted; the in-process registry
-intercepts every event before any HTTP delivery is attempted.
-
-## What is in this directory
-
-Use it as a **template**. The app code is split by concern so it reads as
-boilerplate:
-
-| Path | Purpose |
-|---|---|
-| `main.go` | Wiring only: config → pool → registry → engine → serve |
-| `config.go` | Environment configuration (`DATABASE_URL`, `ADDR`, pool size) |
-| `handlers.go` | **Your event-trigger handlers** — the business logic you edit |
-| `server.go` | **Your HTTP routes**, mounted next to the engine's GraphQL handler |
-| `gen/donat_gen.go` | Generated row structs — `donat codegen go` output, do not edit |
-| `core-config.json` | Pre-serialised `{metadata, catalog}` snapshot for `core_init` |
-| `metadata/` | Petshop YAML metadata with `event_triggers` declarations |
-| `migrations/` | `V{n}__*.sql` — this example's own DDL and demo seed. The platform's deploy-time catalog is NOT copied here; it is applied from the engine's own `migrations/` directory. |
-| `Dockerfile` | Multi-stage, `CGO_ENABLED=0`, distroless final image |
-| `docker-compose.yml` | `db` (postgres:16) → one-shot `migrate` → `app` |
-| `go.mod` | Module with `replace` to the in-repo SDK |
-
-To adapt it: edit `handlers.go` (your event logic), `server.go` (your routes),
-and swap the `metadata/` + `migrations/` for your schema (then regenerate
-`gen/` with `donat codegen go` and `core-config.json` with `donat dump-core-config`).
-
-## Quick start — docker-compose
-
-```bash
-# From the repository root:
-docker-compose -f examples/petshop-golang/docker-compose.yml up --build
-```
-
-Compose runs the project's deploy model: `postgres` → two one-shot `donat
-migrate` runs (the platform's own catalog, then this schema and demo seed) →
-the Go `app` (serves GraphQL and fires the in-process hooks). The engine itself
-never runs DDL, and this example keeps no copy of the platform's DDL, so the
-helper functions the error decoder pins cannot drift from a stale local copy.
-
-### Or run locally (no Docker)
-
-```bash
-# 1. Migrate the schema once (the engine never runs DDL):
-URL=postgresql://postgres:postgres@localhost:5432/petshop_golang
-donat --database-url "$URL" migrate --migrations-dir <repo>/migrations
-donat --database-url "$URL" migrate --migrations-dir migrations
-
-# 2. Serve (reads DATABASE_URL, default localhost:15432):
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/petshop_golang go run .
-```
-
-(`--database-url` is a top-level flag, before the subcommand.) The app needs no
-Rust binary at runtime — `core-config.json` is embedded.
-
-## Demo queries
-
-All requests go to `http://localhost:8080/v1/graphql`. The engine enforces the
-no-admin rule: `X-Donat-Role` is always required.
-
-### Query pets (staff role sees all rows)
-
-```bash
-curl -s -X POST http://localhost:8080/v1/graphql \
-  -H "Content-Type: application/json" \
-  -H "X-Donat-Role: staff" \
-  -d '{"query":"query { pet(limit:3) { id name status price } }"}' | jq .
-```
-
-Expected response:
-
-```json
-{
-  "data": {
-    "pet": [
-      {"id": 1, "name": "Rex",     "status": "available", "price": 350.00},
-      {"id": 2, "name": "Bella",   "status": "available", "price": 420.00},
-      {"id": 3, "name": "Whiskers","status": "available", "price":  90.00}
-    ]
-  }
-}
-```
-
-### Update a pet status — fires `on_pet_status` handler in-process
-
-```bash
-curl -s -X POST http://localhost:8080/v1/graphql \
-  -H "Content-Type: application/json" \
-  -H "X-Donat-Role: staff" \
-  -d '{"query":"mutation { update_pet(where:{id:{_eq:1}}, _set:{status:\"sold\"}) { affected_rows returning { id name status } } }"}' | jq .
-```
-
-Check the app logs — you will see the handler fire immediately after the
-mutation commits (no webhook, no round-trip):
-
-```
-[event] on_pet_status fired: op=UPDATE trigger=on_pet_status table=pet
-```
-
-### Insert an order — fires `on_order_placed` handler in-process
-
-Customer role requires `X-Donat-User-Id` (the session variable the metadata
-uses as the `customer_id` preset):
-
-```bash
-curl -s -X POST http://localhost:8080/v1/graphql \
-  -H "Content-Type: application/json" \
-  -H "X-Donat-Role: customer" \
-  -H "X-Donat-User-Id: 1" \
-  -d '{"query":"mutation { insert_orders(objects:[{status:\"placed\"}]) { affected_rows returning { id customer_id status } } }"}' | jq .
-```
-
-App log:
-
-```
-[event] on_order_placed fired: op=INSERT trigger=on_order_placed table=orders
-```
-
-### Update an order status — fires `on_order_placed` UPDATE handler
-
-```bash
-curl -s -X POST http://localhost:8080/v1/graphql \
-  -H "Content-Type: application/json" \
-  -H "X-Donat-Role: staff" \
-  -d '{"query":"mutation { update_orders(where:{id:{_eq:1}}, _set:{status:\"shipped\"}) { affected_rows returning { id customer_id status } } }"}' | jq .
-```
-
-App log:
-
-```
-[event] on_order_placed fired: op=UPDATE trigger=on_order_placed table=orders
-```
-
-### Composability — your own route next to the engine
-
-```bash
-curl http://localhost:8080/healthz
-# {"status":"ok"}
-```
-
-`/healthz` is a plain `mux.HandleFunc` registered in `main.go` alongside
-`eng.Handler()`. The engine does not own the server — you do.
-
-## How it works
-
-### Engine construction
+A Donat API served from a Go binary, in as little Go as it takes. The whole
+program:
 
 ```go
 //go:embed core-config.json
 var coreConfig []byte
 
-eng, err := donat.New(ctx, donat.Config{
-    Backend:  donat.Postgres(pool), // your database, behind the Backend interface
-    Metadata: coreConfig,           // pre-serialised metadata+catalog snapshot
-    Registry: reg,                  // in-process event handler registry
-    PoolSize: 4,                    // wasm instance pool
-})
+func main() {
+    donat.Main(donat.WithMetadata(coreConfig))
+}
 ```
 
-`core-config.json` was produced by:
+That is not an abridged listing — it is `main.go`. The behaviour lives in
+`metadata/`; the pool, the mux, the listener and the graceful shutdown are what
+`donat.Main` does. No cgo: the Rust core is compiled to `wasm32` and driven
+through [wazero](https://wazero.io), so the binary is static and the module is
+`go get`-able.
+
+Start here when you want a Donat API inside your own process. Go to
+[`examples/lending-golang`](../lending-golang) to see the parts you add to it.
+
+## Running it
 
 ```bash
-donat dump-core-config \
-  --database-url postgresql://... \
-  --metadata-dir examples/petshop-golang/metadata \
-  --out examples/petshop-golang/core-config.json
+docker compose up --build
 ```
 
-Note: `--database-url` is a top-level flag (before the subcommand), not a
-subcommand flag. Regenerate this file whenever the metadata or schema changes.
+That is postgres → two one-shot migrates → the app. Then:
 
-### Event handler registration
+```bash
+curl -s localhost:8080/v1/graphql \
+  -H 'content-type: application/json' \
+  -H 'X-Donat-Role: staff' \
+  -d '{"query":"{ pet(limit: 3) { id name status } }"}'
+```
+
+Every request runs as exactly one role, taken from `X-Donat-Role`. A request
+without it is denied before it reaches the database — this engine has no admin
+role, and there is no way around a permission.
+
+## Running it directly
+
+The engine never runs DDL, so the schema is applied out-of-band, exactly the
+way the standalone engine deploys:
+
+```bash
+donat --database-url "$URL" migrate --migrations-dir ../../migrations
+donat --database-url "$URL" migrate --migrations-dir migrations
+donat --database-url "$URL" dump-core-config --metadata-dir metadata
+DONAT_DATABASE_URL="$URL" go run .
+```
+
+`--help` lists what `main` reads from the environment; `--version` reports the
+core ABI the binary carries.
+
+Do not copy the platform's own migrations into this directory. The helper
+functions they install are an internal protocol that the GraphQL error decoder
+pins by SQLSTATE and envelope, and a local copy drifts silently: a stale
+function still exists and still raises, just in a shape the decoder no longer
+recognises.
+
+## The snapshot
+
+`core-config.json` is `{metadata, catalog}` — the metadata directory plus the
+live catalog, compiled by the core at startup. Metadata that does not compile
+fails the boot rather than the first request that touches it.
+
+It is generated and then committed, so it goes stale the moment the metadata or
+the schema changes, and the engine cannot notice: a stale snapshot is a
+perfectly valid one. Check it in CI:
+
+```bash
+donat --database-url "$URL" dump-core-config --metadata-dir metadata --check
+```
+
+## What is here
+
+| Path | What it is |
+| --- | --- |
+| `metadata/` | Tables, per-role permissions, relationships. The behaviour. |
+| `migrations/` | This application's own schema and demo seed. The platform's catalog is not copied here; it is applied from the engine's own `migrations/`. |
+| `core-config.json` | The compiled snapshot the binary embeds. |
+| `main.go` | Which snapshot to serve. |
+| `Dockerfile` | Multi-stage, `CGO_ENABLED=0`, distroless final image. |
+| `docker-compose.yml` | `db` → two one-shot migrates → `app`. |
+| `go.mod` | Module with a `replace` to the in-repo SDK. |
+
+## What you add next
+
+This example deliberately declares nothing it does not implement — no event
+triggers without handlers, no actions without functions. Each of the three
+extension points is one option away.
+
+**Logic no declaration can express** — rendering a file, calling a library.
+Declare an action in the metadata *without* a `handler`, which is what makes it
+resolved in this process, and write the body:
 
 ```go
-reg := donat.NewRegistry()
-
-donat.On(reg, "on_pet_status", func(_ context.Context, ev donat.Event[gen.Pet]) error {
-    log.Printf("[event] on_pet_status fired: op=%s table=%s", ev.Op, ev.Table.Name)
-    return nil
-})
+donat.Main(
+    donat.WithMetadata(coreConfig),
+    donat.WithFunction("render_invoice_pdf", renderInvoicePDF),
+)
 ```
 
-The trigger name (`"on_pet_status"`) must match the `event_triggers[].name`
-in the table YAML. The handler is called synchronously after the mutation's
-Postgres transaction commits — in the same Go process, no network.
+The engine refuses to start if a declared action has no function, or if the Go
+struct disagrees with the arguments the metadata declares.
 
-### SDK v1 data limitation
+**Work that runs after a write commits** — notifying, indexing, emitting a
+metric. Declare `event_triggers` on the table and register handlers with
+`donat.WithRegistry`. Use it only for work that may fail without undoing the
+write; whether the write was *allowed* belongs in the metadata, where it
+compiles into the same statement.
 
-In the current SDK v1, the in-process hook envelope carries the mutation result
-shape (e.g. `{"affected_rows":1,"returning":[...]}`) as `ev.New`, not the
-individual captured row. `ev.Table` and `ev.Trigger` are always accurate.
-Full old/new row capture (matching the webhook envelope) is a planned v2
-follow-up. The webhook model carried proper row data via the PG trigger
-(`donat.notify_event()`); the in-process path currently provides the mutation
-result. Handlers should use `ev.Table.Name` / `ev.Op` for routing and query
-the database for row details if needed.
+**Your own routes, middleware or auth** — build the engine with `donat.New`
+instead, and mount `eng.Handler()` in your own mux beside your own routes.
 
-## Building locally (no Docker)
-
-```bash
-# From the repo root:
-cd examples/petshop-golang
-CGO_ENABLED=0 go build -o /tmp/petshop .
-
-DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/petshop_golang \
-  /tmp/petshop
-```
-
-Migrate the database first — the platform's `migrations/`, then this
-directory's (`donat --database-url <url> migrate --migrations-dir <dir>`) — the
-app only serves, it never runs DDL.
-
-The binary is fully static — no libc, no cgo, no runtime dependencies other
-than the Postgres connection you point it at.
-
-## Roles and headers
-
-| Role | Header | Capabilities |
-|---|---|---|
-| `staff` | `X-Donat-Role: staff` | Full read/write on all tables |
-| `customer` | `X-Donat-Role: customer` + `X-Donat-User-Id: <id>` | Own orders + available pets |
-| `anonymous` | `X-Donat-Role: anonymous` | Available pets only, read-only |
-
-The engine enforces the no-admin rule: `X-Donat-Role` is always required.
-Requests without it are denied with an `access-denied` error.
+All three are worked through in
+[`examples/lending-golang`](../lending-golang); the SDK reference is
+[`sdk/go/README.md`](../../sdk/go/README.md).

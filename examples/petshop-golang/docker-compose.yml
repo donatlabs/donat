@@ -66,6 +66,8 @@ services:
       migrate-domain:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang
+      # donat.Main reads its database from the environment, the way the
+      # standalone engine does.
+      DONAT_DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang
     ports:
       - "8080:8080"

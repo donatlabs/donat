@@ -199,25 +199,6 @@
                   "filter": {}
                 }
               }
-            ],
-            "event_triggers": [
-              {
-                "name": "on_pet_status",
-                "definition": {
-                  "enable_manual": false,
-                  "update": {
-                    "columns": [
-                      "status"
-                    ]
-                  }
-                },
-                "webhook": "http://handler:8081/events",
-                "retry_conf": {
-                  "num_retries": 3,
-                  "interval_sec": 5,
-                  "timeout_sec": 60
-                }
-              }
             ]
           },
           {
@@ -379,28 +360,6 @@
                 "role": "staff",
                 "permission": {
                   "filter": {}
-                }
-              }
-            ],
-            "event_triggers": [
-              {
-                "name": "on_order_placed",
-                "definition": {
-                  "enable_manual": false,
-                  "insert": {
-                    "columns": "*"
-                  },
-                  "update": {
-                    "columns": [
-                      "status"
-                    ]
-                  }
-                },
-                "webhook": "http://handler:8081/events",
-                "retry_conf": {
-                  "num_retries": 3,
-                  "interval_sec": 5,
-                  "timeout_sec": 60
                 }
               }
             ]
