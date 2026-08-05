@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use donat_catalog_types::{Catalog, ColumnInfo, ForeignKey, TableInfo};
 use donat_metadata::Metadata;
-use donat_wasm_core::compile::{compile, CompileInput, CoreState};
+use donat_wasm_core::compile::{CompileInput, CoreState, compile};
 use donat_wasm_core::plan::PlanV1;
 
 // -----------------------------------------------------------------------
@@ -115,7 +115,11 @@ fn catalog() -> Catalog {
             name: "author".into(),
             relation_kind: donat_catalog_types::RelationKind::Table,
             unique_keys: vec![],
-            columns: vec![col("id", "int4"), col("name", "text"), col("secret", "text")],
+            columns: vec![
+                col("id", "int4"),
+                col("name", "text"),
+                col("secret", "text"),
+            ],
             primary_key: vec!["id".into()],
             foreign_keys: vec![],
         },
@@ -142,7 +146,10 @@ fn catalog() -> Catalog {
             }],
         },
     );
-    Catalog { tables, functions: BTreeMap::new() }
+    Catalog {
+        tables,
+        functions: BTreeMap::new(),
+    }
 }
 
 fn state_of(metadata: donat_metadata::Metadata) -> CoreState {
@@ -158,7 +165,9 @@ fn fixture_state() -> CoreState {
 }
 
 fn session_vars(role: &str) -> HashMap<String, String> {
-    [("x-donat-role".to_string(), role.to_string())].into_iter().collect()
+    [("x-donat-role".to_string(), role.to_string())]
+        .into_iter()
+        .collect()
 }
 
 fn user_session_vars() -> HashMap<String, String> {
@@ -498,8 +507,7 @@ fn command_emits_hooks_for_the_tables_its_steps_write() {
     };
     match compile(&state, &input) {
         PlanV1::Mutation(body) => {
-            let triggers: Vec<&str> =
-                body.hooks.iter().map(|h| h.trigger.as_str()).collect();
+            let triggers: Vec<&str> = body.hooks.iter().map(|h| h.trigger.as_str()).collect();
             assert_eq!(
                 triggers,
                 vec!["on_author_updated"],
@@ -512,5 +520,108 @@ fn command_emits_hooks_for_the_tables_its_steps_write() {
             assert_eq!(body.hooks[0].phase, "post_commit");
         }
         other => panic!("expected a mutation plan, got {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------------------
+// What the embedded core refuses, and when
+// -----------------------------------------------------------------------
+
+/// The same command, plus an effect that starts a durable Process.
+fn metadata_with_process_effect() -> Metadata {
+    let mut value =
+        serde_json::to_value(metadata_with_command()).expect("command fixture serializes");
+    value["commands"][0]["idempotency"] = serde_json::json!({
+        "key": { "argument": "new_name" }
+    });
+    value["commands"][0]["effects"] = serde_json::json!([{
+        "start_process": {
+            "process": "onboard_author",
+            "idempotency_key": { "argument": "new_name" }
+        }
+    }]);
+    serde_json::from_value(value).expect("metadata with a process effect deserializes")
+}
+
+/// A durable Process needs a journal, a transition queue and leases, none of
+/// which exist here — so a command that declares one must be refused while the
+/// snapshot compiles, not accepted and then quietly stripped of its effect at
+/// runtime. `sdk/go/README.md` promises exactly this, and ADR 034 makes a
+/// declaration the runtime ignores a defect rather than a limitation.
+#[test]
+fn a_command_starting_a_process_is_refused_at_snapshot_compile() {
+    let err = CoreState::compile_snapshot(
+        metadata_with_process_effect(),
+        HashMap::from([("default".to_string(), catalog())]),
+    )
+    .err()
+    .expect("a process effect must not compile in the embedded core");
+
+    // The operator has a directory of command files; the message has to say
+    // which declaration is at fault.
+    assert!(
+        err.message.contains("onboard_author"),
+        "the refusal must name the process it cannot run: {err:?}"
+    );
+}
+
+/// A command with no effects is the control: the refusal above must come from
+/// the effect, not from effects being present in the fixture at all.
+#[test]
+fn a_command_without_effects_still_compiles() {
+    CoreState::compile_snapshot(
+        metadata_with_command(),
+        HashMap::from([("default".to_string(), catalog())]),
+    )
+    .expect("a command with no process effect must still compile");
+}
+
+/// The same fixture, with the author's `secret` column declared a file.
+fn metadata_with_attachment() -> Metadata {
+    let mut value = serde_json::to_value(metadata()).expect("fixture metadata serializes");
+    value["sources"][0]["tables"][0]["attachments"] = serde_json::json!([{
+        "column": "secret",
+        "backend": "files",
+        "max_bytes": 1024
+    }]);
+    // The base fixture withholds `secret` from every role; a field the role
+    // cannot select would fail for the wrong reason.
+    value["sources"][0]["tables"][0]["select_permissions"][0]["permission"]["columns"] =
+        serde_json::json!(["id", "name", "display_name", "secret"]);
+    serde_json::from_value(value).expect("metadata with an attachment deserializes")
+}
+
+/// File attachments are not available in the embedded core: signing a URL
+/// needs the storage material the standalone server resolves per request, and
+/// nothing here supplies it.
+///
+/// Unlike a Process effect, an attachment is *not* refused while the snapshot
+/// compiles — the declaration is accepted and the field fails when it is
+/// selected. The distinction matters to an operator deciding what a deploy
+/// proves, so it is pinned rather than described: if attachments ever do start
+/// failing at boot, this test should be the thing that says so.
+#[test]
+fn an_attachment_compiles_but_its_field_cannot_be_selected() {
+    let state = state_of(metadata_with_attachment());
+
+    let input = CompileInput {
+        query: "{ author { id secret { url } } }".to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: user_session_vars(),
+        stringify_numerics: false,
+        dialect: None,
+    };
+    match compile(&state, &input) {
+        PlanV1::Error(body) => {
+            // A caller has to be able to tell "not configured here" from
+            // "you may not read this", so the message must not read as a
+            // permission denial.
+            assert!(
+                body.message.contains("storage"),
+                "the failure must name the missing storage configuration: {body:?}"
+            );
+        }
+        other => panic!("expected selecting a file column to fail, got {other:?}"),
     }
 }

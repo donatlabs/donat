@@ -126,7 +126,9 @@ fails the boot rather than the first request that touches it.
 
 ## What the embedded host does not do
 
-Stated plainly, because these fail at boot rather than degrading quietly:
+Stated plainly, because each fails loudly rather than degrading quietly — but
+they do not all fail at the same moment, and the difference decides what a
+successful deploy actually proves:
 
 - **Durable Processes.** A command declaring `effects:` that start or signal a
   Process is **refused when the snapshot compiles**. A Process needs a journal,
@@ -138,8 +140,14 @@ Stated plainly, because these fail at boot rather than degrading quietly:
   [ADR 010](../../knowledgebase/declarative-saas/decisions/010-static-community-connector-factory-and-runtime-boundaries.md),
   which rejects loading any plugin at runtime — so a connector is not a place
   user Go code plugs in on either host.
-- **File attachments.** Storage is not wired into the wasm core, so
-  upload/download URL minting is unavailable.
+- **File attachments.** Storage is not wired into the wasm core, so no URL can
+  be signed. Unlike a Process effect, this one is **not caught when the
+  snapshot compiles**: an `attachments:` declaration loads, the file field
+  appears in the schema, and the request that selects it fails with `field
+  '<name>' is not available: this deployment has no storage configuration`. A
+  boot that succeeds is therefore not evidence that your attachment metadata
+  works here. Pinned by `an_attachment_compiles_but_its_field_cannot_be_selected`
+  in `crates/wasm-core/tests/plan_snapshots.rs`.
 - **Subscriptions and the REST/MCP surfaces.** GraphQL over HTTP only.
 
 Commands *without* effects — the large majority — plan and execute with the
