@@ -247,9 +247,11 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
             ));
         }
         let loops = Arc::clone(&runtime);
-        tokio::spawn(supervise(runtime.source_name.clone(), "source", move || {
-            run(Arc::clone(&loops), poll_interval)
-        }));
+        tokio::spawn(supervise(
+            runtime.source_name.clone(),
+            "source",
+            move || run(Arc::clone(&loops), poll_interval),
+        ));
     }
     Ok(())
 }

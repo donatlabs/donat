@@ -177,7 +177,10 @@ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
 ORDER BY t.typname, e.enumsortorder";
 
 async fn fetch_enums(client: &tokio_postgres::Client) -> Result<EnumMap> {
-    let rows = client.query(ENUMS_SQL, &[]).await.context("querying pg_enum")?;
+    let rows = client
+        .query(ENUMS_SQL, &[])
+        .await
+        .context("querying pg_enum")?;
     let mut map = EnumMap::new();
     for row in rows {
         let typname: String = row.get(0);
@@ -263,7 +266,11 @@ pub async fn dump_core_config(database_url: &str, metadata_dir: &Path, out: &Pat
 /// already valid Go; gofmt only aligns struct columns. If gofmt is not on
 /// PATH we leave the valid-but-unaligned file and log a hint.
 fn gofmt_in_place(path: &Path) {
-    match std::process::Command::new("gofmt").arg("-w").arg(path).status() {
+    match std::process::Command::new("gofmt")
+        .arg("-w")
+        .arg(path)
+        .status()
+    {
         Ok(s) if s.success() => {}
         Ok(s) => tracing::warn!(status = ?s, "gofmt exited non-zero; left unformatted (valid) Go"),
         Err(_) => tracing::info!("gofmt not found on PATH; generated valid Go is left unformatted"),
@@ -383,8 +390,8 @@ mod tests {
             relation_kind: donat_catalog::RelationKind::Table,
             unique_keys: vec![],
             columns: vec![
-                col("ids", "_int4", false),  // int4[] -> []int32
-                col("tags", "_text", true),  // nullable text[] -> *[]string
+                col("ids", "_int4", false), // int4[] -> []int32
+                col("tags", "_text", true), // nullable text[] -> *[]string
             ],
             primary_key: vec![],
             foreign_keys: vec![],
@@ -409,7 +416,7 @@ mod tests {
             columns: vec![
                 col("id", "int4", false),
                 col("status", "task_status", false), // enum
-                col("prev", "task_status", true),     // nullable enum -> pointer
+                col("prev", "task_status", true),    // nullable enum -> pointer
             ],
             primary_key: vec![],
             foreign_keys: vec![],

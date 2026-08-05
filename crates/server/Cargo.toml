@@ -14,6 +14,7 @@ name = "donat"
 path = "src/main.rs"
 
 [dependencies]
+donat-action = { path = "../action" }
 donat-metadata = { path = "../metadata" }
 donat-rules = { path = "../rules" }
 donat-catalog = { path = "../catalog" }

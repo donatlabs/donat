@@ -1,0 +1,12 @@
+[package]
+name = "donat-action"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Action routing, argument binding and response shaping, with no transport"
+
+[dependencies]
+donat-metadata = { path = "../metadata" }
+graphql-parser = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

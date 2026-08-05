@@ -609,6 +609,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-action"
+version = "0.1.0"
+dependencies = [
+ "donat-metadata",
+ "graphql-parser",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "donat-backend"
 version = "0.1.0"
 dependencies = [
@@ -750,6 +760,7 @@ dependencies = [
  "clap",
  "croner",
  "deadpool-postgres",
+ "donat-action",
  "donat-backend",
  "donat-catalog",
  "donat-connector-abi",
