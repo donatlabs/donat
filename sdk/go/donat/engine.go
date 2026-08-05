@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"sync"
 )
@@ -21,7 +22,10 @@ type Config struct {
 	// so New refuses to start when one has no function: the field would be
 	// in the schema and never work.
 	Functions *Functions
-	PoolSize  int // wasm instance pool size (default 4)
+	// HTTPClient calls actions that declare a webhook handler. Optional;
+	// http.DefaultClient is used when unset.
+	HTTPClient *http.Client
+	PoolSize   int // wasm instance pool size (default 4)
 }
 
 // Option configures a Config. The same options build the Config that Main
