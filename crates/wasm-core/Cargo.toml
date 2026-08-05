@@ -11,6 +11,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 donat-action = { path = "../action" }
 donat-metadata = { path = "../metadata" }
+donat-storage = { path = "../storage" }
+chrono = { workspace = true }
 donat-schema = { path = "../schema" }
 donat-sqlgen = { path = "../sqlgen" }
 donat-backend = { path = "../backend" }

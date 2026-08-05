@@ -83,6 +83,14 @@ pub extern "C" fn core_init(ptr: *mut u8, len: i32) -> i32 {
         catalog: Option<donat_catalog_types::Catalog>,
         #[serde(default)]
         catalogs: Option<std::collections::HashMap<String, donat_catalog_types::Catalog>>,
+        /// Deployment secrets the storage registry resolves its
+        /// `value_from_env` references against.
+        ///
+        /// Supplied by the host rather than read from an environment, because
+        /// wasm has none — and because a signing key has no business in a
+        /// `core-config.json` that ships inside a binary.
+        #[serde(default)]
+        secrets: std::collections::HashMap<String, String>,
     }
     let cfg = match serde_json::from_slice::<Cfg>(bytes) {
         Ok(cfg) => cfg,
@@ -106,7 +114,7 @@ pub extern "C" fn core_init(ptr: *mut u8, len: i32) -> i32 {
         }
         (None, None) => std::collections::HashMap::new(),
     };
-    match compile::CoreState::compile_snapshot(cfg.metadata, catalogs) {
+    match compile::CoreState::compile_snapshot_with_secrets(cfg.metadata, catalogs, cfg.secrets) {
         Ok(state) => {
             STATE.with(|s| *s.borrow_mut() = Some(state));
             set_last_error(String::new());

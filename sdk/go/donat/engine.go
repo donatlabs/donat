@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Config constructs an Engine. The Backend is supplied by the caller — the
@@ -25,7 +26,18 @@ type Config struct {
 	// HTTPClient calls actions that declare a webhook handler. Optional;
 	// http.DefaultClient is used when unset.
 	HTTPClient *http.Client
-	PoolSize   int // wasm instance pool size (default 4)
+	// Secrets resolve the `value_from_env` references in the metadata's
+	// storage configuration. They are supplied here rather than baked into
+	// the snapshot, because a signing key has no business in a file that
+	// ships inside a binary.
+	Secrets map[string]string
+	// ExternalBaseURL is the absolute prefix for engine-served URLs, e.g.
+	// "https://api.example.com". Empty means same-origin.
+	ExternalBaseURL string
+	// Now overrides the clock URLs are signed with. Optional; time.Now is
+	// used when unset.
+	Now      func() time.Time
+	PoolSize int // wasm instance pool size (default 4)
 }
 
 // Option configures a Config. The same options build the Config that Main
@@ -41,6 +53,18 @@ type Engine struct {
 	mu       sync.Mutex
 	insts    []*wasmCore // idle wazero instances, each seeded by core_init
 	cache    sync.Map    // planCacheKey -> Plan
+	// signsURLs is true when the metadata declares a file attachment, which
+	// makes every plan unique to its request and therefore uncacheable.
+	signsURLs bool
+}
+
+// now is the clock the engine signs with. Config.Now overrides it so a test
+// can pin a day boundary.
+func (e *Engine) now() time.Time {
+	if e.cfg.Now != nil {
+		return e.cfg.Now()
+	}
+	return time.Now()
 }
 
 // New constructs and returns a ready Engine. It pre-seeds one wasm instance
@@ -52,10 +76,14 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 	if cfg.PoolSize == 0 {
 		cfg.PoolSize = 4
 	}
+	signs, err := snapshotDeclaresAttachments(cfg.Metadata)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkFunctionsCoverActions(cfg.Metadata, cfg.Functions); err != nil {
 		return nil, err
 	}
-	e := &Engine{cfg: cfg, backend: cfg.Backend, registry: cfg.Registry}
+	e := &Engine{cfg: cfg, backend: cfg.Backend, registry: cfg.Registry, signsURLs: signs}
 	// Pre-seed one instance to fail fast on a bad metadata/catalog blob.
 	c, err := e.newSeededInstance(ctx)
 	if err != nil {
@@ -70,7 +98,12 @@ func (e *Engine) newSeededInstance(ctx context.Context) (*wasmCore, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.initState(ctx, e.cfg.Metadata); err != nil {
+	snapshot, err := withSecrets(e.cfg.Metadata, e.cfg.Secrets)
+	if err != nil {
+		_ = c.close(ctx)
+		return nil, err
+	}
+	if err := c.initState(ctx, snapshot); err != nil {
 		_ = c.close(ctx)
 		return nil, fmt.Errorf("core_init: %w", err)
 	}
@@ -120,6 +153,13 @@ type compileInput struct {
 	SessionVars       map[string]string          `json:"session_vars"`
 	StringifyNumerics bool                       `json:"stringify_numerics"`
 	Dialect           string                     `json:"dialect,omitempty"`
+	// Now is the instant this request signs file URLs as of, RFC 3339. wasm
+	// has no clock, and a signature carries a day-scoped key and an expiry,
+	// so the time travels with the request.
+	Now string `json:"now,omitempty"`
+	// ExternalBaseURL is the absolute prefix for engine-served URLs. Empty
+	// means same-origin, which is what a browser needs by default.
+	ExternalBaseURL string `json:"external_base_url,omitempty"`
 }
 
 // compilePlan runs the wasm core (or returns a cached Plan). The cache key
@@ -131,6 +171,20 @@ func (e *Engine) compilePlan(ctx context.Context, in compileInput) (Plan, error)
 	if in.Dialect == "" {
 		in.Dialect = e.backend.Dialect()
 	}
+	if in.Now == "" {
+		in.Now = e.now().UTC().Format(time.RFC3339)
+	}
+	if in.ExternalBaseURL == "" {
+		in.ExternalBaseURL = e.cfg.ExternalBaseURL
+	}
+	// A plan that signs a URL must never be reused. The signature covers a
+	// one-shot upload id and a day-scoped key, so a cached plan would hand
+	// two callers the same staging object and would keep serving yesterday's
+	// key after the day rolls over. Deployments with no attachments — the
+	// common case — cache exactly as before.
+	if e.signsURLs {
+		return e.compileUncached(ctx, in)
+	}
 	key := planCacheKey{
 		query:    in.Query,
 		role:     in.SessionVars["x-donat-role"],
@@ -141,6 +195,16 @@ func (e *Engine) compilePlan(ctx context.Context, in compileInput) (Plan, error)
 	if v, ok := e.cache.Load(key); ok {
 		return v.(Plan), nil
 	}
+	p, err := e.compileUncached(ctx, in)
+	if err != nil {
+		return Plan{}, err
+	}
+	e.cache.Store(key, p)
+	return p, nil
+}
+
+// compileUncached runs the wasm core without consulting or filling the cache.
+func (e *Engine) compileUncached(ctx context.Context, in compileInput) (Plan, error) {
 	c, err := e.acquire(ctx)
 	if err != nil {
 		return Plan{}, err
@@ -154,12 +218,7 @@ func (e *Engine) compilePlan(ctx context.Context, in compileInput) (Plan, error)
 	if err != nil {
 		return Plan{}, err
 	}
-	p, err := decodePlan(out)
-	if err != nil {
-		return Plan{}, err
-	}
-	e.cache.Store(key, p)
-	return p, nil
+	return decodePlan(out)
 }
 
 // hashJSON returns a sha256 hex digest of the JSON-marshalled value.

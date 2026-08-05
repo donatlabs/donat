@@ -834,6 +834,7 @@ dependencies = [
 name = "donat-wasm-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "donat-action",
  "donat-backend",
  "donat-catalog-types",
@@ -841,6 +842,7 @@ dependencies = [
  "donat-metadata",
  "donat-schema",
  "donat-sqlgen",
+ "donat-storage",
  "getrandom 0.4.2",
  "graphql-parser",
  "insta",

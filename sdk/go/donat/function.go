@@ -156,3 +156,57 @@ func checkFunctionsCoverActions(snapshot []byte, f *Functions) error {
 		missing,
 	)
 }
+
+// snapshotDeclaresAttachments reports whether any table in the snapshot
+// declares a file column, which is what makes a plan unique to its request and
+// therefore uncacheable.
+func snapshotDeclaresAttachments(snapshot []byte) (bool, error) {
+	if len(snapshot) == 0 {
+		return false, nil
+	}
+	var cfg struct {
+		Metadata struct {
+			Sources []struct {
+				Tables []struct {
+					Attachments []json.RawMessage `json:"attachments"`
+				} `json:"tables"`
+			} `json:"sources"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(snapshot, &cfg); err != nil {
+		// core_init reports an unreadable snapshot with the detail this
+		// function does not have.
+		return false, nil //nolint:nilerr
+	}
+	for _, source := range cfg.Metadata.Sources {
+		for _, table := range source.Tables {
+			if len(table.Attachments) > 0 {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// withSecrets adds the deployment secrets to the snapshot the core is seeded
+// with.
+//
+// They are merged here rather than written into `core-config.json`, because
+// that file is committed and shipped inside a binary, and a signing key that
+// travels with the artifact is a key everyone who has the artifact holds.
+func withSecrets(snapshot []byte, secrets map[string]string) ([]byte, error) {
+	if len(secrets) == 0 || len(snapshot) == 0 {
+		return snapshot, nil
+	}
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(snapshot, &cfg); err != nil {
+		// Leave it to core_init to report, with the detail this has not got.
+		return snapshot, nil //nolint:nilerr
+	}
+	raw, err := json.Marshal(secrets)
+	if err != nil {
+		return nil, fmt.Errorf("encoding storage secrets: %w", err)
+	}
+	cfg["secrets"] = raw
+	return json.Marshal(cfg)
+}

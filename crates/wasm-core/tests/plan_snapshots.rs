@@ -195,6 +195,8 @@ fn query_plan_v1() {
         session_vars: user_session_vars(),
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -218,6 +220,8 @@ fn mutation_plan_v1() {
         session_vars: session_vars("user"),
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -240,6 +244,8 @@ fn permission_error_plan_v1() {
         session_vars: session_vars("stranger"),
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -328,6 +334,8 @@ fn mutation_emits_event_hook() {
         session_vars: session_vars("user"),
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -354,6 +362,8 @@ fn query_plan_v1_sqlite() {
         session_vars: user_session_vars(),
         stringify_numerics: false,
         dialect: Some("sqlite".into()),
+        now: None,
+        external_base_url: None,
     };
     let plan = compile(&state, &input);
     insta::assert_json_snapshot!(plan);
@@ -371,6 +381,8 @@ fn missing_role_is_denied() {
         session_vars: Default::default(), // no x-donat-role
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     };
     match compile(&state, &input) {
         PlanV1::Error(e) => {
@@ -436,6 +448,8 @@ fn declarative_command_is_planned() {
         session_vars: session_vars("user"),
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     };
     match compile(&state, &input) {
         PlanV1::Mutation(body) => {
@@ -465,6 +479,8 @@ fn declarative_command_denies_unlisted_role() {
         session_vars: session_vars("nopk"),
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     };
     match compile(&state, &input) {
         PlanV1::Error(_) => {}
@@ -504,6 +520,8 @@ fn command_emits_hooks_for_the_tables_its_steps_write() {
         session_vars: session_vars("user"),
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     };
     match compile(&state, &input) {
         PlanV1::Mutation(body) => {
@@ -576,7 +594,8 @@ fn a_command_without_effects_still_compiles() {
     .expect("a command with no process effect must still compile");
 }
 
-/// The same fixture, with the author's `secret` column declared a file.
+/// The same fixture with the author's `secret` column declared a file, plus
+/// the storage backend and signing secret a deployment needs to sign URLs.
 fn metadata_with_attachment() -> Metadata {
     let mut value = serde_json::to_value(metadata()).expect("fixture metadata serializes");
     value["sources"][0]["tables"][0]["attachments"] = serde_json::json!([{
@@ -588,42 +607,111 @@ fn metadata_with_attachment() -> Metadata {
     // cannot select would fail for the wrong reason.
     value["sources"][0]["tables"][0]["select_permissions"][0]["permission"]["columns"] =
         serde_json::json!(["id", "name", "display_name", "secret"]);
+    value["storage"] = serde_json::json!({
+        "backends": [{
+            "name": "files",
+            "kind": "s3",
+            "bucket": "donat-test",
+            "region": "eu-central-1",
+            "endpoint": "http://127.0.0.1:19000",
+            "path_style": true,
+            "access_key_id": { "value_from_env": "TEST_STORAGE_KEY" },
+            "secret_access_key": { "value_from_env": "TEST_STORAGE_SECRET" }
+        }],
+        "signing": { "secret": { "value_from_env": "TEST_STORAGE_SECRET" } }
+    });
     serde_json::from_value(value).expect("metadata with an attachment deserializes")
 }
 
-/// File attachments are not available in the embedded core: signing a URL
-/// needs the storage material the standalone server resolves per request, and
-/// nothing here supplies it.
-///
-/// Unlike a Process effect, an attachment is *not* refused while the snapshot
-/// compiles — the declaration is accepted and the field fails when it is
-/// selected. The distinction matters to an operator deciding what a deploy
-/// proves, so it is pinned rather than described: if attachments ever do start
-/// failing at boot, this test should be the thing that says so.
-#[test]
-fn an_attachment_compiles_but_its_field_cannot_be_selected() {
-    let state = state_of(metadata_with_attachment());
+fn attachment_state() -> CoreState {
+    CoreState::compile_snapshot_with_secrets(
+        metadata_with_attachment(),
+        HashMap::from([("default".to_string(), catalog())]),
+        HashMap::from([
+            ("TEST_STORAGE_KEY".to_string(), "key".to_string()),
+            ("TEST_STORAGE_SECRET".to_string(), "s3cr3t".to_string()),
+        ]),
+    )
+    .expect("a deployment with attachments compiles")
+}
 
-    let input = CompileInput {
+/// The embedded core signs file URLs, which it could not do before: the
+/// registry needs deployment secrets and wasm has no environment, and signing
+/// needs a clock and wasm has none of that either. Both now arrive from the
+/// host, and the URL is signed in SQL exactly as the standalone server does it.
+#[test]
+fn a_file_column_is_signed_in_the_statement() {
+    let state = attachment_state();
+    let mut input = CompileInput {
         query: "{ author { id secret { url } } }".to_string(),
         operation_name: None,
         variables: Default::default(),
         session_vars: user_session_vars(),
         stringify_numerics: false,
         dialect: None,
+        now: Some("2026-08-05T12:00:00Z".to_string()),
+        external_base_url: None,
     };
     match compile(&state, &input) {
-        PlanV1::Error(body) => {
-            // A caller has to be able to tell "not configured here" from
-            // "you may not read this", so the message must not read as a
-            // permission denial.
+        PlanV1::Query(body) => {
+            let sql = &body.statements[0].sql;
             assert!(
-                body.message.contains("storage"),
-                "the failure must name the missing storage configuration: {body:?}"
+                sql.contains("s3_presigned_url"),
+                "the URL must be signed in SQL, not assembled in the host: {sql}"
             );
         }
-        other => panic!("expected selecting a file column to fail, got {other:?}"),
+        other => panic!("expected a query plan, got {other:?}"),
     }
+
+    // The same request without a clock must be refused rather than served a
+    // URL dated from the epoch, which would be signed and permanently expired.
+    input.now = None;
+    match compile(&state, &input) {
+        PlanV1::Error(body) => assert!(
+            body.message.contains("`now`"),
+            "the refusal must name what is missing: {body:?}"
+        ),
+        other => panic!("expected a refusal without a clock, got {other:?}"),
+    }
+}
+
+/// A deployment that declares an attachment but whose signing secret the host
+/// did not supply must fail while the snapshot compiles. Starting would leave
+/// a file column in the schema that can never produce a URL.
+#[test]
+fn a_missing_storage_secret_is_refused_at_snapshot_compile() {
+    let err = CoreState::compile_snapshot_with_secrets(
+        metadata_with_attachment(),
+        HashMap::from([("default".to_string(), catalog())]),
+        HashMap::new(),
+    )
+    .err()
+    .expect("a deployment with no storage secret must not compile");
+    assert!(
+        err.message.contains("storage"),
+        "the refusal must name the storage configuration: {err:?}"
+    );
+}
+
+/// A deployment that declares no attachment must be byte-for-byte unaffected:
+/// no registry, no clock requirement, no change to the statement.
+#[test]
+fn a_deployment_without_attachments_needs_no_clock() {
+    let state = fixture_state();
+    let input = CompileInput {
+        query: "query { article { id title } }".to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: user_session_vars(),
+        stringify_numerics: false,
+        dialect: None,
+        now: None,
+        external_base_url: None,
+    };
+    assert!(
+        matches!(compile(&state, &input), PlanV1::Query(_)),
+        "a deployment with no attachments must not need a clock"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -662,6 +750,8 @@ fn render_input(query: &str) -> CompileInput {
         session_vars: session_vars("user"),
         stringify_numerics: false,
         dialect: None,
+        now: None,
+        external_base_url: None,
     }
 }
 

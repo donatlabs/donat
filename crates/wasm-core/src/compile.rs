@@ -23,6 +23,10 @@ pub struct CoreState {
     pub metadata: donat_metadata::Metadata,
     pub catalogs: HashMap<String, donat_catalog_types::Catalog>,
     pub compiled: CompiledMultiSourceSchema,
+    /// Resolved once at init, because it is the same for every request and
+    /// building it per request would re-derive the signing chain each time.
+    /// Empty when the deployment declares no attachment.
+    pub storage: donat_storage::StorageRegistry,
 }
 
 impl CoreState {
@@ -37,6 +41,15 @@ impl CoreState {
     pub fn compile_snapshot(
         metadata: donat_metadata::Metadata,
         catalogs: HashMap<String, donat_catalog_types::Catalog>,
+    ) -> Result<Self, PlanError> {
+        Self::compile_snapshot_with_secrets(metadata, catalogs, HashMap::new())
+    }
+
+    /// The same, with the deployment secrets the storage registry needs.
+    pub fn compile_snapshot_with_secrets(
+        metadata: donat_metadata::Metadata,
+        catalogs: HashMap<String, donat_catalog_types::Catalog>,
+        secrets: HashMap<String, String>,
     ) -> Result<Self, PlanError> {
         // Matches the server's default: a tracked function's permissions are
         // inferred from the underlying table unless a role entry says otherwise.
@@ -55,10 +68,25 @@ impl CoreState {
             &process_effects,
             INFER_FUNCTION_PERMISSIONS,
         )?;
+        // A deployment that declares no attachment resolves to an empty
+        // registry and never notices this. One that does declare an attachment
+        // but whose secret the host did not supply must fail here rather than
+        // at the first request for a URL it cannot sign.
+        let storage = donat_storage::StorageRegistry::build_with(&metadata, &|name| {
+            secrets.get(name).cloned()
+        })
+        .map_err(|e| {
+            PlanError::validation(
+                "storage",
+                format!("the storage configuration did not resolve: {e:?}"),
+            )
+        })?;
+
         Ok(Self {
             metadata,
             catalogs,
             compiled,
+            storage,
         })
     }
 }
@@ -97,6 +125,17 @@ pub struct CompileInput {
     /// `"sqlite"`, `"mysql"`. Unknown values fall back to Postgres.
     #[serde(default)]
     pub dialect: Option<String>,
+    /// The instant this request is signed as of, as RFC 3339.
+    ///
+    /// wasm has no clock, and file URLs are signed with a day-scoped key and
+    /// carry an expiry, so the time has to arrive with the request. Absent is
+    /// only valid for a deployment with no attachments; one that has them and
+    /// omits the clock is refused rather than served URLs dated from the epoch.
+    #[serde(default)]
+    pub now: Option<String>,
+    /// Absolute prefix for engine-served URLs. Empty means same-origin.
+    #[serde(default)]
+    pub external_base_url: Option<String>,
 }
 
 /// Map the caller-supplied dialect name to a concrete [`donat_backend::AnyDialect`].
@@ -202,6 +241,23 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
         Ok(p) => p,
         Err(e) => return error_plan(&e),
     };
+    // Attach the request's storage material, so a file column can be selected
+    // and an upload URL minted. A deployment that declares no attachment
+    // resolves to an empty registry and skips this entirely, so the planner
+    // behaves exactly as it did before.
+    let storage_ctx = if state.storage.is_empty() {
+        None
+    } else {
+        match request_storage(state, input) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => return error_plan(&e),
+        }
+    };
+    let mut planner = planner;
+    if let Some(ctx) = &storage_ctx {
+        planner.set_storage(ctx);
+    }
+
     let plan = match planner.plan(
         &doc,
         input.operation_name.as_deref(),
@@ -591,5 +647,39 @@ fn shape_error(path: &str, code: &str, message: &str) -> ShapeResult {
         code: code.to_string(),
         path: path.to_string(),
         message: message.to_string(),
+    })
+}
+
+/// Build the per-request storage material from the clock the host supplied.
+fn request_storage<'a>(
+    state: &'a CoreState,
+    input: &CompileInput,
+) -> Result<donat_storage::RequestContext<'a>, PlanError> {
+    let Some(raw) = input.now.as_deref() else {
+        return Err(PlanError::new(
+            "$",
+            "unexpected",
+            "this deployment declares file attachments, so the request must carry \
+             `now`: URLs are signed with a day-scoped key and carry an expiry, \
+             and wasm has no clock to read",
+        ));
+    };
+    let now = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| {
+            PlanError::new(
+                "$",
+                "unexpected",
+                format!("`now` is not an RFC 3339 instant: {e}"),
+            )
+        })?
+        .with_timezone(&chrono::Utc);
+
+    Ok(donat_storage::RequestContext {
+        registry: &state.storage,
+        now,
+        // Production mints a fresh id per request; the entropy comes from the
+        // host through `donat_host.random_bytes`.
+        fixed_upload_id: None,
+        external_base_url: input.external_base_url.clone().unwrap_or_default(),
     })
 }
