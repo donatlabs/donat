@@ -31,6 +31,16 @@ import (
 // shutdown — builds the same Config with New instead and keeps every
 // registration it already wrote.
 func Main(opts ...Option) {
+	for _, arg := range os.Args[1:] {
+		if arg == "-h" || arg == "--help" || arg == "help" {
+			fmt.Fprint(os.Stderr, usage)
+			return
+		}
+		if arg == "--version" || arg == "version" {
+			fmt.Fprintln(os.Stderr, Version())
+			return
+		}
+	}
 	if err := Run(context.Background(), opts...); err != nil {
 		fmt.Fprintln(os.Stderr, "donat:", err)
 		os.Exit(1)
@@ -148,6 +158,30 @@ func WithSecrets(secrets map[string]string) Option {
 // "https://api.example.com". Empty means same-origin.
 func WithExternalBaseURL(base string) Option {
 	return func(c *Config) { c.ExternalBaseURL = base }
+}
+
+// usage is what a `--help` prints. The three variables are otherwise only
+// discoverable by reading the SDK's README, which nobody does at 2am.
+const usage = `donat (embedded host)
+
+The database and the compiled metadata snapshot come from the environment:
+
+  DONAT_DATABASE_URL   required   PostgreSQL connection string
+  DONAT_CORE_CONFIG    required   path to the ` + "`donat dump-core-config`" + ` snapshot
+  DONAT_PORT           8080       listen port
+
+Serves POST /v1/graphql and GET /healthz. Every request runs as exactly one
+role, taken from X-Donat-Role; there is no admin role.
+
+  --help      this text
+  --version   the core ABI this binary speaks
+`
+
+// Version reports the wasm core ABI this build speaks and the size of the
+// embedded blob, which is what an operator needs when a snapshot and a binary
+// disagree.
+func Version() string {
+	return fmt.Sprintf("donat sdk: PlanV1 ABI %d, core.wasm %d bytes", ABIVersion, len(coreWasm))
 }
 
 func env(name, fallback string) string {

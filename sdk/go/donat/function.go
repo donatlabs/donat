@@ -164,16 +164,45 @@ func checkFunctionsCoverActions(snapshot []byte, f *Functions) error {
 		// detail this function does not have.
 		return nil //nolint:nilerr
 	}
-	missing := missingFunctions(cfg.Metadata.Actions, f)
-	if len(missing) == 0 {
+	if missing := missingFunctions(cfg.Metadata.Actions, f); len(missing) > 0 {
+		return fmt.Errorf(
+			"donat.New: actions %v are declared without a handler, which means they are "+
+				"resolved in this process, but no function is registered for them — add "+
+				"donat.WithFunction(<name>, ...) for each, or give them a handler in the metadata",
+			missing,
+		)
+	}
+	// The other direction. A function registered under a name the metadata does
+	// not declare is dead code that reads like working code, and the usual
+	// cause is a rename on one side or a typo — the author believes the action
+	// is wired and it silently is not.
+	if stray := strayFunctions(cfg.Metadata.Actions, f); len(stray) > 0 {
+		return fmt.Errorf(
+			"donat.New: functions %v are registered, but no action of those names is "+
+				"declared in the metadata — they would never be called",
+			stray,
+		)
+	}
+	return nil
+}
+
+// strayFunctions returns registered names with no matching action.
+func strayFunctions(actions []snapshotAction, f *Functions) []string {
+	if f == nil {
 		return nil
 	}
-	return fmt.Errorf(
-		"donat.New: actions %v are declared without a handler, which means they are "+
-			"resolved in this process, but no function is registered for them — add "+
-			"donat.WithFunction(<name>, ...) for each, or give them a handler in the metadata",
-		missing,
-	)
+	declared := make(map[string]struct{}, len(actions))
+	for _, a := range actions {
+		declared[a.Name] = struct{}{}
+	}
+	var stray []string
+	for _, name := range f.Names() {
+		if _, ok := declared[name]; !ok {
+			stray = append(stray, name)
+		}
+	}
+	sort.Strings(stray)
+	return stray
 }
 
 // snapshotDeclaresAttachments reports whether any table in the snapshot

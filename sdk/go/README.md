@@ -237,6 +237,45 @@ engine's own SQL. [`tests-system-lending`](../../tests-system-lending) runs the
 same cases against both this host and the standalone engine and fails if they
 disagree.
 
+## Testing your functions
+
+The wiring is what usually breaks and what a plain unit test misses: whether
+the Go structs agree with the metadata, whether the role may see the action,
+whether what you return satisfies the declared output type. All of it is
+decided before any SQL runs, so it needs no database:
+
+```go
+eng, _ := donat.TestEngine(ctx, snapshot,
+    donat.WithFunction("render_invoice_pdf", renderInvoicePDF))
+
+body, _ := eng.Execute(ctx, query, nil,
+    map[string]string{"x-donat-role": "user"})
+```
+
+An operation that does read tables says so rather than panicking. For those,
+pass `donat.WithBackend(donat.Postgres(pool))`.
+
+## Choosing an error code
+
+A function's error is the caller's answer. By default it is `unexpected`, which
+is what an unclassified fault is; when you know better, say so:
+
+```go
+return Out{}, donat.Errorf("validation-failed", "invoice %s has no lines", id)
+```
+
+## Keeping the snapshot current
+
+`core-config.json` is generated from the metadata directory and a live catalog
+and then committed, so it goes stale the moment either changes — and the engine
+cannot notice, because a stale snapshot is still a valid one. Run this in CI:
+
+```bash
+donat --database-url "$URL" dump-core-config --metadata-dir metadata --check
+```
+
+It exits non-zero when the committed file is not what would be written now.
+
 ## Regenerating the core
 
 The wasm blob is committed so `go get` needs no Rust toolchain, which means

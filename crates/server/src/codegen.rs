@@ -248,6 +248,47 @@ pub async fn run_codegen(
 /// consumes. Introspection happens here, deploy-time and host-side — exactly
 /// the snapshot the Go SDK hands to the wasm core (Spec 004). This is the
 /// "prepare the core config" step a Go host runs before serving.
+/// Verify that `out` is what `dump_core_config` would write right now.
+///
+/// A snapshot is generated from a metadata directory and a live catalog, and
+/// then committed — so it silently goes stale the moment either changes. The
+/// engine cannot notice: it boots from the snapshot and the snapshot is
+/// perfectly valid, just not current. This is the check that says so.
+pub async fn check_core_config(database_url: &str, metadata_dir: &Path, out: &Path) -> Result<()> {
+    let expected = core_config_json(database_url, metadata_dir).await?;
+    let actual = std::fs::read_to_string(out)
+        .with_context(|| format!("reading {} to check it", out.display()))?;
+    if actual.trim() == expected.trim() {
+        tracing::info!(path = %out.display(), "core config is current");
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} is stale: it does not match {} and the current database schema. \
+         Regenerate it with `donat dump-core-config --metadata-dir {}`",
+        out.display(),
+        metadata_dir.display(),
+        metadata_dir.display(),
+    )
+}
+
+/// The `{metadata, catalog}` JSON for a metadata directory and a live database.
+async fn core_config_json(database_url: &str, metadata_dir: &Path) -> Result<String> {
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
+        .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
+
+    let (client, conn) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .context("connecting to database for core-config dump")?;
+    let conn = tokio::spawn(async move { conn.await });
+    let catalog = donat_catalog::introspect(&client)
+        .await
+        .context("introspecting database")?;
+    conn.abort();
+
+    let cfg = serde_json::json!({ "metadata": metadata, "catalog": catalog });
+    serde_json::to_string_pretty(&cfg).context("serializing core config")
+}
+
 pub async fn dump_core_config(database_url: &str, metadata_dir: &Path, out: &Path) -> Result<()> {
     let metadata = donat_metadata::load_metadata_dir(metadata_dir)
         .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;

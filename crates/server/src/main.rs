@@ -190,6 +190,11 @@ struct DumpCoreConfigArgs {
     /// Output file for the `{metadata, catalog}` JSON.
     #[arg(long, default_value = "core-config.json")]
     out: PathBuf,
+    /// Do not write: compare the existing file with what would be written and
+    /// exit non-zero if they differ. For CI, where a snapshot that has drifted
+    /// from its metadata is a defect rather than a thing to fix silently.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -472,7 +477,11 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("dump-core-config needs --metadata-dir"))?;
             let database_url = resolve_global_database_url(&args, &|name| std::env::var(name))?
                 .ok_or_else(|| anyhow::anyhow!("dump-core-config needs --database-url"))?;
-            codegen::dump_core_config(&database_url, &dir, &d.out).await?;
+            if d.check {
+                codegen::check_core_config(&database_url, &dir, &d.out).await?;
+            } else {
+                codegen::dump_core_config(&database_url, &dir, &d.out).await?;
+            }
             return Ok(());
         }
         _ => {}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,8 +59,15 @@ func (e *Engine) runAction(
 		}
 		if err != nil {
 			// The function's own failure is the caller's answer, not a host
-			// fault: it is the business logic saying no.
-			return errorBody("unexpected", "$", err.Error()), nil
+			// fault: it is the business logic saying no. A FunctionError picks
+			// the code; anything else is `unexpected`, which is what an
+			// unclassified fault is.
+			code := "unexpected"
+			var fe *FunctionError
+			if errors.As(err, &fe) && fe.Code != "" {
+				code = fe.Code
+			}
+			return errorBody(code, "$", err.Error()), nil
 		}
 		raw, err := json.Marshal(out)
 		if err != nil {
