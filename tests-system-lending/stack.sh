@@ -40,6 +40,11 @@ go_log="$state/go.log"
 
 createdb() {
   local name="$1"
+  # Terminate anything still connected before dropping. A stand left running
+  # from a previous `up` holds sessions, and DROP DATABASE refuses while they
+  # exist — which used to fail the recreate and then quietly let the suite run
+  # against the *old* stands, reporting a pass for code it never loaded.
+  local kill_sql="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$name' AND pid <> pg_backend_pid()"
   # A CI runner has psql; a developer machine often only has the database in a
   # container. Try the direct client first and fall back rather than assuming
   # either, because a stand that cannot create its database fails much later
@@ -49,6 +54,7 @@ createdb() {
   # -c in a single transaction, and DROP DATABASE cannot run inside one.
   if command -v psql >/dev/null 2>&1; then
     psql "$PG_BASE/postgres" -q -v ON_ERROR_STOP=1 \
+      -c "$kill_sql" \
       -c "DROP DATABASE IF EXISTS $name" \
       -c "CREATE DATABASE $name" >/dev/null
     return
@@ -61,6 +67,7 @@ createdb() {
     exit 1
   fi
   docker exec "$container" psql -U postgres -q -v ON_ERROR_STOP=1 \
+    -c "$kill_sql" \
     -c "DROP DATABASE IF EXISTS $name" \
     -c "CREATE DATABASE $name" >/dev/null
 }
@@ -84,6 +91,10 @@ wait_for() {
 }
 
 cmd_up() {
+  # `up` is idempotent: a stand left from a previous run is stopped rather than
+  # left to serve stale code beside a suite that believes it is fresh.
+  cmd_down >/dev/null
+
   echo "==> building the engine and the Go host from this working tree"
   cargo build --manifest-path "$repo/Cargo.toml" -p donat-server --bin donat
   ( cd "$repo" && make wasm-core >/dev/null )
