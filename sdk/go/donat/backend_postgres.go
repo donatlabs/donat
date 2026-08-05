@@ -122,3 +122,18 @@ func runStmtsInTx(ctx context.Context, tx pgx.Tx, plan Plan) (map[string]json.Ra
 	}
 	return data, nil
 }
+
+// postgresFromURL opens a pool for Main, which has no pool of its own to be
+// given. A program that owns its pool passes WithBackend(donat.Postgres(pool))
+// and this is never reached.
+func postgresFromURL(ctx context.Context, url string) (Backend, func(), error) {
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connecting to the database: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("connecting to the database: %w", err)
+	}
+	return Postgres(pool), pool.Close, nil
+}

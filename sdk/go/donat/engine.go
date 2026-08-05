@@ -16,8 +16,18 @@ type Config struct {
 	Backend  Backend   // required: database backend (e.g. Postgres(pool))
 	Metadata []byte    // serialized {"metadata":..., "catalog":...} for core_init
 	Registry *Registry // optional: Spec 003 native event-trigger handlers
-	PoolSize int       // wasm instance pool size (default 4)
+	// Functions implement the actions the metadata declares without a
+	// `handler`. An action declared that way is resolved in this process,
+	// so New refuses to start when one has no function: the field would be
+	// in the schema and never work.
+	Functions *Functions
+	PoolSize  int // wasm instance pool size (default 4)
 }
+
+// Option configures a Config. The same options build the Config that Main
+// serves from, so a program that outgrows Main can switch to New without
+// rewriting its registrations.
+type Option func(*Config)
 
 // Engine is an embeddable Donat GraphQL engine backed by the wasm core.
 type Engine struct {
@@ -37,6 +47,9 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 	}
 	if cfg.PoolSize == 0 {
 		cfg.PoolSize = 4
+	}
+	if err := checkFunctionsCoverActions(cfg.Metadata, cfg.Functions); err != nil {
+		return nil, err
 	}
 	e := &Engine{cfg: cfg, backend: cfg.Backend, registry: cfg.Registry}
 	// Pre-seed one instance to fail fast on a bad metadata/catalog blob.

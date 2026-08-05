@@ -11,6 +11,7 @@ type PlanKind string
 const (
 	PlanQuery    PlanKind = "query"
 	PlanMutation PlanKind = "mutation"
+	PlanAction   PlanKind = "action"
 	PlanErrorK   PlanKind = "error"
 )
 
@@ -27,7 +28,29 @@ type Plan struct {
 	// and never reaches SQL.
 	Response []ResponseSlot
 	ErrorMap map[string]string
-	Err      *PlanErr // set when Kind == PlanErrorK
+	// IsQuery and Items are set when Kind == PlanAction. Query actions may
+	// run concurrently; mutation actions must not, because a client that
+	// ordered two writes in one operation gets that order.
+	IsQuery bool
+	Items   []ActionItem
+	Err     *PlanErr // set when Kind == PlanErrorK
+}
+
+// ActionItem is one top-level field of an action operation. A "typename" item
+// is answered by the core and never reaches a function.
+type ActionItem struct {
+	Kind  string `json:"kind"` // "typename" | "call"
+	Alias string `json:"alias"`
+	Value string `json:"value"` // typename only
+
+	Name             string          `json:"name"`
+	Input            json.RawMessage `json:"input"`
+	SessionVariables json.RawMessage `json:"session_variables"`
+	// Handler nil means the action is resolved by a function this host
+	// registered under Name; a value is a webhook URL.
+	Handler            *string `json:"handler"`
+	Timeout            *uint64 `json:"timeout"`
+	ForwardClientHeads bool    `json:"forward_client_headers"`
 }
 
 // ResponseSlot is one top-level response key. Kind is "source_field" when the
@@ -71,6 +94,8 @@ type wirePlan struct {
 	Hooks       []Hook            `json:"hooks"`
 	Response    []ResponseSlot    `json:"response"`
 	ErrorMap    map[string]string `json:"error_map"`
+	IsQuery     bool              `json:"is_query"`
+	Items       []ActionItem      `json:"items"`
 	Code        string            `json:"code"`
 	Path        string            `json:"path"`
 	Message     string            `json:"message"`
@@ -89,7 +114,7 @@ func decodePlan(raw []byte) (Plan, error) {
 	p := Plan{
 		Kind: w.Kind, Version: w.Version, Transaction: w.Transaction,
 		Statements: w.Statements, Hooks: w.Hooks, Response: w.Response,
-		ErrorMap: w.ErrorMap,
+		ErrorMap: w.ErrorMap, IsQuery: w.IsQuery, Items: w.Items,
 	}
 	if w.Kind == PlanErrorK {
 		p.Err = &PlanErr{Code: w.Code, Path: w.Path, Message: w.Message}

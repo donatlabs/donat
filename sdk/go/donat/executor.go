@@ -142,6 +142,9 @@ func (e *Engine) Execute(ctx context.Context, query string, vars map[string]json
 		}
 		return envelope, nil
 
+	case PlanAction:
+		return e.runAction(ctx, plan, query, vars, sessionVars)
+
 	case PlanMutation:
 		data, err := e.backend.RunMutation(ctx, plan)
 		if err != nil {

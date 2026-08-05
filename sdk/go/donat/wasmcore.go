@@ -27,6 +27,7 @@ type wasmCore struct {
 	deallocFn api.Function
 	initFn    api.Function
 	compileFn api.Function
+	shapeFn   api.Function
 	lastErrFn api.Function
 }
 
@@ -81,6 +82,7 @@ func newWasmCore(ctx context.Context) (*wasmCore, error) {
 		deallocFn: mod.ExportedFunction("core_dealloc"),
 		initFn:    mod.ExportedFunction("core_init"),
 		compileFn: mod.ExportedFunction("core_compile"),
+		shapeFn:   mod.ExportedFunction("core_shape_action"),
 		lastErrFn: mod.ExportedFunction("core_last_error"),
 	}
 	if c.abiVer == nil || c.allocFn == nil || c.deallocFn == nil ||
@@ -177,32 +179,47 @@ func (c *wasmCore) lastError(ctx context.Context) string {
 // Both the input buffer and the wasm-side output buffer are dealloc'd before
 // returning; the returned slice is owned by the caller.
 func (c *wasmCore) compile(ctx context.Context, inputJSON []byte) ([]byte, error) {
+	return c.callJSON(ctx, c.compileFn, inputJSON)
+}
+
+// callJSON writes inputJSON into linear memory, calls fn, and copies the
+// packed (ptr<<32|len) result out. Both buffers are freed before returning;
+// the returned slice is owned by the caller.
+func (c *wasmCore) callJSON(ctx context.Context, fn api.Function, inputJSON []byte) ([]byte, error) {
 	n := uint32(len(inputJSON))
 	inPtr, err := c.alloc(ctx, n)
 	if err != nil {
-		return nil, fmt.Errorf("compile alloc: %w", err)
+		return nil, fmt.Errorf("alloc: %w", err)
 	}
-	// Free the input buffer once core_compile has consumed it (fires at return).
 	defer c.dealloc(ctx, inPtr, n) //nolint:errcheck
 	if ok := c.mod.Memory().Write(inPtr, inputJSON); !ok {
-		return nil, fmt.Errorf("compile memory write out of range")
+		return nil, fmt.Errorf("memory write out of range")
 	}
-	res, err := c.compileFn.Call(ctx, uint64(inPtr), uint64(n))
+	res, err := fn.Call(ctx, uint64(inPtr), uint64(n))
 	if err != nil {
-		return nil, fmt.Errorf("core_compile call: %w", err)
+		return nil, fmt.Errorf("call: %w", err)
 	}
 	packed := res[0]
 	outPtr := uint32(packed >> 32)
 	outLen := uint32(packed)
 	data, ok := c.mod.Memory().Read(outPtr, outLen)
 	if !ok {
-		return nil, fmt.Errorf("compile: cannot read output at ptr=%d len=%d", outPtr, outLen)
+		return nil, fmt.Errorf("cannot read output at ptr=%d len=%d", outPtr, outLen)
 	}
 	// Copy the bytes out before dealloc-ing the output buffer.
 	out := make([]byte, outLen)
 	copy(out, data)
 	if err := c.dealloc(ctx, outPtr, outLen); err != nil {
-		return nil, fmt.Errorf("compile dealloc output: %w", err)
+		return nil, fmt.Errorf("dealloc output: %w", err)
 	}
 	return out, nil
+}
+
+// shapeAction sends the collected action results to the core and returns the
+// shaped response JSON. Same buffer discipline as compile.
+func (c *wasmCore) shapeAction(ctx context.Context, inputJSON []byte) ([]byte, error) {
+	if c.shapeFn == nil {
+		return nil, fmt.Errorf("core.wasm predates core_shape_action")
+	}
+	return c.callJSON(ctx, c.shapeFn, inputJSON)
 }
