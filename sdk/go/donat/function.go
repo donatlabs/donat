@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -16,12 +18,20 @@ import (
 // its name is what resolves it.
 type Functions struct {
 	mu sync.RWMutex
-	fn map[string]func(context.Context, json.RawMessage) (any, error)
+	fn map[string]registered
+}
+
+// registered is one function plus the argument type it decodes into. The type
+// is kept so the engine can check it against the metadata at boot rather than
+// letting a mismatch surface as a zero value at runtime.
+type registered struct {
+	call    func(context.Context, json.RawMessage) (any, error)
+	argType reflect.Type
 }
 
 // NewFunctions returns an empty set.
 func NewFunctions() *Functions {
-	return &Functions{fn: make(map[string]func(context.Context, json.RawMessage) (any, error))}
+	return &Functions{fn: make(map[string]registered)}
 }
 
 // WithFunction registers fn as the implementation of the action named name.
@@ -40,7 +50,8 @@ func WithFunction[In, Out any](name string, fn func(context.Context, In) (Out, e
 		if c.Functions == nil {
 			c.Functions = NewFunctions()
 		}
-		c.Functions.register(name, func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var zero In
+		c.Functions.register(name, reflect.TypeOf(zero), func(ctx context.Context, raw json.RawMessage) (any, error) {
 			var in In
 			// An action with no arguments sends `{}`; decoding that into a
 			// struct with no fields is fine, and into one with fields leaves
@@ -55,10 +66,14 @@ func WithFunction[In, Out any](name string, fn func(context.Context, In) (Out, e
 	}
 }
 
-func (f *Functions) register(name string, fn func(context.Context, json.RawMessage) (any, error)) {
+func (f *Functions) register(
+	name string,
+	argType reflect.Type,
+	fn func(context.Context, json.RawMessage) (any, error),
+) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.fn[name] = fn
+	f.fn[name] = registered{call: fn, argType: argType}
 }
 
 // Call invokes the function registered for name. The bool reports whether one
@@ -66,12 +81,12 @@ func (f *Functions) register(name string, fn func(context.Context, json.RawMessa
 // itself failing.
 func (f *Functions) Call(ctx context.Context, name string, input json.RawMessage) (any, bool, error) {
 	f.mu.RLock()
-	fn, ok := f.fn[name]
+	r, ok := f.fn[name]
 	f.mu.RUnlock()
 	if !ok {
 		return nil, false, nil
 	}
-	out, err := fn(ctx, input)
+	out, err := r.call(ctx, input)
 	return out, true, err
 }
 
@@ -119,7 +134,11 @@ func missingFunctions(actions []snapshotAction, f *Functions) []string {
 type snapshotAction struct {
 	Name       string `json:"name"`
 	Definition struct {
-		Handler *string `json:"handler"`
+		Handler   *string `json:"handler"`
+		Arguments []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"arguments"`
 	} `json:"definition"`
 }
 
@@ -209,4 +228,118 @@ func withSecrets(snapshot []byte, secrets map[string]string) ([]byte, error) {
 	}
 	cfg["secrets"] = raw
 	return json.Marshal(cfg)
+}
+
+// checkFunctionShapes reports the functions whose argument struct does not
+// match the arguments its action declares.
+//
+// The names are checked separately; this is about what the metadata and the Go
+// type each say the call looks like. A tag typo is invisible without it:
+// `json.Unmarshal` ignores a field the payload does not have and leaves the
+// struct's zero value, so an action declaring `invoice_id` against a struct
+// tagged `invoiceId` runs happily with an empty string and answers 200. The
+// author then looks for the bug in the database.
+func checkFunctionShapes(actions []snapshotAction, f *Functions) []string {
+	if f == nil {
+		return nil
+	}
+	var problems []string
+	for _, a := range actions {
+		f.mu.RLock()
+		r, ok := f.fn[a.Name]
+		f.mu.RUnlock()
+		if !ok {
+			continue // reported by the coverage check, with its own advice
+		}
+		problems = append(problems, shapeProblems(a, r.argType)...)
+	}
+	sort.Strings(problems)
+	return problems
+}
+
+func shapeProblems(a snapshotAction, argType reflect.Type) []string {
+	// A function taking a map or an interface opts out: it decodes whatever
+	// arrives, which is a choice the author may legitimately make.
+	if argType == nil || argType.Kind() != reflect.Struct {
+		return nil
+	}
+
+	got := make(map[string]struct{}, argType.NumField())
+	for i := 0; i < argType.NumField(); i++ {
+		field := argType.Field(i)
+		if field.PkgPath != "" {
+			continue // unexported: not part of the JSON shape
+		}
+		got[jsonName(field)] = struct{}{}
+	}
+
+	var problems []string
+	declared := make(map[string]struct{}, len(a.Definition.Arguments))
+	for _, arg := range a.Definition.Arguments {
+		declared[arg.Name] = struct{}{}
+		if _, ok := got[arg.Name]; !ok {
+			problems = append(problems, fmt.Sprintf(
+				"action %q declares argument %q, but its Go struct has no field tagged "+
+					"`json:\"%s\"` — it would always arrive empty",
+				a.Name, arg.Name, arg.Name,
+			))
+		}
+	}
+	for name := range got {
+		if name == "-" {
+			continue
+		}
+		if _, ok := declared[name]; !ok {
+			problems = append(problems, fmt.Sprintf(
+				"action %q has no argument %q, but its Go struct expects one — "+
+					"the metadata and the struct disagree",
+				a.Name, name,
+			))
+		}
+	}
+	return problems
+}
+
+// jsonName is the key encoding/json uses for a field.
+func jsonName(f reflect.StructField) string {
+	tag, ok := f.Tag.Lookup("json")
+	if !ok {
+		return f.Name
+	}
+	name, _, _ := strings.Cut(tag, ",")
+	if name == "" {
+		return f.Name
+	}
+	return name
+}
+
+// checkFunctionsMatchDeclarations fails the boot when a function's argument
+// struct disagrees with the metadata that describes it.
+func checkFunctionsMatchDeclarations(snapshot []byte, f *Functions) error {
+	actions, err := snapshotActions(snapshot)
+	if err != nil || len(actions) == 0 {
+		return err
+	}
+	problems := checkFunctionShapes(actions, f)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("donat.New: %s", strings.Join(problems, "; "))
+}
+
+// snapshotActions reads the action declarations out of a core snapshot.
+func snapshotActions(snapshot []byte) ([]snapshotAction, error) {
+	if len(snapshot) == 0 {
+		return nil, nil
+	}
+	var cfg struct {
+		Metadata struct {
+			Actions []snapshotAction `json:"actions"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(snapshot, &cfg); err != nil {
+		// core_init reports an unreadable snapshot with the detail this has not.
+		return nil, nil //nolint:nilerr
+	}
+	return cfg.Metadata.Actions, nil
 }

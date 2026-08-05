@@ -83,6 +83,9 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 	if err := checkFunctionsCoverActions(cfg.Metadata, cfg.Functions); err != nil {
 		return nil, err
 	}
+	if err := checkFunctionsMatchDeclarations(cfg.Metadata, cfg.Functions); err != nil {
+		return nil, err
+	}
 	e := &Engine{cfg: cfg, backend: cfg.Backend, registry: cfg.Registry, signsURLs: signs}
 	// Pre-seed one instance to fail fast on a bad metadata/catalog blob.
 	c, err := e.newSeededInstance(ctx)
