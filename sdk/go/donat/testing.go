@@ -56,3 +56,15 @@ func (noDatabase) RunMutation(context.Context, Plan) (map[string]json.RawMessage
 func (noDatabase) MapError(err error, _ map[string]string) []byte {
 	return errorBody("unexpected", "$", err.Error())
 }
+
+func (noDatabase) ReadUpload(context.Context, string) (UploadRow, error) {
+	return UploadRow{}, fmt.Errorf(
+		"donat.TestEngine has no database: storing a file needs a real backend — " +
+			"pass donat.WithBackend(donat.Postgres(pool))")
+}
+
+func (noDatabase) FinalizeUpload(context.Context, string, string, int64) error {
+	return fmt.Errorf(
+		"donat.TestEngine has no database: storing a file needs a real backend — " +
+			"pass donat.WithBackend(donat.Postgres(pool))")
+}

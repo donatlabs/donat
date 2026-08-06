@@ -193,6 +193,32 @@ pub extern "C" fn core_shape_action(ptr: *mut u8, len: i32) -> i64 {
     pack_output(out)
 }
 
+/// Sign the S3 operations that finish one upload.
+///
+/// The host stored the bytes with a URL this core signed; finishing them needs
+/// three more signatures and the address the object will live at. Keeping that
+/// here means one signer rather than one per host — the property ADR 033 pays
+/// for deliberately.
+#[unsafe(no_mangle)]
+pub extern "C" fn core_file_completion(ptr: *mut u8, len: i32) -> i64 {
+    // SAFETY: ptr/len originate from core_alloc; host wrote len initialised bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let out = STATE.with(|s| {
+        let borrow = s.borrow();
+        match borrow.as_ref() {
+            None => err_json("validation-failed", "core not initialized"),
+            Some(state) => match serde_json::from_slice::<compile::CompletionInput>(bytes) {
+                Ok(input) => serde_json::to_vec(&compile::file_completion(state, &input))
+                    .unwrap_or_else(|_| {
+                        err_json("validation-failed", "completion serialize failed")
+                    }),
+                Err(e) => err_json("validation-failed", &e.to_string()),
+            },
+        }
+    });
+    pack_output(out)
+}
+
 /// Leak `bytes` into linear memory and return `(ptr << 32) | len` for the
 /// host to read and then `core_dealloc`.
 fn pack_output(bytes: Vec<u8>) -> i64 {

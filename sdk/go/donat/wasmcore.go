@@ -37,6 +37,7 @@ type wasmCore struct {
 	initFn    api.Function
 	compileFn api.Function
 	shapeFn   api.Function
+	fileFn    api.Function
 	lastErrFn api.Function
 }
 
@@ -98,6 +99,7 @@ func newWasmCore(ctx context.Context) (*wasmCore, error) {
 		initFn:    mod.ExportedFunction("core_init"),
 		compileFn: mod.ExportedFunction("core_compile"),
 		shapeFn:   mod.ExportedFunction("core_shape_action"),
+		fileFn:    mod.ExportedFunction("core_file_completion"),
 		lastErrFn: mod.ExportedFunction("core_last_error"),
 	}
 	if c.abiVer == nil || c.allocFn == nil || c.deallocFn == nil ||
@@ -237,4 +239,12 @@ func (c *wasmCore) shapeAction(ctx context.Context, inputJSON []byte) ([]byte, e
 		return nil, fmt.Errorf("core.wasm predates core_shape_action")
 	}
 	return c.callJSON(ctx, c.shapeFn, inputJSON)
+}
+
+// fileCompletion asks the core to sign the operations that finish an upload.
+func (c *wasmCore) fileCompletion(ctx context.Context, inputJSON []byte) ([]byte, error) {
+	if c.fileFn == nil {
+		return nil, fmt.Errorf("core.wasm predates core_file_completion")
+	}
+	return c.callJSON(ctx, c.fileFn, inputJSON)
 }

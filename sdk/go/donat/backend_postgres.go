@@ -137,3 +137,37 @@ func postgresFromURL(ctx context.Context, url string) (Backend, func(), error) {
 	}
 	return Postgres(pool), pool.Close, nil
 }
+
+// ReadUpload returns what finishing a pending upload needs from its row.
+func (b *postgresBackend) ReadUpload(ctx context.Context, id string) (UploadRow, error) {
+	var row UploadRow
+	err := b.pool.QueryRow(ctx,
+		"SELECT backend, object_key FROM donat.file_uploads WHERE id = $1 AND state = 'pending'",
+		id,
+	).Scan(&row.Backend, &row.StagingKey)
+	if err != nil {
+		return UploadRow{}, err
+	}
+	return row, nil
+}
+
+// FinalizeUpload records the size the store reported and the address the bytes
+// now live at.
+//
+// The `state = 'pending'` guard is what stops a finished upload being pointed
+// somewhere else: once a claim has certified the bytes, moving the row would
+// let them be replaced under a row that already references them.
+func (b *postgresBackend) FinalizeUpload(ctx context.Context, id, objectKey string, size int64) error {
+	tag, err := b.pool.Exec(ctx,
+		"UPDATE donat.file_uploads SET byte_size = $2, object_key = $3 "+
+			"WHERE id = $1 AND state = 'pending'",
+		id, size, objectKey,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("the upload was claimed before it was finalized")
+	}
+	return nil
+}

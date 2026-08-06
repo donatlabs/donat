@@ -54,7 +54,14 @@ func (e *Engine) runAction(
 			continue
 		}
 
-		out, ok, err := e.functions().Call(ctx, item.Name, item.Input)
+		// The function reaches the uploader through its context, bound to this
+		// request's session so that storing a file is subject to the same
+		// permissions as writing the column it will end up in.
+		fnCtx := context.WithValue(ctx, uploaderKey{}, Uploader(engineUploader{
+			engine:      e,
+			sessionVars: sessionVars,
+		}))
+		out, ok, err := e.functions().Call(fnCtx, item.Name, item.Input)
 		if !ok {
 			// New refuses to start in this state, so reaching it means the
 			// registry changed under a running engine.

@@ -686,3 +686,89 @@ fn request_storage<'a>(
         external_base_url: input.external_base_url.clone().unwrap_or_default(),
     })
 }
+
+/// What the host must know to finish an upload it has already stored.
+///
+/// The engine never touches the bytes: a presigned `PUT` writes them straight
+/// to the store. Finishing means asking the store what it actually received,
+/// moving the object out from under the URL that wrote it, and recording the
+/// verified size — four operations, every one of them signed.
+///
+/// The signing lives here rather than in the host. `donat-storage` already
+/// owns it and has a twin in SQL that the conformance suite pins against a
+/// real MinIO; a third implementation in Go would be a third thing to keep
+/// exactly right, and ADR 033 already names the two as the price of the
+/// design. The host does dumb HTTP with URLs it is handed.
+#[derive(Deserialize)]
+pub struct CompletionInput {
+    pub upload_id: String,
+    pub attachment: String,
+    pub backend: String,
+    /// Where the presigned PUT wrote the bytes.
+    pub staging_key: String,
+    /// RFC 3339. wasm has no clock, and a signature carries an expiry.
+    pub now: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum CompletionResult {
+    Urls(CompletionUrls),
+    Error(PlanErrorBody),
+}
+
+#[derive(serde::Serialize)]
+pub struct CompletionUrls {
+    /// Ask the store what it holds, so a claim cannot succeed for bytes
+    /// nobody uploaded.
+    pub head_url: String,
+    /// Copy to the address the row will name. The presigned PUT stays valid
+    /// for its whole lifetime and cannot be revoked, so bytes left where it
+    /// wrote them could be replaced after a claim certified them.
+    pub copy_url: String,
+    pub copy_headers: Vec<(String, String)>,
+    /// Drop the staging object, after the row points at the final key.
+    pub delete_url: String,
+    pub final_key: String,
+    /// The declaration's ceiling, so the host can refuse an object that grew
+    /// between the request and the upload.
+    pub max_bytes: u64,
+}
+
+/// Sign the operations that finish one upload.
+pub fn file_completion(state: &CoreState, input: &CompletionInput) -> CompletionResult {
+    let Ok(upload_id) = uuid::Uuid::parse_str(&input.upload_id) else {
+        return completion_error("upload_id is not a uuid");
+    };
+    let Ok(now) = chrono::DateTime::parse_from_rfc3339(&input.now) else {
+        return completion_error("`now` is not an RFC 3339 instant");
+    };
+    let now = now.with_timezone(&chrono::Utc);
+
+    let Some(spec) = state.storage.attachment(&input.attachment) else {
+        return completion_error(&format!("unknown attachment '{}'", input.attachment));
+    };
+    let Some(donat_storage::Backend::S3(s3)) = state.storage.backend(&input.backend) else {
+        return completion_error(&format!("unknown storage backend '{}'", input.backend));
+    };
+
+    let final_key = spec.object_key(upload_id);
+    let (copy_url, copy_headers) = s3.presign_copy(&input.staging_key, &final_key, now, 60);
+    CompletionResult::Urls(CompletionUrls {
+        head_url: s3.presign("HEAD", &input.staging_key, now, 60),
+        copy_url,
+        copy_headers,
+        delete_url: s3.presign("DELETE", &input.staging_key, now, 60),
+        final_key,
+        max_bytes: spec.max_bytes,
+    })
+}
+
+fn completion_error(message: &str) -> CompletionResult {
+    CompletionResult::Error(PlanErrorBody {
+        version: PLAN_VERSION,
+        code: "unexpected".to_string(),
+        path: "$".to_string(),
+        message: message.to_string(),
+    })
+}

@@ -125,3 +125,15 @@ func (b *sqlBackend) MapError(err error, errorMap map[string]string) []byte {
 	}
 	return errorBody("data-exception", "$", err.Error())
 }
+
+// ReadUpload is not available on this backend: file attachments are
+// Postgres-only, which the metadata loader refuses to declare elsewhere.
+func (b *sqlBackend) ReadUpload(context.Context, string) (UploadRow, error) {
+	return UploadRow{}, fmt.Errorf(
+		"donat: file attachments are Postgres-only; this backend is %q", b.dialect)
+}
+
+func (b *sqlBackend) FinalizeUpload(context.Context, string, string, int64) error {
+	return fmt.Errorf(
+		"donat: file attachments are Postgres-only; this backend is %q", b.dialect)
+}
