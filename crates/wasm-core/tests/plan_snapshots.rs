@@ -607,6 +607,10 @@ fn metadata_with_attachment() -> Metadata {
     // cannot select would fail for the wrong reason.
     value["sources"][0]["tables"][0]["select_permissions"][0]["permission"]["columns"] =
         serde_json::json!(["id", "name", "display_name", "secret"]);
+    // A role may mint an upload for a column exactly when it may write that
+    // column (ADR 033), so the fixture has to say so.
+    value["sources"][0]["tables"][0]["update_permissions"][0]["permission"]["columns"] =
+        serde_json::json!(["name", "system_meta", "secret"]);
     value["storage"] = serde_json::json!({
         "backends": [{
             "name": "files",
@@ -861,3 +865,27 @@ fn an_action_is_invisible_to_a_role_it_does_not_name() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 }
+
+/// The upload root must be in the schema when a table declares a file, or a
+/// host has no way to store one.
+#[test]
+fn the_upload_root_is_offered_when_an_attachment_is_declared() {
+    let state = attachment_state();
+    let input = CompileInput {
+        query: r#"mutation { donat_request_file_upload(attachment: public_author_secret, file_name: "x.pdf", media_type: "application/pdf", size: 10) { id url } }"#.to_string(),
+        operation_name: None,
+        variables: Default::default(),
+        session_vars: user_session_vars(),
+        stringify_numerics: false,
+        dialect: None,
+        now: Some("2026-08-05T12:00:00Z".to_string()),
+        external_base_url: None,
+    };
+    match compile(&state, &input) {
+        PlanV1::Mutation(body) => {
+            assert!(body.statements[0].sql.contains("donat.file_uploads"), "{:?}", body.statements[0].sql);
+        }
+        other => panic!("the upload root must plan, got {other:?}"),
+    }
+}
+

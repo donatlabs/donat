@@ -1,0 +1,22 @@
+# Where the bytes live. The engine never holds a file: a presigned PUT writes
+# it straight to the store, and a presigned GET reads it back — both signed in
+# SQL, so a query returns a per-row URL without the response leaving the
+# database.
+#
+# The secrets are references, never values. The host resolves them at startup
+# (donat.WithSecrets), which keeps them out of `core-config.json` — that file is
+# generated at deploy time and travels inside the binary.
+backends:
+  - name: receipts
+    kind: s3
+    bucket: lending-receipts
+    region: eu-central-1
+    endpoint: http://127.0.0.1:19000
+    path_style: true
+    access_key_id: { value_from_env: LENDING_S3_KEY }
+    secret_access_key: { value_from_env: LENDING_S3_SECRET }
+
+# The key that signs the URLs. Day-scoped inside the statement, so what a
+# statement log could retain stops working the next day.
+signing:
+  secret: { value_from_env: LENDING_SIGNING_SECRET }

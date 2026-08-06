@@ -1,0 +1,23 @@
+# A receipt cannot be declared: rendering a PDF is a library call, not a
+# statement. So it is an action, and the body is Go.
+#
+# There is no `handler:`, which is what makes it resolved in this process by
+# the function registered under its name. The engine refuses to start if that
+# function is missing — a field in the schema that never works is worse than a
+# failed boot.
+actions:
+  - name: render_loan_receipt
+    definition:
+      type: mutation
+      arguments:
+        - { name: loan_id, type: uuid! }
+      output_type: LoanReceipt
+    permissions:
+      - role: member
+
+custom_types:
+  objects:
+    - name: LoanReceipt
+      fields:
+        - { name: file_id, type: uuid! }
+        - { name: bytes, type: Int! }

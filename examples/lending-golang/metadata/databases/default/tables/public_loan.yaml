@@ -1,6 +1,15 @@
 table:
   name: loan
   schema: public
+# The receipt is a file, and the declaration is two lines: which column holds
+# it, which store keeps the bytes, and how large it may be. Selecting the
+# column returns a signed URL rather than a uuid — the signing happens in SQL,
+# so the response is still assembled in one statement.
+attachments:
+  - column: receipt
+    backend: receipts
+    max_bytes: 2097152
+    media_types: [application/pdf]
 object_relationships:
   - name: copy
     using:
@@ -12,7 +21,7 @@ object_relationships:
 select_permissions:
   - role: member
     permission:
-      columns: [id, copy_id, member_id, status, borrowed_on, due_on, returned_on, extensions]
+      columns: [id, copy_id, member_id, status, borrowed_on, due_on, returned_on, extensions, receipt]
       filter:
         member_id:
           _eq: X-Donat-User-Id
@@ -28,7 +37,7 @@ select_permissions:
 command_select_permissions:
   - role: member
     permission:
-      columns: [id, copy_id, member_id, status, borrowed_on, due_on, returned_on, extensions]
+      columns: [id, copy_id, member_id, status, borrowed_on, due_on, returned_on, extensions, receipt]
       filter:
         member_id:
           _eq: X-Donat-User-Id
@@ -37,6 +46,22 @@ command_insert_permissions:
     permission:
       check: {}
       columns: [copy_id, member_id, status, borrowed_on, due_on, extensions]
+# A member may attach a receipt to their own loan — and nothing else about it.
+#
+# This has to be an ordinary update permission rather than a command one: an
+# upload URL is a capability the caller holds, and command-only permissions
+# exist precisely to let a closed command write a table *without* opening a
+# CRUD root. So the engine refuses to mint an upload for a column the role
+# cannot write directly (ADR 033), and the narrow grant below is what makes
+# `render_loan_receipt` possible without widening anything else.
+update_permissions:
+  - role: member
+    permission:
+      columns: [receipt]
+      filter:
+        member_id:
+          _eq: X-Donat-User-Id
+      check: {}
 command_update_permissions:
   - role: member
     permission:

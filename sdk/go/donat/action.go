@@ -61,6 +61,9 @@ func (e *Engine) runAction(
 			engine:      e,
 			sessionVars: sessionVars,
 		}))
+		// The caller's session travels too, so a function that reads data back
+		// does it as them rather than as nobody.
+		fnCtx = context.WithValue(fnCtx, sessionKey{}, sessionVars)
 		out, ok, err := e.functions().Call(fnCtx, item.Name, item.Input)
 		if !ok {
 			// New refuses to start in this state, so reaching it means the

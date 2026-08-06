@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -35,6 +36,22 @@ type Uploader interface {
 }
 
 type uploaderKey struct{}
+type sessionKey struct{}
+
+// SessionFromContext returns the session variables of the request a function is
+// serving — the role and every `X-Donat-*` the caller sent.
+//
+// A function that reads data back should pass these to `Execute` rather than
+// inventing a session: then the caller's own permissions decide what it sees,
+// and a member asking about another member's row gets nothing rather than a
+// leak. Outside a function it returns nil, and an Execute with no role is
+// denied, which is the safe direction.
+func SessionFromContext(ctx context.Context) map[string]string {
+	if vars, ok := ctx.Value(sessionKey{}).(map[string]string); ok {
+		return vars
+	}
+	return nil
+}
 
 // UploaderFrom returns the Uploader for this request. It is never nil inside a
 // function the engine called; outside one it returns an Uploader that explains
@@ -107,13 +124,16 @@ func (u engineUploader) mint(
 	attachment, fileName, mediaType string,
 	size int,
 ) (mintedUpload, error) {
+	// The metadata names an attachment `schema.table.column`; the generated
+	// enum spells the same thing with underscores. Callers use the metadata's
+	// name, so the translation happens here rather than in every function.
 	const query = `mutation ($a: donat_file_attachment!, $n: String!, $m: String!, $s: Int!) {
 		donat_request_file_upload(attachment: $a, file_name: $n, media_type: $m, size: $s) {
 			id url method headers { name value }
 		}
 	}`
 	vars := map[string]json.RawMessage{
-		"a": mustJSON(attachment),
+		"a": mustJSON(strings.ReplaceAll(attachment, ".", "_")),
 		"n": mustJSON(fileName),
 		"m": mustJSON(mediaType),
 		"s": mustJSON(size),
@@ -170,14 +190,6 @@ func (u engineUploader) store(ctx context.Context, minted mintedUpload, content 
 			resp.Status, bytes.TrimSpace(detail))
 	}
 	return nil
-}
-
-// completionRow is what the engine must read back before it can finish an
-// upload: the core signs against the address the bytes were actually written
-// to, which the mutation chose.
-type completionRow struct {
-	Backend    string
-	StagingKey string
 }
 
 // finishUpload verifies the stored object and moves it to its final address.

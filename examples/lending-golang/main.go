@@ -77,14 +77,32 @@ func main() {
 	reg := donat.NewRegistry()
 	RegisterHandlers(reg)
 
+	// Rendering a receipt is the one thing here that cannot be declared, so it
+	// is an action with a Go body. The engine refuses to start if the metadata
+	// declares it and no function is registered.
+	receipts := &Receipts{}
+	fns := donat.NewFunctions()
+	donat.WithFunction("render_loan_receipt", receipts.Render)(&donat.Config{Functions: fns})
+
 	eng, err := donat.New(ctx, donat.Config{
-		Backend:  donat.Postgres(pool),
-		Metadata: coreConfig,
-		Registry: reg,
+		Backend:   donat.Postgres(pool),
+		Metadata:  coreConfig,
+		Registry:  reg,
+		Functions: fns,
+		// The storage secrets stay out of the committed snapshot: it is
+		// generated at deploy time and travels inside the binary.
+		Secrets: map[string]string{
+			"LENDING_S3_KEY":         env("LENDING_S3_KEY", "minioadmin"),
+			"LENDING_S3_SECRET":      env("LENDING_S3_SECRET", "minioadmin"),
+			"LENDING_SIGNING_SECRET": env("LENDING_SIGNING_SECRET", "dev-signing-secret"),
+		},
 	})
 	if err != nil {
 		log.Fatalf("donat.New: %v", err)
 	}
+	// The function reads the loan back through the engine, which does not
+	// exist until every function is registered.
+	receipts.Bind(eng)
 
 	// The engine's handler is an ordinary http.Handler, mounted beside the
 	// application's own routes in the application's own mux.
