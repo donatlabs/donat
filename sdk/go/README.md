@@ -287,12 +287,17 @@ donat --database-url "$URL" dump-core-config --metadata-dir metadata --check
 
 It exits non-zero when the committed file is not what would be written now.
 
-## Regenerating the core
+## Building the core
 
-The blob is committed so `go get` needs no Rust toolchain — which is also how
-it silently goes stale when a crate below it changes. The build is
-path-remapped and therefore reproducible, so CI compares bytes and fails on a
-difference; regenerate with:
+`go get` needs no Rust toolchain: the compiled core travels inside the module,
+which is why it has to exist in the tree the proxy fetches. That tree is the
+release tag, and only the release tag — on a branch the core is a build output
+like any other, so a checkout does not have one and nothing goes stale between
+releases.
+
+Working on the repository itself, build it first — `make go-test` does this for
+you, and without it `//go:embed` fails with `pattern wasm/core.wasm: no
+matching files found`:
 
 ```bash
 make wasm-core      # rebuilds sdk/go/donat/wasm/core.wasm

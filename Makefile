@@ -31,7 +31,7 @@ wasm-core:
 
 # The Go host's own suite. CGO stays off: the SDK is `go get`-able and
 # builds a static binary, which is the property wazero was chosen for.
-go-test:
+go-test: wasm-core
 	cd sdk/go && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...
 
 # Both lending stands: the standalone engine and the Go host, from one

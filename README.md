@@ -209,7 +209,9 @@ behaviour — the SQL is the same SQL because it is the same code.
 | [`server`](crates/server) | The axum binary: `/v1/graphql` (+ws), Relay, `/api/rest`, `/mcp`, cron, durable processes, plus `migrate`, `validate` and `codegen`. There is no admin API; configuration is deploy-time. |
 | [`conformance`](crates/conformance) | The harness and its fixtures — the executable source of truth. It builds and spawns the engine itself. |
 
-The Go host lives in [`sdk/go`](sdk/go/README.md): it embeds `core.wasm`,
+The Go host lives in [`sdk/go`](sdk/go/README.md): it embeds `core.wasm`
+(built by `make wasm-core`; it ships inside the released module rather than in
+the branches),
 drives it through wazero with no cgo, and owns the pool, the HTTP surface and
 the functions you write for logic no declaration can express.
 

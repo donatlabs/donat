@@ -19,6 +19,16 @@ COPY sdk/go ./sdk/go
 COPY examples/petshop-golang ./examples/petshop-golang
 
 WORKDIR /src/examples/petshop-golang
+# The wasm core is a build output kept out of the branches, so it is not in a
+# fresh checkout — `//go:embed` would fail here with "no matching files found",
+# which says nothing about the cause. Build it first:
+#
+#     make wasm-core && docker compose up --build
+#
+RUN test -f ../../sdk/go/donat/wasm/core.wasm || { \
+      echo "the wasm core is missing: run 'make wasm-core' in the repository root first" >&2; \
+      exit 1; \
+    }
 # CGO_ENABLED=0 → pure-Go, static binary (no libc dependency).
 RUN CGO_ENABLED=0 go build -o /petshop .
 

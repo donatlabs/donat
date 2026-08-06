@@ -10,6 +10,15 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
+// coreWasm is the compiled Rust core. It is a build output kept out of the
+// branches and committed only on the release tag this module is published
+// from, so a checkout of a branch does not have it:
+//
+//	make wasm-core
+//
+// Without it the build fails here with "pattern wasm/core.wasm: no matching
+// files found", which names the file but not the fix.
+//
 //go:embed wasm/core.wasm
 var coreWasm []byte
 

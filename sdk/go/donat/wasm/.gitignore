@@ -1,0 +1,8 @@
+# The compiled core is a build output, not source.
+#
+# Committing it on every branch added a five-megabyte object to the history
+# each time a crate below it changed — twelve revisions so far, none of them a
+# release. It is built by `make wasm-core` for local work and CI, and committed
+# only on the release tag the module is published from, which is the one tree
+# `go get` ever fetches.
+/core.wasm
