@@ -346,12 +346,12 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                     }
                     _ => donat_sqlgen::mutation_to_sql_with(root, dialect),
                 };
+                hooks.extend(hooks_for_root(root, &alias, &state.metadata));
                 statements.push(Statement {
                     alias,
                     sql,
                     params: vec![],
                 });
-                hooks.extend(hooks_for_root(root, &state.metadata));
             }
             PlanV1::Mutation(PlanBody {
                 version: PLAN_VERSION,
@@ -435,17 +435,19 @@ fn written_tables(root: &donat_ir::MutationRoot) -> Vec<(&str, &str, &'static st
 /// operation.
 fn hooks_for_root(
     root: &donat_ir::MutationRoot,
+    alias: &str,
     metadata: &donat_metadata::Metadata,
 ) -> Vec<crate::plan::Hook> {
     let mut out = Vec::new();
     for (schema, table, op) in written_tables(root) {
-        collect_hooks(metadata, schema, table, op, &mut out);
+        collect_hooks(metadata, alias, schema, table, op, &mut out);
     }
     out
 }
 
 fn collect_hooks(
     metadata: &donat_metadata::Metadata,
+    alias: &str,
     schema: &str,
     table: &str,
     op: &str,
@@ -466,6 +468,7 @@ fn collect_hooks(
                 if covers {
                     out.push(crate::plan::Hook {
                         phase: "post_commit".into(),
+                        alias: alias.to_string(),
                         trigger: et.name.clone(),
                         schema: schema.to_string(),
                         table: table.to_string(),

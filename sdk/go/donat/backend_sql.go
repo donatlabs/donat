@@ -36,7 +36,20 @@ var _ Backend = (*sqlBackend)(nil)
 // result-assembly strategy used by RunQuery/RunMutation.
 //
 // The db is caller-owned and must outlive the Engine.
+//
+// An unrecognised dialect panics rather than being passed through. The core
+// falls back to Postgres for anything it does not know, so `"sqlite3"` — the
+// driver's own name, and the obvious thing to write — would silently render
+// Postgres SQL against a SQLite database and fail somewhere far from the
+// cause.
 func SQL(db *sql.DB, dialect string) Backend {
+	switch dialect {
+	case "postgres", "sqlite", "mysql":
+	default:
+		panic(fmt.Sprintf(
+			"donat.SQL: unknown dialect %q; want \"postgres\", \"sqlite\" or \"mysql\"",
+			dialect))
+	}
 	return &sqlBackend{db: db, dialect: dialect}
 }
 

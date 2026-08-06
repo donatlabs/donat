@@ -74,7 +74,8 @@ func (e *Engine) Handler() http.Handler {
 		}
 
 		// Step 3: compile + execute.
-		result, err := e.Execute(r.Context(), req.Query, req.Variables, sessionVars)
+		result, err := e.ExecuteOperation(
+			r.Context(), req.Query, req.OperationName, req.Variables, sessionVars)
 		if err != nil {
 			// Execute returns a non-nil Go error only for host-level failures
 			// (marshal bugs etc.) — treat as internal error, still HTTP 200.

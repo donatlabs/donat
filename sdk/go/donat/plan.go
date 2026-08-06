@@ -71,7 +71,11 @@ type Statement struct {
 
 // Hook is a post-commit event-trigger hook emitted by the wasm core.
 type Hook struct {
-	Phase   string `json:"phase"`
+	Phase string `json:"phase"`
+	// Alias is the response key of the statement this hook's payload comes
+	// from. A root may fire several triggers, so a trigger name does not
+	// identify a result.
+	Alias   string `json:"alias"`
 	Trigger string `json:"trigger"`
 	Schema  string `json:"schema"`
 	Table   string `json:"table"`

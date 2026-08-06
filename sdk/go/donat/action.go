@@ -40,9 +40,15 @@ func (e *Engine) runAction(
 		// hosts interchangeable rather than making "which host" a property of
 		// the declaration.
 		if item.Handler != nil {
-			raw, err := e.callWebhook(ctx, item)
+			raw, refusal, err := e.callWebhook(ctx, item)
 			if err != nil {
 				return errorBody("unexpected", "$", err.Error()), nil
+			}
+			// A handler that refused answers the caller in its own words, and
+			// in the same shape the standalone server gives it: one metadata
+			// file, one handler, one answer regardless of which host called.
+			if refusal != nil {
+				return refusal, nil
 			}
 			results[item.Alias] = raw
 			continue
@@ -144,14 +150,20 @@ func (e *Engine) functions() *Functions {
 
 // callWebhook resolves an action that names an HTTP handler, with the payload
 // the standalone server sends so one handler serves both hosts unchanged.
-func (e *Engine) callWebhook(ctx context.Context, item ActionItem) (json.RawMessage, error) {
+// callWebhook returns the handler's body, or — when the handler refused — the
+// finished GraphQL error body to answer with. Only a transport failure is
+// returned as an error.
+func (e *Engine) callWebhook(
+	ctx context.Context,
+	item ActionItem,
+) (json.RawMessage, []byte, error) {
 	payload, err := json.Marshal(map[string]any{
 		"action":            map[string]string{"name": item.Name},
 		"input":             item.Input,
 		"session_variables": item.SessionVariables,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("action %q: encoding the webhook payload: %w", item.Name, err)
+		return nil, nil, fmt.Errorf("action %q: encoding the webhook payload: %w", item.Name, err)
 	}
 	if item.Timeout != nil {
 		var cancel context.CancelFunc
@@ -160,32 +172,58 @@ func (e *Engine) callWebhook(ctx context.Context, item ActionItem) (json.RawMess
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, *item.Handler, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("action %q: %w", item.Name, err)
+		return nil, nil, fmt.Errorf("action %q: %w", item.Name, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := e.httpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http exception when calling webhook: %w", err)
+		return nil, nil, fmt.Errorf("http exception when calling webhook: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("action %q: reading the webhook response: %w", item.Name, err)
+		return nil, nil, fmt.Errorf("action %q: reading the webhook response: %w", item.Name, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		// The handler's own message is the caller's answer, the way the
-		// standalone server surfaces it.
-		var e struct {
-			Message string `json:"message"`
-		}
-		_ = json.Unmarshal(body, &e)
-		if e.Message == "" {
-			e.Message = "webhook returned an error"
-		}
-		return nil, fmt.Errorf("%s", e.Message)
+		return nil, webhookRefusal(body), nil
 	}
-	return body, nil
+	return body, nil, nil
+}
+
+// webhookRefusal turns a non-2xx handler body into the GraphQL error the
+// caller receives, reproducing crates/server/src/action.rs verbatim: the
+// body's `extensions` object is used as-is when present, otherwise `{path,
+// code}` is built with `code` from the body's top-level field. Dropping either
+// — as this host did — makes the same handler answer `validation-failed` on
+// one host and `unexpected` on the other.
+func webhookRefusal(body []byte) []byte {
+	var parsed struct {
+		Message    string          `json:"message"`
+		Code       string          `json:"code"`
+		Extensions json.RawMessage `json:"extensions"`
+	}
+	_ = json.Unmarshal(body, &parsed)
+
+	message := parsed.Message
+	if message == "" {
+		message = "webhook returned an error"
+	}
+	if len(parsed.Extensions) > 0 && string(parsed.Extensions) != "null" {
+		envelope, err := json.Marshal(map[string]any{
+			"errors": []map[string]any{
+				{"extensions": parsed.Extensions, "message": message},
+			},
+		})
+		if err == nil {
+			return envelope
+		}
+	}
+	code := parsed.Code
+	if code == "" {
+		code = "unexpected"
+	}
+	return errorBody(code, "$", message)
 }
 
 // httpClient is the client webhook actions use. A caller that needs its own

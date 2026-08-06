@@ -17,9 +17,13 @@ import (
 //	}
 //
 // It serves `/v1/graphql` and nothing else. A probe endpoint, a metrics route,
-// middleware, a shutdown sequence — every deployment wants a different set, and
-// a program that wants any of them builds the engine with New and mounts
+// a shutdown sequence — every deployment wants a different set, and a program
+// that wants any of them builds the engine with New and mounts
 // `eng.Handler()` in its own mux, keeping every registration it already wrote.
+//
+// Authentication is not optional and not included: the engine takes a
+// request's role from its headers, so anything that reaches the handler is
+// already trusted. Use WithMiddleware, or do not expose the port.
 //
 // Configuration comes from the environment, so the same binary is deployed the
 // way the standalone engine is:
@@ -76,8 +80,16 @@ func Run(ctx context.Context, opts ...Option) error {
 		return err
 	}
 
+	// Every request declares its own role in X-Donat-Role, so whatever
+	// reaches the handler is trusted to have been authenticated already. On a
+	// public address that is an open role-impersonation endpoint, and a
+	// deployment that needs otherwise puts its own check in front.
+	var handler http.Handler = engine.Handler()
+	for i := len(cfg.Middleware) - 1; i >= 0; i-- {
+		handler = cfg.Middleware[i](handler)
+	}
 	mux := http.NewServeMux()
-	mux.Handle("/v1/graphql", engine.Handler())
+	mux.Handle("/v1/graphql", handler)
 
 	addr := ":" + env("DONAT_PORT", "8080")
 	fmt.Fprintf(os.Stderr, "donat: listening on %s\n", addr)
@@ -113,6 +125,18 @@ func WithSecrets(secrets map[string]string) Option {
 			c.Secrets[k] = v
 		}
 	}
+}
+
+// WithMiddleware wraps the GraphQL handler, outermost first.
+//
+// The engine resolves a request's role from its X-Donat-* headers and does not
+// authenticate it — deciding who may reach the handler at all is the
+// deployment's job. Without something here, anyone who can reach the port can
+// name their own role.
+//
+//	donat.Main(donat.WithMiddleware(requireJWT))
+func WithMiddleware(mw ...func(http.Handler) http.Handler) Option {
+	return func(c *Config) { c.Middleware = append(c.Middleware, mw...) }
 }
 
 // WithExternalBaseURL sets the absolute prefix for engine-served URLs, e.g.

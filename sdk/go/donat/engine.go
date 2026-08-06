@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +39,12 @@ type Config struct {
 	// used when unset.
 	Now      func() time.Time
 	PoolSize int // wasm instance pool size (default 4)
+	// PlanCacheSize bounds the compiled-plan cache. Optional; 2048 when unset.
+	PlanCacheSize int
+	// Middleware wraps the GraphQL handler that Main serves, outermost first.
+	// The engine authenticates nothing — it reads the role from the request —
+	// so this is where a deployment decides who may reach it at all.
+	Middleware []func(http.Handler) http.Handler
 }
 
 // Option configures a Config. The same options build the Config that Main
@@ -56,7 +63,17 @@ type Engine struct {
 	// signsURLs is true when the metadata declares a file attachment, which
 	// makes every plan unique to its request and therefore uncacheable.
 	signsURLs bool
+	cacheSize atomic.Int64
+	// live counts instances that exist, idle or in use, so the pool size is a
+	// limit rather than a target. waiters are callers parked until a release.
+	live    int
+	waiters []chan struct{}
 }
+
+// defaultPlanCacheSize bounds the compiled-plan cache. Large enough that a
+// normal application never evicts, small enough that a caller cannot grow the
+// process by sending distinct variables.
+const defaultPlanCacheSize = 2048
 
 // now is the clock the engine signs with. Config.Now overrides it so a test
 // can pin a day boundary.
@@ -87,12 +104,14 @@ func New(ctx context.Context, cfg Config) (*Engine, error) {
 		return nil, err
 	}
 	e := &Engine{cfg: cfg, backend: cfg.Backend, registry: cfg.Registry, signsURLs: signs}
-	// Pre-seed one instance to fail fast on a bad metadata/catalog blob.
+	// Pre-seed one instance to fail fast on a bad metadata/catalog blob. It
+	// counts against the pool limit like any other.
 	c, err := e.newSeededInstance(ctx)
 	if err != nil {
 		return nil, err
 	}
 	e.insts = append(e.insts, c)
+	e.live = 1
 	return e, nil
 }
 
@@ -113,34 +132,62 @@ func (e *Engine) newSeededInstance(ctx context.Context) (*wasmCore, error) {
 	return c, nil
 }
 
+// acquire takes an idle instance, or waits for one when the pool is at its
+// limit.
+//
+// Creating one is not cheap — it instantiates the module and re-runs
+// `core_init` over the whole snapshot — so a burst of concurrent compiles used
+// to create an unbounded number of them, each competing for the same cores.
+// Blocking instead makes PoolSize mean what it says.
 func (e *Engine) acquire(ctx context.Context) (*wasmCore, error) {
-	e.mu.Lock()
-	if n := len(e.insts); n > 0 {
-		c := e.insts[n-1]
-		e.insts = e.insts[:n-1]
+	for {
+		e.mu.Lock()
+		if n := len(e.insts); n > 0 {
+			c := e.insts[n-1]
+			e.insts = e.insts[:n-1]
+			e.mu.Unlock()
+			return c, nil
+		}
+		if e.live < e.cfg.PoolSize {
+			e.live++
+			e.mu.Unlock()
+			c, err := e.newSeededInstance(ctx)
+			if err != nil {
+				e.mu.Lock()
+				e.live--
+				e.mu.Unlock()
+				return nil, err
+			}
+			return c, nil
+		}
+		// At the limit: wait for a release rather than adding another.
+		wait := make(chan struct{})
+		e.waiters = append(e.waiters, wait)
 		e.mu.Unlock()
-		return c, nil
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	e.mu.Unlock()
-	return e.newSeededInstance(ctx)
 }
 
 func (e *Engine) release(c *wasmCore) {
 	e.mu.Lock()
-	if len(e.insts) < e.cfg.PoolSize {
-		e.insts = append(e.insts, c)
-		e.mu.Unlock()
-		return
+	e.insts = append(e.insts, c)
+	if n := len(e.waiters); n > 0 {
+		wait := e.waiters[n-1]
+		e.waiters = e.waiters[:n-1]
+		close(wait)
 	}
 	e.mu.Unlock()
-	_ = c.close(context.Background())
 }
 
 // planCacheKey uniquely identifies a compiled plan. dialect is constant per
 // Engine (set from backend.Dialect()) but included for correctness in case
 // two engines with different backends share a sync.Map (they don't today, but
 // the key must be self-contained).
-type planCacheKey struct{ query, role, varsHash, sessHash, dialect string }
+type planCacheKey struct{ query, operation, role, varsHash, sessHash, dialect string }
 
 // compileInput is the Go mirror of the Rust CompileInput (crates/wasm-core/src/compile.rs).
 // JSON field names match the Rust serde field names exactly.
@@ -188,12 +235,19 @@ func (e *Engine) compilePlan(ctx context.Context, in compileInput) (Plan, error)
 	if e.signsURLs {
 		return e.compileUncached(ctx, in)
 	}
+	// Two operations in one document share its text, so the name is part of
+	// the identity of the plan.
+	operation := ""
+	if in.OperationName != nil {
+		operation = *in.OperationName
+	}
 	key := planCacheKey{
-		query:    in.Query,
-		role:     in.SessionVars["x-donat-role"],
-		varsHash: hashJSON(in.Variables),
-		sessHash: hashMap(in.SessionVars),
-		dialect:  in.Dialect,
+		query:     in.Query,
+		operation: operation,
+		role:      in.SessionVars["x-donat-role"],
+		varsHash:  hashJSON(in.Variables),
+		sessHash:  hashMap(in.SessionVars),
+		dialect:   in.Dialect,
 	}
 	if v, ok := e.cache.Load(key); ok {
 		return v.(Plan), nil
@@ -202,8 +256,34 @@ func (e *Engine) compilePlan(ctx context.Context, in compileInput) (Plan, error)
 	if err != nil {
 		return Plan{}, err
 	}
-	e.cache.Store(key, p)
+	e.cacheStore(key, p)
 	return p, nil
+}
+
+// cacheStore adds a plan, evicting everything when the cache is full.
+//
+// The key includes the variables and every session variable, so the entries
+// are per user and per argument: a caller sending unique values grows it
+// without limit, which on a long-lived process is a slow leak. Clearing
+// wholesale rather than evicting the least-used keeps this to a few lines and
+// costs a recompile per entry afterwards — which is what the cache saves,
+// once, and not what it exists for.
+func (e *Engine) cacheStore(key planCacheKey, p Plan) {
+	if e.cacheSize.Add(1) > int64(e.planCacheLimit()) {
+		e.cache.Range(func(k, _ any) bool {
+			e.cache.Delete(k)
+			return true
+		})
+		e.cacheSize.Store(1)
+	}
+	e.cache.Store(key, p)
+}
+
+func (e *Engine) planCacheLimit() int {
+	if e.cfg.PlanCacheSize > 0 {
+		return e.cfg.PlanCacheSize
+	}
+	return defaultPlanCacheSize
 }
 
 // compileUncached runs the wasm core without consulting or filling the cache.

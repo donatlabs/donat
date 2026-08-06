@@ -59,8 +59,14 @@ func randomBytes(_ context.Context, mod api.Module, ptr, size uint32) uint32 {
 	return 0
 }
 
+// compilationCache lets every instance share one compilation of core.wasm.
+// Compiling a five-megabyte module per instance is the dominant cost of
+// creating one, and the result is identical every time.
+var compilationCache = wazero.NewCompilationCache()
+
 func newWasmCore(ctx context.Context) (*wasmCore, error) {
-	rt := wazero.NewRuntime(ctx)
+	rt := wazero.NewRuntimeWithConfig(ctx,
+		wazero.NewRuntimeConfig().WithCompilationCache(compilationCache))
 	if _, err := rt.NewHostModuleBuilder(hostModuleName).
 		NewFunctionBuilder().
 		WithFunc(randomBytes).

@@ -1,6 +1,7 @@
 package donat
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,15 +44,14 @@ func (e *Engine) fireHooks(ctx context.Context, hooks []Hook, data map[string]js
 		// Build the event envelope mirroring crates/server/src/events.rs (tick fn).
 		// V1: data.new is the aliased statement result if available; data.old is
 		// null (INSERT only in v1; full old/new capture is a planned follow-up).
-		var newData json.RawMessage = []byte("null")
-		if part, ok := data[h.Trigger]; ok {
+		// The payload is the result of the statement this hook came from,
+		// found by the alias the core recorded. Looking it up by trigger name
+		// used to miss — the map is keyed by response alias — and the fallback
+		// then took whichever entry ranged first, so a handler could be handed
+		// another root's rows. Absent is `null`, never someone else's data.
+		newData := json.RawMessage("null")
+		if part, ok := data[h.Alias]; ok {
 			newData = part
-		} else {
-			// Fall back to the first statement's result as the "new" payload.
-			for _, v := range data {
-				newData = v
-				break
-			}
 		}
 
 		type tableRef struct {
@@ -119,10 +119,19 @@ func (e *Engine) fireHooks(ctx context.Context, hooks []Hook, data map[string]js
 // All database and plan-level errors are returned as a GraphQL body (nil Go
 // error). A non-nil Go error indicates a host-level failure (marshal etc.).
 func (e *Engine) Execute(ctx context.Context, query string, vars map[string]json.RawMessage, sessionVars map[string]string) ([]byte, error) {
+	return e.ExecuteOperation(ctx, query, nil, vars, sessionVars)
+}
+
+// ExecuteOperation is Execute for a document carrying more than one operation,
+// where `operationName` says which to run — the same field the GraphQL request
+// body has. Without it such a document is ambiguous and the core refuses it,
+// so a client that works against the standalone server would fail here.
+func (e *Engine) ExecuteOperation(ctx context.Context, query string, operationName *string, vars map[string]json.RawMessage, sessionVars map[string]string) ([]byte, error) {
 	plan, err := e.compilePlan(ctx, compileInput{
-		Query:       query,
-		Variables:   vars,
-		SessionVars: sessionVars,
+		Query:         query,
+		OperationName: operationName,
+		Variables:     vars,
+		SessionVars:   sessionVars,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("Execute: compile: %w", err)
@@ -136,7 +145,11 @@ func (e *Engine) Execute(ctx context.Context, query string, vars map[string]json
 		if err != nil {
 			return e.backend.MapError(err, plan.ErrorMap), nil
 		}
-		envelope, err := json.Marshal(map[string]json.RawMessage{"data": data})
+		assembled, err := assembleResponse(plan.Response, data)
+		if err != nil {
+			return nil, fmt.Errorf("Execute: %w", err)
+		}
+		envelope, err := json.Marshal(map[string]json.RawMessage{"data": assembled})
 		if err != nil {
 			return nil, fmt.Errorf("Execute: marshal query envelope: %w", err)
 		}
@@ -242,4 +255,57 @@ func (e *Engine) executeQuery(ctx context.Context, query string, vars map[string
 		return nil, fmt.Errorf("executeQuery: marshal envelope: %w", err)
 	}
 	return envelope, nil
+}
+
+// assembleResponse builds the top-level object in the order the client asked
+// for, mirroring crates/server/src/gql.rs.
+//
+// A root `__typename` is answered by the planner and never reaches SQL, so a
+// host that returned the statement result unchanged dropped it — and a query
+// selecting only `__typename` produced no statement at all, which then read as
+// an error. With no slots the result passes through untouched, which is every
+// plan the core built before it emitted them.
+func assembleResponse(slots []ResponseSlot, data json.RawMessage) (json.RawMessage, error) {
+	if len(slots) == 0 {
+		return data, nil
+	}
+	values := map[string]json.RawMessage{}
+	if len(data) > 0 && string(data) != "null" {
+		if err := json.Unmarshal(data, &values); err != nil {
+			return nil, fmt.Errorf("decoding the statement result: %w", err)
+		}
+	}
+
+	// json.Marshal of a map sorts its keys, and the client's field order is
+	// part of the response, so the object is built by hand.
+	var out bytes.Buffer
+	out.WriteByte('{')
+	for i, slot := range slots {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		key, err := json.Marshal(slot.Key)
+		if err != nil {
+			return nil, fmt.Errorf("encoding response key %q: %w", slot.Key, err)
+		}
+		out.Write(key)
+		out.WriteByte(':')
+
+		switch slot.Kind {
+		case "local_typename":
+			value, err := json.Marshal(slot.Value)
+			if err != nil {
+				return nil, fmt.Errorf("encoding __typename for %q: %w", slot.Key, err)
+			}
+			out.Write(value)
+		default:
+			if v, ok := values[slot.Key]; ok {
+				out.Write(v)
+			} else {
+				out.WriteString("null")
+			}
+		}
+	}
+	out.WriteByte('}')
+	return out.Bytes(), nil
 }

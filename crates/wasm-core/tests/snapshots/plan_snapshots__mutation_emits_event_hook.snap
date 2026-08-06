@@ -1,5 +1,6 @@
 ---
 source: crates/wasm-core/tests/plan_snapshots.rs
+assertion_line: 341
 expression: plan
 ---
 {
@@ -16,6 +17,7 @@ expression: plan
   "hooks": [
     {
       "phase": "post_commit",
+      "alias": "insert_author",
       "trigger": "on_author_change",
       "schema": "public",
       "table": "author",

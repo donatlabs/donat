@@ -68,6 +68,13 @@ pub enum ResponseSlot {
 #[derive(Debug, Serialize)]
 pub struct Hook {
     pub phase: String, // "post_commit"
+    /// The response key of the statement whose result this hook carries.
+    ///
+    /// A mutation has one statement per root and a root may fire several
+    /// triggers, so a trigger name does not identify a result. Without this the
+    /// host has to guess, and guessing wrong hands a handler another root's
+    /// payload.
+    pub alias: String,
     pub trigger: String,
     pub schema: String,
     pub table: String,
