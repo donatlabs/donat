@@ -4,6 +4,7 @@ go 1.22.0
 
 require (
 	github.com/donatlabs/donat/sdk/go v0.0.0
+	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.4
 )
 

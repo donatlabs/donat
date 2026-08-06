@@ -241,9 +241,9 @@ func TestConcurrentBorrowersLeaveOneLoan(t *testing.T) {
 			// gqlErr, not gql: a worker must not call t.Fatalf, which would
 			// terminate only that goroutine and hang the test.
 			results[i], failures[i] = svc.gqlErr(roleMember, `
-				mutation ($copy: uuid!, $from: date!, $due: date!) {
-				  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) { loan_id }
-				}`, map[string]any{"copy": copyID, "from": today(), "due": plusDays(14)})
+				mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+				  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) { loan_id }
+				}`, map[string]any{"copy": copyID, "from": today(), "due": plusDays(14), "req": newRequestID()})
 		}(i)
 	}
 	wg.Wait()
@@ -274,9 +274,9 @@ func TestLibrarianCannotInvokeMemberCommands(t *testing.T) {
 	copyID := svc.addCopy(book, "c-1")
 
 	resp := svc.gql(roleLibrarian, `
-		mutation ($copy: uuid!, $from: date!, $due: date!) {
-		  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) { loan_id }
-		}`, map[string]any{"copy": copyID, "from": today(), "due": plusDays(14)})
+		mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+		  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) { loan_id }
+		}`, map[string]any{"copy": copyID, "from": today(), "due": plusDays(14), "req": newRequestID()})
 
 	if errorMessage(resp) == "" {
 		t.Fatalf("librarian invoked a member-only command: %v", resp)

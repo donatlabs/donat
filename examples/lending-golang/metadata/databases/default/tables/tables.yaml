@@ -2,3 +2,4 @@
 - "!include public_book.yaml"
 - "!include public_copy.yaml"
 - "!include public_loan.yaml"
+- "!include public_loan_followup.yaml"

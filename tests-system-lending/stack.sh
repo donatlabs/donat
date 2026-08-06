@@ -35,6 +35,7 @@ engine_metadata="$state/metadata-engine"
 PG_BASE="${LENDING_PG_BASE:-postgresql://postgres:postgres@127.0.0.1:15433}"
 ENGINE_PORT="${LENDING_ENGINE_PORT:-8090}"
 GO_PORT="${LENDING_GO_PORT:-8091}"
+DRIVER_PORT="${LENDING_DRIVER_PORT:-8092}"
 ENGINE_DB="${LENDING_ENGINE_DB:-lending_engine}"
 GO_DB="${LENDING_GO_DB:-lending_go}"
 ADMIN_SECRET="${LENDING_ADMIN_SECRET:-lending-secret}"
@@ -53,6 +54,8 @@ engine_pid="$state/engine.pid"
 engine_log="$state/engine.log"
 go_pid="$state/go.pid"
 go_log="$state/go.log"
+driver_pid="$state/driver.pid"
+driver_log="$state/driver.log"
 
 createdb() {
   local name="$1"
@@ -94,6 +97,13 @@ migrate() {
     --migrations-dir "$repo/migrations" >/dev/null
   "$repo/target/debug/donat" --database-url "$url" migrate \
     --migrations-dir "$example/migrations" >/dev/null
+  # The third step of the platform's deploy model: publish the Process
+  # revisions. A command that starts a Process writes a journal row whose
+  # foreign key names the revision, so without this the borrow fails on the
+  # constraint rather than on anything a caller did.
+  DONAT_GRAPHQL_DATABASE_URL="$url" "$repo/target/debug/donat" \
+    --database-url "$url" migrate --migrations-dir "$repo/migrations" \
+    --metadata-dir "$engine_metadata" --source default >/dev/null
 }
 
 wait_for() {
@@ -149,6 +159,19 @@ cmd_up() {
       >"$engine_log" 2>&1 &
   echo $! >"$engine_pid"
 
+  # The Go host originates durable work but does not carry it forward, so its
+  # database gets an engine whose only job is the runtime loop. This is the
+  # deployment shape the SDK documents, and running it here is what makes the
+  # suite prove it rather than assert it.
+  echo "==> driving the Go stand's Processes with an engine on $DRIVER_PORT"
+  DONAT_PORT="$DRIVER_PORT" \
+  DONAT_GRAPHQL_DATABASE_URL="$go_url" \
+  DONAT_GRAPHQL_ADMIN_SECRET="$ADMIN_SECRET" \
+  RUST_LOG="${RUST_LOG:-donat=info}" \
+    nohup "$repo/target/debug/donat" --metadata-dir "$engine_metadata" \
+      >"$driver_log" 2>&1 &
+  echo $! >"$driver_pid"
+
   echo "==> serving the Go host on $GO_PORT"
   DONAT_DATABASE_URL="$go_url" DONAT_PORT="$GO_PORT" \
   DONAT_CORE_CONFIG="$example/core-config.json" \
@@ -156,13 +179,14 @@ cmd_up() {
   echo $! >"$go_pid"
 
   wait_for "http://127.0.0.1:$ENGINE_PORT" engine
+  wait_for "http://127.0.0.1:$DRIVER_PORT" "process driver"
   wait_for "http://127.0.0.1:$GO_PORT" "go host"
   echo "==> both stands are up"
   cmd_env
 }
 
 cmd_down() {
-  for f in "$engine_pid" "$go_pid"; do
+  for f in "$engine_pid" "$go_pid" "$driver_pid"; do
     [ -f "$f" ] || continue
     kill "$(cat "$f")" 2>/dev/null || true
     rm -f "$f"
@@ -177,7 +201,7 @@ cmd_env() {
 }
 
 cmd_logs() {
-  tail -n 50 -F "$engine_log" "$go_log"
+  tail -n 50 -F "$engine_log" "$go_log" "$driver_log"
 }
 
 case "${1:-}" in

@@ -237,7 +237,12 @@ successful deploy actually proves:
   does not do is carry that Process forward — transitions, timers, activity
   leases and webhook ingress are a runtime loop that lives in `donat-server`.
   Run one against the same database and it drives what this host originates;
-  without one, a started Process sits in the journal.
+  without one, a started Process sits in the journal. Publishing the Process
+  revisions is a third `donat migrate` step — the journal row's foreign key
+  names the revision, so a command that starts one fails on that constraint
+  until it is published. `examples/lending-golang` shows the whole shape, and
+  `tests-system-lending` runs an engine beside the Go host to prove the
+  Process completes.
 - **Connectors.** Connectors are invoked from Process activities
   (`crates/server/src/processes/activity.rs`), so this host reaches none of
   them, and a Process that declares one fails to compile here. Their design is

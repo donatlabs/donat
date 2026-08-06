@@ -53,6 +53,34 @@ pub struct Statement {
     /// `params` is reserved for the future $n refactor).
     pub sql: String,
     pub params: Vec<serde_json::Value>,
+    /// How the host must read this statement's row.
+    ///
+    /// Almost every statement yields one JSON value in column 0. An idempotent
+    /// command does not: its row carries the execution generation beside the
+    /// result, because a replay has to be distinguishable from a first run.
+    /// The host cannot infer that from the SQL, and a host that guessed would
+    /// fail on the shape rather than on anything meaningful — so the plan says
+    /// it.
+    #[serde(default, skip_serializing_if = "ResultShape::is_default")]
+    pub result: ResultShape,
+}
+
+/// The row shape a statement returns.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultShape {
+    /// One JSON (or text) value in column 0.
+    #[default]
+    Value,
+    /// Columns `root`, `invocation_id` and `replayed`: an idempotent command's
+    /// durable execution generation alongside its result.
+    CommandExecution,
+}
+
+impl ResultShape {
+    fn is_default(&self) -> bool {
+        matches!(self, ResultShape::Value)
+    }
 }
 
 /// One top-level response key, in client order.

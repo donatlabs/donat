@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import os
+import time
 import uuid
 from typing import Any
 
@@ -170,15 +171,16 @@ class Library:
     def borrow(self, copy_id: str, days: int = 14, **kwargs) -> dict[str, Any]:
         data = self.call(
             MEMBER,
-            """mutation ($copy: uuid!, $from: date!, $due: date!) {
-                 borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) {
+            """mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+                 borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) {
                    loan_id
                    copy_id
                    due_on
                    open_loans_before
                  }
                }""",
-            {"copy": copy_id, "from": today(), "due": plus_days(days)},
+            {"copy": copy_id, "from": today(), "due": plus_days(days),
+             "req": str(uuid.uuid4())},
             **kwargs,
         )
         return data["borrow_copy"]
@@ -223,6 +225,31 @@ class Library:
         )
         rows = data["copy"]
         return rows[0]["status"] if rows else ""
+
+    def followup_note(self, loan_id: str, timeout: float = 20.0) -> str | None:
+        """Wait for the durable follow-up on a loan, or give up.
+
+        The row is written by a Process, not by the borrow that started it, so
+        it appears some time after the mutation returned. Polling is what a
+        caller would actually do; the timeout is what stops a stand with
+        nothing driving its Processes from hanging the suite instead of
+        failing it.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            data = self.call(
+                LIBRARIAN,
+                """query ($id: uuid!) {
+                     loan_followup(where: { loan_id: { _eq: $id } }) { note }
+                   }""",
+                {"id": loan_id},
+            )
+            rows = data["loan_followup"]
+            if rows:
+                return str(rows[0]["note"])
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.25)
 
     def open_loans(self, member_id: str) -> int:
         data = self.call(

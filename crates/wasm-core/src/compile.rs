@@ -323,6 +323,7 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                         alias: "data".into(),
                         sql,
                         params: vec![],
+                        result: crate::plan::ResultShape::Value,
                     }]
                 }
             };
@@ -360,10 +361,22 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
                     _ => donat_sqlgen::mutation_to_sql_with(root, dialect),
                 };
                 hooks.extend(hooks_for_root(root, &alias, &state.metadata));
+                // An idempotent command returns its execution generation beside
+                // the result, so the host must read the row by name rather than
+                // take column 0.
+                let result = match root {
+                    donat_ir::MutationRoot::Command { command, .. }
+                        if command.idempotency.is_some() =>
+                    {
+                        crate::plan::ResultShape::CommandExecution
+                    }
+                    _ => crate::plan::ResultShape::Value,
+                };
                 statements.push(Statement {
                     alias,
                     sql,
                     params: vec![],
+                    result,
                 });
             }
             PlanV1::Mutation(PlanBody {

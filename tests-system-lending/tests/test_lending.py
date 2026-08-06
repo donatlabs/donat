@@ -8,6 +8,8 @@ the service enforces them — on every configured stand.
 
 from __future__ import annotations
 
+import uuid
+
 import concurrent.futures
 
 from lending_qa import LIBRARIAN, MEMBER, Library, plus_days, today
@@ -29,10 +31,10 @@ def test_a_copy_on_loan_cannot_be_lent_again(library: Library, shelf):
 
     refused = library.attempt(
         MEMBER,
-        """mutation ($copy: uuid!, $from: date!, $due: date!) {
-             borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) { loan_id }
+        """mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+             borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) { loan_id }
            }""",
-        {"copy": copy_id, "from": today(), "due": plus_days(14)},
+        {"copy": copy_id, "from": today(), "due": plus_days(14), "req": str(uuid.uuid4())},
     )
 
     assert refused is not None, "a copy already on loan was lent twice"
@@ -47,10 +49,10 @@ def test_the_loan_limit_refuses_one_too_many(library: Library, shelf):
 
     refused = library.attempt(
         MEMBER,
-        """mutation ($copy: uuid!, $from: date!, $due: date!) {
-             borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) { loan_id }
+        """mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+             borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) { loan_id }
            }""",
-        {"copy": copies[3], "from": today(), "due": plus_days(14)},
+        {"copy": copies[3], "from": today(), "due": plus_days(14), "req": str(uuid.uuid4())},
     )
 
     assert refused is not None, "a fourth loan was allowed past a limit of 3"
@@ -67,10 +69,10 @@ def test_returning_frees_the_limit_and_the_copy(library: Library, shelf):
 
     assert library.attempt(
         MEMBER,
-        """mutation ($copy: uuid!, $from: date!, $due: date!) {
-             borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) { loan_id }
+        """mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+             borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) { loan_id }
            }""",
-        {"copy": copies[3], "from": today(), "due": plus_days(14)},
+        {"copy": copies[3], "from": today(), "due": plus_days(14), "req": str(uuid.uuid4())},
     ), "the limit was not enforced before the return"
 
     returned = library.return_copy(loans[0])
@@ -151,10 +153,10 @@ def test_a_librarian_cannot_invoke_a_member_command(library: Library, shelf):
 
     refused = library.attempt(
         LIBRARIAN,
-        """mutation ($copy: uuid!, $from: date!, $due: date!) {
-             borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) { loan_id }
+        """mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+             borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) { loan_id }
            }""",
-        {"copy": copy_id, "from": today(), "due": plus_days(14)},
+        {"copy": copy_id, "from": today(), "due": plus_days(14), "req": str(uuid.uuid4())},
     )
 
     assert refused is not None, "a librarian invoked a member-only command"
@@ -175,10 +177,10 @@ def test_concurrent_borrowers_leave_exactly_one_loan(library: Library, shelf):
     def borrow():
         return library.attempt(
             MEMBER,
-            """mutation ($copy: uuid!, $from: date!, $due: date!) {
-                 borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) { loan_id }
+            """mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+                 borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) { loan_id }
                }""",
-            {"copy": copy_id, "from": today(), "due": plus_days(14)},
+            {"copy": copy_id, "from": today(), "due": plus_days(14), "req": str(uuid.uuid4())},
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -187,3 +189,24 @@ def test_concurrent_borrowers_leave_exactly_one_loan(library: Library, shelf):
     won = sum(1 for o in outcomes if o is None)
     assert won == 1, f"{won} of 4 concurrent borrowers succeeded, want exactly 1"
     assert library.open_loans(library.member_id) == 1
+
+
+def test_borrowing_starts_a_durable_process_that_completes(library: Library, shelf):
+    """The whole point of the effect: work that outlives the request.
+
+    `borrow_copy` declares a `start_process` effect, so the journal row is
+    written by the same statement as the loan — it cannot exist for a borrow
+    that rolled back. Carrying that Process forward is a runtime loop, and the
+    two stands get there differently: the engine stand drives its own, and the
+    Go stand's database has an engine beside it doing nothing else. Both must
+    end up with the follow-up row, because the declaration is the same.
+    """
+    (copy_id,) = shelf(1)
+
+    loan = library.borrow(copy_id)
+
+    note = library.followup_note(loan["loan_id"])
+    assert note == "borrowed", (
+        "the Process the borrow started never reached its command state; "
+        "nothing recorded a follow-up for this loan"
+    )

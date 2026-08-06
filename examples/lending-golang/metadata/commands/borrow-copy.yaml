@@ -16,6 +16,8 @@ arguments:
     type: date!
   - name: due_on
     type: date!
+  - name: request_id
+    type: uuid!
 steps:
   # The copy must be available *now*. `require_found` turns a race with another
   # borrower into a rejection rather than a silently empty result.
@@ -95,3 +97,24 @@ result:
   copy_id: { step: loan, column: copy_id }
   due_on: { step: loan, column: due_on }
   open_loans_before: { step: open_loan_count, column: total }
+
+# Handing the follow-up to a durable Process rather than doing it here.
+#
+# The journal row is written by this same statement, so the Process cannot
+# exist for a loan that rolled back. What carries it forward is a runtime loop
+# in donat-server: the embedded host originates durable work but does not
+# finish it, and a deployment that embeds runs an engine beside it for that.
+effects:
+  - start_process:
+      process: loan_followup
+      input:
+        loan_id: { step: loan, column: id }
+      idempotency_key: { argument: request_id }
+
+# An effect needs a durable execution generation, which is what an idempotency
+# declaration establishes: a replayed borrow must not start a second Process.
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { session_variable: x-donat-user-id }
+  retention: 30d

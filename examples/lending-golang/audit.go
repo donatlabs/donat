@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	"github.com/donatlabs/donat/sdk/go/donat"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -53,6 +55,9 @@ func BorrowWithAudit(
 		"copy": mustJSON(copyID),
 		"from": mustJSON(borrowedOn),
 		"due":  mustJSON(dueOn),
+		// A fresh request id per call: the command's idempotency key, which is
+		// what stops a replayed borrow from starting a second Process.
+		"req": mustJSON(newRequestID()),
 	}
 	body, err := eng.ExecuteTx(ctx, tx, borrowMutation, vars, map[string]string{
 		"x-donat-role":    "member",
@@ -77,8 +82,8 @@ func BorrowWithAudit(
 }
 
 const borrowMutation = `
-mutation ($copy: uuid!, $from: date!, $due: date!) {
-  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) {
+mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) {
     loan_id
     copy_id
     due_on
@@ -113,3 +118,6 @@ func mustJSON(v any) json.RawMessage {
 	}
 	return raw
 }
+
+// newRequestID mints the idempotency key a borrow is identified by.
+func newRequestID() string { return uuid.NewString() }

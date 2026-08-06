@@ -67,7 +67,23 @@ type Statement struct {
 	Alias  string            `json:"alias"`
 	SQL    string            `json:"sql"`
 	Params []json.RawMessage `json:"params"`
+	// Result is how this statement's row must be read. Empty means the
+	// ordinary shape: one value in column 0. See ResultCommandExecution.
+	Result string `json:"result"`
 }
+
+// Result shapes a statement can declare.
+const (
+	// ResultValue is the default and the absent value: one JSON or text value
+	// in column 0.
+	ResultValue = ""
+	// ResultCommandExecution is an idempotent command's row: columns `root`,
+	// `invocation_id` and `replayed`. A replay has to be distinguishable from
+	// a first run, so the generation travels beside the result — and a host
+	// that took column 0 would fail on the shape rather than on anything
+	// meaningful.
+	ResultCommandExecution = "command_execution"
+)
 
 // Hook is a post-commit event-trigger hook emitted by the wasm core.
 type Hook struct {

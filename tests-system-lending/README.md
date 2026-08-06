@@ -27,9 +27,22 @@ tests-system-lending/stack.sh down        # when finished
 ```
 
 `stack.sh` builds both binaries **from this working tree** — a published image
-would test somebody else's build — applies the platform's migrations and then
-the example's, regenerates the snapshot the Go host embeds, and serves each
-stand against its own database so one cannot observe the other's rows.
+would test somebody else's build — applies the platform's migrations, then the
+example's, then publishes the Process revisions, regenerates the snapshot the
+Go host embeds, and serves each stand against its own database so one cannot
+observe the other's rows.
+
+It raises a third process: an engine against the Go stand's database whose only
+job is the durable runtime loop. The Go host originates Process work and does
+not carry it forward, so this is the deployment shape the SDK documents — and
+running it here is what lets the suite prove the durable outcome rather than
+assert it. The two stands reach the same follow-up row by different routes.
+
+The engine stand serves a copy of the metadata with handler-less actions
+removed (`engine_metadata.py`): those are resolved in-process by a function the
+embedding program registered, and `donat-server` refuses to mount a field it
+could never answer. Everything the suite compares — every command, rule,
+permission and table — is byte-identical.
 
 With neither `LENDING_ENGINE_URL` nor `LENDING_GO_URL` set the whole suite
 skips. A run with no service must not look like a passing run, and must not
@@ -41,7 +54,7 @@ look like a broken library either.
 | `LENDING_GO_URL` | the Go host stand; unset skips that half |
 | `LENDING_ADMIN_SECRET` | sent as `X-Donat-Admin-Secret`; the engine only honours `X-Donat-*` headers on a trusted request, and the Go host ignores it |
 | `LENDING_PG_BASE` | the database server, default `…@127.0.0.1:15433` |
-| `LENDING_ENGINE_PORT`, `LENDING_GO_PORT` | listen ports, default 8090 and 8091 |
+| `LENDING_ENGINE_PORT`, `LENDING_GO_PORT`, `LENDING_DRIVER_PORT` | listen ports, default 8090, 8091 and 8092 |
 
 ## How the tests talk to the library
 

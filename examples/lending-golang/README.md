@@ -84,6 +84,35 @@ happened. The price is that post-commit hooks do not fire — the engine has not
 committed anything, so it cannot know when to fire them, and side effects after
 the caller's own commit are the caller's job.
 
+## Work that outlives the request
+
+Some work should not be finished by the request that asked for it. `borrow_copy`
+declares an effect:
+
+```yaml
+effects:
+  - start_process:
+      process: loan_followup
+      input:
+        loan_id: { step: loan, column: id }
+      idempotency_key: { argument: request_id }
+```
+
+The journal row is written by the same statement as the loan, so the Process
+cannot exist for a borrow that rolled back — and a replayed borrow, carrying the
+same `request_id`, does not start a second one.
+
+What this host does **not** do is carry that Process forward. Transitions,
+timers and activity leases are a runtime loop that lives in `donat-server`. The
+journal is source-local and in the same database precisely so the writer and the
+driver need not be the same process: run an engine beside the Go host, pointed
+at the same URL, and the follow-up appears. Without one, the Process simply
+waits — a deployment mistake nothing can catch for you.
+
+Deploying a Process needs the third `donat migrate` step below: the journal
+row's foreign key names the revision, so a borrow fails on that constraint
+until the revision is published.
+
 ## Why the handler is Go and not YAML
 
 `handlers.go` runs after the transaction commits, in the same process, with no
@@ -108,9 +137,12 @@ DDL either — the platform's deploy-time catalog is applied from the platform's
 own migrations, so the helper functions its error decoder pins cannot drift:
 
 ```bash
-# 1. the platform's catalog, then this library's tables
+# 1. the platform's catalog, then this library's tables, then the Process
+#    revisions (a command that starts one references the revision by key)
 donat --database-url "$URL" migrate --migrations-dir ../../migrations
 donat --database-url "$URL" migrate --migrations-dir migrations
+donat --database-url "$URL" migrate --migrations-dir ../../migrations \
+  --metadata-dir metadata --source default
 
 # 2. the snapshot the Go host embeds (metadata + catalog, compiled at boot)
 DONAT_GRAPHQL_DATABASE_URL="$URL" donat --database-url "$URL" \
@@ -120,7 +152,7 @@ DONAT_GRAPHQL_DATABASE_URL="$URL" donat --database-url "$URL" \
 DATABASE_URL="$URL" go run .
 ```
 
-`docker compose up` wires the same three steps.
+`docker compose up` wires the same steps.
 
 Borrow something:
 

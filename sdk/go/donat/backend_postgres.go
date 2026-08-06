@@ -114,13 +114,68 @@ func (b *postgresBackend) runQueryTx(ctx context.Context, tx any, plan Plan) (js
 func runStmtsInTx(ctx context.Context, tx pgx.Tx, plan Plan) (map[string]json.RawMessage, error) {
 	data := make(map[string]json.RawMessage, len(plan.Statements))
 	for _, stmt := range plan.Statements {
-		var part json.RawMessage
-		if err := tx.QueryRow(ctx, stmt.SQL).Scan(&part); err != nil {
+		part, err := scanStatement(ctx, tx, stmt)
+		if err != nil {
 			return nil, err
 		}
 		data[stmt.Alias] = part
 	}
 	return data, nil
+}
+
+// scanStatement reads one statement's row in whatever shape the plan declared.
+//
+// The shape is not guessable from the SQL, and it is not cosmetic: an
+// idempotent command returns its durable execution generation beside the
+// result, so a host that scanned column 0 would fail with a column-count
+// mismatch — an error about the row shape, telling an operator nothing about
+// the command that produced it.
+func scanStatement(ctx context.Context, tx pgx.Tx, stmt Statement) (json.RawMessage, error) {
+	switch stmt.Result {
+	case ResultCommandExecution:
+		rows, err := tx.Query(ctx, stmt.SQL)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			if err := rows.Err(); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("command %q returned no execution row", stmt.Alias)
+		}
+		// By name, not by position: the engine reads `root` the same way, and
+		// the column order is the renderer's business, not the host's.
+		values, err := rows.Values()
+		if err != nil {
+			return nil, err
+		}
+		var root json.RawMessage
+		for i, field := range rows.FieldDescriptions() {
+			if field.Name != "root" {
+				continue
+			}
+			if values[i] == nil {
+				return json.RawMessage("null"), nil
+			}
+			raw, err := json.Marshal(values[i])
+			if err != nil {
+				return nil, fmt.Errorf("command %q result: %w", stmt.Alias, err)
+			}
+			root = raw
+		}
+		if root == nil {
+			return nil, fmt.Errorf("command %q returned no `root` column", stmt.Alias)
+		}
+		rows.Close()
+		return root, rows.Err()
+	default:
+		var part json.RawMessage
+		if err := tx.QueryRow(ctx, stmt.SQL).Scan(&part); err != nil {
+			return nil, err
+		}
+		return part, nil
+	}
 }
 
 // postgresFromURL opens a pool for Main, which has no pool of its own to be

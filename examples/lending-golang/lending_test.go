@@ -115,6 +115,12 @@ func (s *service) reset() {
 	s.t.Helper()
 	ctx := context.Background()
 	for _, stmt := range []string{
+		// The journal goes first, and by TRUNCATE ... CASCADE because its own
+		// tables reference each other. A Process left pointing at a loan this
+		// reset deleted would fail forever in whatever is driving it — which,
+		// in a deployment that embeds, is an engine running beside the host.
+		"TRUNCATE donat.process_events, donat.process_start_requests CASCADE",
+		"DELETE FROM public.loan_followup",
 		"DELETE FROM public.audit_entry",
 		"DELETE FROM public.loan",
 		"DELETE FROM public.copy",
@@ -273,14 +279,14 @@ func firstReturnedID(t *testing.T, data map[string]any, root string) string {
 func (s *service) borrow(copyID string) map[string]any {
 	s.t.Helper()
 	return s.gql(roleMember, `
-		mutation ($copy: uuid!, $from: date!, $due: date!) {
-		  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due) {
+		mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+		  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) {
 		    loan_id
 		    copy_id
 		    due_on
 		    open_loans_before
 		  }
-		}`, map[string]any{"copy": copyID, "from": today(), "due": plusDays(14)})
+		}`, map[string]any{"copy": copyID, "from": today(), "due": plusDays(14), "req": newRequestID()})
 }
 
 func (s *service) returnCopy(loanID string) map[string]any {
