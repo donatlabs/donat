@@ -15,6 +15,7 @@ donat-storage = { path = "../storage" }
 chrono = { workspace = true }
 uuid = { workspace = true }
 donat-schema = { path = "../schema" }
+donat-processes = { path = "../processes" }
 donat-sqlgen = { path = "../sqlgen" }
 donat-backend = { path = "../backend" }
 donat-ir = { path = "../ir" }

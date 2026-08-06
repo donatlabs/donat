@@ -231,13 +231,17 @@ Stated plainly, because each fails loudly rather than degrading quietly — but
 they do not all fail at the same moment, and the difference decides what a
 successful deploy actually proves:
 
-- **Durable Processes.** A command declaring `effects:` that start or signal a
-  Process is **refused when the snapshot compiles**. A Process needs a journal,
-  a transition queue and leases, which live host-side in `donat-server` and
-  have no counterpart here.
+- **Driving durable Processes.** A command may *start* or *signal* a Process:
+  the effect compiles into the same statement as the command's own writes, so
+  the journal row and the rows that justify it commit together. What this host
+  does not do is carry that Process forward — transitions, timers, activity
+  leases and webhook ingress are a runtime loop that lives in `donat-server`.
+  Run one against the same database and it drives what this host originates;
+  without one, a started Process sits in the journal.
 - **Connectors.** Connectors are invoked from Process activities
-  (`crates/server/src/processes/activity.rs`), so they are unreachable for the
-  same reason. Their design is a deploy-time one besides — see
+  (`crates/server/src/processes/activity.rs`), so this host reaches none of
+  them, and a Process that declares one fails to compile here. Their design is
+  a deploy-time one besides — see
   [ADR 010](../../knowledgebase/declarative-saas/decisions/010-static-community-connector-factory-and-runtime-boundaries.md),
   which rejects loading any plugin at runtime — so a connector is not a place
   user Go code plugs in on either host.

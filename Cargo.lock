@@ -714,6 +714,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-processes"
+version = "0.1.0"
+dependencies = [
+ "donat-connector-abi",
+ "donat-connector-catalog",
+ "donat-ir",
+ "donat-metadata",
+ "donat-rules",
+ "donat-schema",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "donat-rules"
 version = "0.1.0"
 dependencies = [
@@ -767,6 +781,7 @@ dependencies = [
  "donat-connector-catalog",
  "donat-ir",
  "donat-metadata",
+ "donat-processes",
  "donat-rules",
  "donat-schema",
  "donat-sqlgen",
@@ -840,6 +855,7 @@ dependencies = [
  "donat-catalog-types",
  "donat-ir",
  "donat-metadata",
+ "donat-processes",
  "donat-schema",
  "donat-sqlgen",
  "donat-storage",

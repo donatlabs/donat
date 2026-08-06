@@ -73,10 +73,24 @@ func newService(t *testing.T) *service {
 		t.Fatalf("%v", err)
 	}
 
+	// The metadata declares `render_loan_receipt` without a handler, so the
+	// engine refuses to start unless a function is registered for it. The test
+	// registers the same implementation the binary does, rather than a stub:
+	// a harness that resolved the action differently would be testing itself.
+	receipts := &Receipts{}
+	fns := donat.NewFunctions()
+	donat.WithFunction("render_loan_receipt", receipts.Render)(&donat.Config{Functions: fns})
+
 	eng, err := donat.New(ctx, donat.Config{
-		Backend:  donat.Postgres(pool),
-		Metadata: coreConfig,
-		Registry: reg,
+		Backend:   donat.Postgres(pool),
+		Metadata:  coreConfig,
+		Registry:  reg,
+		Functions: fns,
+		Secrets: map[string]string{
+			"LENDING_S3_KEY":         env("LENDING_S3_KEY", "minioadmin"),
+			"LENDING_S3_SECRET":      env("LENDING_S3_SECRET", "minioadmin"),
+			"LENDING_SIGNING_SECRET": env("LENDING_SIGNING_SECRET", "dev-signing-secret"),
+		},
 		PoolSize: 2,
 	})
 	if err != nil {

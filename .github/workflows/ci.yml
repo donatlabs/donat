@@ -378,12 +378,14 @@ jobs:
       # stack.sh builds both binaries from this commit, applies the platform's
       # migrations and then the example's, and serves each stand against its
       # own database.
-      - name: Raise both stands
-        run: tests-system-lending/stack.sh up
+      # Installed before the stands are raised: stack.sh uses this interpreter
+      # to prepare the engine stand's metadata copy.
       - name: Install the suite
         run: |
           python3 -m venv tests-system-lending/.venv
           tests-system-lending/.venv/bin/pip install -q -r tests-system-lending/requirements.txt
+      - name: Raise both stands
+        run: tests-system-lending/stack.sh up
       - name: Black-box system tests
         working-directory: tests-system-lending
         env:

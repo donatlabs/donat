@@ -5,9 +5,8 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use donat_schema::{
-    CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError,
-    ProcessEffectContractCatalog, QueryResponseSlot, Session, compile_command_catalog,
-    compile_rule_catalog, finalize_command_effects,
+    CompiledMultiSourceSchema, MultiSourcePlan, MultiSourcePlanner, PlanError, QueryResponseSlot,
+    Session, compile_command_catalog, compile_rule_catalog, finalize_command_effects,
 };
 
 use crate::plan::{PLAN_VERSION, PlanBody, PlanErrorBody, PlanV1, ResponseSlot, Statement};
@@ -31,13 +30,6 @@ pub struct CoreState {
 
 impl CoreState {
     /// Compile a snapshot from a metadata + catalog config.
-    ///
-    /// Process effects are deliberately empty: a durable Process needs a
-    /// journal and a transition queue, which live host-side in `donat-server`
-    /// and have no counterpart here yet. `finalize_command_effects` therefore
-    /// refuses a command that declares an effect against a Process this core
-    /// cannot run, which is the honest outcome — the alternative is accepting
-    /// the metadata and silently dropping the effect at runtime.
     pub fn compile_snapshot(
         metadata: donat_metadata::Metadata,
         catalogs: HashMap<String, donat_catalog_types::Catalog>,
@@ -58,7 +50,28 @@ impl CoreState {
         let rules = compile_rule_catalog(&metadata)?;
         let commands =
             compile_command_catalog(&metadata, &catalogs, &rules, INFER_FUNCTION_PERMISSIONS)?;
-        let process_effects = ProcessEffectContractCatalog::default();
+
+        // Process definitions are compiled here for one reason: a command that
+        // starts or signals a Process needs that Process's effect contract in
+        // order to compile at all. Deriving the contract differently in wasm
+        // than in the engine would let the two disagree about what a command
+        // may start, which is the divergence this whole core exists to avoid,
+        // so the same compiler runs on both.
+        //
+        // Connectors resolve to nothing. This host cannot execute a connector
+        // activity, so a Process that declares one fails to compile with the
+        // ordinary unknown-operation error rather than being accepted and
+        // never run.
+        let processes = {
+            let dependencies = donat_processes::ServerProcessDependencies::new(
+                &metadata,
+                &commands,
+                &rules,
+                &donat_processes::NoConnectors,
+            );
+            donat_processes::compile_process_catalog(&metadata, &dependencies)?
+        };
+        let process_effects = donat_processes::build_process_effect_contract_catalog(&processes)?;
         let finalized = finalize_command_effects(commands, &process_effects)?;
         let compiled = CompiledMultiSourceSchema::compile_with_command_catalog_and_process_effects(
             &metadata,

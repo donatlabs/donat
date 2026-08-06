@@ -11,6 +11,13 @@
 # runs every case against both — a difference between them is the bug this
 # suite exists to find.
 #
+# One exception, and only one: an action declared without a `handler` is
+# resolved in-process by a function the embedding program registered, and
+# `donat-server` refuses to start rather than mount a field it could never
+# answer. The engine stand is therefore given a copy with those actions
+# removed (see engine_metadata.py). Everything the suite actually compares —
+# every command, rule, permission and table — is byte-identical.
+#
 # Each stand gets its own database so a test on one cannot observe the other's
 # rows. The deploy model is the platform's: `donat migrate` for the engine's
 # own catalog, a second `donat migrate` for the example's tables, and only then
@@ -23,6 +30,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 example="$repo/examples/lending-golang"
 state="$here/.stack"
+engine_metadata="$state/metadata-engine"
 
 PG_BASE="${LENDING_PG_BASE:-postgresql://postgres:postgres@127.0.0.1:15433}"
 ENGINE_PORT="${LENDING_ENGINE_PORT:-8090}"
@@ -30,6 +38,14 @@ GO_PORT="${LENDING_GO_PORT:-8091}"
 ENGINE_DB="${LENDING_ENGINE_DB:-lending_engine}"
 GO_DB="${LENDING_GO_DB:-lending_go}"
 ADMIN_SECRET="${LENDING_ADMIN_SECRET:-lending-secret}"
+# The metadata declares an attachment, so both stands need the same storage
+# secrets. The Go host defaults them in main.go; the engine reads them from the
+# environment, so the same values are exported for it here — a stand signing
+# URLs with a different key than its twin would compare two different
+# deployments.
+export LENDING_S3_KEY="${LENDING_S3_KEY:-minioadmin}"
+export LENDING_S3_SECRET="${LENDING_S3_SECRET:-minioadmin}"
+export LENDING_SIGNING_SECRET="${LENDING_SIGNING_SECRET:-dev-signing-secret}"
 
 mkdir -p "$state"
 
@@ -107,6 +123,13 @@ cmd_up() {
   createdb "$ENGINE_DB"
   createdb "$GO_DB"
 
+  echo "==> preparing the engine stand's metadata"
+  # The suite's venv has PyYAML; a bare interpreter may not, so prefer it when
+  # the suite has already been installed and fall back otherwise.
+  local python="python3"
+  [ -x "$here/.venv/bin/python" ] && python="$here/.venv/bin/python"
+  "$python" "$here/engine_metadata.py" "$example/metadata" "$engine_metadata" >/dev/null
+
   echo "==> applying DDL (the platform's catalog, then the library's)"
   migrate "$engine_url"
   migrate "$go_url"
@@ -122,7 +145,7 @@ cmd_up() {
   DONAT_GRAPHQL_DATABASE_URL="$engine_url" \
   DONAT_GRAPHQL_ADMIN_SECRET="$ADMIN_SECRET" \
   RUST_LOG="${RUST_LOG:-donat=info}" \
-    nohup "$repo/target/debug/donat" --metadata-dir "$example/metadata" \
+    nohup "$repo/target/debug/donat" --metadata-dir "$engine_metadata" \
       >"$engine_log" 2>&1 &
   echo $! >"$engine_pid"
 

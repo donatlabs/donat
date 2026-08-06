@@ -2,3 +2,5 @@
 # already-running stands; nothing imports the engine.
 pytest>=8.3,<9
 requests>=2.32,<3
+# stack.sh strips embedded-only actions from the engine stand's metadata copy.
+PyYAML>=6,<7

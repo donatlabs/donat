@@ -561,13 +561,15 @@ fn metadata_with_process_effect() -> Metadata {
     serde_json::from_value(value).expect("metadata with a process effect deserializes")
 }
 
-/// A durable Process needs a journal, a transition queue and leases, none of
-/// which exist here — so a command that declares one must be refused while the
-/// snapshot compiles, not accepted and then quietly stripped of its effect at
-/// runtime. `sdk/go/README.md` promises exactly this, and ADR 034 makes a
-/// declaration the runtime ignores a defect rather than a limitation.
+/// An effect naming a Process the metadata does not declare must be refused
+/// while the snapshot compiles.
+///
+/// The core compiles Process definitions so a command that starts one can get
+/// its contract; a name with no definition behind it has no contract, and
+/// accepting it would leave a command whose effect could never fire. ADR 034
+/// makes a declaration the runtime ignores a defect rather than a limitation.
 #[test]
-fn a_command_starting_a_process_is_refused_at_snapshot_compile() {
+fn an_effect_naming_an_undeclared_process_is_refused_at_snapshot_compile() {
     let err = CoreState::compile_snapshot(
         metadata_with_process_effect(),
         HashMap::from([("default".to_string(), catalog())]),
@@ -889,3 +891,92 @@ fn the_upload_root_is_offered_when_an_attachment_is_declared() {
     }
 }
 
+
+// -----------------------------------------------------------------------
+// Durable Process effects
+// -----------------------------------------------------------------------
+
+/// The command above, plus a Process it starts.
+///
+/// A `start_process` effect is what a command uses to hand work to a durable
+/// flow. The effect needs the Process's contract to compile, which is why the
+/// core compiles Process definitions at all — it does not run them.
+fn metadata_with_declared_process() -> Metadata {
+    let mut value = serde_json::to_value(metadata_with_command()).expect("serializes");
+    value["commands"][0]["arguments"]
+        .as_array_mut()
+        .expect("arguments is an array")
+        .push(serde_json::json!({ "name": "request_id", "type": "uuid!" }));
+    // An effect requires a durable execution generation, which idempotency is
+    // what establishes.
+    value["commands"][0]["idempotency"] = serde_json::json!({
+        "key": { "argument": "request_id" },
+        "scope": [{ "session_variable": "x-donat-user-id" }],
+        "retention": "30d"
+    });
+    value["commands"][0]["effects"] = serde_json::json!([{
+        "start_process": {
+            "process": "author_renamed",
+            "input": { "author_id": { "step": "renamed", "column": "id" } },
+            "idempotency_key": { "argument": "request_id" }
+        }
+    }]);
+    value["processes"] = serde_json::json!([{
+        "name": "author_renamed",
+        "kind": "process",
+        "version": 1,
+        "source": "default",
+        "permissions": [{ "role": "user", "owner_session_variable": "x-donat-user-id" }],
+        "owner": { "type": "string!", "capture": { "session_variable": "x-donat-user-id" } },
+        "input": [{ "name": "author_id", "type": "int!" }],
+        "output": [{ "name": "author_id", "type": "int!" }],
+        "start_at": "done",
+        "states": [{
+            "id": "done",
+            "output": { "values": { "author_id": { "input": "author_id" } } }
+        }]
+    }]);
+    serde_json::from_value(value).expect("metadata with a process deserializes")
+}
+
+/// A command that starts a Process must plan, and its statement must carry the
+/// journal write. Before the core compiled Process definitions it passed an
+/// empty contract catalog, so `finalize_command_effects` refused the command
+/// and the whole snapshot failed to compile — an embedded host could not serve
+/// a deployment that used a Process anywhere, even for the commands that did
+/// not touch one.
+#[test]
+fn command_with_a_process_effect_is_planned() {
+    let state = state_of(metadata_with_declared_process());
+    let input = CompileInput {
+        query: r#"mutation($r: uuid!) {
+            rename_author(author_id: 1, new_name: "Ada", request_id: $r) { author_id }
+        }"#
+        .to_string(),
+        operation_name: None,
+        variables: serde_json::from_value(serde_json::json!({
+            "r": "11111111-2222-3333-4444-555555555555"
+        }))
+        .expect("variables"),
+        session_vars: HashMap::from([
+            ("x-donat-role".to_string(), "user".to_string()),
+            ("x-donat-user-id".to_string(), "1".to_string()),
+        ]),
+        stringify_numerics: false,
+        dialect: None,
+        now: None,
+        external_base_url: None,
+    };
+    match compile(&state, &input) {
+        PlanV1::Mutation(body) => {
+            assert_eq!(body.statements.len(), 1, "one command, one statement");
+            let sql = &body.statements[0].sql;
+            assert!(
+                sql.contains("process_start_requests"),
+                "the effect must write the Process start into the journal, \
+                 in the same statement as the command's own writes: {sql}"
+            );
+        }
+        other => panic!("expected a mutation plan, got {other:?}"),
+    }
+}

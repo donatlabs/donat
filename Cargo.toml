@@ -9,6 +9,7 @@ members = [
     "crates/catalog-types",
     "crates/storage",
     "crates/rules",
+    "crates/processes",
     "crates/catalog",
     "crates/schema",
     "crates/ir",
