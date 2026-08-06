@@ -171,6 +171,7 @@ jobs:
           cache-dependency-path: sdk/go/go.sum
       - name: Build the embedded core
         run: make wasm-core
+        working-directory: .
       # The hard packaging constraint (specs/003): the SDK must be
       # go-get-able and statically buildable with no cgo.
       - name: Build with cgo disabled
@@ -253,6 +254,11 @@ jobs:
         env:
           URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
           DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      # Same reason as the snapshot below: the wasm core is a build output and
+      # lives only on release tags, so a branch checkout has to build it before
+      # any Go code that embeds it will compile.
+      - name: Build the embedded core
+        run: make wasm-core
       # The snapshot the example embeds is a build output, not source: it is
       # the metadata directory compiled against the live catalog, so it can
       # only be produced once the database is migrated. Committing it would
