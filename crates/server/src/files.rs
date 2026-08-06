@@ -348,7 +348,7 @@ pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
     let pool = storage_pool(state)
         .await
         .ok_or_else(|| anyhow::anyhow!("no storage source"))?;
-    let client = pool.get().await?;
+    let mut client = pool.get().await?;
     let mut reclaimed = 0;
 
     // 1. Uploads nobody claimed. Their expiry has already passed; the TTL is
@@ -359,7 +359,12 @@ pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
     //    orders of magnitude. SKIP LOCKED keeps two engine replicas from
     //    fighting over the same rows.
     loop {
-        let pending = client
+        // `FOR UPDATE SKIP LOCKED` holds its locks only for the life of a
+        // transaction. Outside one they are released as the statement ends, so
+        // two replicas would select the same rows and delete the same objects
+        // — the fight this clause is here to prevent.
+        let tx = client.transaction().await?;
+        let pending = tx
             .query(
                 "SELECT id, backend, object_key FROM donat.file_uploads \
                  WHERE state = 'pending' AND expires_at < now() - ($1 || ' days')::interval \
@@ -371,10 +376,17 @@ pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
             break;
         }
         let batch = pending.len();
+        let mut removed = 0;
         for row in pending {
-            reclaimed += reclaim(state, &client, row).await? as usize;
+            removed += reclaim_in(state, &tx, row).await? as usize;
         }
-        if batch < 500 {
+        tx.commit().await?;
+        reclaimed += removed;
+        // A storage outage leaves every row in place by design, so the next
+        // query returns the same batch. Without this the pass would spin on it
+        // until the interval came round again, hammering a store that is
+        // already failing. Stopping leaves the retry to the next pass.
+        if batch < 500 || removed == 0 {
             break;
         }
     }
@@ -394,17 +406,23 @@ pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
             column = quote_ident(&attachment.column),
         );
         loop {
-            let orphans = client
+            let tx = client.transaction().await?;
+            let orphans = tx
                 .query(&sql, &[&attachment.key, &gc.orphan_grace_days.to_string()])
                 .await?;
             if orphans.is_empty() {
                 break;
             }
             let batch = orphans.len();
+            let mut removed = 0;
             for row in orphans {
-                reclaimed += reclaim(state, &client, row).await? as usize;
+                removed += reclaim_in(state, &tx, row).await? as usize;
             }
-            if batch < 500 {
+            tx.commit().await?;
+            reclaimed += removed;
+            // As above: no progress on a full batch means storage is refusing,
+            // and retrying it in a tight loop helps nobody.
+            if batch < 500 || removed == 0 {
                 break;
             }
         }
@@ -417,9 +435,9 @@ pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
 /// The order is deliberate: a storage failure leaves the row in place, so the
 /// next pass retries instead of forgetting an object nobody can reach any more.
 /// A missing object counts as deleted — that is the state the row was claiming.
-async fn reclaim(
+async fn reclaim_in(
     state: &SharedState,
-    client: &deadpool_postgres::Client,
+    client: &deadpool_postgres::Transaction<'_>,
     row: tokio_postgres::Row,
 ) -> anyhow::Result<bool> {
     let id: Uuid = row.get("id");

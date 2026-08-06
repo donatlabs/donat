@@ -1684,9 +1684,11 @@ fn command_scope_prefix(command: &CommandMutation) -> usize {
     if referenced.is_empty() {
         return 0;
     }
-    let Some(last) = command.steps.iter().rposition(|step| {
-        command_step_cte_name(step).is_some_and(|cte| referenced.contains(cte))
-    }) else {
+    let Some(last) = command
+        .steps
+        .iter()
+        .rposition(|step| command_step_cte_name(step).is_some_and(|cte| referenced.contains(cte)))
+    else {
         return 0;
     };
     let prefix = last + 1;
@@ -5118,13 +5120,27 @@ fn file_upload_request_to_sql(ctx: &mut Ctx, request: &donat_ir::FileUploadReque
         None => "NULL".to_string(),
     };
     // The insert is conditional on the session's own budget, counted in the
-    // same statement. A caller cannot outrun this by sending requests in
-    // parallel: every one of them counts the rows the others committed.
+    // same statement — and serialised against the session's other requests
+    // first.
+    //
+    // Counting alone is not enough: under READ COMMITTED the subqueries read
+    // the snapshot taken when the statement began, so concurrent requests each
+    // see the state before the others inserted and all of them pass. The
+    // budget then holds only against a client that waits for each reply, which
+    // is not the client it exists to stop. The advisory lock is taken in a CTE
+    // so it is held before any count is evaluated, is scoped to this session's
+    // own key so unrelated callers never wait on each other, and is released
+    // when the transaction ends.
     let dml = format!(
-        "INSERT INTO donat.file_uploads (id, attachment, backend, object_key, file_name, \
+        "WITH session_budget AS (\
+           SELECT pg_advisory_xact_lock(\
+             hashtext('donat.file_uploads:' || {role} || ':' || coalesce({session_key}, ''))) \
+         ) \
+         INSERT INTO donat.file_uploads (id, attachment, backend, object_key, file_name, \
          media_type, declared_bytes, byte_size, state, session_role, session_key, expires_at) \
          SELECT {id}::uuid, {attachment}, {backend}, {object_key}, {file_name}, {media_type}, \
          {declared_bytes}, {byte_size}, 'pending', {role}, {session_key}, to_timestamp({expires}) \
+         FROM session_budget \
          WHERE (SELECT count(*) FROM donat.file_uploads b \
                 WHERE b.session_role = {role} \
                   AND b.session_key IS NOT DISTINCT FROM {session_key} \
