@@ -32,6 +32,7 @@ fn file_field(alias: &str) -> OutputField {
             column: "photo".to_string(),
             attachment: "public.pet.photo".to_string(),
             url_sql: DOWNLOAD_URL_SQL.to_string(),
+            guard: None,
             fields: vec![
                 FileRefOutput {
                     alias: "id".into(),
@@ -56,6 +57,20 @@ fn file_field(alias: &str) -> OutputField {
             ],
         },
     }
+}
+
+/// The same field, but granted by only some of an inherited role's parents.
+fn guarded_file_field(alias: &str) -> OutputField {
+    let mut field = file_field(alias);
+    let FieldValue::FileRef { guard, .. } = &mut field.value else {
+        unreachable!("file_field builds a FileRef")
+    };
+    *guard = Some(Box::new(BoolExp::Compare {
+        column: "owner_id".into(),
+        pg_type: "text".into(),
+        op: CompareOp::Eq(Scalar::Json(json!("u-1"))),
+    }));
+    field
 }
 
 fn select_with(fields: Vec<OutputField>) -> SelectQuery {
@@ -261,4 +276,48 @@ fn requesting_an_upload_inserts_the_pending_row_and_returns_its_url() {
     // A disk upload has no completion call: the bytes pass through the engine.
     assert!(sql.contains("'complete_url', NULL"), "{sql}");
     insta::assert_snapshot!(sql);
+}
+
+/// A file column carries the same cell guard an ordinary column does.
+///
+/// It is the one field whose value is a capability — a signed download URL —
+/// so a row the granting parent cannot see must yield NULL rather than a URL.
+/// The guard once applied only to the plain-column branch, which the file
+/// branch runs ahead of, so this was the single field that escaped it.
+#[test]
+fn a_guarded_file_column_mints_no_url_on_a_row_its_parent_cannot_see() {
+    let sql = operation_to_sql(&[RootField::Select {
+        alias: "pet".into(),
+        query: select_with(vec![guarded_file_field("photo")]),
+    }]);
+
+    assert!(
+        sql.contains("CASE WHEN"),
+        "the guard must gate the whole object: {sql}"
+    );
+    let case_at = sql.find("CASE WHEN").expect("guard");
+    let url_at = sql.find("s3_presigned_url").expect("url expression");
+    assert!(
+        case_at < url_at,
+        "the signing expression must sit inside the guard, not beside it: {sql}"
+    );
+    assert!(
+        sql.contains("ELSE NULL END"),
+        "a row the parent cannot see must read NULL: {sql}"
+    );
+}
+
+/// The control: without inherited parents there is no guard, and the object is
+/// projected directly — so the assertion above is about the guard, not about
+/// `CASE` appearing somewhere in every file statement.
+#[test]
+fn an_unguarded_file_column_is_projected_without_a_case() {
+    let sql = operation_to_sql(&[RootField::Select {
+        alias: "pet".into(),
+        query: select_with(vec![file_field("photo")]),
+    }]);
+    assert!(
+        !sql.contains("CASE WHEN"),
+        "an ungranted-by-nobody column needs no guard: {sql}"
+    );
 }

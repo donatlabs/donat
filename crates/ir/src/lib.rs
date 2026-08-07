@@ -227,6 +227,11 @@ pub enum FieldValue {
         attachment: String,
         url_sql: String,
         fields: Vec<FileRefOutput>,
+        /// Inherited-role cell guard, exactly as an ordinary column carries.
+        /// A file column is the one field whose value is a capability — a
+        /// signed URL — so a row the granting parent cannot see must yield
+        /// NULL here for the same reason it does for a plain column.
+        guard: Option<Box<BoolExp>>,
     },
     /// Scalar computed field: `"schema"."fn"("outer".*[, session])`.
     ComputedScalar {

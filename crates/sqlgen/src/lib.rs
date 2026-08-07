@@ -710,7 +710,21 @@ impl Ctx {
                         attachment,
                         url_sql,
                         fields,
-                    } => self.file_ref_expr(table_alias, column, attachment, url_sql, fields),
+                        guard,
+                    } => {
+                        let object =
+                            self.file_ref_expr(table_alias, column, attachment, url_sql, fields);
+                        match guard {
+                            // Same shape as a guarded plain column: the whole
+                            // object is NULL on a row the granting parents
+                            // cannot see, so no signed URL is minted for it.
+                            Some(guard) => {
+                                let cond = self.bool_exp(guard, table_alias, table_alias);
+                                format!("CASE WHEN {cond} THEN {object} ELSE NULL END")
+                            }
+                            None => object,
+                        }
+                    }
                     FieldValue::Aggregate { .. } | FieldValue::Nodes { .. } => {
                         panic!("aggregate fields must go through aggregate_expr")
                     }
