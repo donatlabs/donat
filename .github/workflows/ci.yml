@@ -249,6 +249,21 @@ jobs:
         run: ./target/debug/donat --database-url "$URL" migrate --migrations-dir examples/lending-golang/migrations
         env:
           URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      # The third step of the deploy model. `borrow_copy` starts a durable
+      # Process, and the journal row it writes names the revision by foreign
+      # key — so without this every borrow fails on that constraint rather
+      # than on anything a caller did.
+      - name: Deploy the Process revisions
+        run: |
+          ./target/debug/donat --database-url "$URL" migrate \
+            --migrations-dir migrations \
+            --metadata-dir examples/lending-golang/metadata --source default
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+          DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+          LENDING_S3_KEY: minioadmin
+          LENDING_S3_SECRET: minioadmin
+          LENDING_SIGNING_SECRET: dev-signing-secret
       - name: Metadata must be consistent with the database
         run: ./target/debug/donat --database-url "$URL" validate --metadata-dir examples/lending-golang/metadata
         env:
