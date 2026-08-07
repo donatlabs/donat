@@ -148,15 +148,7 @@ func (e *Engine) ExecuteOperation(ctx context.Context, query string, operationNa
 		if err != nil {
 			return e.backend.MapError(err, plan.ErrorMap), nil
 		}
-		assembled, err := assembleResponse(plan.Response, data)
-		if err != nil {
-			return nil, fmt.Errorf("Execute: %w", err)
-		}
-		envelope, err := json.Marshal(map[string]json.RawMessage{"data": assembled})
-		if err != nil {
-			return nil, fmt.Errorf("Execute: marshal query envelope: %w", err)
-		}
-		return envelope, nil
+		return queryEnvelope(plan, data)
 
 	case PlanAction:
 		return e.runAction(ctx, plan, query, vars, sessionVars)
@@ -215,11 +207,7 @@ func (e *Engine) ExecuteTx(ctx context.Context, tx any, query string, vars map[s
 		if err != nil {
 			return e.backend.MapError(err, plan.ErrorMap), nil
 		}
-		envelope, err := json.Marshal(map[string]json.RawMessage{"data": data})
-		if err != nil {
-			return nil, fmt.Errorf("ExecuteTx: marshal query envelope: %w", err)
-		}
-		return envelope, nil
+		return queryEnvelope(plan, data)
 
 	case PlanMutation:
 		// Run inside caller's transaction. No hooks — caller owns commit.
@@ -253,9 +241,26 @@ func (e *Engine) executeQuery(ctx context.Context, query string, vars map[string
 	if err != nil {
 		return e.backend.MapError(err, plan.ErrorMap), nil
 	}
-	envelope, err := json.Marshal(map[string]json.RawMessage{"data": data})
+	return queryEnvelope(plan, data)
+}
+
+// queryEnvelope wraps a read's result in the GraphQL envelope, in the order
+// the client asked for.
+//
+// Every read path goes through here rather than marshalling the statement
+// result itself. Two of the three once did that, and both silently dropped a
+// root `__typename` — the planner answers it, so it never reaches SQL and
+// cannot come back in the statement result. A host that moved a read inside
+// its own transaction got a different response body than the same read outside
+// one, which is precisely the difference the embedded SDK exists not to have.
+func queryEnvelope(plan Plan, data json.RawMessage) ([]byte, error) {
+	assembled, err := assembleResponse(plan.Response, data)
 	if err != nil {
-		return nil, fmt.Errorf("executeQuery: marshal envelope: %w", err)
+		return nil, fmt.Errorf("assembling the query response: %w", err)
+	}
+	envelope, err := json.Marshal(map[string]json.RawMessage{"data": assembled})
+	if err != nil {
+		return nil, fmt.Errorf("marshalling the query envelope: %w", err)
 	}
 	return envelope, nil
 }

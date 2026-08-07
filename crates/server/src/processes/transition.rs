@@ -1096,8 +1096,22 @@ impl ProcessRuntime {
                     // Report it rather than swallowing it: the consumer logs
                     // the failure and counts the tick as progress, so the loop
                     // moves straight on to the next instance.
+                    //
+                    // On the client this scope already holds, exactly as the
+                    // transient arm above does. Asking the pool for a second
+                    // one while the first is still alive waits — and the wait
+                    // is unbounded unless a deployment configured otherwise —
+                    // so a fault that fails every instance's preparation at
+                    // once, such as a redeploy that dropped a revision, would
+                    // park every transition worker on a connection none of
+                    // them can get.
                     return self
-                        .fail_instance(failing, "transition_preparation_failed", &error, None)
+                        .fail_instance(
+                            failing,
+                            "transition_preparation_failed",
+                            &error,
+                            Some(&mut client),
+                        )
                         .await
                         .map(Preparation::Failed);
                 }

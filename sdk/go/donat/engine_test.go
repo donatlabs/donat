@@ -5,7 +5,34 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
+
+// poolBackend is enough Backend for the pool tests: they never reach the
+// database, only the instance pool in front of it.
+type poolBackend struct{}
+
+func (poolBackend) Dialect() string { return "postgres" }
+
+func (poolBackend) RunQuery(context.Context, Plan) (json.RawMessage, error) {
+	return json.RawMessage("null"), nil
+}
+
+func (poolBackend) RunMutation(context.Context, Plan) (map[string]json.RawMessage, error) {
+	return map[string]json.RawMessage{}, nil
+}
+
+func (poolBackend) ReadUpload(context.Context, string) (UploadRow, error) {
+	return UploadRow{}, nil
+}
+
+func (poolBackend) FinalizeUpload(context.Context, string, string, int64) error {
+	return nil
+}
+
+func (poolBackend) MapError(error, map[string]string) []byte {
+	return errorBody("unexpected", "$", "poolBackend has no database")
+}
 
 // TestEngineRequiresBackend confirms New returns an error when Config.Backend is nil.
 func TestEngineRequiresBackend(t *testing.T) {
@@ -245,5 +272,82 @@ func TestCompileCacheKey(t *testing.T) {
 	}
 	if key1 == key3 {
 		t.Errorf("different roles must produce different cache keys: %+v == %+v", key1, key3)
+	}
+}
+
+// A cancelled caller must not take a live one's turn with it.
+//
+// `release` wakes the last waiter it finds. A caller that gave up but left its
+// channel in the queue absorbs that wake, and the caller still waiting blocks
+// forever while the instance it was promised sits idle in the pool. With
+// PoolSize 1 that is one abandoned request against one real one.
+func TestACancelledAcquireDoesNotStrandALiveOne(t *testing.T) {
+	ctx := context.Background()
+	eng, err := New(ctx, Config{
+		Backend:  poolBackend{},
+		Metadata: fixtureMetaCatalog(),
+		PoolSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Hold the only instance, so every other caller must wait.
+	held, err := eng.acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	// The caller that will not give up is queued FIRST, because `release`
+	// wakes the last waiter it finds: the one that gives up has to be the one
+	// holding that position, or nothing is being tested.
+	live := make(chan error, 1)
+	go func() {
+		c, err := eng.acquire(ctx)
+		if err == nil {
+			eng.release(c)
+		}
+		live <- err
+	}()
+	waitUntilWaiters(t, eng, 1)
+
+	giveUp, cancel := context.WithCancel(ctx)
+	abandoned := make(chan error, 1)
+	go func() { _, err := eng.acquire(giveUp); abandoned <- err }()
+	waitUntilWaiters(t, eng, 2)
+
+	cancel()
+	if err := <-abandoned; err == nil {
+		t.Fatal("the abandoned caller should have reported its cancellation")
+	}
+
+	eng.release(held)
+
+	select {
+	case err := <-live:
+		if err != nil {
+			t.Fatalf("the live caller failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the live caller never got the instance: the cancelled one took its wake")
+	}
+}
+
+// waitUntilWaiters blocks until exactly n callers are parked, so the test does
+// not race the goroutines it just started.
+func waitUntilWaiters(t *testing.T, eng *Engine, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		eng.mu.Lock()
+		got := len(eng.waiters)
+		eng.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waited for %d parked callers, saw %d", n, got)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

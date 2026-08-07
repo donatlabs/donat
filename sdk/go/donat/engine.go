@@ -174,8 +174,34 @@ func (e *Engine) acquire(ctx context.Context) (*wasmCore, error) {
 		select {
 		case <-wait:
 		case <-ctx.Done():
+			e.abandonWait(wait)
 			return nil, ctx.Err()
 		}
+	}
+}
+
+// abandonWait takes a cancelled caller's channel out of the queue.
+//
+// Leaving it there is not merely untidy: `release` wakes the last waiter it
+// finds, so an abandoned channel absorbs a release meant for somebody still
+// waiting — and that caller then blocks forever while the instance sits idle
+// in `e.insts`.
+//
+// If the channel is already gone, a release reached it first. The wake cannot
+// be used and must not be dropped either, so it is handed to the next waiter.
+func (e *Engine) abandonWait(wait chan struct{}) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i, w := range e.waiters {
+		if w == wait {
+			e.waiters = append(e.waiters[:i], e.waiters[i+1:]...)
+			return
+		}
+	}
+	if n := len(e.waiters); n > 0 {
+		next := e.waiters[n-1]
+		e.waiters = e.waiters[:n-1]
+		close(next)
 	}
 }
 
