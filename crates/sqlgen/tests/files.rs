@@ -321,3 +321,56 @@ fn an_unguarded_file_column_is_projected_without_a_case() {
         "an ungranted-by-nobody column needs no guard: {sql}"
     );
 }
+
+/// A write that claims an upload and then projects it must not report null.
+///
+/// A data-modifying CTE's writes are invisible to the rest of its own
+/// statement, so the projection reads the upload row under the pre-claim
+/// snapshot: `state` is still `pending`, the `= 'claimed'` gate rejects it, and
+/// the caller gets `photo: null` for a file that was stored. Reading the row
+/// back afterwards works, which is what made it look like a timing problem
+/// rather than a statement that contradicts itself.
+#[test]
+fn a_write_that_claims_an_upload_can_project_it_in_the_same_statement() {
+    let mut root = insert_with_claims(vec![claim(&["11111111-1111-1111-1111-111111111111"])]);
+    let MutationRoot::Insert { insert, .. } = &mut root else {
+        unreachable!("insert_with_claims builds an insert")
+    };
+    insert.output = MutationOutput::SingleRow(vec![file_field("photo")]);
+
+    let sql = mutation_to_sql(&root);
+
+    assert!(
+        sql.contains("IN (SELECT id FROM \"__donat_claim_0\")"),
+        "the projection must also accept the id this statement is claiming: {sql}"
+    );
+    // And the ordinary gate is still there, so an id put in the column by any
+    // other route than a claim still reads as NULL.
+    assert!(
+        sql.contains("= 'claimed' OR"),
+        "the claimed-state gate must remain: {sql}"
+    );
+}
+
+/// A write matching no row must not consume the upload it was offered.
+///
+/// The claim ran beside the DML regardless of what the DML matched, so an
+/// update whose predicate found nothing still moved the upload from `pending`
+/// to `claimed` — leaving a claimed row no column references, which the
+/// collector later removes. The caller was told `affected_rows: 0` and quietly
+/// lost the file.
+#[test]
+fn a_write_matching_no_row_leaves_its_upload_alone() {
+    let sql = mutation_to_sql(&insert_with_claims(vec![claim(&[
+        "11111111-1111-1111-1111-111111111111",
+    ])]));
+
+    assert!(
+        sql.contains("AND EXISTS (SELECT 1 FROM \"ins\")"),
+        "the claim must be conditional on the write matching: {sql}"
+    );
+    assert!(
+        sql.contains("(SELECT count(*) FROM \"ins\") > 0 AND"),
+        "and a zero-row write must not be told its upload was rejected: {sql}"
+    );
+}

@@ -53,6 +53,7 @@ fn operation_to_sql_full(
         next_alias: 0,
         stringify_numerics,
         dialect,
+        claiming_ctes: Vec::new(),
     };
     let pairs: Vec<(String, String)> = roots
         .iter()
@@ -82,6 +83,15 @@ struct Ctx {
     /// identifier/literal/limit ops are backend-identical and stay as free
     /// functions.
     dialect: donat_backend::AnyDialect,
+    /// Claim CTEs live in the statement currently being rendered.
+    ///
+    /// A data-modifying CTE's writes are invisible to the rest of its own
+    /// statement, so a `returning` that projects the file column would look at
+    /// the upload row under the pre-claim snapshot and find it still
+    /// `pending` — reporting `null` for a file the same statement had just
+    /// claimed. The projection therefore also accepts an id this statement is
+    /// claiming, which these CTEs name.
+    claiming_ctes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -777,13 +787,31 @@ impl Ctx {
         // never be minted for an upload that was not verified, or for one that
         // belongs to another column. A value that does not qualify reads as
         // NULL, exactly like an unset attachment.
+        // ...or an upload this very statement is claiming. A data-modifying
+        // CTE's writes are invisible to the rest of its own statement, so a
+        // write that claims an upload and then projects the column in
+        // `returning` would read the row under the pre-claim snapshot, find it
+        // `pending`, and report `null` for the file it had just stored.
+        let claimed_here = self
+            .claiming_ctes
+            .iter()
+            .map(|cte| format!("{id} IN (SELECT id FROM {cte})", id = qualified(&alias, "id")))
+            .collect::<Vec<_>>();
+        let state_gate = if claimed_here.is_empty() {
+            format!("{} = 'claimed'", qualified(&alias, "state"))
+        } else {
+            format!(
+                "({} = 'claimed' OR {})",
+                qualified(&alias, "state"),
+                claimed_here.join(" OR ")
+            )
+        };
         format!(
             "(SELECT {object} FROM donat.file_uploads {quoted} WHERE {id} = {value} \
-             AND {state} = 'claimed' AND {attachment_column} = {attachment})",
+             AND {state_gate} AND {attachment_column} = {attachment})",
             object = json_object(&dialect, &pairs),
             id = qualified(&alias, "id"),
             value = qualified(table_alias, column),
-            state = qualified(&alias, "state"),
             attachment_column = qualified(&alias, "attachment"),
             attachment = quote_lit(attachment),
         )
@@ -4017,6 +4045,7 @@ fn mutation_to_sql_full(
         next_alias: 0,
         stringify_numerics,
         dialect,
+        claiming_ctes: Vec::new(),
     };
     let dialect = ctx.dialect;
     match root {
@@ -4310,6 +4339,7 @@ pub fn sqlite_mutation_plan(root: &MutationRoot) -> SqliteMutationPlan {
         next_alias: 0,
         stringify_numerics: false,
         dialect,
+        claiming_ctes: Vec::new(),
     };
     match root {
         MutationRoot::Command { .. } => {
@@ -4706,6 +4736,7 @@ pub fn mysql_mutation_plan(root: &MutationRoot, pk: &[String]) -> MySqlMutationP
         next_alias: 0,
         stringify_numerics: false,
         dialect,
+        claiming_ctes: Vec::new(),
     };
     match root {
         MutationRoot::Command { .. } => {
@@ -4983,6 +5014,13 @@ impl Ctx {
         } = options;
         let dialect = self.dialect;
         let cte_ident = quote_ident(cte);
+        // Declared before the output is rendered, because `returning` may
+        // project the very column this statement is claiming and the claim's
+        // writes are invisible to it. The names are fixed by position below.
+        let claim_cte_names: Vec<String> = (0..file_claims.len())
+            .map(|index| quote_ident(&format!("__donat_claim_{index}")))
+            .collect();
+        let outer_claims = std::mem::replace(&mut self.claiming_ctes, claim_cte_names.clone());
         let result = match output {
             MutationOutput::Response(fields) => {
                 let pairs: Vec<(String, String)> = fields
@@ -5016,6 +5054,9 @@ impl Ctx {
             }
         };
 
+        // The output is rendered; a nested statement must not inherit these.
+        self.claiming_ctes = outer_claims;
+
         let mut guarded = result;
         // Validators are wrapped first, so they end up innermost: a role that
         // may not write the row at all is told that, and is never handed a
@@ -5039,8 +5080,7 @@ impl Ctx {
         // not write the row at all never learns anything about an upload.
         let mut claim_ctes = Vec::new();
         for (index, claim) in file_claims.iter().enumerate() {
-            let claim_cte = format!("__donat_claim_{index}");
-            let claim_ident = quote_ident(&claim_cte);
+            let claim_ident = claim_cte_names[index].clone();
             let ids: Vec<String> = claim
                 .upload_ids
                 .iter()
@@ -5050,18 +5090,28 @@ impl Ctx {
                 Some(key) => quote_lit(key),
                 None => "NULL".to_string(),
             };
+            // Only when the write itself matched something. An update whose
+            // predicate matched no row stores nothing, so consuming the upload
+            // for it would leave a claimed row no column references — one the
+            // collector later removes, having reported `affected_rows: 0` and
+            // taken the caller's file with it.
             claim_ctes.push(format!(
                 "{claim_ident} AS (UPDATE donat.file_uploads SET state = 'claimed', \
                  claimed_at = now() WHERE id IN ({ids}) AND state = 'pending' \
                  AND expires_at > now() AND byte_size > 0 AND attachment = {attachment} \
                  AND session_role = {role} AND session_key IS NOT DISTINCT FROM {session_key} \
+                 AND EXISTS (SELECT 1 FROM {cte_ident}) \
                  RETURNING id)",
                 ids = ids.join(", "),
                 attachment = quote_lit(&claim.attachment),
                 role = quote_lit(&claim.role),
             ));
+            // ...and the claim is only required when the write matched. A
+            // zero-row write reports zero rows; it does not report a rejected
+            // upload it never needed.
             guarded = format!(
-                "CASE WHEN (SELECT count(*) FROM {claim_ident}) <> {expected} THEN \
+                "CASE WHEN (SELECT count(*) FROM {cte_ident}) > 0 \
+                 AND (SELECT count(*) FROM {claim_ident}) <> {expected} THEN \
                  donat.raise_graphql_error('validation-failed', {path}, {message})::json \
                  ELSE {guarded} END",
                 expected = claim.upload_ids.len(),

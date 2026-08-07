@@ -3074,18 +3074,17 @@ async fn commit_wait_entry(
 /// Offer this wait the signals that arrived before it existed.
 ///
 /// A signal committed while the instance was still working its way to the wait
-/// finds nothing receptive. `persist_before_match` is the Process saying that
-/// such a signal is not lost: entering the wait returns those exact correlated
-/// requests to `pending`, and the ordinary consumer matches them against the
-/// marker that now exists.
+/// finds nothing receptive and is recorded as `unmatched`. `persist_before_
+/// match` is the Process saying that such a signal is not lost: entering the
+/// wait returns those exact correlated requests to `pending`, and the ordinary
+/// consumer matches them against the marker that now exists.
 ///
-/// Two statuses, because "nothing receptive" has two spellings and the wider
-/// window produces the second one. `unmatched` is a signal that found no
-/// instance at all. `unexpected_state` is a signal that found the instance —
-/// already sitting at this very wait state — while its timer marker had not
-/// yet been inserted by the later `continue` event. Reviving only `unmatched`
-/// left every signal that landed inside that one queue hop dropped for good,
-/// and the instance waited out its deadline for a signal that had arrived.
+/// Deliberately `unmatched` only. A signal recorded `unexpected_state` found
+/// the instance and was refused by the state it was in; ADR 034 scopes this
+/// fallback to signals that matched no instance at all, and
+/// `signal_created_before_the_wait_is_receptive_is_not_buffered` guards the
+/// difference. Widening it here would accept an early outbox row merely
+/// because its worker polled after the instance reached the wait.
 async fn reopen_persisted_signals(
     transaction: &Transaction<'_>,
     source_name: &str,
@@ -3104,7 +3103,7 @@ async fn reopen_persisted_signals(
               AND process_name = $2
               AND signal_name = $3
               AND correlation_json = $4
-              AND status IN ('unmatched', 'unexpected_state')
+              AND status = 'unmatched'
             ",
             &[
                 &source_name,

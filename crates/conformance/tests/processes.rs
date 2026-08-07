@@ -639,8 +639,6 @@ fn await_instances(client: &mut postgres::Client, expected: i64) {
 // ------------------------------------------------------------ early signals
 
 const EARLY_TICKET: &str = "550e8400-e29b-41d4-a716-446655440140";
-const STRANDED_TICKET: &str = "550e8400-e29b-41d4-a716-446655440142";
-const STRANDED_RECEIPT: &str = "550e8400-e29b-41d4-a716-446655440143";
 const EARLY_RECEIPT: &str = "550e8400-e29b-41d4-a716-446655440141";
 
 /// A Process that waits for a Command signal, declaring that the signal is
@@ -854,112 +852,5 @@ fn a_signal_that_arrives_before_the_wait_is_persisted_until_it_matches() {
             panic!("the ticket never closed; signals: [{signals}]; instances: {states:?}");
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// The other spelling of "nothing receptive", and the one the wider race
-/// produces.
-///
-/// A signal that finds no instance at all is recorded `unmatched`. A signal
-/// that finds the instance — already sitting at this very wait state — while
-/// its timer marker has not yet been inserted is recorded `unexpected_state`.
-/// Both mean the same thing to `persist_before_match`, and reviving only the
-/// first left every signal that landed inside that one queue hop dropped for
-/// good: the instance then waited out its deadline for a signal that had
-/// already arrived, with nothing anywhere reporting a problem.
-///
-/// The race is a window of one queue hop, so the test does not try to hit it.
-/// It has the engine record the request the ordinary way, restates its status
-/// as the race would have left it, and then asserts the wait still takes it.
-#[test]
-fn a_signal_recorded_as_unexpected_state_is_still_delivered_to_its_wait() {
-    let suite = Suite::new("processes_stranded_signal")
-        .initial_metadata(early_signal_metadata())
-        .with_migrations()
-        .start();
-
-    // Closing before opening: no instance exists, so the engine files the
-    // request itself — with a valid revision and correlation — as `unmatched`.
-    let (status, body) = suite.post(
-        "/v1/graphql",
-        &json!({
-            "query": format!(
-                "mutation {{ close_ticket(ticket_id: \"{STRANDED_TICKET}\", receipt_id: \"{STRANDED_RECEIPT}\") {{ ticket_id }} }}"
-            )
-        }),
-        &[("X-Donat-Role".to_owned(), "customer".to_owned())],
-    );
-    assert_eq!(status, 200, "close_ticket: {body}");
-
-    let mut client =
-        postgres::Client::connect(suite.db_url(), NoTls).expect("connect to the source database");
-
-    // Restate it as the race would have: the instance was there, just not yet
-    // receptive.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let changed = client
-            .execute(
-                "
-                UPDATE donat.process_signal_requests SET status = 'unexpected_state'
-                WHERE source_name = 'default' AND process_name = 'ticket'
-                  AND correlation_json->>'ticket_id' = $1
-                  AND status = 'unmatched'
-                ",
-                &[&STRANDED_TICKET],
-            )
-            .expect("restate the signal request");
-        if changed == 1 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the engine never filed the early signal as `unmatched`"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    let (status, body) = suite.post(
-        "/v1/graphql",
-        &json!({
-            "query": format!(
-                "mutation {{ open_ticket(ticket_id: \"{STRANDED_TICKET}\") {{ ticket_id }} }}"
-            )
-        }),
-        &[("X-Donat-Role".to_owned(), "customer".to_owned())],
-    );
-    assert_eq!(status, 200, "open_ticket: {body}");
-
-    let deadline = Instant::now() + Duration::from_secs(25);
-    loop {
-        let row = client
-            .query_opt(
-                "
-                SELECT status, coalesce(terminal_output_json::text, 'null')
-                FROM donat.process_instances
-                WHERE source_name = 'default' AND process_name = 'ticket'
-                  AND input_json->>'ticket_id' = $1
-                ",
-                &[&STRANDED_TICKET],
-            )
-            .expect("poll the stranded ticket instance");
-        if let Some(row) = row {
-            let status: String = row.get(0);
-            if status != "running" {
-                let output: String = row.get(1);
-                assert!(
-                    output.contains("closed"),
-                    "the stranded signal never reached its wait; the instance \
-                     finished as {status} with {output}"
-                );
-                return;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the instance never left `running`: a signal recorded \
-             `unexpected_state` was not returned to the queue"
-        );
-        std::thread::sleep(Duration::from_millis(200));
     }
 }
