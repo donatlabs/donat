@@ -8,6 +8,7 @@ mod activity;
 mod catalog;
 mod command;
 mod definition;
+pub mod diagnostics;
 mod inbound;
 mod reconcile;
 mod runtime;

@@ -245,7 +245,10 @@ fn sqlite_answers_a_selection_wider_than_one_json_object_call() {
         row["articles"]
     );
     assert_eq!(
-        row.keys().take(width).map(String::as_str).collect::<Vec<_>>(),
+        row.keys()
+            .take(width)
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         aliases.iter().map(String::as_str).collect::<Vec<_>>(),
         "and in the order the query asked in"
     );

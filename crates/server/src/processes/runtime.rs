@@ -192,7 +192,11 @@ pub fn build_process_runtime_with_activity_executor(
 /// The immutable Engine snapshot is captured before any task is spawned.
 /// Polling is only a wake-up mechanism; correctness lives entirely in the
 /// source-local journal transaction.
-pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
+pub async fn spawn(
+    state: SharedState,
+    shutdown: tokio_util::sync::CancellationToken,
+    tasks: &tokio_util::task::TaskTracker,
+) -> anyhow::Result<()> {
     if process_workers_disabled() {
         tracing::info!("Process workers disabled by deployment configuration");
         return Ok(());
@@ -240,16 +244,24 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
         let runtime = Arc::new(runtime);
         for _ in 0..workers {
             let runtime = Arc::clone(&runtime);
-            tokio::spawn(supervise(
+            let worker_shutdown = shutdown.clone();
+            tasks.spawn(supervise(
                 runtime.source_name.clone(),
                 "transition",
-                move || transition_worker(Arc::clone(&runtime), poll_interval),
+                shutdown.clone(),
+                move || {
+                    transition_worker(Arc::clone(&runtime), poll_interval, worker_shutdown.clone())
+                },
             ));
         }
         let loops = Arc::clone(&runtime);
-        tokio::spawn(supervise(runtime.source_name.clone(), "source", move || {
-            run(Arc::clone(&loops), poll_interval)
-        }));
+        let loop_shutdown = shutdown.clone();
+        tasks.spawn(supervise(
+            runtime.source_name.clone(),
+            "source",
+            shutdown.clone(),
+            move || run(Arc::clone(&loops), poll_interval, loop_shutdown.clone()),
+        ));
     }
     Ok(())
 }
@@ -266,13 +278,24 @@ const WORKER_RESTART_DELAY: Duration = Duration::from_millis(250);
 /// but a deployment that gets slower and eventually stops — the failure this
 /// whole queue exists to prevent, arriving by another route. So a worker that
 /// dies is started again, and the log says which one and why.
-async fn supervise<F, Fut>(source: String, worker: &'static str, make: F)
-where
+async fn supervise<F, Fut>(
+    source: String,
+    worker: &'static str,
+    shutdown: tokio_util::sync::CancellationToken,
+    make: F,
+) where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     loop {
         match tokio::spawn(make()).await {
+            // A worker that returned because the deployment is stopping has
+            // finished its item and declined the next one. Restarting it here
+            // would undo exactly the drain the signal asked for.
+            Ok(()) if shutdown.is_cancelled() => {
+                tracing::info!(%source, worker, "Process worker drained");
+                return;
+            }
             Ok(()) => {
                 tracing::warn!(%source, worker, "Process worker returned; starting it again");
             }
@@ -286,7 +309,9 @@ where
             // Cancelled: the runtime is going away, and so is this.
             Err(_) => return,
         }
-        tokio::time::sleep(WORKER_RESTART_DELAY).await;
+        if !crate::shutdown::idle(WORKER_RESTART_DELAY, &shutdown).await {
+            return;
+        }
     }
 }
 
@@ -296,8 +321,17 @@ where
 /// worker claims a different instance with `SKIP LOCKED` — so a transition that
 /// takes a second is that instance's second and nobody else's. A worker that
 /// finds nothing waits out one poll interval before asking again.
-async fn transition_worker(runtime: Arc<ProcessRuntime>, poll_interval: Duration) {
+async fn transition_worker(
+    runtime: Arc<ProcessRuntime>,
+    poll_interval: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     loop {
+        // Claiming another instance now would take a lease this process is
+        // about to stop renewing. The one already in hand has been applied.
+        if shutdown.is_cancelled() {
+            return;
+        }
         let mut progressed = false;
         match runtime.consume_one_transition().await {
             Ok(TransitionConsumption::NoWork) => {}
@@ -469,14 +503,21 @@ async fn transition_worker(runtime: Arc<ProcessRuntime>, poll_interval: Duration
                 );
             }
         }
-        if !progressed {
-            tokio::time::sleep(poll_interval).await;
+        if !progressed && !crate::shutdown::idle(poll_interval, &shutdown).await {
+            return;
         }
     }
 }
 
-async fn run(runtime: Arc<ProcessRuntime>, poll_interval: Duration) {
+async fn run(
+    runtime: Arc<ProcessRuntime>,
+    poll_interval: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
         let mut progressed = false;
         match runtime.consume_one_start().await {
             Ok(StartConsumption::NoWork) => {}
@@ -510,7 +551,9 @@ async fn run(runtime: Arc<ProcessRuntime>, poll_interval: Duration) {
                     error = format_args!("{error:#}"),
                     "Process start consumer failed"
                 );
-                tokio::time::sleep(poll_interval).await;
+                if !crate::shutdown::idle(poll_interval, &shutdown).await {
+                    return;
+                }
                 continue;
             }
         }
@@ -522,7 +565,9 @@ async fn run(runtime: Arc<ProcessRuntime>, poll_interval: Duration) {
                     error = format_args!("{error:#}"),
                     "Process signal consumer failed"
                 );
-                tokio::time::sleep(poll_interval).await;
+                if !crate::shutdown::idle(poll_interval, &shutdown).await {
+                    return;
+                }
                 continue;
             }
         }
@@ -638,12 +683,14 @@ async fn run(runtime: Arc<ProcessRuntime>, poll_interval: Duration) {
                     error = format_args!("{error:#}"),
                     "Process activity consumer failed"
                 );
-                tokio::time::sleep(poll_interval).await;
+                if !crate::shutdown::idle(poll_interval, &shutdown).await {
+                    return;
+                }
                 continue;
             }
         }
-        if !progressed {
-            tokio::time::sleep(poll_interval).await;
+        if !progressed && !crate::shutdown::idle(poll_interval, &shutdown).await {
+            return;
         }
     }
 }
@@ -818,16 +865,21 @@ mod worker_pool_tests {
     async fn a_worker_that_panics_is_started_again() {
         let starts = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&starts);
-        let supervisor = tokio::spawn(supervise("test".to_owned(), "unit", move || {
-            let counted = Arc::clone(&counted);
-            async move {
-                // Panics the first two times it is started, then stays up.
-                if counted.fetch_add(1, Ordering::SeqCst) < 2 {
-                    panic!("a worker fell over");
+        let supervisor = tokio::spawn(supervise(
+            "test".to_owned(),
+            "unit",
+            tokio_util::sync::CancellationToken::new(),
+            move || {
+                let counted = Arc::clone(&counted);
+                async move {
+                    // Panics the first two times it is started, then stays up.
+                    if counted.fetch_add(1, Ordering::SeqCst) < 2 {
+                        panic!("a worker fell over");
+                    }
+                    std::future::pending::<()>().await;
                 }
-                std::future::pending::<()>().await;
-            }
-        }));
+            },
+        ));
 
         // Two restarts, each after the supervisor's delay, plus slack.
         for _ in 0..20 {
@@ -842,6 +894,36 @@ mod worker_pool_tests {
             starts.load(Ordering::SeqCst) >= 3,
             "a panicking worker was not restarted: {} start(s)",
             starts.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A worker that returned because the deployment is stopping must stay
+    /// stopped. The supervisor's whole job is to start workers again, so it is
+    /// also the one thing that can undo a drain.
+    #[tokio::test]
+    async fn a_drained_worker_is_not_started_again() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&starts);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+
+        let supervisor = tokio::spawn(supervise("test".to_owned(), "unit", shutdown, move || {
+            let counted = Arc::clone(&counted);
+            // Returns immediately, the way a worker does once it sees that
+            // the deployment is stopping.
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("the supervisor returns instead of restarting forever")
+            .expect("the supervisor did not panic");
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "a drained worker must be started exactly once"
         );
     }
 }

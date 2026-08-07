@@ -1,8 +1,9 @@
 # donat Knowledge Base
 
 > Living documentation for design explorations and decisions that are not yet
-> (or not only) code. Engine internals and conformance status live in PLAN.md
-> and tests/donat/COVERAGE.md; this base holds ideas, research, and ADRs.
+> (or not only) code. Engine internals and milestones live in PLAN.md, and the
+> conformance contract is the `crates/conformance` suite itself; this base
+> holds ideas, research, and ADRs.
 
 ## Domains
 
@@ -17,6 +18,11 @@ Serving the per-role data plane over Donat v2 RESTified endpoints
 (`rest_endpoints` → saved GraphQL queries) and an MCP server (streamable HTTP,
 generic CRUD tools). Both translate to GraphQL and reuse the execution
 pipeline. 1 design note, 2 decisions. **Status: in progress (June 2026).**
+
+### [[operations/_index|Operations — deploying and running the engine]]
+The engine as a process: what bounds a request, how it reaches its database,
+how it drains on `SIGTERM`, and what an operator may inspect without a
+permission bypass. 5 decisions. **Status: in progress (August 2026).**
 
 ## Cross-cutting
 

@@ -803,7 +803,25 @@ pub async fn forward(
         Ok(response) => {
             let status = axum::http::StatusCode::from_u16(response.status().as_u16())
                 .unwrap_or(axum::http::StatusCode::OK);
-            let body = response.json::<Json>().await.unwrap_or(Json::Null);
+            let body = match crate::upstream::read_json(response, crate::upstream::max_body_bytes())
+                .await
+            {
+                Ok(body) => body,
+                // The remote answered, but not with something the engine can
+                // hold or parse. That is a resolver failure, reported the way
+                // any other forwarding failure is.
+                Err(error) => {
+                    return (
+                        axum::http::StatusCode::OK,
+                        json!({
+                            "errors": [{
+                                "extensions": { "path": "$", "code": "unexpected" },
+                                "message": format!("remote schema response rejected: {error}"),
+                            }]
+                        }),
+                    );
+                }
+            };
             (status, body)
         }
         Err(e) => (

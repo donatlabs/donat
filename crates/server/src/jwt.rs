@@ -55,20 +55,51 @@ pub struct JwtError {
     pub message: String,
 }
 
+/// Why a `DONAT_GRAPHQL_JWT_SECRET` value cannot be honored.
+///
+/// Carries the offending field and the parser's complaint, never the key.
+#[derive(Debug)]
+pub struct JwtConfigError(String);
+
+impl std::fmt::Display for JwtConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for JwtConfigError {}
+
 fn is_session_claim(name: &str) -> bool {
     name.starts_with("x-donat-") || name.starts_with("x-hasura-")
 }
 
 impl JwtConfig {
-    /// Parse the DONAT_GRAPHQL_JWT_SECRET JSON. jwk_url configs are not
-    /// supported and yield None.
-    pub fn from_env_value(raw: &str) -> Option<JwtConfig> {
-        let config: Json = serde_json::from_str(raw).ok()?;
+    /// Parse the DONAT_GRAPHQL_JWT_SECRET JSON.
+    ///
+    /// Every failure is returned, never swallowed. A configuration the engine
+    /// cannot honor must stop the boot: silently dropping it would leave the
+    /// deployment serving with no token verification at all, and — when no
+    /// admin secret is set either — trusting whatever role a caller names in a
+    /// header. The messages carry field names and the parser's own complaint;
+    /// they never carry the key material.
+    pub fn from_env_value(raw: &str) -> Result<JwtConfig, JwtConfigError> {
+        let config: Json = serde_json::from_str(raw)
+            .map_err(|e| JwtConfigError(format!("not valid JSON: {e}")))?;
         if let Some(url) = config.get("jwk_url").and_then(Json::as_str) {
-            return Some(Self::from_jwk_url(url, &config));
+            return Ok(Self::from_jwk_url(url, &config));
         }
-        let key_type = config.get("type").and_then(Json::as_str)?;
-        let key_data = config.get("key").and_then(Json::as_str)?;
+        let key_type = config
+            .get("type")
+            .and_then(Json::as_str)
+            .ok_or_else(|| JwtConfigError("'type' is missing or not a string".to_string()))?;
+        let key_data = config
+            .get("key")
+            .and_then(Json::as_str)
+            .ok_or_else(|| JwtConfigError("'key' is missing or not a string".to_string()))?;
+        // The key never reaches the error: only the algorithm that rejected it.
+        let pem = |result: jsonwebtoken::errors::Result<DecodingKey>| {
+            result.map_err(|e| JwtConfigError(format!("'key' is not a usable {key_type} key: {e}")))
+        };
         let (algorithm, key) = match key_type {
             "HS256" => (
                 Algorithm::HS256,
@@ -84,29 +115,34 @@ impl JwtConfig {
             ),
             "RS256" => (
                 Algorithm::RS256,
-                DecodingKey::from_rsa_pem(key_data.as_bytes()).ok()?,
+                pem(DecodingKey::from_rsa_pem(key_data.as_bytes()))?,
             ),
             "RS384" => (
                 Algorithm::RS384,
-                DecodingKey::from_rsa_pem(key_data.as_bytes()).ok()?,
+                pem(DecodingKey::from_rsa_pem(key_data.as_bytes()))?,
             ),
             "RS512" => (
                 Algorithm::RS512,
-                DecodingKey::from_rsa_pem(key_data.as_bytes()).ok()?,
+                pem(DecodingKey::from_rsa_pem(key_data.as_bytes()))?,
             ),
             "Ed25519" => (
                 Algorithm::EdDSA,
-                DecodingKey::from_ed_pem(key_data.as_bytes()).ok()?,
+                pem(DecodingKey::from_ed_pem(key_data.as_bytes()))?,
             ),
             "ES256" => (
                 Algorithm::ES256,
-                DecodingKey::from_ec_pem(key_data.as_bytes()).ok()?,
+                pem(DecodingKey::from_ec_pem(key_data.as_bytes()))?,
             ),
             "ES384" => (
                 Algorithm::ES384,
-                DecodingKey::from_ec_pem(key_data.as_bytes()).ok()?,
+                pem(DecodingKey::from_ec_pem(key_data.as_bytes()))?,
             ),
-            _ => return None,
+            other => {
+                return Err(JwtConfigError(format!(
+                    "unsupported 'type' {other:?} (expected one of HS256, HS384, HS512, \
+                     RS256, RS384, RS512, Ed25519, ES256, ES384)"
+                )));
+            }
         };
         let mut validation = Validation::new(algorithm);
         validation.required_spec_claims.clear();
@@ -130,7 +166,7 @@ impl JwtConfig {
         if let Some(iss) = config.get("issuer").and_then(Json::as_str) {
             validation.set_issuer(&[iss]);
         }
-        Some(JwtConfig {
+        Ok(JwtConfig {
             keys: KeySource::Static(key, algorithm),
             validation,
             namespace: config
@@ -222,7 +258,22 @@ impl JwtConfig {
                         .to_ascii_lowercase();
                     let has_expires = resp.headers().contains_key("expires");
                     interval = jwk_refresh_interval(&cache_control, has_expires);
-                    if let Ok(set) = resp.json::<jsonwebtoken::jwk::JwkSet>().await {
+                    // A key set is a small document. Reading it without a
+                    // ceiling would let whatever answers `jwk_url` decide how
+                    // much memory the engine holds.
+                    let document =
+                        crate::upstream::read_json(resp, crate::upstream::MAX_CONTROL_BODY_BYTES)
+                            .await;
+                    let set = match document {
+                        Ok(document) => {
+                            serde_json::from_value::<jsonwebtoken::jwk::JwkSet>(document).ok()
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "donat::jwt", %error, "JWKS refresh rejected");
+                            None
+                        }
+                    };
+                    if let Some(set) = set {
                         let mut new_keys = vec![];
                         for jwk in &set.keys {
                             let Ok(key) = DecodingKey::from_jwk(jwk) else {
@@ -664,6 +715,49 @@ mod tests {
         JwtConfig::from_env_value(&raw).expect("config must parse")
     }
 
+    /// Every unusable configuration must be reported, not dropped. A dropped
+    /// one leaves the deployment with no token verification at all.
+    #[test]
+    fn unusable_configurations_are_reported_without_the_key() {
+        let cases = [
+            ("not JSON at all", "not valid JSON"),
+            (r#"{"key":"k"}"#, "'type' is missing"),
+            (r#"{"type":"HS256"}"#, "'key' is missing"),
+            (r#"{"type":"XX512","key":"k"}"#, "unsupported 'type'"),
+            (
+                r#"{"type":"RS256","key":"-----BEGIN PUBLIC KEY-----\nnot-a-key\n-----END PUBLIC KEY-----"}"#,
+                "not a usable RS256 key",
+            ),
+            (
+                r#"{"type":"ES256","key":"sensitive-material"}"#,
+                "not a usable ES256 key",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let error = JwtConfig::from_env_value(raw)
+                .err()
+                .unwrap_or_else(|| panic!("{raw} must be refused"));
+            let message = error.to_string();
+            assert!(
+                message.contains(expected),
+                "{raw}: expected {expected:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains("sensitive-material"),
+                "the key must never reach the error: {message:?}"
+            );
+        }
+    }
+
+    /// A jwk_url configuration keeps working: its keys arrive later, from the
+    /// refresher, so there is nothing to reject at parse time.
+    #[test]
+    fn jwk_url_configuration_parses() {
+        let config = JwtConfig::from_env_value(r#"{"jwk_url":"http://idp.test/keys"}"#)
+            .expect("a jwk_url config parses");
+        assert!(matches!(config.keys, KeySource::Jwks(_)));
+    }
+
     fn sign_with(claims: &Json, secret: &str, alg: Algorithm) -> String {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(alg),
@@ -695,7 +789,7 @@ mod tests {
         assert!(matches!(cookie.header, TokenLocation::Cookie(ref n) if n == "jwt"));
         let custom = config(r#","header":{"type":"CustomHeader","name":"X-JWT"}"#);
         assert!(matches!(custom.header, TokenLocation::CustomHeader(ref n) if n == "X-JWT"));
-        assert!(JwtConfig::from_env_value(r#"{"type":"XX512","key":"k"}"#).is_none());
+        assert!(JwtConfig::from_env_value(r#"{"type":"XX512","key":"k"}"#).is_err());
     }
 
     #[test]

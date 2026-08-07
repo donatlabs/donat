@@ -126,8 +126,19 @@ fn text_filters_the_engine_accepts_are_published_by_introspection() {
     // Postgres has a regex engine, so the operations built on it are part of
     // what a client may discover here too.
     for operator in [
-        "_eq", "_in", "_is_null", "_like", "_nlike", "_ilike", "_nilike",
-        "_similar", "_nsimilar", "_regex", "_iregex", "_nregex", "_niregex",
+        "_eq",
+        "_in",
+        "_is_null",
+        "_like",
+        "_nlike",
+        "_ilike",
+        "_nilike",
+        "_similar",
+        "_nsimilar",
+        "_regex",
+        "_iregex",
+        "_nregex",
+        "_niregex",
     ] {
         assert!(
             text.contains(&operator.to_owned()),
