@@ -58,19 +58,28 @@ func (b *postgresBackend) RunQuery(ctx context.Context, plan Plan) (json.RawMess
 // Hooks are NOT fired here — the Engine fires them after RunMutation returns.
 // Mirrors crates/server/src/gql.rs:567-600.
 func (b *postgresBackend) RunMutation(ctx context.Context, plan Plan) (map[string]json.RawMessage, error) {
+	data, _, err := b.runMutationReportingReplays(ctx, plan)
+	return data, err
+}
+
+// runMutationReportingReplays implements replayReporter.
+func (b *postgresBackend) runMutationReportingReplays(
+	ctx context.Context,
+	plan Plan,
+) (map[string]json.RawMessage, map[string]bool, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	data, err := runStmtsInTx(ctx, tx, plan)
+	data, replays, err := runStmtsReportingReplays(ctx, tx, plan)
 	if err != nil {
 		_ = tx.Rollback(ctx)
-		return nil, err
+		return nil, nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return data, nil
+	return data, replays, nil
 }
 
 // MapError maps a Postgres driver error to the Donat GraphQL error body JSON.
@@ -112,15 +121,33 @@ func (b *postgresBackend) runQueryTx(ctx context.Context, tx any, plan Plan) (js
 // per-alias JSON results. It does NOT commit or roll back. Returns the data map
 // or the first driver error encountered.
 func runStmtsInTx(ctx context.Context, tx pgx.Tx, plan Plan) (map[string]json.RawMessage, error) {
+	data, _, err := runStmtsReportingReplays(ctx, tx, plan)
+	return data, err
+}
+
+// runStmtsReportingReplays also says which command roots were replayed rather
+// than executed, which is what decides whether their post-commit hooks fire.
+func runStmtsReportingReplays(
+	ctx context.Context,
+	tx pgx.Tx,
+	plan Plan,
+) (map[string]json.RawMessage, map[string]bool, error) {
 	data := make(map[string]json.RawMessage, len(plan.Statements))
+	var replays map[string]bool
 	for _, stmt := range plan.Statements {
-		part, err := scanStatement(ctx, tx, stmt)
+		part, replayed, err := scanStatement(ctx, tx, stmt)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		data[stmt.Alias] = part
+		if replayed {
+			if replays == nil {
+				replays = map[string]bool{}
+			}
+			replays[stmt.Alias] = true
+		}
 	}
-	return data, nil
+	return data, replays, nil
 }
 
 // scanStatement reads one statement's row in whatever shape the plan declared.
@@ -130,19 +157,19 @@ func runStmtsInTx(ctx context.Context, tx pgx.Tx, plan Plan) (map[string]json.Ra
 // result, so a host that scanned column 0 would fail with a column-count
 // mismatch — an error about the row shape, telling an operator nothing about
 // the command that produced it.
-func scanStatement(ctx context.Context, tx pgx.Tx, stmt Statement) (json.RawMessage, error) {
+func scanStatement(ctx context.Context, tx pgx.Tx, stmt Statement) (json.RawMessage, bool, error) {
 	switch stmt.Result {
 	case ResultCommandExecution:
 		rows, err := tx.Query(ctx, stmt.SQL)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		defer rows.Close()
 		if !rows.Next() {
 			if err := rows.Err(); err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			return nil, fmt.Errorf("command %q returned no execution row", stmt.Alias)
+			return nil, false, fmt.Errorf("command %q returned no execution row", stmt.Alias)
 		}
 		// Scanned as raw bytes, never through a decoded Go value. Decoding the
 		// column and re-encoding it would sort the object's keys and round every
@@ -151,37 +178,44 @@ func scanStatement(ctx context.Context, tx pgx.Tx, stmt Statement) (json.RawMess
 		// the same statement. The column is found by name because the order the
 		// renderer emits is its business, not the host's.
 		var root json.RawMessage
+		var replayed bool
 		found := false
 		dest := make([]any, len(rows.FieldDescriptions()))
 		discard := make([]any, len(dest))
 		for i, field := range rows.FieldDescriptions() {
-			if field.Name == "root" && !found {
+			switch {
+			case field.Name == "root" && !found:
 				dest[i] = &root
 				found = true
-				continue
+			// The generation the engine reads too: a replay projects the
+			// stored result and runs no DML, so nothing happened to notify
+			// anybody about.
+			case field.Name == "replayed":
+				dest[i] = &replayed
+			default:
+				dest[i] = &discard[i]
 			}
-			dest[i] = &discard[i]
 		}
 		if !found {
-			return nil, fmt.Errorf("command %q returned no `root` column", stmt.Alias)
+			return nil, false, fmt.Errorf("command %q returned no `root` column", stmt.Alias)
 		}
 		if err := rows.Scan(dest...); err != nil {
-			return nil, fmt.Errorf("command %q result: %w", stmt.Alias, err)
+			return nil, false, fmt.Errorf("command %q result: %w", stmt.Alias, err)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if root == nil {
-			return json.RawMessage("null"), nil
+			return json.RawMessage("null"), replayed, nil
 		}
-		return root, nil
+		return root, replayed, nil
 	default:
 		var part json.RawMessage
 		if err := tx.QueryRow(ctx, stmt.SQL).Scan(&part); err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return part, nil
+		return part, false, nil
 	}
 }
 

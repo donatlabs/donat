@@ -25,6 +25,25 @@ func wrapData(data map[string]json.RawMessage) ([]byte, error) {
 	return envelope, nil
 }
 
+// hooksExcludingReplays drops the hooks belonging to command roots that were
+// replayed rather than executed.
+//
+// A hook names the root it came from, so the match is by alias. With nothing
+// replayed the slice is returned untouched, which is every plan a backend that
+// does not report replays produces.
+func hooksExcludingReplays(hooks []Hook, replays map[string]bool) []Hook {
+	if len(replays) == 0 || len(hooks) == 0 {
+		return hooks
+	}
+	kept := make([]Hook, 0, len(hooks))
+	for _, h := range hooks {
+		if !replays[h.Alias] {
+			kept = append(kept, h)
+		}
+	}
+	return kept
+}
+
 // fireHooks fires the plan's post-commit hooks against the registry. Called
 // only after a successful owned-transaction commit. Hook errors are silently
 // dropped (the mutation is already committed); ErrNoHandler is a no-op.
@@ -154,13 +173,24 @@ func (e *Engine) ExecuteOperation(ctx context.Context, query string, operationNa
 		return e.runAction(ctx, plan, query, vars, sessionVars)
 
 	case PlanMutation:
-		data, err := e.backend.RunMutation(ctx, plan)
+		var (
+			data    map[string]json.RawMessage
+			replays map[string]bool
+			err     error
+		)
+		if reporter, ok := e.backend.(replayReporter); ok {
+			data, replays, err = reporter.runMutationReportingReplays(ctx, plan)
+		} else {
+			data, err = e.backend.RunMutation(ctx, plan)
+		}
 		if err != nil {
 			return e.backend.MapError(err, plan.ErrorMap), nil
 		}
 		// Fire post-commit hooks — the backend committed the transaction before
-		// returning, so it is safe to dispatch side effects now.
-		e.fireHooks(ctx, plan.Hooks, data, sessionVars)
+		// returning, so it is safe to dispatch side effects now. A replayed
+		// command is skipped: it projected its stored result and ran no DML, so
+		// on the native engine no trigger fired either.
+		e.fireHooks(ctx, hooksExcludingReplays(plan.Hooks, replays), data, sessionVars)
 		return wrapData(data)
 
 	default:

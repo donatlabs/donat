@@ -980,3 +980,106 @@ fn command_with_a_process_effect_is_planned() {
         other => panic!("expected a mutation plan, got {other:?}"),
     }
 }
+
+/// `x-hasura-role` is the same header under its v2 spelling.
+///
+/// Metadata exported from an existing Donat project refers to it in filters and
+/// presets, and the server accepts either name and then writes the resolved
+/// role into both. The core once read only `x-donat-role`, so the same
+/// deployment planned on the server and was denied here — and metadata that
+/// referenced `X-Hasura-Role` failed with a missing session variable rather
+/// than resolving.
+#[test]
+fn either_role_spelling_resolves_and_both_are_offered_to_metadata() {
+    let state = fixture_state();
+    let query = "query { article { id title } }".to_string();
+
+    for header in ["x-donat-role", "x-hasura-role"] {
+        let input = CompileInput {
+            query: query.clone(),
+            operation_name: None,
+            variables: Default::default(),
+            session_vars: HashMap::from([
+                (header.to_string(), "user".to_string()),
+                ("x-donat-user-id".to_string(), "7".to_string()),
+            ]),
+            stringify_numerics: false,
+            dialect: None,
+            now: None,
+            external_base_url: None,
+        };
+        match compile(&state, &input) {
+            PlanV1::Query(_) => {}
+            other => panic!("{header} did not resolve a role: {other:?}"),
+        }
+    }
+
+    // And the resolved role is readable under both names, because a permission
+    // may reference either.
+    let session = donat_wasm_core::compile::session_from(&HashMap::from([(
+        "x-hasura-role".to_string(),
+        "user".to_string(),
+    )]))
+    .expect("the v2 spelling resolves");
+    assert_eq!(session.role, "user");
+    assert_eq!(session.vars.get("x-donat-role").map(String::as_str), Some("user"));
+    assert_eq!(session.vars.get("x-hasura-role").map(String::as_str), Some("user"));
+}
+
+/// A trigger that names the columns it watches must not fire for a write that
+/// touches none of them.
+///
+/// The native engine compiles a column list into `AFTER UPDATE OF <cols>`, so
+/// on `donat-server` such a write emits nothing. The core once asked only
+/// whether an `update` block existed, so an embedded host delivered events the
+/// engine never would — the two hosts disagreeing about what happened, which
+/// is the one thing this core exists to prevent.
+#[test]
+fn an_update_trigger_watching_columns_ignores_a_write_that_misses_them() {
+    let mut value = serde_json::to_value(metadata()).expect("fixture serializes");
+    // The role needs a second writable column, so the test can write one the
+    // trigger does not watch.
+    value["sources"][0]["tables"][0]["update_permissions"][0]["permission"]["columns"] =
+        serde_json::json!(["name", "secret"]);
+    value["sources"][0]["tables"][0]["event_triggers"] = serde_json::json!([{
+        "name": "on_name_changed",
+        "definition": { "enable_manual": false, "update": { "columns": ["name"] } },
+        "webhook": "http://in-process/events"
+    }]);
+    let state = state_of(serde_json::from_value(value).expect("deserializes"));
+
+    let plan_for = |mutation: &str| {
+        let input = CompileInput {
+            query: mutation.to_string(),
+            operation_name: None,
+            variables: Default::default(),
+            session_vars: session_vars("user"),
+            stringify_numerics: false,
+            dialect: None,
+            now: None,
+            external_base_url: None,
+        };
+        match compile(&state, &input) {
+            PlanV1::Mutation(body) => body.hooks,
+            other => panic!("expected a mutation plan, got {other:?}"),
+        }
+    };
+
+    let watched = plan_for(
+        r#"mutation { update_author(where: {id: {_eq: 1}}, _set: {name: "Ada"}) { affected_rows } }"#,
+    );
+    assert_eq!(
+        watched.len(),
+        1,
+        "a write to the watched column must fire: {watched:?}"
+    );
+
+    let unwatched = plan_for(
+        r#"mutation { update_author(where: {id: {_eq: 1}}, _set: {secret: "x"}) { affected_rows } }"#,
+    );
+    assert!(
+        unwatched.is_empty(),
+        "a write to no watched column must fire nothing, as the engine's \
+         AFTER UPDATE OF would not: {unwatched:?}"
+    );
+}

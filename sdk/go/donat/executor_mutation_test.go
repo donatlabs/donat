@@ -400,3 +400,28 @@ func TestEventHookFires(t *testing.T) {
 	}
 	t.Logf("hook: op=%s table=%s trigger=%s", gotOp, gotTbl, gotTrig)
 }
+
+// A replayed command must not fire its post-commit hooks.
+//
+// On the native engine an event is a Postgres trigger, and a replay projects
+// the stored result without running any DML — so nothing fires. An embedded
+// host fires from the plan, which cannot know, so the runtime fact has to
+// travel back from the statement's own execution row.
+func TestHooksAreSkippedForAReplayedCommand(t *testing.T) {
+	hooks := []Hook{
+		{Trigger: "on_loan", Alias: "borrow_copy", Op: "INSERT"},
+		{Trigger: "on_audit", Alias: "write_audit", Op: "INSERT"},
+	}
+
+	kept := hooksExcludingReplays(hooks, map[string]bool{"borrow_copy": true})
+	if len(kept) != 1 || kept[0].Alias != "write_audit" {
+		t.Fatalf("only the executed root's hook may survive, got %v", kept)
+	}
+
+	// Nothing replayed: the plan passes through, which is what a backend that
+	// does not report replays produces.
+	same := hooksExcludingReplays(hooks, nil)
+	if len(same) != 2 {
+		t.Fatalf("with no replays every hook stands, got %v", same)
+	}
+}

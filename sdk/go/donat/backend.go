@@ -36,6 +36,23 @@ type Backend interface {
 	FinalizeUpload(ctx context.Context, id, objectKey string, size int64) error
 }
 
+// replayReporter is an OPTIONAL capability: run a mutation and say which of
+// its command roots were replayed from the idempotency journal rather than
+// executed.
+//
+// It matters for post-commit hooks. On the native engine an event is a
+// Postgres trigger, and a replay re-projects the stored result without
+// re-running any DML — so no trigger fires. An embedded host fires from the
+// plan, which cannot know, so without this it would deliver an event for a
+// write that did not happen this time. A backend that does not implement it
+// keeps the old behaviour.
+type replayReporter interface {
+	runMutationReportingReplays(
+		ctx context.Context,
+		plan Plan,
+	) (map[string]json.RawMessage, map[string]bool, error)
+}
+
 // txRunner is an OPTIONAL capability: run a mutation/query inside a caller-owned
 // transaction (composability). Backends that support it are reached via
 // Engine.ExecuteTx. tx is the driver's transaction handle (e.g. pgx.Tx).

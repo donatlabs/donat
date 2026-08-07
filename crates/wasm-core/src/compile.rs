@@ -176,7 +176,16 @@ pub fn session_from(vars: &HashMap<String, String>) -> Result<Session, PlanError
         .iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
         .collect();
-    let role = match lower.get("x-donat-role") {
+    // `x-hasura-role` is the same header under its v2 spelling, and metadata
+    // exported from an existing Donat project refers to it in filters and
+    // presets. The server accepts either and then writes the resolved role
+    // into both, so a permission reading one spelling resolves whichever the
+    // caller sent. Without that here, the same metadata planned on the server
+    // and failed in the core with a missing session variable.
+    let role = match lower
+        .get("x-donat-role")
+        .or_else(|| lower.get("x-hasura-role"))
+    {
         Some(r) if !r.is_empty() => r.clone(),
         _ => {
             return Err(PlanError::new(
@@ -200,9 +209,12 @@ pub fn session_from(vars: &HashMap<String, String>) -> Result<Session, PlanError
             }
         },
     };
+    let mut vars = lower;
+    vars.insert("x-donat-role".to_string(), role.clone());
+    vars.insert("x-hasura-role".to_string(), role.clone());
     Ok(Session {
         role,
-        vars: lower,
+        vars,
         backend_request,
     })
 }
@@ -401,25 +413,63 @@ fn error_plan(e: &PlanError) -> PlanV1 {
     })
 }
 
+/// One table a mutation root writes, how, and which columns it set.
+///
+/// `columns` matters only for an UPDATE: an event trigger may name the columns
+/// it watches, and the native engine compiles that into `AFTER UPDATE OF
+/// <cols>`, so a write touching none of them fires nothing there. Empty means
+/// "not an update, or the columns are not knowable", which the matcher treats
+/// as covering everything — the same as a trigger that named no columns.
+struct WrittenTable<'a> {
+    schema: &'a str,
+    name: &'a str,
+    op: &'static str,
+    columns: Vec<&'a str>,
+}
+
 /// The tables a mutation root writes, and how.
 ///
 /// A CRUD root writes exactly one table. A declarative command writes as many
-/// as its steps do, which is why the pair is a list: a command is the only
-/// place where one root field commits to several tables at once, and a host
-/// that only watched the root would never learn about any of them.
-fn written_tables(root: &donat_ir::MutationRoot) -> Vec<(&str, &str, &'static str)> {
+/// as its steps do, which is why this is a list: a command is the only place
+/// where one root field commits to several tables at once, and a host that
+/// only watched the root would never learn about any of them.
+fn written_tables(root: &donat_ir::MutationRoot) -> Vec<WrittenTable<'_>> {
     use donat_ir::CommandExecutionStep as Step;
+    use donat_ir::SetOp;
+
+    fn set_columns(sets: &[SetOp]) -> Vec<&str> {
+        sets.iter()
+            .map(|set| match set {
+                SetOp::Set { column, .. }
+                | SetOp::Inc { column, .. }
+                | SetOp::JsonbAppend { column, .. } => column.as_str(),
+            })
+            .collect()
+    }
+
+    fn assigned_columns(sets: &[donat_ir::CommandAssignment]) -> Vec<&str> {
+        sets.iter().map(|a| a.column.name.as_str()).collect()
+    }
 
     match root {
-        donat_ir::MutationRoot::Insert { insert, .. } => {
-            vec![(&insert.table.schema, &insert.table.name, "INSERT")]
-        }
-        donat_ir::MutationRoot::Update { update, .. } => {
-            vec![(&update.table.schema, &update.table.name, "UPDATE")]
-        }
-        donat_ir::MutationRoot::Delete { delete, .. } => {
-            vec![(&delete.table.schema, &delete.table.name, "DELETE")]
-        }
+        donat_ir::MutationRoot::Insert { insert, .. } => vec![WrittenTable {
+            schema: &insert.table.schema,
+            name: &insert.table.name,
+            op: "INSERT",
+            columns: vec![],
+        }],
+        donat_ir::MutationRoot::Update { update, .. } => vec![WrittenTable {
+            schema: &update.table.schema,
+            name: &update.table.name,
+            op: "UPDATE",
+            columns: set_columns(&update.sets),
+        }],
+        donat_ir::MutationRoot::Delete { delete, .. } => vec![WrittenTable {
+            schema: &delete.table.schema,
+            name: &delete.table.name,
+            op: "DELETE",
+            columns: vec![],
+        }],
         // A command's writes are its steps. Reading them from the resolved IR
         // rather than from the metadata declaration means a step the planner
         // dropped cannot leave a hook behind that fires for a write that did
@@ -430,17 +480,41 @@ fn written_tables(root: &donat_ir::MutationRoot) -> Vec<(&str, &str, &'static st
             .filter_map(|step| match step {
                 Step::Insert { table, .. }
                 | Step::InsertMany { table, .. }
-                | Step::InsertRows { table, .. } => {
-                    Some((table.schema.as_str(), table.name.as_str(), "INSERT"))
-                }
-                Step::Update { table, .. }
-                | Step::UpdateWhen { table, .. }
-                | Step::UpdateMany { table, .. } => {
-                    Some((table.schema.as_str(), table.name.as_str(), "UPDATE"))
-                }
-                Step::Delete { table, .. } => {
-                    Some((table.schema.as_str(), table.name.as_str(), "DELETE"))
-                }
+                | Step::InsertRows { table, .. } => Some(WrittenTable {
+                    schema: &table.schema,
+                    name: &table.name,
+                    op: "INSERT",
+                    columns: vec![],
+                }),
+                Step::Update { table, set, .. } => Some(WrittenTable {
+                    schema: &table.schema,
+                    name: &table.name,
+                    op: "UPDATE",
+                    columns: assigned_columns(set),
+                }),
+                Step::UpdateMany {
+                    table, assignments, ..
+                } => Some(WrittenTable {
+                    schema: &table.schema,
+                    name: &table.name,
+                    op: "UPDATE",
+                    columns: assigned_columns(assignments),
+                }),
+                // A conditional update's branches each set their own columns;
+                // treating it as touching everything keeps the hook on the
+                // safe side of a trigger that names columns.
+                Step::UpdateWhen { table, .. } => Some(WrittenTable {
+                    schema: &table.schema,
+                    name: &table.name,
+                    op: "UPDATE",
+                    columns: vec![],
+                }),
+                Step::Delete { table, .. } => Some(WrittenTable {
+                    schema: &table.schema,
+                    name: &table.name,
+                    op: "DELETE",
+                    columns: vec![],
+                }),
                 // Reads, assertions and projections commit nothing.
                 _ => None,
             })
@@ -465,8 +539,8 @@ fn hooks_for_root(
     metadata: &donat_metadata::Metadata,
 ) -> Vec<crate::plan::Hook> {
     let mut out = Vec::new();
-    for (schema, table, op) in written_tables(root) {
-        collect_hooks(metadata, alias, schema, table, op, &mut out);
+    for written in written_tables(root) {
+        collect_hooks(metadata, alias, &written, &mut out);
     }
     out
 }
@@ -474,11 +548,10 @@ fn hooks_for_root(
 fn collect_hooks(
     metadata: &donat_metadata::Metadata,
     alias: &str,
-    schema: &str,
-    table: &str,
-    op: &str,
+    written: &WrittenTable<'_>,
     out: &mut Vec<crate::plan::Hook>,
 ) {
+    let (schema, table, op) = (written.schema, written.name, written.op);
     for source in &metadata.sources {
         for entry in &source.tables {
             if entry.table.schema() != schema || entry.table.name() != table {
@@ -487,7 +560,16 @@ fn collect_hooks(
             for et in &entry.event_triggers {
                 let covers = match op {
                     "INSERT" => et.definition.insert.is_some(),
-                    "UPDATE" => et.definition.update.is_some(),
+                    // A trigger may name the columns it watches, and the native
+                    // engine compiles that into `AFTER UPDATE OF <cols>` — so a
+                    // write touching none of them fires nothing there. Emitting
+                    // a hook regardless made the embedded host deliver events
+                    // the engine never would.
+                    "UPDATE" => et
+                        .definition
+                        .update
+                        .as_ref()
+                        .is_some_and(|spec| update_watches(spec, &written.columns)),
                     "DELETE" => et.definition.delete.is_some(),
                     _ => false,
                 };
@@ -503,6 +585,23 @@ fn collect_hooks(
                 }
             }
         }
+    }
+}
+
+/// Does an update touching `written` columns reach a trigger's column list?
+///
+/// A trigger that names no columns watches all of them, and an update whose
+/// columns are not knowable from the IR is treated the same way: the safe side
+/// of the comparison is firing, because a missed event is silent while an
+/// extra one is at least visible to the handler.
+fn update_watches(spec: &donat_metadata::OperationSpec, written: &[&str]) -> bool {
+    use donat_metadata::Columns;
+
+    match &spec.columns {
+        Columns::List(watched) if !watched.is_empty() => {
+            written.is_empty() || written.iter().any(|c| watched.iter().any(|w| w == c))
+        }
+        _ => true,
     }
 }
 
