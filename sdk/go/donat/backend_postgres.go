@@ -144,31 +144,38 @@ func scanStatement(ctx context.Context, tx pgx.Tx, stmt Statement) (json.RawMess
 			}
 			return nil, fmt.Errorf("command %q returned no execution row", stmt.Alias)
 		}
-		// By name, not by position: the engine reads `root` the same way, and
-		// the column order is the renderer's business, not the host's.
-		values, err := rows.Values()
-		if err != nil {
-			return nil, err
-		}
+		// Scanned as raw bytes, never through a decoded Go value. Decoding the
+		// column and re-encoding it would sort the object's keys and round every
+		// bigint and numeric through float64 — 9007199254740993 comes back as
+		// ...992 — so the command's own result would differ from the engine's for
+		// the same statement. The column is found by name because the order the
+		// renderer emits is its business, not the host's.
 		var root json.RawMessage
+		found := false
+		dest := make([]any, len(rows.FieldDescriptions()))
+		discard := make([]any, len(dest))
 		for i, field := range rows.FieldDescriptions() {
-			if field.Name != "root" {
+			if field.Name == "root" && !found {
+				dest[i] = &root
+				found = true
 				continue
 			}
-			if values[i] == nil {
-				return json.RawMessage("null"), nil
-			}
-			raw, err := json.Marshal(values[i])
-			if err != nil {
-				return nil, fmt.Errorf("command %q result: %w", stmt.Alias, err)
-			}
-			root = raw
+			dest[i] = &discard[i]
 		}
-		if root == nil {
+		if !found {
 			return nil, fmt.Errorf("command %q returned no `root` column", stmt.Alias)
 		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, fmt.Errorf("command %q result: %w", stmt.Alias, err)
+		}
 		rows.Close()
-		return root, rows.Err()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		if root == nil {
+			return json.RawMessage("null"), nil
+		}
+		return root, nil
 	default:
 		var part json.RawMessage
 		if err := tx.QueryRow(ctx, stmt.SQL).Scan(&part); err != nil {

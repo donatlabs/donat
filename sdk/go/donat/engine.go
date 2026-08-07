@@ -41,6 +41,13 @@ type Config struct {
 	PoolSize int // wasm instance pool size (default 4)
 	// PlanCacheSize bounds the compiled-plan cache. Optional; 2048 when unset.
 	PlanCacheSize int
+	// OnHookError is called when a post-commit event handler could not be
+	// reached — its payload failed to decode, or it returned an error. The
+	// write has already committed, so nothing can be undone; what matters is
+	// that the failure is not silent. A handler whose payload shape does not
+	// match the row would otherwise simply never run, and look identical to
+	// one with nothing to do. Optional; failures are logged when unset.
+	OnHookError func(trigger string, err error)
 	// Middleware wraps the GraphQL handler that Main serves, outermost first.
 	// The engine authenticates nothing — it reads the role from the request —
 	// so this is where a deployment decides who may reach it at all.

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -102,10 +103,12 @@ func (e *Engine) fireHooks(ctx context.Context, hooks []Hook, data map[string]js
 		}
 		dispatchErr := e.registry.Dispatch(ctx, h.Trigger, raw)
 		if dispatchErr != nil && !errors.Is(dispatchErr, ErrNoHandler) {
-			// Hook errors are silently dropped — the mutation is already committed.
-			// In v1 we don't propagate hook errors to the caller. A future version
-			// may collect them and expose via a side-channel.
-			_ = dispatchErr
+			// The write has already committed, so the error cannot be returned
+			// to the caller — but it must not vanish either. A handler whose
+			// payload shape does not match the row never runs, and a swallowed
+			// error makes that indistinguishable from a handler with nothing
+			// to do.
+			e.reportHookError(h.Trigger, dispatchErr)
 		}
 	}
 }
@@ -308,4 +311,14 @@ func assembleResponse(slots []ResponseSlot, data json.RawMessage) (json.RawMessa
 	}
 	out.WriteByte('}')
 	return out.Bytes(), nil
+}
+
+// reportHookError surfaces a post-commit handler failure through the
+// configured callback, or to the standard logger when none is set.
+func (e *Engine) reportHookError(trigger string, err error) {
+	if e.cfg.OnHookError != nil {
+		e.cfg.OnHookError(trigger, err)
+		return
+	}
+	log.Printf("donat: event handler %q failed: %v", trigger, err)
 }

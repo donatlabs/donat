@@ -45,10 +45,16 @@ fn map_type(pg_type: &str, enums: &EnumMap, needs: &mut Needs) -> String {
         "text" | "varchar" | "bpchar" | "name" => "string".into(),
         "bool" => "bool".into(),
         "uuid" => "string".into(),
-        "timestamptz" | "timestamp" | "date" => {
+        "timestamptz" | "timestamp" => {
             needs.time = true;
             "time.Time".into()
         }
+        // A `date` is rendered as "2026-08-20", which `time.Time` refuses:
+        // encoding/json parses only RFC 3339, and a date carries neither a
+        // time nor a zone to make one. Typing it `time.Time` produced a struct
+        // that could not decode the row it was generated from — an event
+        // handler taking it simply never ran.
+        "date" => "string".into(),
         "json" | "jsonb" => {
             needs.json = true;
             "json.RawMessage".into()
@@ -398,6 +404,7 @@ mod tests {
                 col("amount", "numeric", false),
                 col("ratio", "float8", false),
                 col("created_at", "timestamptz", false),
+                col("due_on", "date", false),
                 col("uid", "uuid", false),
                 col("payload", "jsonb", false),
                 col("weird", "tsvector", false), // unknown -> json.RawMessage
@@ -606,10 +613,12 @@ fn graphql_named(t: &str, metadata: &donat_metadata::Metadata, needs: &mut Needs
         "bigint" | "int8" => "int64".into(),
         "Float" | "float8" => "float64".into(),
         "Boolean" | "bool" | "boolean" => "bool".into(),
-        "timestamptz" | "timestamp" | "date" => {
+        "timestamptz" | "timestamp" => {
             needs.time = true;
             "time.Time".into()
         }
+        // See the note on `date` above: RFC 3339 cannot read a bare date.
+        "date" => "string".into(),
         _ => {
             // A custom scalar, an enum, or a type this generator does not know:
             // raw JSON rather than a guess that would not round-trip.

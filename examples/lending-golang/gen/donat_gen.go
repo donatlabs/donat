@@ -26,12 +26,29 @@ type Copy struct {
 }
 
 type Loan struct {
-	Id         string     `json:"id"`
-	CopyId     string     `json:"copy_id"`
-	MemberId   string     `json:"member_id"`
-	Status     string     `json:"status"`
-	BorrowedOn time.Time  `json:"borrowed_on"`
-	DueOn      time.Time  `json:"due_on"`
-	ReturnedOn *time.Time `json:"returned_on"`
-	Extensions int32      `json:"extensions"`
+	Id         string  `json:"id"`
+	CopyId     string  `json:"copy_id"`
+	MemberId   string  `json:"member_id"`
+	Status     string  `json:"status"`
+	BorrowedOn string  `json:"borrowed_on"`
+	DueOn      string  `json:"due_on"`
+	ReturnedOn *string `json:"returned_on"`
+	Extensions int32   `json:"extensions"`
+	Receipt    *string `json:"receipt"`
+}
+
+type LoanFollowup struct {
+	Id       int64     `json:"id"`
+	LoanId   string    `json:"loan_id"`
+	Note     string    `json:"note"`
+	Recorded time.Time `json:"recorded"`
+}
+
+type LoanReceipt struct {
+	FileId string `json:"file_id"`
+	Bytes  int32  `json:"bytes"`
+}
+
+type RenderLoanReceiptArgs struct {
+	LoanId string `json:"loan_id"`
 }

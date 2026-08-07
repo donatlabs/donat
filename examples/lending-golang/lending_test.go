@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/donatlabs/donat/examples/lending-golang/gen"
 	"github.com/donatlabs/donat/sdk/go/donat"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -63,7 +64,13 @@ func newService(t *testing.T) *service {
 	// be satisfied by an earlier test's events.
 	loans := &LoanLog{}
 	reg := donat.NewRegistry()
-	donat.On(reg, "on_loan_recorded", func(_ context.Context, ev donat.Event[loanRow]) error {
+	// The generated row type, not a substitute. A test that declared its own
+	// shape here proved only that the hook fired — the shipped handler takes
+	// gen.Loan, and when a column's generated type could not decode what
+	// Postgres renders, the real handler never ran while this test stayed
+	// green. Registering the same type the binary does is what makes the test
+	// about the service rather than about itself.
+	donat.On(reg, "on_loan_recorded", func(_ context.Context, ev donat.Event[gen.Loan]) error {
 		loans.record(LoanEvent{Op: ev.Op, Table: ev.Table.Name})
 		return nil
 	})
@@ -100,13 +107,6 @@ func newService(t *testing.T) *service {
 	svc := &service{t: t, handler: eng.Handler(), pool: pool, engine: eng, loans: loans}
 	svc.reset()
 	return svc
-}
-
-// loanRow is the handler payload shape. It mirrors gen.Loan but is declared
-// here so the test does not depend on the generated file being regenerated.
-type loanRow struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
 }
 
 // reset empties the library between tests. It talks to the database directly
