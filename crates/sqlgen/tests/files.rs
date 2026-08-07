@@ -269,10 +269,15 @@ fn requesting_an_upload_inserts_the_pending_row_and_returns_its_url() {
     });
     assert_eq!(sql.matches("INSERT INTO").count(), 1, "{sql}");
     assert!(sql.contains("'pending'"), "{sql}");
-    // The session's budget is counted in the same statement, so parallel
-    // requests cannot each see room that only one of them has.
-    assert!(sql.contains("< 20") && sql.contains("< 60"), "{sql}");
-    assert!(sql.contains("interval '1 minute'"), "{sql}");
+    // The budget is decided by a function, not by subqueries here. Counting in
+    // this statement could not work: under READ COMMITTED its snapshot is
+    // fixed before it executes, so every parallel request read the same
+    // pre-lock state and all of them passed. The comment this replaces claimed
+    // the opposite.
+    assert!(
+        sql.contains("donat.file_upload_budget_ok('customer', 'u-1', 20, 60)"),
+        "{sql}"
+    );
     // A disk upload has no completion call: the bytes pass through the engine.
     assert!(sql.contains("'complete_url', NULL"), "{sql}");
     insta::assert_snapshot!(sql);

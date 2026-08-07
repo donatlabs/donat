@@ -234,6 +234,10 @@ pub struct HttpOperation {
     /// It is what decides whether a failure is retryable, so it has to reach
     /// the runtime rather than stay a deploy-time description.
     declared_classes: BTreeMap<u16, ConnectorErrorClass>,
+    /// The operation's `error_map.fallback`: the class for a status no rule
+    /// names. `None` means the operation declared no error map at all, and
+    /// the built-in handling answers.
+    declared_fallback: Option<ConnectorErrorClass>,
     idempotency_header: Option<HeaderName>,
 }
 
@@ -248,6 +252,7 @@ pub struct HttpOperationBuilder {
     response_pointers: Vec<ResponsePointer>,
     declared_5xx: BTreeSet<u16>,
     declared_classes: BTreeMap<u16, ConnectorErrorClass>,
+    declared_fallback: Option<ConnectorErrorClass>,
     idempotency_header: Option<String>,
 }
 
@@ -260,6 +265,7 @@ impl HttpOperation {
             query_inputs: Vec::new(),
             headers: Vec::new(),
             declared_classes: BTreeMap::new(),
+            declared_fallback: None,
             body: None,
             success_statuses: BTreeSet::new(),
             response_pointers: Vec::new(),
@@ -313,6 +319,12 @@ impl HttpOperationBuilder {
     }
 
     /// Bind the operation's declared error map: status to failure class.
+    /// The class a status no rule names falls back to.
+    pub fn declared_fallback(mut self, class: ConnectorErrorClass) -> Self {
+        self.declared_fallback = Some(class);
+        self
+    }
+
     pub fn declared_classes(
         mut self,
         classes: impl IntoIterator<Item = (u16, ConnectorErrorClass)>,
@@ -405,6 +417,7 @@ impl HttpOperationBuilder {
             response_pointers: self.response_pointers,
             declared_5xx: self.declared_5xx,
             declared_classes: self.declared_classes,
+            declared_fallback: self.declared_fallback,
             idempotency_header,
         })
     }
@@ -552,6 +565,7 @@ impl ValidatedHttpOperation {
                 let class = metadata_error_class(&rule.class_);
                 rule.statuses.iter().map(move |status| (*status, class))
             }));
+            builder = builder.declared_fallback(metadata_error_class(&error_map.fallback.class_));
         }
         // The header the provider deduplicates on is declared in one of two
         // places. The legacy field names it directly; the effect names it as
@@ -1277,6 +1291,14 @@ impl HttpConnector {
             if let Some(class) = operation.declared_classes.get(&status) {
                 return Err(declared_failure(*class, &response.headers));
             }
+            // ...and an operation that declared an error map also declared what
+            // a status none of its rules name should be. Ignoring it meant a
+            // 502 under `fallback: { class: http_5xx }` was classified
+            // `Permanent`, so an activity declaring `retry_on: [http_5xx]`
+            // refused to retry the very failure it was written for.
+            if let Some(class) = operation.declared_fallback {
+                return Err(declared_failure(class, &response.headers));
+            }
             return Err(match status {
                 408 => timeout_failure(),
                 429 => ConnectorFailure::new(
@@ -1582,6 +1604,14 @@ mod tests {
     /// reading only the legacy fields left it sending no key and treating a
     /// declared 500 as permanent.
     fn catalog_declared_operation(path: &str) -> ValidatedHttpOperation {
+        catalog_declared_operation_with_fallback(path, "permanent")
+    }
+
+    /// The same, with the error map's fallback class chosen by the caller.
+    fn catalog_declared_operation_with_fallback(
+        path: &str,
+        fallback: &str,
+    ) -> ValidatedHttpOperation {
         let operation: ConnectorOperation = serde_json::from_value(json!({
             "name": "create_shipment",
             "version": "v1",
@@ -1609,7 +1639,7 @@ mod tests {
                     { "statuses": [503], "class": "http_5xx", "code": "unavailable" },
                     { "statuses": [409], "class": "validation", "code": "conflict" }
                 ],
-                "fallback": { "class": "permanent", "code": "provider_error" }
+                "fallback": { "class": fallback, "code": "provider_error" }
             },
             "capacity": {
                 "max_in_flight": 1,
@@ -1682,6 +1712,42 @@ mod tests {
                 "status {status} is classified by what the operation declared"
             );
         }
+    }
+
+    /// A status no rule names takes the error map's own `fallback`.
+    ///
+    /// `fallback` is required by the metadata shape, and nothing read it: a
+    /// provider returning 502 under `fallback: { class: http_5xx }` was
+    /// classified `Permanent` by the built-in handling, so an activity that
+    /// declared `retry_on: [http_5xx]` refused to retry the exact failure it
+    /// was written for — and the operation's own declaration was the thing
+    /// being overruled.
+    #[tokio::test]
+    async fn an_unmapped_status_takes_the_error_map_fallback() {
+        let server = LocalServer::start(Router::new().fallback(post(|| async {
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": "upstream" })))
+        })))
+        .await;
+
+        // The same operation, but its fallback says a status it did not name is
+        // a server error rather than a permanent one.
+        let operation = catalog_declared_operation_with_fallback("/v1/orders", "http_5xx");
+
+        let failure = local_connector(&server.base_url)
+            .execute_validated(
+                &operation,
+                json!({ "order_id": "order-42" }),
+                "logical-activity-42",
+                context().deadline,
+            )
+            .await
+            .expect_err("the provider refused");
+
+        assert_eq!(
+            failure.class,
+            ConnectorErrorClass::Http5xx,
+            "502 names no rule, so the operation's fallback decides it"
+        );
     }
 
     #[tokio::test]

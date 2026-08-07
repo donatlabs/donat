@@ -1067,6 +1067,7 @@ fn plan_internal_select_from_snapshot(
     session: &Session,
     doc: &graphql_parser::query::Document<'static, String>,
     variables: &JsonMap<String, Json>,
+    storage: Option<&donat_storage::RequestContext<'_>>,
 ) -> Result<(String, Vec<donat_ir::RootField>, SourceRuntime), Json> {
     let compiled = engine
         .compiled
@@ -1079,9 +1080,16 @@ fn plan_internal_select_from_snapshot(
         .find(|source| source.name == "default")
         .or_else(|| engine.metadata.sources.first())
         .ok_or_else(|| error_json("unexpected", "no default source"))?;
-    let planner = compiled
+    let mut planner = compiled
         .source_planner(&engine.metadata, &engine.catalogs, &source.name)
         .map_err(|error| error.to_graphql())?;
+    // The same storage material the request path attaches. This planner serves
+    // an action's output-object relationships, so without it a file column
+    // reached through one reported "this deployment has no storage
+    // configuration" while the identical column resolved at the top level.
+    if let Some(storage) = storage {
+        planner = planner.with_storage(storage);
+    }
     let plan = planner
         .plan(doc, None, variables, session)
         .map_err(|error| error.to_graphql())?;
@@ -1109,7 +1117,14 @@ pub(crate) async fn execute_select_internal(
         .map_err(|e| error_json("unexpected", format!("internal query parse error: {e}")))?
         .into_static();
 
-    let (_, roots, runtime) = plan_internal_select_from_snapshot(engine, session, &doc, variables)?;
+    let storage_context = state.storage_request_context();
+    let (_, roots, runtime) = plan_internal_select_from_snapshot(
+        engine,
+        session,
+        &doc,
+        variables,
+        storage_context.as_ref(),
+    )?;
     let SourceRuntime::Postgres { pool, .. } = runtime else {
         return Err(error_json("unexpected", "no default source"));
     };
@@ -2697,6 +2712,7 @@ mod tests {
                 &session,
                 &parse("{ public_item { id } }"),
                 &JsonMap::new(),
+                None,
             )
             .expect("internal action select plans from the snapshot");
             assert_eq!(source, "default");

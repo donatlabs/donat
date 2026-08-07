@@ -5183,36 +5183,24 @@ fn file_upload_request_to_sql(ctx: &mut Ctx, request: &donat_ir::FileUploadReque
         Some(size) => size.to_string(),
         None => "NULL".to_string(),
     };
-    // The insert is conditional on the session's own budget, counted in the
-    // same statement — and serialised against the session's other requests
-    // first.
+    // The insert is conditional on the session's own budget.
     //
-    // Counting alone is not enough: under READ COMMITTED the subqueries read
-    // the snapshot taken when the statement began, so concurrent requests each
-    // see the state before the others inserted and all of them pass. The
-    // budget then holds only against a client that waits for each reply, which
-    // is not the client it exists to stop. The advisory lock is taken in a CTE
-    // so it is held before any count is evaluated, is scoped to this session's
-    // own key so unrelated callers never wait on each other, and is released
-    // when the transaction ends.
+    // The counting lives in `donat.file_upload_budget_ok` rather than in
+    // subqueries here, and that is the whole point. Under READ COMMITTED a
+    // statement's snapshot is fixed before it starts executing — before any
+    // lock inside it is taken — so counting in this statement had every
+    // concurrent caller reading the same pre-lock state and passing. The lock
+    // serialised them and changed nothing; fifty parallel requests all saw
+    // zero pending against a ceiling of ten. Each statement inside a PL/pgSQL
+    // body takes its own snapshot, so the counts there run after the lock and
+    // see what the previous holder committed.
     let dml = format!(
-        "WITH session_budget AS (\
-           SELECT pg_advisory_xact_lock(\
-             hashtext('donat.file_uploads:' || {role} || ':' || coalesce({session_key}, ''))) \
-         ) \
-         INSERT INTO donat.file_uploads (id, attachment, backend, object_key, file_name, \
+        "INSERT INTO donat.file_uploads (id, attachment, backend, object_key, file_name, \
          media_type, declared_bytes, byte_size, state, session_role, session_key, expires_at) \
          SELECT {id}::uuid, {attachment}, {backend}, {object_key}, {file_name}, {media_type}, \
          {declared_bytes}, {byte_size}, 'pending', {role}, {session_key}, to_timestamp({expires}) \
-         FROM session_budget \
-         WHERE (SELECT count(*) FROM donat.file_uploads b \
-                WHERE b.session_role = {role} \
-                  AND b.session_key IS NOT DISTINCT FROM {session_key} \
-                  AND b.state = 'pending' AND b.expires_at > now()) < {max_pending} \
-           AND (SELECT count(*) FROM donat.file_uploads b \
-                WHERE b.session_role = {role} \
-                  AND b.session_key IS NOT DISTINCT FROM {session_key} \
-                  AND b.created_at > now() - interval '1 minute') < {max_per_minute} \
+         WHERE donat.file_upload_budget_ok({role}, {session_key}, {max_pending}, \
+         {max_per_minute}) \
          RETURNING *",
         id = quote_lit(&request.upload_id),
         attachment = quote_lit(&request.attachment),

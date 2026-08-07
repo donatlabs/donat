@@ -210,6 +210,16 @@ func (e *Engine) finishUpload(ctx context.Context, id, attachment string, declar
 		return err
 	}
 
+	// Already finished. A staging key is `<key>/<id>.part` and a final key is
+	// `<key>/<id>`, so a row naming its final key can only mean an earlier
+	// call got all the way through — and a caller whose request timed out
+	// after the work was done is exactly the one who retries. Going on would
+	// copy the final object onto itself, which the store refuses, reporting a
+	// failure for a file that is stored and claimable.
+	if row.StagingKey == signed.FinalKey {
+		return nil
+	}
+
 	// Ask the store what it holds. A size the caller merely promised would let
 	// a claim succeed for an object that was never written.
 	size, err := e.observedSize(ctx, signed.HeadURL)
