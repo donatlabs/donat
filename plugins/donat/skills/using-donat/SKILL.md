@@ -54,7 +54,7 @@ jargon because a technical detail came up — translate it instead.
 
 Mode first, then architecture, then the domain skill.
 
-0. `goal` — on anything larger than a single change, fix what "done" means
+0. `set-goal` — on anything larger than a single change, fix what "done" means
    before starting. Once it is fixed, drive to it instead of asking at each
    seam.
 1. `using-analytics-mode` **or** `using-tech-mode` — sets how you talk and what

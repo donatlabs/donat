@@ -41,13 +41,24 @@ the source has moved. So a release that changes skills must bump `version` in
 **both** `plugins/donat/.claude-plugin/plugin.json` and the entry in
 `.claude-plugin/marketplace.json` — they are two files and both are read.
 
+**The cache is keyed by version, and content is not re-read.** Once a version
+has been cached, `update` finds that directory and switches to it rather than
+re-copying from the source — so a version whose *content* moved reports a
+successful update and hands back the old files. This is the failure that looks
+most like success.
+
 Working from a local checkout, where the source moves with every commit, the
-reliable refresh is a reinstall:
+reliable refresh removes the cached version first:
 
 ```sh
+V=$(python3 -c "import json;print(json.load(open('plugins/donat/.claude-plugin/plugin.json'))['version'])")
 claude plugin uninstall donat@donat --scope local
+rm -rf ~/.claude/plugins/cache/donat/donat/$V
 claude plugin install   donat@donat --scope local
 ```
+
+From a GitHub marketplace this does not arise: a version moves only with a
+merge, so "same version, different content" never happens.
 
 ## Install — Codex
 
@@ -130,8 +141,13 @@ keep an expensive technique from firing on cheap problems.
 | `/donat:add-table` | Migration, tracking, relationships, per-role permissions, validators |
 | `/donat:add-command` | A domain command with guards, idempotency and any process effect |
 | `/donat:add-process` | A durable process with routed errors, deadlines and terminals |
-| `/donat:review` | Review a metadata directory for permission holes and misplaced constraints |
-| `/donat:goal` | Fix what "done" means in one sentence, write it to `docs/goal.md`, then stop asking about direction |
+| `/donat:review-metadata` | Review a metadata directory for permission holes and misplaced constraints |
+| `/donat:set-goal` | Fix what "done" means in one sentence, write it to `docs/goal.md`, then stop asking about direction |
+
+Skill names are compound on purpose. A single generic word — `goal`, `review` —
+collides with a host UI command, and the Skill tool then refuses to resolve it
+("`goal` is a UI command, not a skill"). The plugin namespace does not save you:
+the collision is on the bare name. Keep new skills two words or prefixed.
 
 ### Agent
 

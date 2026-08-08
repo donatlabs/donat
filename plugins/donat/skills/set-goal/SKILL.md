@@ -1,6 +1,6 @@
 ---
-name: goal
-description: Use when the user runs /donat:goal, or at the start of a piece of donat work, to fix what "done" means in one sentence. Once fixed, drive toward it and stop asking at every step.
+name: set-goal
+description: Use when the user runs /donat:set-goal, or at the start of a piece of donat work, to fix what "done" means in one sentence. Once fixed, drive toward it and stop asking at every step.
 argument-hint: [what you are trying to end up with]
 allowed-tools: [Read, Write, Edit, Glob, Grep, Bash]
 ---
@@ -133,7 +133,7 @@ finished goal is a decision point that belongs to them:
 
 ## If there is no goal yet
 
-`/donat:goal` with no argument: ask the two questions that produce one, then
+`/donat:set-goal` with no argument: ask the two questions that produce one, then
 write it.
 
 > What do you want to be able to do at the end of this that you can't do now?

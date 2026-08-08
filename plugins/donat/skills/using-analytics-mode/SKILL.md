@@ -122,7 +122,7 @@ either stranding them or collecting a live secret in the chat:
 ## The four steps
 
 **0. Fix the goal.** One sentence for what they end up with, one for what
-"done" means, one for what is out of scope. See `goal`. Once it is confirmed,
+"done" means, one for what is out of scope. See `set-goal`. Once it is confirmed,
 stop asking about direction — drive to it.
 
 **1. Interview.** One question at a time. Let the answer be a story; you do the
