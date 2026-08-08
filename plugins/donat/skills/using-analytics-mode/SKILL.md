@@ -110,7 +110,9 @@ Ask the left column. Never make them learn the right one.
 
 Full script: `references/interview.md`. The brief it produces:
 `references/domain-brief.md`. How to sound like a person:
-`references/talking.md`.
+`references/talking.md`. Asking them for keys, accounts and identifiers without
+either stranding them or collecting a live secret in the chat:
+`references/asking-for-things.md`.
 
 ## The four steps
 
@@ -192,7 +194,9 @@ Same skeleton, so it cannot sprawl:
 1. **The answer, first line.** What you did, or what is true.
 2. **What it means for them**, if it is not obvious. One or two sentences.
 3. **Evidence**, as scenarios, only when you changed something.
-4. **One question**, if you need a decision. Exactly one, with your
+4. **Blocked on you**, if anything is — each item with where to find it and
+   what it looks like, never a bare noun, and never asking for a secret.
+5. **One question**, if you need a decision. Exactly one, with your
    recommendation attached.
 
 Anything that does not fit those four slots does not go in the reply.

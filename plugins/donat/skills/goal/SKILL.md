@@ -72,12 +72,27 @@ have a recommendation, you have an answer; state it and go.
 | An outside constraint that changes what is possible | "these amounts are in roubles" — Stripe cannot process them |
 | An artifact only they can give you | Stripe price ids, the Auth0 tenant, a real bank account |
 
-The last one is not a question, it is a **list**. Hand it over and keep going
-on everything that does not depend on it:
+The last one is not a question, it is a **list** — and a list of nouns is
+homework with no instructions. Each item needs what it is, where to click,
+what it looks like when they find it, and how to send it. Anything secret is
+never sent at all: they paste it themselves, into a place you point at.
 
-> To take real money I need three things from you: the price ids from Stripe,
-> your Auth0 tenant, and which account payouts land in. Until then the stand
-> runs on test keys, and everything else carries on.
+> Чтобы перейти на живые платежи, понадобится три вещи. До них стенд работает
+> на тестовых ключах, и всё остальное я делаю дальше.
+>
+> **Идентификаторы тарифов в Stripe.** Stripe → раздел с товарами → откройте
+> тариф → у цены есть строка вида `price_1QxYz…`. Нужны три, и рядом какая
+> какому тарифу. Присылайте сообщением, это не секрет — а вот всё, что
+> начинается на `sk_` или `whsec_`, мне присылать не надо вообще.
+>
+> **Auth0.** Applications → ваше приложение → Domain (`dev-…​.eu.auth0.com`) и
+> Client ID. Client Secret не присылайте, вы вставите его сами, я покажу куда.
+>
+> **Счёт для выплат** настраивается внутри Stripe, мне ничего слать не нужно —
+> просто скажите, когда заполните.
+
+Worked versions of each, plus what to do when a secret arrives in the chat
+anyway, are in `using-analytics-mode`'s `references/asking-for-things.md`.
 
 ### Never stop for these
 
