@@ -53,6 +53,42 @@ hand-written Rust — not because inbound is inherently special.
 **So: give inbound the same declarative treatment, and Stripe's built-in
 triggers become defaults rather than the mechanism.**
 
+## 2b. Why a webhook is not just a request
+
+The obvious objection: an operation already declares a method, a path, a body
+and a typed response, and a REST endpoint already accepts a POST. Why is
+inbound a second contract rather than the same one pointed the other way?
+
+**Receiving the POST is not the missing part.** A provider can post to
+`/api/rest/<url>` today and it will run a saved operation. Three things are
+missing, and none is expressible in a request contract, because an outbound
+request never needs them.
+
+**Proving it came from the provider.** Nothing outside the Stripe module
+verifies a signature — `grep` for `hmac` across `crates/server/src/*.rs`
+returns one unrelated test. And the REST path forecloses it structurally: it
+parses the JSON, and a signature covers the *exact raw bytes*. Once parsed,
+re-serialising produces different bytes and the signature fails even when it
+was valid. Verification has to happen before anything reads the body, which is
+a property of the route, not of the contract on it.
+
+**Running as someone.** `crates/server/src/rest.rs:86` resolves the session from
+headers, exactly as GraphQL does. A provider cannot present a JWT. What is left
+is the admin secret — which is transport authentication, not a permission, and
+must not be in production — or the unauthorized role, which makes the endpoint
+a mutation any stranger may call. That is not a webhook; it is an open door
+with a provider's name on it.
+
+**Once-only.** Providers retry, for years. Without a ledger keyed on *their*
+event id, a retry is a second payment recorded. The dedupe table exists for
+exactly this and the REST path does not touch it.
+
+What the two directions genuinely share is the payload half — the typed,
+bounded `json_pointer` mapping — and §3 reuses it rather than inventing a
+parallel vocabulary. What they do not share is trust: an outbound response is
+trusted because we made the call. Everything above is the cost of not having
+made the call.
+
 ## 3. A — inbound as a connector capability
 
 ### Metadata
