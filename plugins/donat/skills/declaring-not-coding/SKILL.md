@@ -85,6 +85,7 @@ Name the primitive **before** you write anything.
 | "our AI assistant should be able to …" | an MCP tool, with its role |
 | "attach a document to it" | a file column plus `storage.yaml` |
 | "show total including tax on the record" | a computed field |
+| "people need to log in" | an identity provider plus a claim mapping — never a users table and a password column |
 | "we need a screen to manage these" | a resource config — see `donat-admin-ui`, not a page component |
 
 If a requirement does not land anywhere on this table, that is a signal to

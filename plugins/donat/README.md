@@ -51,8 +51,8 @@ an agent is told to read, rather than material the harness loads on relevance.
 
 Everything is a skill, in the `skills/<name>/SKILL.md` layout that Anthropic's
 own `example-plugin` recommends for new plugins over the legacy `commands/*.md`
-files. Three set the working mode, eleven are model-invoked knowledge, and five
-carry `argument-hint` and are invoked by name as slash commands.
+files. Four set how the agent works, fifteen are model-invoked knowledge, and
+five carry `argument-hint` and are invoked by name as slash commands.
 
 ### Mode skills
 
@@ -92,6 +92,7 @@ keep an expensive technique from firing on cheap problems.
 | `donat-connectors` | HTTP provider contracts: typed responses, success contracts, error classes, bounds, retry, capacity, redaction, idempotency evidence |
 | `donat-api-surfaces` | Saved operations, RESTified endpoints, MCP tools |
 | `donat-file-attachments` | File columns, the object store, the request/upload/complete flow |
+| `donat-authentication` | Login, users and SSO: donat verifies tokens and never issues them — provider choice, claim mapping, and the default-role trap |
 | `donat-automation` | Cron triggers, event triggers, verified inbound webhooks and actions — and which of them need no receiver at all |
 | `donat-embedded-go` | The engine inside a Go program (wasm core, no cgo): in-process action functions, event handlers, `ExecuteTx`, and what the embedded host refuses |
 | `donat-admin-ui` | An admin panel as TypeScript resource configs, derived from the metadata — screens, forms and nav generated, never hand-written |

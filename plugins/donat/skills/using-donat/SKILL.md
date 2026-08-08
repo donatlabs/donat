@@ -63,8 +63,8 @@ Mode first, then architecture, then the domain skill.
 4. The domain skill: `donat-tables-and-permissions`, `donat-validators`,
    `donat-rules`, `donat-commands`, `donat-processes`, `donat-connectors`,
    `donat-schema-and-migrations`, `donat-api-surfaces`,
-   `donat-file-attachments`, `donat-automation`, `donat-admin-ui`,
-   `donat-embedded-go`, `donat-deploy-and-verify`.
+   `donat-file-attachments`, `donat-authentication`, `donat-automation`,
+   `donat-admin-ui`, `donat-embedded-go`, `donat-deploy-and-verify`.
 
 Examples:
 

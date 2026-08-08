@@ -98,6 +98,7 @@ Detailed patterns live in `~/.codex/donat/skills/*/SKILL.md` (installed by
 | interviewing a non-technical domain owner | `using-analytics-mode` (+ its `references/`) |
 | working with an engineer | `using-tech-mode` |
 | which primitive a requirement becomes; how to escalate | `declaring-not-coding` |
+| login, users, SSO, mapping token claims to roles | `donat-authentication` |
 | schedules, row-change hooks, inbound webhooks, actions | `donat-automation` |
 | the engine embedded in a Go program; in-process functions | `donat-embedded-go` |
 | an admin panel as resource configs, not components | `donat-admin-ui` |
