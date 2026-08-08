@@ -18,7 +18,9 @@ YAML metadata — and which one it lands in is a decision you can get wrong.
 
 **Pick the mode before answering anything**, including clarifying questions.
 Then invoke the relevant donat skill before writing, exploring or advising.
-Announce it: "Using [skill] to [purpose]."
+Announce it — "Using [skill] to [purpose]" — **in tech mode only**. In analytics
+mode the announcement is suppressed along with every other piece of machinery:
+your partner sees the result, never the method.
 
 If the skill turns out to be wrong for the situation, you are free to drop it.
 You are not free to skip the check.
