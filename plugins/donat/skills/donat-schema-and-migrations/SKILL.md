@@ -32,14 +32,28 @@ sides.
 
 ## Two sets of migrations, one history table
 
-**The image ships the binary and nothing else.** The engine's own `donat.*`
-schema — cron state, the event log, command claims, the durable Process
-journals and their bounded fan-out — lives in the donat repository's top-level
-`migrations/` directory, twelve files, **not inside the container**. Somebody
-has to apply it, and that somebody is a `donat migrate` run pointed at those
-files.
+**The image ships the binary and nothing else** — the Dockerfile's only `COPY`
+into the runtime stage is `/usr/local/bin/donat`. There is no `/migrations`
+inside the container, and pointing `--migrations-dir` at one is a hard error
+("reading migrations directory"), not a silent no-op.
 
-So a deployment runs `migrate` twice, engine first:
+What the binary *does* carry is a two-file bootstrap: cron state and the event
+log are compiled in with `include_str!` and applied by every `migrate` run
+whatever directory you give it. Everything else in the engine's own `donat.*`
+schema — command claims, the durable Process journals, bounded fan-out — is in
+the donat repository's top-level `migrations/`, and `crates/server/src/migrate.rs`
+says so in as many words: those "must be applied through the explicit
+`donat migrate --migrations-dir ...` path only."
+
+So how many `migrate` runs you need depends on what the application uses:
+
+| The application uses | Runs needed |
+|---|---|
+| Tables, permissions, REST, MCP, files | **one** — your own migrations. The built-in bootstrap covers the rest. |
+| Commands or durable Processes | **two** — the engine's `migrations/` first, then yours. |
+
+`examples/petshop-rest` and `examples/petshop-mcp` are the first case and have a
+single migrate service. `examples/petshop` is the second:
 
 ```yaml
 migrate:
