@@ -26,7 +26,7 @@ use serde_json::{Map as JsonMap, Value as Json, json};
 
 use donat_metadata::{Metadata, RestEndpoint};
 
-use crate::{gql, state::SharedState};
+use crate::{endpoint_auth, gql, state::SharedState};
 
 pub(crate) type CompiledRestQueries =
     HashMap<(String, String), Result<Arc<CompiledRestQuery>, String>>;
@@ -80,14 +80,13 @@ pub async fn dispatch(
     uri: Uri,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
-    body: Option<axum::Json<Json>>,
+    // Raw bytes rather than parsed JSON: an endpoint may authenticate its
+    // caller by a signature over the exact body, and re-serializing a parsed
+    // document produces different bytes. Session resolution therefore moves
+    // below endpoint selection, since which credential applies is a property
+    // of the endpoint.
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    // Role is mandatory, exactly like /v1/graphql.
-    let session = match gql::resolve_session(&state, &headers).await {
-        Ok(s) => s,
-        Err((status, errors)) => return (status, axum::Json(errors)).into_response(),
-    };
-
     // The path after `/api/rest/`.
     let full = uri.path();
     let rest_path = full.strip_prefix("/api/rest/").unwrap_or("");
@@ -162,9 +161,103 @@ pub async fn dispatch(
     };
     drop(engine);
 
+    // How this caller proves itself. An endpoint with no `authenticate` block
+    // behaves exactly as it always has: the role is mandatory and comes from
+    // headers, the same way /v1/graphql resolves it.
+    let session = match &endpoint.authenticate {
+        None => match gql::resolve_session(&state, &headers).await {
+            Ok(session) => session,
+            Err((status, errors)) => return (status, axum::Json(errors)).into_response(),
+        },
+        Some(auth) => {
+            let signed = endpoint_auth::SignedRequest {
+                body: &body,
+                path: full,
+                query: raw_query.as_deref().unwrap_or(""),
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default();
+            if let Err(rejection) = endpoint_auth::verify(
+                auth,
+                &headers,
+                &signed,
+                &|name| std::env::var(name).ok(),
+                now,
+            ) {
+                // One status for every rejection: a prober must not learn
+                // whether a header was missing, malformed or merely wrong.
+                tracing::warn!(
+                    endpoint = %endpoint.name,
+                    ?rejection,
+                    "rest endpoint authentication rejected a request"
+                );
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(rest_error("unauthorized", "authentication failed")),
+                )
+                    .into_response();
+            }
+            let mut vars = std::collections::HashMap::new();
+            for (name, value) in &auth.session_variables {
+                vars.insert(name.to_ascii_lowercase(), value.clone());
+            }
+            vars.insert("x-donat-role".to_string(), auth.run_as.clone());
+            donat_schema::Session {
+                role: auth.run_as.clone(),
+                vars,
+                backend_request: false,
+            }
+        }
+    };
+
     let query_params = parse_query_string(raw_query.as_deref().unwrap_or(""));
-    let body_obj = body
-        .and_then(|axum::Json(v)| v.as_object().cloned())
+
+    // Parsed only now, after verification. Everything above sees bytes.
+    let parsed_body: Option<Json> = if body.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(rest_error(
+                        "validation-failed",
+                        format!("request body is not valid JSON: {error}"),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // A verified request whose payload this endpoint does not act on is
+    // acknowledged rather than refused. Refusing makes a sender retry and
+    // eventually disable the endpoint, taking the deliveries we do want.
+    if let Some(auth) = endpoint
+        .authenticate
+        .as_ref()
+        .filter(|a| !a.accept.is_empty())
+    {
+        {
+            let matched = parsed_body.as_ref().is_some_and(|value| {
+                auth.accept.iter().any(|predicate| {
+                    value
+                        .pointer(&predicate.json_pointer)
+                        .and_then(Json::as_str)
+                        .is_some_and(|found| found == predicate.equals)
+                })
+            });
+            if !matched {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+        }
+    }
+
+    let body_obj = parsed_body
+        .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
 
     let variables = match build_variables(
