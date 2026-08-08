@@ -39,40 +39,73 @@ merged one.*
 
 ---
 
-## 3. What each of them sees
+## 3. The matrix, filled in before you ask
 
-For each kind of person, one at a time:
+Do **not** walk through "what can this person see? and change? and delete?" role
+by role in prose. It takes twenty minutes, and the operations nobody mentions —
+almost always delete, and almost always "who creates this in the first place" —
+simply never come up.
 
-> When [a shopper] opens this, what should they see?
+Put up the table instead, **already filled with your best guess**, and ask what
+is wrong. Correcting a table is faster and more accurate than answering eight
+open questions, and it makes the gaps visible.
 
-> Is there anything on that record they should *not* see? A cost price, an
-> internal note, someone's phone number?
+> Пробегусь по табличке — для каждой записи, кто что может. Я заполнил как
+> мне кажется правильным, скажите, где не так.
+>
+> | Запись | Клиент | Оператор |
+> |---|---|---|
+> | Тариф | видит | видит |
+> | Клиент | видит и меняет только себя | видит всех, не меняет |
+> | Подписка | видит свою | видит все, не меняет |
+> | Платёж | видит свои | видит все, не меняет |
+>
+> Три вопроса к ней:
+> — кто заводит клиента: он сам при регистрации, или вы вручную?
+> — что-нибудь здесь вообще удаляется, или только помечается закрытым?
+> — есть запись, которую видно, но трогать нельзя даже владельцу?
 
-> Should they be able to find records that aren't theirs at all — by searching,
-> or by guessing a number?
+*What this decides: every select/insert/update/delete permission at once, plus
+the presets. Four cells per record, and the ones people forget are the create
+("who brings this row into existence") and the delete.*
 
-*What this decides: row filters and column masks. The last question separates
-"cannot see" from "sees an error", which matters: a well-built system returns
-nothing rather than "access denied", so an outsider cannot even confirm the
-record exists.*
+**Delete deserves its own question every time.** In most business systems
+nothing is deleted — a subscription is cancelled, a client is closed, a payment
+is refunded. If they say "delete" out loud, ask whether they mean the row is
+gone or the record is marked finished. Getting that wrong is unrecoverable in
+the direction that matters.
+
+Then, per record, the one that decides masks:
+
+> Есть что-то в этой записи, что человек видеть не должен, хотя саму запись
+> видит? Себестоимость, внутренняя заметка, чей-то телефон?
+
+And the one that separates "cannot see" from "sees an error":
+
+> Может ли клиент найти чужую запись — поиском или подобрав номер?
+
+*What this decides: a well-built system returns nothing rather than "access
+denied", so an outsider cannot even confirm the record exists. Worth saying out
+loud once, because it looks like a bug to people.*
 
 ---
 
-## 4. What each of them changes
+## 4. When the right to change runs out
 
-> What can [a shopper] create, edit or delete?
+For every row in the matrix that says "меняет", one follow-up:
 
-> Is there a point after which they can't change it any more? What is that
-> point?
+> До какого момента это можно менять? Что должно произойти, чтобы стало
+> нельзя?
 
-> When they create one of these, is there anything the system should fill in
-> for them rather than trusting them to type it?
+*What this decides: the state filter on the update permission — a basket
+editable while open, a subscription editable until it is cancelled. Without
+this the permission is "may edit forever", which is almost never what they
+meant.*
 
-*What this decides: insert/update/delete permissions, state-based filters, and
-presets. The last one is important — anything the system fills in cannot be
-forged.*
+> Когда он это создаёт, есть что-то, что система должна подставить сама, а не
+> доверять ему вписать?
 
----
+*What this decides: presets. Anything the system fills in cannot be forged.*
 
 ## 5. What must never happen
 

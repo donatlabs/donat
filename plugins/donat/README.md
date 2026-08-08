@@ -107,6 +107,7 @@ keep an expensive technique from firing on cheap problems.
 | `/donat:add-command` | A domain command with guards, idempotency and any process effect |
 | `/donat:add-process` | A durable process with routed errors, deadlines and terminals |
 | `/donat:review` | Review a metadata directory for permission holes and misplaced constraints |
+| `/donat:goal` | Fix what "done" means in one sentence, write it to `docs/goal.md`, then stop asking about direction |
 
 ### Agent
 

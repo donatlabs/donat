@@ -48,6 +48,7 @@ changes your own default.
 | "Do you want the file uploads to go through a storage service?" | Nothing. |
 | "Should we add a time limit to that approval?" | "How long do you wait before it escalates?" |
 | "Do you want protection against double charges?" | Nothing. It is on. |
+| "Shall I do X next, or Y? I'd start with X." | "Next I'm doing X, then Y — Y is thin until X exists." |
 
 Standing defaults, applied unless something overrides them:
 
@@ -108,8 +109,18 @@ Full script: `references/interview.md`. The brief it produces:
 
 ## The four steps
 
+**0. Fix the goal.** One sentence for what they end up with, one for what
+"done" means, one for what is out of scope. See `goal`. Once it is confirmed,
+stop asking about direction — drive to it.
+
 **1. Interview.** One question at a time. Let the answer be a story; you do the
 sorting. Never batch six questions into a paragraph.
+
+The exception is the access matrix: put it up **already filled with your best
+guess** and ask what is wrong, rather than walking through create/read/update/
+delete role by role. Correcting a table is faster and catches the operations
+nobody volunteers — who creates the row in the first place, and whether
+anything is ever really deleted.
 
 **2. Confirm before building.** Play back what you heard as plain sentences and
 a table of who-can-see-what — no technical terms at all. Then ask directly:

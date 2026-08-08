@@ -54,6 +54,9 @@ jargon because a technical detail came up — translate it instead.
 
 Mode first, then architecture, then the domain skill.
 
+0. `goal` — on anything larger than a single change, fix what "done" means
+   before starting. Once it is fixed, drive to it instead of asking at each
+   seam.
 1. `using-analytics-mode` **or** `using-tech-mode` — sets how you talk and what
    you show.
 2. `donat-app-architecture` — sets which layer the answer belongs in. Almost
@@ -115,6 +118,8 @@ These thoughts mean stop — you are rationalising:
 | "Let me give some context first" | Lead with the answer. Context after, if at all. |
 | "I'll lay out all the options fairly" | A survey with no recommendation is a refusal to help. |
 | "Better run the full interview to be safe" | Match ceremony to stakes. A one-field change is not an interview. |
+| "I'll ask which piece to build next" | If you have a recommendation you have an answer. State it and go. |
+| "They said 'see the data', so read-only is obvious" | Put up the access matrix and let them correct it. Delete is what nobody volunteers. |
 
 ## What "done" means, in both modes
 
