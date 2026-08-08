@@ -30,6 +30,74 @@ applied history onto the new versions by joining on the migration name. It
 refuses to guess when a name does not identify exactly one migration on both
 sides.
 
+## Two sets of migrations, one history table
+
+**The image ships the binary and nothing else.** The engine's own `donat.*`
+schema — cron state, the event log, command claims, the durable Process
+journals and their bounded fan-out — lives in the donat repository's top-level
+`migrations/` directory, twelve files, **not inside the container**. Somebody
+has to apply it, and that somebody is a `donat migrate` run pointed at those
+files.
+
+So a deployment runs `migrate` twice, engine first:
+
+```yaml
+migrate:
+  image: ghcr.io/donatlabs/donat:${ENGINE_TAG}
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - >
+      donat migrate --migrations-dir /engine-migrations &&
+      donat migrate --migrations-dir /app-migrations
+  volumes:
+    - ./engine-migrations:/engine-migrations:ro
+    - ./migrations:/app-migrations:ro
+```
+
+Both sets share one `refinery_schema_history`, which is only possible because
+both are versioned by timestamp — two sets of counters would each start at `V1`
+and collide. That is the concrete reason for the naming rule above.
+
+### Getting the engine's migrations into a standalone application
+
+`examples/petshop` mounts `../../migrations` because it lives inside the donat
+repository. Your application does not, so the files have to arrive some other
+way — and this is where the arrangement goes wrong quietly.
+
+**A vendored copy drifts.** Nothing checks that `./engine-migrations` matches
+the engine you are running. Pair it with `ENGINE_TAG: ${ENGINE_TAG:-latest}`
+and drift is not a risk but a schedule: the image moves on the next pull, the
+copy does not, and the failure surfaces as a runtime error in a `donat.*` table
+nobody on the team has heard of.
+
+Either:
+
+- **pin the tag to an exact version** — never `latest` — and record in the
+  directory's README which version the copy came from, so the pair is reviewed
+  together; or
+- **fetch the migrations at that same pinned tag** as a build or deploy step,
+  so the copy cannot disagree with the binary.
+
+Pinning is the minimum. A floating tag beside a vendored schema is the one
+combination to refuse outright.
+
+### If the application has Processes
+
+A third step, after both migrations: a `migrate` that also reads the metadata
+and deploys the Process revisions for each source.
+
+```yaml
+deploy:
+  image: ghcr.io/donatlabs/donat:${ENGINE_TAG}
+  command: ["migrate", "--migrations-dir", "/engine-migrations",
+            "--metadata-dir", "/metadata", "--source", "default"]
+```
+
+Skip it and the engine boots into `revision ... is not deployed as active` and
+retries forever. This step reads the metadata, so every connector's
+configuration has to resolve here too — an unset credential fails the deploy
+rather than the first request that needs it.
+
 ## What belongs in a migration
 
 Everything that binds **every** writer:
