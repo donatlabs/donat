@@ -684,7 +684,7 @@ pub enum ShapeResult {
 pub fn shape(state: &CoreState, input: &ShapeInput) -> ShapeResult {
     let session = match session_from(&input.session_vars) {
         Ok(s) => s,
-        Err(e) => return shape_error(&e.path, &e.code, &e.message),
+        Err(e) => return shape_error(&e.path, e.code, &e.message),
     };
     let doc = match graphql_parser::parse_query::<String>(&input.query) {
         Ok(d) => d.into_static(),

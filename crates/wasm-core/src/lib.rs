@@ -175,6 +175,7 @@ pub extern "C" fn core_compile(ptr: *mut u8, len: i32) -> i64 {
 /// results do not exist yet when the plan is made: the host has to call the
 /// functions in between. The request is repeated instead of remembered so that
 /// an instance is not pinned to one in-flight operation.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // wasm ABI: ptr/len written by the host via core_alloc; cannot be `unsafe fn`
 #[unsafe(no_mangle)]
 pub extern "C" fn core_shape_action(ptr: *mut u8, len: i32) -> i64 {
     // SAFETY: ptr/len originate from core_alloc; host wrote len initialised bytes.
@@ -199,6 +200,7 @@ pub extern "C" fn core_shape_action(ptr: *mut u8, len: i32) -> i64 {
 /// three more signatures and the address the object will live at. Keeping that
 /// here means one signer rather than one per host — the property ADR 033 pays
 /// for deliberately.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // wasm ABI: ptr/len written by the host via core_alloc; cannot be `unsafe fn`
 #[unsafe(no_mangle)]
 pub extern "C" fn core_file_completion(ptr: *mut u8, len: i32) -> i64 {
     // SAFETY: ptr/len originate from core_alloc; host wrote len initialised bytes.

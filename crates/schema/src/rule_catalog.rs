@@ -22,7 +22,6 @@ use donat_rules::{
 
 use crate::PlanError;
 
-
 /// Translate the YAML metadata shape into the strict rules crate model and
 /// compile it before a candidate snapshot can publish.
 ///

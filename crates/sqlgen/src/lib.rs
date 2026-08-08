@@ -795,7 +795,12 @@ impl Ctx {
         let claimed_here = self
             .claiming_ctes
             .iter()
-            .map(|cte| format!("{id} IN (SELECT id FROM {cte})", id = qualified(&alias, "id")))
+            .map(|cte| {
+                format!(
+                    "{id} IN (SELECT id FROM {cte})",
+                    id = qualified(&alias, "id")
+                )
+            })
             .collect::<Vec<_>>();
         let state_gate = if claimed_here.is_empty() {
             format!("{} = 'claimed'", qualified(&alias, "state"))

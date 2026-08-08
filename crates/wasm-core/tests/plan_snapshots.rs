@@ -885,12 +885,15 @@ fn the_upload_root_is_offered_when_an_attachment_is_declared() {
     };
     match compile(&state, &input) {
         PlanV1::Mutation(body) => {
-            assert!(body.statements[0].sql.contains("donat.file_uploads"), "{:?}", body.statements[0].sql);
+            assert!(
+                body.statements[0].sql.contains("donat.file_uploads"),
+                "{:?}",
+                body.statements[0].sql
+            );
         }
         other => panic!("the upload root must plan, got {other:?}"),
     }
 }
-
 
 // -----------------------------------------------------------------------
 // Durable Process effects
@@ -1022,8 +1025,14 @@ fn either_role_spelling_resolves_and_both_are_offered_to_metadata() {
     )]))
     .expect("the v2 spelling resolves");
     assert_eq!(session.role, "user");
-    assert_eq!(session.vars.get("x-donat-role").map(String::as_str), Some("user"));
-    assert_eq!(session.vars.get("x-hasura-role").map(String::as_str), Some("user"));
+    assert_eq!(
+        session.vars.get("x-donat-role").map(String::as_str),
+        Some("user")
+    );
+    assert_eq!(
+        session.vars.get("x-hasura-role").map(String::as_str),
+        Some("user")
+    );
 }
 
 /// A trigger that names the columns it watches must not fire for a write that

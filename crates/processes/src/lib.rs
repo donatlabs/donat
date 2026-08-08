@@ -21,7 +21,6 @@ use donat_schema::{
 use serde_json::{Map as JsonMap, Value as Json};
 use sha2::{Digest, Sha256};
 
-
 pub const PROCESS_RUNTIME_ABI_EPOCH: u32 = 1;
 pub const MAXIMUM_ACTIVITY_TAKEOVER_DELAY_MS: u64 = 5_000;
 
@@ -81,7 +80,6 @@ pub trait ProcessConnectorCatalog {
         trigger: &str,
     ) -> Result<Option<ResolvedProcessConnectorTrigger>, String>;
 }
-
 
 /// A catalog with no connectors at all.
 ///

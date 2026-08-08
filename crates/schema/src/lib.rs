@@ -35,10 +35,10 @@ pub use multi_source::{
 };
 pub use naming::{CrudRoots, crud_roots, table_base_name};
 pub use plan::{Plan, PlanError, Planner, Session};
-pub use rule_catalog::compile_rule_catalog;
 pub use process_effects::{
     FinalizedCommandCatalog, FinalizedCommandEffect, FinalizedCompiledCommand,
     FinalizedSignalProcessEffect, FinalizedSourceCommandCatalog, FinalizedStartProcessEffect,
     ProcessEffectContract, ProcessEffectContractCatalog, ProcessEffectContractSource,
     ProcessSignalEffectContract,
 };
+pub use rule_catalog::compile_rule_catalog;

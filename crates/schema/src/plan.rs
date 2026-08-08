@@ -1108,11 +1108,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    pub(crate) fn catalog_function(
-        &self,
-        schema: &str,
-        name: &str,
-    ) -> Option<&'a FunctionInfo> {
+    pub(crate) fn catalog_function(&self, schema: &str, name: &str) -> Option<&'a FunctionInfo> {
         self.catalog.function(schema, name)
     }
 
@@ -1600,6 +1596,7 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn file_ref_value(
         &self,
         ctx: &TableCtx<'a>,
@@ -1808,9 +1805,8 @@ impl<'a> Planner<'a> {
                 let guard = self.inherited_column_guard(ctx, &db_name, session, &fpath)?;
                 out.push(OutputField {
                     alias,
-                    value: self.file_ref_value(
-                        ctx, &db_name, field, fragments, vars, &fpath, guard,
-                    )?,
+                    value: self
+                        .file_ref_value(ctx, &db_name, field, fragments, vars, &fpath, guard)?,
                 });
                 continue;
             }

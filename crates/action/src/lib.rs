@@ -807,5 +807,4 @@ mod tests {
         let err = validate(&ct, &parse_type("[String!]!"), &json!(["a", null]), &[]).unwrap_err();
         assert_eq!(err, "got null for the action webhook response");
     }
-
 }

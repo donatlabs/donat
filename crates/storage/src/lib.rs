@@ -973,8 +973,7 @@ storage:
     fn a_missing_supplied_secret_fails_the_build() {
         let metadata: Metadata = serde_yaml::from_str(TEST_METADATA).expect("test metadata");
         let err = StorageRegistry::build_with(&metadata, &|_| None)
-            .err()
-            .expect("a registry with no secrets must not build");
+            .expect_err("a registry with no secrets must not build");
         assert!(
             format!("{err:?}").contains("DONAT_TEST_STORAGE"),
             "the failure must name the secret it wanted: {err:?}"

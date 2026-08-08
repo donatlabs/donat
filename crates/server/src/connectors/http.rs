@@ -1725,7 +1725,10 @@ mod tests {
     #[tokio::test]
     async fn an_unmapped_status_takes_the_error_map_fallback() {
         let server = LocalServer::start(Router::new().fallback(post(|| async {
-            (StatusCode::BAD_GATEWAY, Json(json!({ "error": "upstream" })))
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "upstream" })),
+            )
         })))
         .await;
 

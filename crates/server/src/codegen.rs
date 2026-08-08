@@ -69,7 +69,7 @@ fn map_type(pg_type: &str, enums: &EnumMap, needs: &mut Needs) -> String {
 
 /// snake_case / lower_case identifier -> PascalCase Go identifier.
 fn pascal(s: &str) -> String {
-    s.split(|c| c == '_' || c == ' ')
+    s.split(['_', ' '])
         .filter(|p| !p.is_empty())
         .map(|p| {
             let mut ch = p.chars();
@@ -232,7 +232,7 @@ pub async fn run_codegen(
     let (client, conn) = tokio_postgres::connect(database_url, NoTls)
         .await
         .context("connecting to database for codegen")?;
-    let conn = tokio::spawn(async move { conn.await });
+    let conn = tokio::spawn(conn);
     let catalog = donat_catalog::introspect(&client)
         .await
         .context("introspecting database")?;
@@ -285,7 +285,7 @@ async fn core_config_json(database_url: &str, metadata_dir: &Path) -> Result<Str
     let (client, conn) = tokio_postgres::connect(database_url, NoTls)
         .await
         .context("connecting to database for core-config dump")?;
-    let conn = tokio::spawn(async move { conn.await });
+    let conn = tokio::spawn(conn);
     let catalog = donat_catalog::introspect(&client)
         .await
         .context("introspecting database")?;
@@ -302,7 +302,7 @@ pub async fn dump_core_config(database_url: &str, metadata_dir: &Path, out: &Pat
     let (client, conn) = tokio_postgres::connect(database_url, NoTls)
         .await
         .context("connecting to database for core-config dump")?;
-    let conn = tokio::spawn(async move { conn.await });
+    let conn = tokio::spawn(conn);
     let catalog = donat_catalog::introspect(&client)
         .await
         .context("introspecting database")?;
