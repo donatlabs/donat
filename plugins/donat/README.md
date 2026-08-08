@@ -25,6 +25,30 @@ Or, from a local checkout:
 Skills load themselves when relevant; the slash commands are available
 immediately.
 
+### Updating
+
+```sh
+claude plugin marketplace update donat
+claude plugin update donat@donat --scope <the scope you installed at>
+```
+
+Then `/reload-plugins`, or restart. Note the `--scope`: `update` defaults to
+`user`, and fails outright if you installed at `local` or `project`.
+
+**`update` compares versions, not content.** A plugin whose `version` has not
+changed is reported as "already at the latest" and nothing is copied, even when
+the source has moved. So a release that changes skills must bump `version` in
+**both** `plugins/donat/.claude-plugin/plugin.json` and the entry in
+`.claude-plugin/marketplace.json` — they are two files and both are read.
+
+Working from a local checkout, where the source moves with every commit, the
+reliable refresh is a reinstall:
+
+```sh
+claude plugin uninstall donat@donat --scope local
+claude plugin install   donat@donat --scope local
+```
+
 ## Install — Codex
 
 The plugin ships a `.codex-plugin/plugin.json` manifest pointing at the same
