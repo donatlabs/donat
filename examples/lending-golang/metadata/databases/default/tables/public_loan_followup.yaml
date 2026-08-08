@@ -1,0 +1,35 @@
+table:
+  name: loan_followup
+  schema: public
+object_relationships:
+  - name: loan
+    using:
+      foreign_key_constraint_on: loan_id
+# A member can see the follow-up on their own loan; a librarian sees all.
+select_permissions:
+  - role: member
+    permission:
+      columns: [id, loan_id, note, recorded]
+      filter:
+        loan:
+          member_id:
+            _eq: X-Donat-User-Id
+  - role: librarian
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# Written only by `record_followup`, which the durable Process runs as
+# `librarian`. There is deliberately no ordinary insert permission: the row
+# exists to record that a Process reached this state, and a raw write would
+# claim that without it having happened.
+command_insert_permissions:
+  - role: librarian
+    permission:
+      check: {}
+      columns: [loan_id, note]
+command_select_permissions:
+  - role: librarian
+    permission:
+      columns: [id, loan_id, note]
+      filter: {}

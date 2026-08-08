@@ -1,0 +1,55 @@
+# Close one of the caller's own loans and put the copy back on the shelf.
+#
+# The mirror of borrow_copy: the loan must still be active, and closing it and
+# releasing the copy happen in the same statement, so a copy can never be
+# released while its loan still reads as active.
+name: return_copy
+source: default
+permissions:
+  - role: member
+arguments:
+  - name: loan_id
+    type: uuid!
+  - name: returned_on
+    type: date!
+steps:
+  # `member_id` is in the predicate as well as in the command permission's
+  # filter. The permission is what enforces it; repeating it here is what makes
+  # the intent readable at the call site.
+  - name: open_loan
+    select_one:
+      table: public.loan
+      by:
+        id: { arg: loan_id }
+        member_id: { session_variable: x-donat-user-id }
+        status: { literal: active }
+      returning: [id, copy_id, status]
+      require_found: true
+
+  - name: closed
+    update:
+      table: public.loan
+      where:
+        id: { step: open_loan, column: id }
+        status: { literal: active }
+      set:
+        status: { literal: returned }
+        returned_on: { arg: returned_on }
+      returning: [id, copy_id, status, returned_on]
+      require_affected: true
+
+  - name: shelved
+    update:
+      table: public.copy
+      where:
+        id: { step: open_loan, column: copy_id }
+        status: { literal: on_loan }
+      set:
+        status: { literal: available }
+      returning: [id, status]
+      require_affected: true
+result:
+  loan_id: { step: closed, column: id }
+  copy_id: { step: shelved, column: id }
+  returned_on: { step: closed, column: returned_on }
+  copy_status: { step: shelved, column: status }

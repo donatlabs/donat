@@ -8,6 +8,7 @@
 //! binary's side, which buried real dead code in a dozen false positives.
 
 pub mod action;
+pub mod codegen;
 pub mod commands;
 pub mod connector_webhook;
 pub mod connectors;

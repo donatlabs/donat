@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use donat_catalog::{Catalog, TableInfo};
+use donat_catalog_types::{Catalog, ColumnInfo, FunctionInfo, TableInfo};
 use donat_ir::*;
 use donat_metadata::{
     Columns, Metadata, QualifiedTable, SelectPermission, Source, SourceKind, TableEntry,
@@ -200,7 +200,7 @@ impl<'a> TableCtx<'a> {
             })
     }
 
-    pub(crate) fn column_info(&self, name: &str) -> Option<&'a donat_catalog::ColumnInfo> {
+    pub(crate) fn column_info(&self, name: &str) -> Option<&'a ColumnInfo> {
         self.info.column(name)
     }
 
@@ -1056,7 +1056,7 @@ impl<'a> Planner<'a> {
     /// row, the session json, and any extra user-provided `args`.
     pub(crate) fn computed_field_args(
         &self,
-        finfo: &donat_catalog::FunctionInfo,
+        finfo: &FunctionInfo,
         def: &donat_metadata::ComputedFieldDefinition,
         session: &Session,
         user_args: Option<&JsonMap<String, Json>>,
@@ -1108,11 +1108,7 @@ impl<'a> Planner<'a> {
         }
     }
 
-    pub(crate) fn catalog_function(
-        &self,
-        schema: &str,
-        name: &str,
-    ) -> Option<&'a donat_catalog::FunctionInfo> {
+    pub(crate) fn catalog_function(&self, schema: &str, name: &str) -> Option<&'a FunctionInfo> {
         self.catalog.function(schema, name)
     }
 
@@ -1337,7 +1333,7 @@ impl<'a> Planner<'a> {
     fn function_from(
         &self,
         fentry: &donat_metadata::FunctionEntry,
-        finfo: &donat_catalog::FunctionInfo,
+        finfo: &FunctionInfo,
         field: &GqlField<'static, String>,
         vars: &JsonMap<String, Json>,
         session: &Session,
@@ -1578,6 +1574,29 @@ impl<'a> Planner<'a> {
     /// The URL inside it is signed by the database, per row, from material this
     /// request resolved — so the response is still assembled entirely in
     /// Postgres and the engine never walks it.
+    /// The inherited-role cell guard for one column.
+    ///
+    /// When a role inherits several parents and only some of them grant the
+    /// column, the value is NULL on rows the granting parents cannot see. Both
+    /// the plain-column and the file-column branch call this, so the rule
+    /// cannot be applied in one place and forgotten in the other — which is
+    /// exactly how a signed URL once escaped it.
+    fn inherited_column_guard(
+        &self,
+        ctx: &TableCtx<'a>,
+        db_name: &str,
+        session: &Session,
+        path: &str,
+    ) -> Result<Option<BoolExp>, PlanError> {
+        let granting = ctx.granting_perms(db_name);
+        if ctx.perms.len() > 1 && granting.len() < ctx.perms.len() {
+            self.combined_filter(ctx, &granting, session, path)
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn file_ref_value(
         &self,
         ctx: &TableCtx<'a>,
@@ -1586,6 +1605,7 @@ impl<'a> Planner<'a> {
         fragments: &Fragments,
         vars: &JsonMap<String, Json>,
         path: &str,
+        guard: Option<BoolExp>,
     ) -> Result<FieldValue, PlanError> {
         let type_name = format!("{}_{db_name}_file", ctx.type_name);
         if field.selection_set.items.is_empty() {
@@ -1659,6 +1679,7 @@ impl<'a> Planner<'a> {
         }
 
         Ok(FieldValue::FileRef {
+            guard: guard.map(Box::new),
             column: db_name.to_string(),
             attachment: attachment_key,
             url_sql,
@@ -1777,9 +1798,15 @@ impl<'a> Planner<'a> {
                 if !field.arguments.is_empty() {
                     return Err(unexpected_arg(&fpath, &field.arguments[0].0));
                 }
+                // The same inherited-role guard the plain-column branch below
+                // applies. This branch runs first, so leaving it out meant a
+                // file column — the one whose value is a signed URL — was the
+                // single field that skipped the check.
+                let guard = self.inherited_column_guard(ctx, &db_name, session, &fpath)?;
                 out.push(OutputField {
                     alias,
-                    value: self.file_ref_value(ctx, &db_name, field, fragments, vars, &fpath)?,
+                    value: self
+                        .file_ref_value(ctx, &db_name, field, fragments, vars, &fpath, guard)?,
                 });
                 continue;
             }
@@ -1793,14 +1820,7 @@ impl<'a> Planner<'a> {
                     return Err(unexpected_arg(&fpath, &field.arguments[0].0));
                 }
                 let col = ctx.info.column(&db_name).unwrap();
-                // Inherited roles: when only SOME parents grant the column,
-                // it is NULLed on rows those parents cannot see.
-                let granting = ctx.granting_perms(&db_name);
-                let guard = if ctx.perms.len() > 1 && granting.len() < ctx.perms.len() {
-                    self.combined_filter(ctx, &granting, session, &fpath)?
-                } else {
-                    None
-                };
+                let guard = self.inherited_column_guard(ctx, &db_name, session, &fpath)?;
                 out.push(OutputField {
                     alias,
                     value: match guard {

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use donat_catalog::{Catalog, ColumnInfo, FunctionInfo, TableInfo};
+use donat_catalog_types::{Catalog, ColumnInfo, FunctionInfo, TableInfo};
 use donat_ir::{BoolExp, MutationRoot, RootField};
 use donat_metadata::Metadata;
 use donat_schema::{
@@ -80,7 +80,7 @@ fn catalog(schema: &str, table: &str, columns: &[&str]) -> Catalog {
             TableInfo {
                 schema: schema.to_string(),
                 name: table.to_string(),
-                relation_kind: donat_catalog::RelationKind::Table,
+                relation_kind: donat_catalog_types::RelationKind::Table,
                 columns: columns.iter().map(|name| col(name)).collect(),
                 primary_key: vec!["id".to_string()],
                 unique_keys: vec![],
@@ -847,7 +847,7 @@ fn permits_conflicting_response_keys_in_mutually_exclusive_typed_fragments() {
         TableInfo {
             schema: "public".to_string(),
             name: "other".to_string(),
-            relation_kind: donat_catalog::RelationKind::Table,
+            relation_kind: donat_catalog_types::RelationKind::Table,
             columns: vec![
                 ColumnInfo {
                     name: "id".to_string(),

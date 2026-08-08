@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
-use donat_catalog::{Catalog, ColumnInfo, RelationKind, TableInfo};
+use donat_catalog_types::{Catalog, ColumnInfo, RelationKind, TableInfo};
 use donat_ir::{
     TypeRef, ValueContractCatalog, ValueContractField, ValueObjectContract, ValueScalar, ValueType,
     compile_value_contract_catalog,

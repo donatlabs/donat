@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use donat_catalog::Catalog;
+use donat_catalog_types::Catalog;
 use donat_ir::{
     CommandExecutionValue, ProcessStartPolicy, ResolvedCommandEffect, Scalar, TypeRef,
     ValueContractCatalog, ValueContractField, ValueScalar, ValueType,

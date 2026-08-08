@@ -198,6 +198,20 @@ async fn complete_inner(
         return (StatusCode::NOT_FOUND, "unknown upload").into_response();
     };
 
+    // Already finished. A staging key is `<key>/<id>.part` and a final key is
+    // `<key>/<id>`, so the row naming its final key can only mean an earlier
+    // call got all the way through — and a client whose POST timed out after
+    // the server had finished is exactly the caller who retries. Running the
+    // rest again would presign a copy from the final key to itself, which S3
+    // refuses with a 400 this handler reports as a 502: a failure for a file
+    // that is stored and claimable. The comment below already promised this
+    // was safe to repeat; now it is.
+    if let Some(spec) = state.storage.attachment(&upload.attachment)
+        && upload.object_key == spec.object_key(upload.id)
+    {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     let url = s3.presign("HEAD", &upload.object_key, Utc::now(), 60);
     let response = match state
         .http

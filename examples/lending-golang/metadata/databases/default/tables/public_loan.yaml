@@ -1,0 +1,90 @@
+table:
+  name: loan
+  schema: public
+# The receipt is a file, and the declaration is two lines: which column holds
+# it, which store keeps the bytes, and how large it may be. Selecting the
+# column returns a signed URL rather than a uuid — the signing happens in SQL,
+# so the response is still assembled in one statement.
+attachments:
+  - column: receipt
+    backend: receipts
+    max_bytes: 2097152
+    media_types: [application/pdf]
+object_relationships:
+  - name: copy
+    using:
+      foreign_key_constraint_on: copy_id
+  - name: member
+    using:
+      foreign_key_constraint_on: member_id
+# A member reads their own borrowing history, including closed loans.
+select_permissions:
+  - role: member
+    permission:
+      columns: [id, copy_id, member_id, status, borrowed_on, due_on, returned_on, extensions, receipt]
+      filter:
+        member_id:
+          _eq: X-Donat-User-Id
+      allow_aggregations: true
+  - role: librarian
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# Loans are written only by commands. A member has no ordinary insert or update
+# permission here at all: every column below is lifecycle state whose invariants
+# live in borrow_copy, return_copy and extend_loan.
+command_select_permissions:
+  - role: member
+    permission:
+      columns: [id, copy_id, member_id, status, borrowed_on, due_on, returned_on, extensions, receipt]
+      filter:
+        member_id:
+          _eq: X-Donat-User-Id
+command_insert_permissions:
+  - role: member
+    permission:
+      check: {}
+      columns: [copy_id, member_id, status, borrowed_on, due_on, extensions]
+# A member may attach a receipt to their own loan — and nothing else about it.
+#
+# This has to be an ordinary update permission rather than a command one: an
+# upload URL is a capability the caller holds, and command-only permissions
+# exist precisely to let a closed command write a table *without* opening a
+# CRUD root. So the engine refuses to mint an upload for a column the role
+# cannot write directly (ADR 033), and the narrow grant below is what makes
+# `render_loan_receipt` possible without widening anything else.
+update_permissions:
+  - role: member
+    permission:
+      columns: [receipt]
+      filter:
+        member_id:
+          _eq: X-Donat-User-Id
+      check: {}
+command_update_permissions:
+  - role: member
+    permission:
+      columns: [status, returned_on, due_on, extensions]
+      filter:
+        member_id:
+          _eq: X-Donat-User-Id
+      check: {}
+# Native Go handler, called in-process right after the transaction commits.
+# Matches donat.On(reg, "on_loan_recorded", ...) in handlers.go.
+#
+# The webhook URL is required by the metadata shape but never dialled in the
+# embedded model: the Go executor dispatches from the compiled plan's hooks.
+event_triggers:
+  - name: on_loan_recorded
+    definition:
+      enable_manual: false
+      insert:
+        columns: "*"
+      update:
+        columns: [status]
+    retry_conf:
+      num_retries: 3
+      interval_sec: 5
+      timeout_sec: 60
+    webhook: http://in-process/events

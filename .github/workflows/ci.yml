@@ -156,6 +156,170 @@ jobs:
             --test tandt_clickhouse_contract -- \
             --test-threads=1 --nocapture
 
+  go-sdk:
+    name: Go SDK (cgo-free, tests)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: sdk/go
+    steps:
+      - uses: actions/checkout@v4
+      # The core is a build output and lives only on release tags, so a
+      # checkout of a branch has to build it before any Go code compiles —
+      # `//go:embed` needs the file present.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: go-sdk-core
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+      - name: Build the embedded core
+        run: make wasm-core
+        working-directory: .
+      # The hard packaging constraint (specs/003): the SDK must be
+      # go-get-able and statically buildable with no cgo.
+      - name: Build with cgo disabled
+        run: CGO_ENABLED=0 go build ./...
+      - name: Test (unit + integration + conformance subset)
+        run: CGO_ENABLED=0 go test ./...
+        env:
+          # DONAT_TEST_PG enables integration tests (executor, handler, conformance
+          # subset) against the postgres service defined above. The service is mapped
+          # to host port 15432 so the default pgTestDSN() works unchanged.
+          DONAT_TEST_PG: "1"
+      - name: Vet
+        run: go vet ./...
+      - name: gofmt (must be clean)
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+  # The wasm core is committed as a blob so that `go get` needs no Rust
+  # toolchain, which means nothing otherwise notices when a crate below it
+  # changes and the blob stops matching the sources. This job rebuilds it and
+  # runs the Go host against the fresh artifact.
+  wasm-core:
+    name: Go SDK (wasm core rebuilds from source)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+      - name: Rebuild the embedded core
+        run: make wasm-core
+      - name: Test the Go host against the freshly built core
+        run: CGO_ENABLED=0 go test ./...
+        working-directory: sdk/go
+
+  # The lending example is where the embedded core is exercised against real
+  # declarative metadata: three commands, three rules and an event handler,
+  # driven through the engine's own handler against Postgres.
+  lending-example:
+    name: Lending example (commands, rules, in-process handlers)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lending
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+      - name: Build the engine binary (for migrate)
+        run: cargo build -p donat-server --bin donat
+      # The platform's own catalog, then the example's tables. The example
+      # deliberately carries no copy of the platform's DDL.
+      - name: Apply the platform's migrations
+        run: ./target/debug/donat --database-url "$URL" migrate --migrations-dir migrations
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      - name: Apply the example's migrations
+        run: ./target/debug/donat --database-url "$URL" migrate --migrations-dir examples/lending-golang/migrations
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      # The third step of the deploy model. `borrow_copy` starts a durable
+      # Process, and the journal row it writes names the revision by foreign
+      # key — so without this every borrow fails on that constraint rather
+      # than on anything a caller did.
+      - name: Deploy the Process revisions
+        run: |
+          ./target/debug/donat --database-url "$URL" migrate \
+            --migrations-dir migrations \
+            --metadata-dir examples/lending-golang/metadata --source default
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+          DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+          LENDING_S3_KEY: minioadmin
+          LENDING_S3_SECRET: minioadmin
+          LENDING_SIGNING_SECRET: dev-signing-secret
+      - name: Metadata must be consistent with the database
+        run: ./target/debug/donat --database-url "$URL" validate --metadata-dir examples/lending-golang/metadata
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+          DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      # Same reason as the snapshot below: the wasm core is a build output and
+      # lives only on release tags, so a branch checkout has to build it before
+      # any Go code that embeds it will compile.
+      - name: Build the embedded core
+        run: make wasm-core
+      # The snapshot the example embeds is a build output, not source: it is
+      # the metadata directory compiled against the live catalog, so it can
+      # only be produced once the database is migrated. Committing it would
+      # mean shipping a file that goes stale while still looking valid.
+      - name: Compile the core snapshot
+        run: |
+          ./target/debug/donat --database-url "$URL" dump-core-config \
+            --metadata-dir examples/lending-golang/metadata \
+            --out examples/lending-golang/core-config.json
+        env:
+          URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+          DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      - name: Test
+        run: CGO_ENABLED=0 go test ./...
+        working-directory: examples/lending-golang
+        env:
+          LENDING_TEST_PG: postgresql://postgres:postgres@127.0.0.1:15432/lending
+      - name: Vet
+        run: CGO_ENABLED=0 go vet ./...
+        working-directory: examples/lending-golang
+      - name: gofmt (must be clean)
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+        working-directory: examples/lending-golang
+
   audit:
     name: Security advisories (cargo-audit)
     runs-on: ubuntu-latest
@@ -214,6 +378,66 @@ jobs:
         run: |
           tests-system/stack.sh down-fast
           tests-system/stack.sh down
+
+  # The claim the embedded SDK rests on: the standalone engine and a Go
+  # application embedding the compiled core serve the same YAML identically.
+  # Every case runs against both stands, and a disagreement fails the job.
+  lending-system:
+    name: Lending system tests (engine vs Go host)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 15433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: sdk/go/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # stack.sh builds both binaries from this commit, applies the platform's
+      # migrations and then the example's, and serves each stand against its
+      # own database.
+      # Installed before the stands are raised: stack.sh uses this interpreter
+      # to prepare the engine stand's metadata copy.
+      - name: Install the suite
+        run: |
+          python3 -m venv tests-system-lending/.venv
+          tests-system-lending/.venv/bin/pip install -q -r tests-system-lending/requirements.txt
+      - name: Raise both stands
+        run: tests-system-lending/stack.sh up
+      - name: Black-box system tests
+        working-directory: tests-system-lending
+        env:
+          LENDING_ENGINE_URL: http://127.0.0.1:8090
+          LENDING_GO_URL: http://127.0.0.1:8091
+          LENDING_ADMIN_SECRET: lending-secret
+        run: .venv/bin/python -m pytest -q
+      - name: Stand logs
+        if: failure()
+        run: |
+          tail -200 tests-system-lending/.stack/engine.log
+          tail -200 tests-system-lending/.stack/go.log
+      - name: Drop the stands
+        if: always()
+        run: tests-system-lending/stack.sh down
 
   artifacts:
     name: Build artifact (${{ matrix.target.name }})

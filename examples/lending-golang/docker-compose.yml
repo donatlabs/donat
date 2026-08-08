@@ -1,0 +1,94 @@
+version: "3.9"
+
+# Standalone lending demo: postgres → the platform's migrations → this
+# example's migrations → the Go app.
+#
+#   docker compose up
+#
+# Two one-shot migrate services rather than one, because this example carries
+# no copy of the platform's DDL. `migrate-platform` applies the engine's own
+# migrations from its image; `migrate-domain` applies the four tables in this
+# directory. The Go app never runs DDL — it serves GraphQL and fires the
+# in-process event hooks.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: lending
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # Check over TCP, not the unix socket: on first init the official image
+      # runs a socket-only temp server, so a socket pg_isready reports healthy
+      # before the real TCP listener is up — and a one-shot migrate does not
+      # retry.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d lending"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # The platform's own deploy-time catalog, applied from the engine image so
+  # there is exactly one copy of it and it cannot drift.
+  migrate-platform:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command: ["migrate", "--migrations-dir", "/migrations"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
+    restart: "no"
+
+  # This library's four tables.
+  migrate-domain:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command: ["migrate", "--migrations-dir", "/migrations"]
+    depends_on:
+      migrate-platform:
+        condition: service_completed_successfully
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
+    volumes:
+      - ./migrations:/migrations:ro
+    restart: "no"
+
+  # One-shot: compile the metadata directory against the live catalog into the
+  # snapshot the app reads. A build output, not source — it needs the migrated
+  # database, which is why it is produced here and not committed.
+  dump-core-config:
+    image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
+    command:
+      ["dump-core-config", "--metadata-dir", "/metadata", "--out", "/snapshot/core-config.json"]
+    depends_on:
+      migrate-domain:
+        condition: service_completed_successfully
+    environment:
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
+    volumes:
+      - ./metadata:/metadata:ro
+      - snapshot:/snapshot
+    restart: "no"
+
+  app:
+    # Build context is the repo root so Docker can see both sdk/go and
+    # examples/lending-golang (the module uses a replace directive).
+    build:
+      context: ../..
+      dockerfile: examples/lending-golang/Dockerfile
+    depends_on:
+      dump-core-config:
+        condition: service_completed_successfully
+    environment:
+      DONAT_DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
+      DONAT_CORE_CONFIG: /snapshot/core-config.json
+    volumes:
+      - snapshot:/snapshot:ro
+    ports:
+      - "8080:8080"
+
+volumes:
+  # The compiled snapshot, handed from the one-shot generator to the app.
+  snapshot:

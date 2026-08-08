@@ -12,14 +12,16 @@
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::future::BoxFuture;
 use futures_util::stream::StreamExt;
-use graphql_parser::query::{
-    Definition, Document, Field, OperationDefinition, Selection, SelectionSet, Value as GqlValue,
-};
+use graphql_parser::query::{Document, Field, OperationDefinition, Selection, SelectionSet};
 use serde_json::{Map as JsonMap, Value as Json, json};
 
+use donat_action::{
+    ActionContext, ActionError, TypeRef, is_session_header, parse_type, select_operation, validate,
+    value_to_json,
+};
+pub use donat_action::{actions_without_a_handler, match_action};
 use donat_metadata::{
-    ActionEntry, CustomTypeRelationship, CustomTypes, Metadata, QualifiedTable,
-    action_visible_to_role,
+    ActionEntry, CustomTypeRelationship, CustomTypes, QualifiedTable, action_visible_to_role,
 };
 use donat_schema::Session;
 
@@ -28,60 +30,11 @@ use crate::state::{Engine, EngineSnapshot, SharedState};
 
 const MAX_CONCURRENT_ACTION_RELATIONSHIP_GROUPS: usize = 4;
 
-fn is_session_header(name: &str) -> bool {
-    name.starts_with("x-donat-") || name.starts_with("x-hasura-")
-}
-
-/// Cloned slice of metadata needed to resolve an action operation after the
-/// engine read-lock is dropped.
-pub struct ActionContext {
-    actions: Vec<ActionEntry>,
-    custom_types: CustomTypes,
-    is_query: bool,
-}
-
 pub(crate) struct ActionRequest<'a> {
     pub(crate) doc: &'a Document<'static, String>,
     pub(crate) variables: &'a JsonMap<String, Json>,
     pub(crate) operation_name: Option<&'a str>,
     pub(crate) headers: &'a HeaderMap,
-}
-
-impl ActionContext {
-    fn find(&self, name: &str) -> Option<&ActionEntry> {
-        self.actions.iter().find(|a| a.name == name)
-    }
-}
-
-/// Decide whether `doc`'s selected operation targets actions. Returns a cloned
-/// [`ActionContext`] when at least one top-level field is an action, else
-/// `None` (the operation falls through to normal table planning).
-pub fn match_action(
-    metadata: &Metadata,
-    doc: &Document<'static, String>,
-    operation_name: Option<&str>,
-) -> Option<ActionContext> {
-    if metadata.actions.is_empty() {
-        return None;
-    }
-    let op = select_operation(doc, operation_name)?;
-    let (set, is_query) = match op {
-        OperationDefinition::Query(q) => (&q.selection_set, true),
-        OperationDefinition::Mutation(m) => (&m.selection_set, false),
-        OperationDefinition::SelectionSet(s) => (s, true),
-        OperationDefinition::Subscription(_) => return None,
-    };
-    let any_action = set.items.iter().any(|item| {
-        matches!(item, Selection::Field(f) if metadata.actions.iter().any(|a| a.name == f.name))
-    });
-    if !any_action {
-        return None;
-    }
-    Some(ActionContext {
-        actions: metadata.actions.clone(),
-        custom_types: metadata.custom_types.clone(),
-        is_query,
-    })
 }
 
 /// Resolve every top-level action field by calling its webhook and shaping the
@@ -123,7 +76,7 @@ pub(crate) async fn resolve(
         )
     };
     let results =
-        schedule_action_items(ctx.is_query, set.items.iter().map(execute_item).collect()).await;
+        schedule_action_items(ctx.is_query(), set.items.iter().map(execute_item).collect()).await;
     let mut data = JsonMap::new();
     for result in results {
         match result {
@@ -172,7 +125,7 @@ async fn resolve_action_item(
     if field.name == "__typename" {
         return Ok((
             alias,
-            Json::String(if ctx.is_query {
+            Json::String(if ctx.is_query() {
                 "query_root".into()
             } else {
                 "mutation_root".into()
@@ -193,29 +146,10 @@ async fn resolve_action_item(
         field,
         variables,
         headers,
-        custom_types: &ctx.custom_types,
+        custom_types: ctx.custom_types(),
     })
     .await?;
     Ok((alias, value))
-}
-
-fn action_field_not_found(
-    ctx: &ActionContext,
-    field: &Field<'static, String>,
-) -> (StatusCode, Json) {
-    err(
-        &format!("$.selectionSet.{}", field.name),
-        "validation-failed",
-        format!(
-            "field \"{}\" not found in type: '{}'",
-            field.name,
-            if ctx.is_query {
-                "query_root"
-            } else {
-                "mutation_root"
-            }
-        ),
-    )
 }
 
 /// Build the webhook payload, POST it, and shape the response.
@@ -263,7 +197,22 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
         "session_variables": session_vars,
     });
 
-    let url = resolve_url_template(&action.definition.handler);
+    // A handler-less action is resolved in-process by an embedded host. This
+    // binary has no such registry, so there is nothing to call. `main` refuses
+    // the declaration at boot; this is the guard for a snapshot that reached a
+    // request some other way.
+    let Some(handler) = action.definition.handler.as_deref() else {
+        return Err(err(
+            &path,
+            "unexpected",
+            format!(
+                "action '{}' declares no handler, so it runs only in an embedded host \
+                 that registers a function for it",
+                action.name
+            ),
+        ));
+    };
+    let url = resolve_url_template(handler);
     let mut req = state.http.post(&url).json(&payload);
     if let Some(seconds) = action.definition.timeout {
         req = req.timeout(std::time::Duration::from_secs(seconds));
@@ -737,240 +686,16 @@ fn render_selection(set: &SelectionSet<'static, String>) -> String {
     format!("{set}")
 }
 
-/// A GraphQL type reference: a named type or a list, each optionally non-null.
-#[derive(Debug, Clone)]
-enum TypeRef {
-    Named { name: String, non_null: bool },
-    List { inner: Box<TypeRef>, non_null: bool },
+/// Map a transport-free [`ActionError`] onto this server's HTTP response.
+fn action_err(e: ActionError) -> (StatusCode, Json) {
+    err(&e.path, &e.code, e.message)
 }
 
-impl TypeRef {
-    fn non_null(&self) -> bool {
-        match self {
-            TypeRef::Named { non_null, .. } | TypeRef::List { non_null, .. } => *non_null,
-        }
-    }
-}
-
-/// Parse a GraphQL type reference such as `UserId`, `[String!]!`, `[[X]]`.
-fn parse_type(s: &str) -> TypeRef {
-    let t = s.trim();
-    if let Some(stripped) = t.strip_suffix('!') {
-        let inner = parse_type(stripped);
-        return match inner {
-            TypeRef::Named { name, .. } => TypeRef::Named {
-                name,
-                non_null: true,
-            },
-            TypeRef::List { inner, .. } => TypeRef::List {
-                inner,
-                non_null: true,
-            },
-        };
-    }
-    if let Some(inner) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
-        return TypeRef::List {
-            inner: Box::new(parse_type(inner)),
-            non_null: false,
-        };
-    }
-    TypeRef::Named {
-        name: t.to_string(),
-        non_null: false,
-    }
-}
-
-/// Validate (and shape) a webhook value against an output type and selection
-/// set, reproducing Donat's response-checking error messages.
-fn validate(
-    custom_types: &CustomTypes,
-    ty: &TypeRef,
-    value: &Json,
-    selection: &[Selection<'static, String>],
-) -> Result<Json, String> {
-    if value.is_null() {
-        return if ty.non_null() {
-            Err("got null for the action webhook response".into())
-        } else {
-            Ok(Json::Null)
-        };
-    }
-
-    match ty {
-        TypeRef::List { inner, .. } => {
-            let Json::Array(items) = value else {
-                return Err("expecting array for the action webhook response".into());
-            };
-            let shaped = items
-                .iter()
-                .map(|item| validate(custom_types, inner, item, selection))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Json::Array(shaped))
-        }
-        TypeRef::Named { name, .. } => {
-            if let Some(obj) = custom_types.objects.iter().find(|o| &o.name == name) {
-                match value {
-                    Json::Array(_) => Err(format!(
-                        "got array for the action webhook response, expecting {name}"
-                    )),
-                    Json::Object(map) => project_object(custom_types, obj, map, selection),
-                    other => Err(format!(
-                        "got scalar {} for the action webhook response, expecting {name}",
-                        scalar_kind(other)
-                    )),
-                }
-            } else {
-                // Scalar / enum / custom scalar.
-                validate_scalar(name, value)
-            }
-        }
-    }
-}
-
-/// Project an object value against its declared fields and the selection set.
-fn project_object(
-    custom_types: &CustomTypes,
-    obj: &donat_metadata::ObjectType,
-    value: &serde_json::Map<String, Json>,
-    selection: &[Selection<'static, String>],
-) -> Result<Json, String> {
-    let mut out = JsonMap::new();
-    for item in selection {
-        let Selection::Field(field) = item else {
-            continue;
-        };
-        let alias = field.alias.clone().unwrap_or_else(|| field.name.clone());
-        if field.name == "__typename" {
-            out.insert(alias, Json::String(obj.name.clone()));
-            continue;
-        }
-        let Some(field_def) = obj.fields.iter().find(|f| f.name == field.name) else {
-            // Relationships to tracked tables are resolved later (phase 3);
-            // anything else passes through unshaped.
-            out.insert(alias, value.get(&field.name).cloned().unwrap_or(Json::Null));
-            continue;
-        };
-        let ftype = parse_type(&field_def.type_);
-        let present = value.contains_key(&field.name);
-        let raw = value.get(&field.name);
-        let shaped = match raw {
-            None => {
-                if ftype.non_null() {
-                    return Err(format!(
-                        "field \"{}\" expected in webhook response, but not found",
-                        field.name
-                    ));
-                }
-                Json::Null
-            }
-            Some(Json::Null) => {
-                let _ = present;
-                if ftype.non_null() {
-                    return Err(format!(
-                        "expecting not null value for field \"{}\"",
-                        field.name
-                    ));
-                }
-                Json::Null
-            }
-            Some(v) => validate(custom_types, &ftype, v, &field.selection_set.items)?,
-        };
-        out.insert(alias, shaped);
-    }
-    Ok(Json::Object(out))
-}
-
-/// Built-in GraphQL scalars are type-checked; custom scalars (and `json`/
-/// `jsonb`) accept any JSON value verbatim.
-fn validate_scalar(name: &str, value: &Json) -> Result<Json, String> {
-    let ok = match name {
-        "String" => value.is_string(),
-        "Int" => value.is_i64() || value.is_u64(),
-        "Float" => value.is_number(),
-        "Boolean" => value.is_boolean(),
-        "ID" => value.is_string() || value.is_number(),
-        // Custom scalar / json / enum: accept as-is.
-        _ => return Ok(value.clone()),
-    };
-    if ok {
-        return Ok(value.clone());
-    }
-    Err(match value {
-        Json::Object(_) => format!("got object for the action webhook response, expecting {name}"),
-        Json::Array(_) => format!("got array for the action webhook response, expecting {name}"),
-        other => format!(
-            "got scalar {} for the action webhook response, expecting {name}",
-            scalar_kind(other)
-        ),
-    })
-}
-
-fn scalar_kind(value: &Json) -> &'static str {
-    match value {
-        Json::String(_) => "String",
-        Json::Number(_) => "Number",
-        Json::Bool(_) => "Boolean",
-        _ => "Null",
-    }
-}
-
-/// Resolve a GraphQL argument value to JSON, substituting variables.
-fn value_to_json(value: &GqlValue<'static, String>, vars: &JsonMap<String, Json>) -> Json {
-    match value {
-        GqlValue::Variable(name) => vars.get(name).cloned().unwrap_or(Json::Null),
-        GqlValue::Int(n) => Json::from(n.as_i64().unwrap_or_default()),
-        GqlValue::Float(f) => serde_json::Number::from_f64(*f)
-            .map(Json::Number)
-            .unwrap_or(Json::Null),
-        GqlValue::String(s) => Json::String(s.clone()),
-        GqlValue::Boolean(b) => Json::Bool(*b),
-        GqlValue::Null => Json::Null,
-        GqlValue::Enum(e) => Json::String(e.clone()),
-        GqlValue::List(items) => {
-            Json::Array(items.iter().map(|v| value_to_json(v, vars)).collect())
-        }
-        GqlValue::Object(map) => {
-            let mut out = JsonMap::new();
-            for (k, v) in map {
-                out.insert(k.clone(), value_to_json(v, vars));
-            }
-            Json::Object(out)
-        }
-    }
-}
-
-/// Pick the operation to execute: the named one, or the sole operation.
-fn select_operation<'d>(
-    doc: &'d Document<'static, String>,
-    operation_name: Option<&str>,
-) -> Option<&'d OperationDefinition<'static, String>> {
-    let ops: Vec<&OperationDefinition<'static, String>> = doc
-        .definitions
-        .iter()
-        .filter_map(|d| match d {
-            Definition::Operation(op) => Some(op),
-            Definition::Fragment(_) => None,
-        })
-        .collect();
-    match operation_name {
-        Some(name) => ops.into_iter().find(|op| op_name(op) == Some(name)),
-        None => {
-            if ops.len() == 1 {
-                Some(ops[0])
-            } else {
-                None
-            }
-        }
-    }
-}
-
-fn op_name<'a>(op: &'a OperationDefinition<'static, String>) -> Option<&'a str> {
-    match op {
-        OperationDefinition::Query(q) => q.name.as_deref(),
-        OperationDefinition::Mutation(m) => m.name.as_deref(),
-        OperationDefinition::Subscription(s) => s.name.as_deref(),
-        OperationDefinition::SelectionSet(_) => None,
-    }
+fn action_field_not_found(
+    ctx: &ActionContext,
+    field: &Field<'static, String>,
+) -> (StatusCode, Json) {
+    action_err(donat_action::field_not_found(ctx, &field.name))
 }
 
 fn err(path: &str, code: &str, message: impl Into<String>) -> (StatusCode, Json) {
@@ -987,6 +712,7 @@ fn err(path: &str, code: &str, message: impl Into<String>) -> (StatusCode, Json)
 
 #[cfg(test)]
 mod tests {
+    use graphql_parser::query::Definition;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -994,196 +720,6 @@ mod tests {
 
     use super::*;
     use donat_metadata::{CustomTypeField, ObjectType};
-
-    fn out_object() -> CustomTypes {
-        CustomTypes {
-            objects: vec![ObjectType {
-                name: "OutObject".into(),
-                fields: vec![
-                    CustomTypeField {
-                        name: "id".into(),
-                        type_: "ID!".into(),
-                        description: None,
-                    },
-                    CustomTypeField {
-                        name: "name".into(),
-                        type_: "String".into(),
-                        description: None,
-                    },
-                ],
-                relationships: vec![],
-                description: None,
-            }],
-            ..Default::default()
-        }
-    }
-
-    /// Parse a query selection set for `{ id name }`.
-    fn id_name_selection() -> Vec<Selection<'static, String>> {
-        let doc = graphql_parser::parse_query::<String>("{ x { id name } }")
-            .unwrap()
-            .into_static();
-        if let Definition::Operation(OperationDefinition::SelectionSet(s)) = &doc.definitions[0]
-            && let Selection::Field(f) = &s.items[0]
-        {
-            return f.selection_set.items.clone();
-        }
-        unreachable!()
-    }
-
-    #[test]
-    fn parses_type_wrappers() {
-        assert!(matches!(
-            parse_type("UserId"),
-            TypeRef::Named {
-                non_null: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            parse_type("UserId!"),
-            TypeRef::Named { non_null: true, .. }
-        ));
-        match parse_type("[String!]!") {
-            TypeRef::List { inner, non_null } => {
-                assert!(non_null);
-                assert!(matches!(*inner, TypeRef::Named { non_null: true, .. }));
-            }
-            _ => panic!("expected list"),
-        }
-    }
-
-    #[test]
-    fn shapes_object_and_ignores_extra_fields() {
-        let ct = out_object();
-        let value = json!({ "id": "x", "name": "Alice", "extra": 1 });
-        let out = validate(&ct, &parse_type("OutObject"), &value, &id_name_selection()).unwrap();
-        assert_eq!(out, json!({ "id": "x", "name": "Alice" }));
-    }
-
-    #[test]
-    fn null_for_non_null_output_errors() {
-        let ct = out_object();
-        let err = validate(&ct, &parse_type("OutObject!"), &Json::Null, &[]).unwrap_err();
-        assert_eq!(err, "got null for the action webhook response");
-    }
-
-    #[test]
-    fn array_for_object_output_errors() {
-        let ct = out_object();
-        let err = validate(
-            &ct,
-            &parse_type("OutObject"),
-            &json!([]),
-            &id_name_selection(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            "got array for the action webhook response, expecting OutObject"
-        );
-    }
-
-    #[test]
-    fn scalar_for_object_output_errors() {
-        let ct = out_object();
-        let err = validate(
-            &ct,
-            &parse_type("OutObject"),
-            &json!("s"),
-            &id_name_selection(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            "got scalar String for the action webhook response, expecting OutObject"
-        );
-    }
-
-    #[test]
-    fn missing_non_null_field_errors() {
-        let ct = out_object();
-        let err = validate(
-            &ct,
-            &parse_type("OutObject"),
-            &json!({ "name": "A" }),
-            &id_name_selection(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            "field \"id\" expected in webhook response, but not found"
-        );
-    }
-
-    #[test]
-    fn null_non_null_field_errors() {
-        let ct = out_object();
-        let err = validate(
-            &ct,
-            &parse_type("OutObject"),
-            &json!({ "id": null, "name": "A" }),
-            &id_name_selection(),
-        )
-        .unwrap_err();
-        assert_eq!(err, "expecting not null value for field \"id\"");
-    }
-
-    #[test]
-    fn nullable_field_absent_becomes_null() {
-        let ct = out_object();
-        let out = validate(
-            &ct,
-            &parse_type("OutObject"),
-            &json!({ "id": "x" }),
-            &id_name_selection(),
-        )
-        .unwrap();
-        assert_eq!(out, json!({ "id": "x", "name": null }));
-    }
-
-    #[test]
-    fn non_array_for_list_output_errors() {
-        let ct = out_object();
-        let err = validate(
-            &ct,
-            &parse_type("[OutObject]"),
-            &json!({}),
-            &id_name_selection(),
-        )
-        .unwrap_err();
-        assert_eq!(err, "expecting array for the action webhook response");
-    }
-
-    #[test]
-    fn object_for_scalar_output_errors() {
-        let ct = CustomTypes::default();
-        let err = validate(&ct, &parse_type("String!"), &json!({ "a": 1 }), &[]).unwrap_err();
-        assert_eq!(
-            err,
-            "got object for the action webhook response, expecting String"
-        );
-    }
-
-    #[test]
-    fn custom_scalar_passes_through_any_json() {
-        let ct = CustomTypes::default();
-        let out = validate(
-            &ct,
-            &parse_type("myCustomScalar!"),
-            &json!({ "foo": "bar" }),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(out, json!({ "foo": "bar" }));
-    }
-
-    #[test]
-    fn list_element_null_for_non_null_errors() {
-        let ct = CustomTypes::default();
-        let err = validate(&ct, &parse_type("[String!]!"), &json!(["a", null]), &[]).unwrap_err();
-        assert_eq!(err, "got null for the action webhook response");
-    }
 
     #[test]
     fn table_base_name_handles_schema() {

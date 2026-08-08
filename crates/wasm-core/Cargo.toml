@@ -1,0 +1,33 @@
+[package]
+name = "donat-wasm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Donat conformance core compiled to wasm: (query,vars,session) -> PlanV1"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+donat-action = { path = "../action" }
+donat-metadata = { path = "../metadata" }
+donat-storage = { path = "../storage" }
+chrono = { workspace = true }
+uuid = { workspace = true }
+donat-schema = { path = "../schema" }
+donat-processes = { path = "../processes" }
+donat-sqlgen = { path = "../sqlgen" }
+donat-backend = { path = "../backend" }
+donat-ir = { path = "../ir" }
+donat-catalog-types = { path = "../catalog-types" }
+graphql-parser = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Only the wasm build needs to supply an entropy backend; a native build of
+# this crate (the snapshot tests) uses the ordinary OS source.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = "0.4"
+
+[dev-dependencies]
+insta = { workspace = true }

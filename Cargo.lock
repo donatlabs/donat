@@ -654,6 +654,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-action"
+version = "0.1.0"
+dependencies = [
+ "donat-metadata",
+ "graphql-parser",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "donat-backend"
 version = "0.1.0"
 dependencies = [
@@ -665,12 +675,20 @@ dependencies = [
 name = "donat-catalog"
 version = "0.1.0"
 dependencies = [
+ "donat-catalog-types",
  "mysql",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "donat-catalog-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -741,6 +759,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-processes"
+version = "0.1.0"
+dependencies = [
+ "donat-connector-abi",
+ "donat-connector-catalog",
+ "donat-ir",
+ "donat-metadata",
+ "donat-rules",
+ "donat-schema",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "donat-rules"
 version = "0.1.0"
 dependencies = [
@@ -760,7 +792,7 @@ dependencies = [
  "base64",
  "chrono",
  "donat-backend",
- "donat-catalog",
+ "donat-catalog-types",
  "donat-ir",
  "donat-metadata",
  "donat-rules",
@@ -772,6 +804,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "tracing",
  "uuid",
 ]
 
@@ -786,12 +819,14 @@ dependencies = [
  "clap",
  "croner",
  "deadpool-postgres",
+ "donat-action",
  "donat-backend",
  "donat-catalog",
  "donat-connector-abi",
  "donat-connector-catalog",
  "donat-ir",
  "donat-metadata",
+ "donat-processes",
  "donat-rules",
  "donat-schema",
  "donat-sqlgen",
@@ -799,6 +834,7 @@ dependencies = [
  "futures-util",
  "graphql-parser",
  "hmac 0.12.1",
+ "insta",
  "jsonwebtoken",
  "mysql",
  "percent-encoding",
@@ -858,6 +894,28 @@ name = "donat-value-contract"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "donat-wasm-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "donat-action",
+ "donat-backend",
+ "donat-catalog-types",
+ "donat-ir",
+ "donat-metadata",
+ "donat-processes",
+ "donat-schema",
+ "donat-sqlgen",
+ "donat-storage",
+ "getrandom 0.4.2",
+ "graphql-parser",
+ "insta",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -3190,7 +3248,17 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "uuid-rng-internal",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "uuid-rng-internal"
+version = "1.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dff7387287837acf196f2596a6216f94c555d947d5331e1cc48393131020119"
+dependencies = [
+ "getrandom 0.4.2",
 ]
 
 [[package]]

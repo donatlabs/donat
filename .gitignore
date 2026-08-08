@@ -11,3 +11,7 @@ tests/donat/tests-py/
 .claude/agent-memory
 .worktrees/
 tests-system/.stack/
+
+# System-test stands write their built binaries, pids and logs here.
+tests-system-lending/.stack/
+tests-system-lending/.venv/

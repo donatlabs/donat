@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use donat_catalog::{Catalog, ColumnInfo, ForeignKey, TableInfo};
+use donat_catalog_types::{Catalog, ColumnInfo, ForeignKey, TableInfo};
 use donat_ir::{
     BoolExp, CompareOp, FieldValue, MutationRoot, OrderByTarget, RootField, Scalar, SelectQuery,
     SetOp,
@@ -145,7 +145,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "author".into(),
-            relation_kind: donat_catalog::RelationKind::Table,
+            relation_kind: donat_catalog_types::RelationKind::Table,
             columns: vec![
                 col("id", "int4"),
                 col("name", "text"),
@@ -163,7 +163,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "profile".into(),
-            relation_kind: donat_catalog::RelationKind::Table,
+            relation_kind: donat_catalog_types::RelationKind::Table,
             columns: vec![col("author_id", "int4"), col("bio", "text")],
             primary_key: vec!["author_id".into()],
             unique_keys: vec![],
@@ -180,7 +180,7 @@ fn catalog() -> Catalog {
         TableInfo {
             schema: "public".into(),
             name: "article".into(),
-            relation_kind: donat_catalog::RelationKind::Table,
+            relation_kind: donat_catalog_types::RelationKind::Table,
             columns: vec![
                 col("id", "int4"),
                 col("title", "text"),

@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use donat_catalog::{Catalog, ColumnInfo};
+use donat_catalog_types::{Catalog, ColumnInfo};
 use donat_ir::RowValidator;
 use donat_metadata::{PermissionValidator, Source, TableEntry};
 use donat_rules::{

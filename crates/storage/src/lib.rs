@@ -146,10 +146,23 @@ struct SigningSecret {
 }
 
 impl StorageRegistry {
-    /// Resolve the deployment's storage configuration. Returns an empty
-    /// registry when no table declares an attachment, in which case nothing
-    /// downstream is mounted.
+    /// Resolve the deployment's storage configuration from the process
+    /// environment. Returns an empty registry when no table declares an
+    /// attachment, in which case nothing downstream is mounted.
     pub fn build(metadata: &Metadata) -> Result<Self, StorageRegistryError> {
+        Self::build_with(metadata, &|name| std::env::var(name).ok())
+    }
+
+    /// The same, with the secrets supplied by the caller instead of read from
+    /// the process environment.
+    ///
+    /// The embedded wasm core has no environment to read: it is handed its
+    /// deployment secrets by the host, which keeps them out of the committed
+    /// `core-config.json` snapshot. `build` is this with `std::env::var`.
+    pub fn build_with(
+        metadata: &Metadata,
+        secret_of: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, StorageRegistryError> {
         let mut attachments = BTreeMap::new();
         for a in metadata.attachments() {
             let spec = AttachmentSpec {
@@ -176,13 +189,16 @@ impl StorageRegistry {
                 if !used.contains(declared.name()) {
                     continue;
                 }
-                backends.insert(declared.name().to_string(), resolve_backend(declared)?);
+                backends.insert(
+                    declared.name().to_string(),
+                    resolve_backend(declared, secret_of)?,
+                );
             }
         }
 
         let signing = match (&metadata.storage.signing, attachments.is_empty()) {
             (Some(signing), false) => {
-                let secret = std::env::var(&signing.secret.value_from_env).map_err(|_| {
+                let secret = secret_of(&signing.secret.value_from_env).ok_or_else(|| {
                     StorageRegistryError::MissingSigningSecret {
                         var: signing.secret.value_from_env.clone(),
                     }
@@ -290,17 +306,20 @@ impl StorageRegistry {
     }
 }
 
-fn resolve_backend(declared: &StorageBackend) -> Result<Backend, StorageRegistryError> {
+fn resolve_backend(
+    declared: &StorageBackend,
+    secret_of: &dyn Fn(&str) -> Option<String>,
+) -> Result<Backend, StorageRegistryError> {
     match declared {
         StorageBackend::S3(s3) => {
-            let access_key_id = std::env::var(&s3.access_key_id.value_from_env).map_err(|_| {
+            let access_key_id = secret_of(&s3.access_key_id.value_from_env).ok_or_else(|| {
                 StorageRegistryError::MissingSecret {
                     backend: s3.name.clone(),
                     var: s3.access_key_id.value_from_env.clone(),
                 }
             })?;
             let secret_access_key =
-                std::env::var(&s3.secret_access_key.value_from_env).map_err(|_| {
+                secret_of(&s3.secret_access_key.value_from_env).ok_or_else(|| {
                     StorageRegistryError::MissingSecret {
                         backend: s3.name.clone(),
                         var: s3.secret_access_key.value_from_env.clone(),
@@ -881,15 +900,7 @@ mod stability_tests {
     use chrono::TimeZone;
     use donat_metadata::Metadata;
 
-    fn registry() -> StorageRegistry {
-        // Safety: the test process sets its own variable and never unsets it.
-        // Safety: the test process sets its own variables and never unsets them.
-        unsafe {
-            std::env::set_var("DONAT_TEST_STORAGE_KEY", "test-key");
-            std::env::set_var("DONAT_TEST_STORAGE_SECRET", "s3cr3t");
-        }
-        let metadata: Metadata = serde_yaml::from_str(
-            r#"
+    const TEST_METADATA: &str = r#"
 version: 3
 sources:
   - name: default
@@ -915,10 +926,58 @@ storage:
       secret_access_key: { value_from_env: DONAT_TEST_STORAGE_SECRET }
   signing:
     secret: { value_from_env: DONAT_TEST_STORAGE_SECRET }
-"#,
-        )
-        .expect("test metadata");
+"#;
+
+    fn registry() -> StorageRegistry {
+        // Safety: the test process sets its own variables and never unsets them.
+        unsafe {
+            std::env::set_var("DONAT_TEST_STORAGE_KEY", "test-key");
+            std::env::set_var("DONAT_TEST_STORAGE_SECRET", "s3cr3t");
+        }
+        let metadata: Metadata = serde_yaml::from_str(TEST_METADATA).expect("test metadata");
         StorageRegistry::build(&metadata).expect("registry")
+    }
+
+    /// The registry has to be resolvable without a process environment, because
+    /// the embedded wasm core has none: it is handed its deployment secrets by
+    /// the Go host, which is also what keeps them out of the committed
+    /// `core-config.json` snapshot. If this ever went back to reading `env`
+    /// directly, file attachments would compile but fail to sign in the
+    /// embedded host with no obvious cause.
+    #[test]
+    fn a_registry_resolves_from_supplied_secrets_without_the_environment() {
+        let metadata: Metadata = serde_yaml::from_str(TEST_METADATA).expect("test metadata");
+        let supplied = |name: &str| match name {
+            "DONAT_TEST_STORAGE_KEY" => Some("key-from-the-host".to_string()),
+            "DONAT_TEST_STORAGE_SECRET" => Some("secret-from-the-host".to_string()),
+            _ => None,
+        };
+
+        let registry = StorageRegistry::build_with(&metadata, &supplied)
+            .expect("registry from supplied secrets");
+        assert!(
+            registry.attachment("public.pet.photo").is_some(),
+            "the declared attachment must be resolved"
+        );
+        assert!(
+            registry
+                .day_key(Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap())
+                .is_some(),
+            "a supplied signing secret must produce a day key"
+        );
+    }
+
+    /// A secret the host does not supply must fail loudly at build, not leave a
+    /// registry that silently cannot sign.
+    #[test]
+    fn a_missing_supplied_secret_fails_the_build() {
+        let metadata: Metadata = serde_yaml::from_str(TEST_METADATA).expect("test metadata");
+        let err = StorageRegistry::build_with(&metadata, &|_| None)
+            .expect_err("a registry with no secrets must not build");
+        assert!(
+            format!("{err:?}").contains("DONAT_TEST_STORAGE"),
+            "the failure must name the secret it wanted: {err:?}"
+        );
     }
 
     /// A request `offset` seconds after a window boundary.

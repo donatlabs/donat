@@ -1,0 +1,46 @@
+table:
+  name: category
+  schema: public
+array_relationships:
+  - name: pets
+    using:
+      foreign_key_constraint_on:
+        column: category_id
+        table:
+          name: pet
+          schema: public
+# Everyone may read the catalog of categories.
+select_permissions:
+  - role: anonymous
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+  - role: customer
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# Only staff manage the catalog structure.
+insert_permissions:
+  - role: staff
+    permission:
+      check: {}
+      columns:
+        - name
+update_permissions:
+  - role: staff
+    permission:
+      columns:
+        - name
+      filter: {}
+      check: {}
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}

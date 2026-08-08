@@ -32,6 +32,7 @@ fn file_field(alias: &str) -> OutputField {
             column: "photo".to_string(),
             attachment: "public.pet.photo".to_string(),
             url_sql: DOWNLOAD_URL_SQL.to_string(),
+            guard: None,
             fields: vec![
                 FileRefOutput {
                     alias: "id".into(),
@@ -56,6 +57,20 @@ fn file_field(alias: &str) -> OutputField {
             ],
         },
     }
+}
+
+/// The same field, but granted by only some of an inherited role's parents.
+fn guarded_file_field(alias: &str) -> OutputField {
+    let mut field = file_field(alias);
+    let FieldValue::FileRef { guard, .. } = &mut field.value else {
+        unreachable!("file_field builds a FileRef")
+    };
+    *guard = Some(Box::new(BoolExp::Compare {
+        column: "owner_id".into(),
+        pg_type: "text".into(),
+        op: CompareOp::Eq(Scalar::Json(json!("u-1"))),
+    }));
+    field
 }
 
 fn select_with(fields: Vec<OutputField>) -> SelectQuery {
@@ -254,11 +269,113 @@ fn requesting_an_upload_inserts_the_pending_row_and_returns_its_url() {
     });
     assert_eq!(sql.matches("INSERT INTO").count(), 1, "{sql}");
     assert!(sql.contains("'pending'"), "{sql}");
-    // The session's budget is counted in the same statement, so parallel
-    // requests cannot each see room that only one of them has.
-    assert!(sql.contains("< 20") && sql.contains("< 60"), "{sql}");
-    assert!(sql.contains("interval '1 minute'"), "{sql}");
+    // The budget is decided by a function, not by subqueries here. Counting in
+    // this statement could not work: under READ COMMITTED its snapshot is
+    // fixed before it executes, so every parallel request read the same
+    // pre-lock state and all of them passed. The comment this replaces claimed
+    // the opposite.
+    assert!(
+        sql.contains("donat.file_upload_budget_ok('customer', 'u-1', 20, 60)"),
+        "{sql}"
+    );
     // A disk upload has no completion call: the bytes pass through the engine.
     assert!(sql.contains("'complete_url', NULL"), "{sql}");
     insta::assert_snapshot!(sql);
+}
+
+/// A file column carries the same cell guard an ordinary column does.
+///
+/// It is the one field whose value is a capability — a signed download URL —
+/// so a row the granting parent cannot see must yield NULL rather than a URL.
+/// The guard once applied only to the plain-column branch, which the file
+/// branch runs ahead of, so this was the single field that escaped it.
+#[test]
+fn a_guarded_file_column_mints_no_url_on_a_row_its_parent_cannot_see() {
+    let sql = operation_to_sql(&[RootField::Select {
+        alias: "pet".into(),
+        query: select_with(vec![guarded_file_field("photo")]),
+    }]);
+
+    assert!(
+        sql.contains("CASE WHEN"),
+        "the guard must gate the whole object: {sql}"
+    );
+    let case_at = sql.find("CASE WHEN").expect("guard");
+    let url_at = sql.find("s3_presigned_url").expect("url expression");
+    assert!(
+        case_at < url_at,
+        "the signing expression must sit inside the guard, not beside it: {sql}"
+    );
+    assert!(
+        sql.contains("ELSE NULL END"),
+        "a row the parent cannot see must read NULL: {sql}"
+    );
+}
+
+/// The control: without inherited parents there is no guard, and the object is
+/// projected directly — so the assertion above is about the guard, not about
+/// `CASE` appearing somewhere in every file statement.
+#[test]
+fn an_unguarded_file_column_is_projected_without_a_case() {
+    let sql = operation_to_sql(&[RootField::Select {
+        alias: "pet".into(),
+        query: select_with(vec![file_field("photo")]),
+    }]);
+    assert!(
+        !sql.contains("CASE WHEN"),
+        "an ungranted-by-nobody column needs no guard: {sql}"
+    );
+}
+
+/// A write that claims an upload and then projects it must not report null.
+///
+/// A data-modifying CTE's writes are invisible to the rest of its own
+/// statement, so the projection reads the upload row under the pre-claim
+/// snapshot: `state` is still `pending`, the `= 'claimed'` gate rejects it, and
+/// the caller gets `photo: null` for a file that was stored. Reading the row
+/// back afterwards works, which is what made it look like a timing problem
+/// rather than a statement that contradicts itself.
+#[test]
+fn a_write_that_claims_an_upload_can_project_it_in_the_same_statement() {
+    let mut root = insert_with_claims(vec![claim(&["11111111-1111-1111-1111-111111111111"])]);
+    let MutationRoot::Insert { insert, .. } = &mut root else {
+        unreachable!("insert_with_claims builds an insert")
+    };
+    insert.output = MutationOutput::SingleRow(vec![file_field("photo")]);
+
+    let sql = mutation_to_sql(&root);
+
+    assert!(
+        sql.contains("IN (SELECT id FROM \"__donat_claim_0\")"),
+        "the projection must also accept the id this statement is claiming: {sql}"
+    );
+    // And the ordinary gate is still there, so an id put in the column by any
+    // other route than a claim still reads as NULL.
+    assert!(
+        sql.contains("= 'claimed' OR"),
+        "the claimed-state gate must remain: {sql}"
+    );
+}
+
+/// A write matching no row must not consume the upload it was offered.
+///
+/// The claim ran beside the DML regardless of what the DML matched, so an
+/// update whose predicate found nothing still moved the upload from `pending`
+/// to `claimed` — leaving a claimed row no column references, which the
+/// collector later removes. The caller was told `affected_rows: 0` and quietly
+/// lost the file.
+#[test]
+fn a_write_matching_no_row_leaves_its_upload_alone() {
+    let sql = mutation_to_sql(&insert_with_claims(vec![claim(&[
+        "11111111-1111-1111-1111-111111111111",
+    ])]));
+
+    assert!(
+        sql.contains("AND EXISTS (SELECT 1 FROM \"ins\")"),
+        "the claim must be conditional on the write matching: {sql}"
+    );
+    assert!(
+        sql.contains("(SELECT count(*) FROM \"ins\") > 0 AND"),
+        "and a zero-row write must not be told its upload was rejected: {sql}"
+    );
 }

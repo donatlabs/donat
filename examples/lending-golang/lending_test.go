@@ -1,0 +1,324 @@
+// Integration tests for the lending example, driven the way the service is
+// driven: GraphQL over the engine's handler, as one of the library's roles.
+//
+// Nothing here reimplements a lending decision. Each test asks the service to
+// do something and then asserts what the YAML said would happen — the limit in
+// rules.yaml, the atomic hold in borrow-copy.yaml, the extension counter in
+// extend-loan.yaml. A test that computed the expected answer in Go would be
+// testing itself.
+//
+// Requires Postgres: set LENDING_TEST_PG to a DSN whose database already has
+// the platform's migrations and this example's applied. Without it the whole
+// file skips — a run with no database must not look like a passing run.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/donatlabs/donat/examples/lending-golang/gen"
+	"github.com/donatlabs/donat/sdk/go/donat"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	roleMember    = "member"
+	roleLibrarian = "librarian"
+)
+
+// service is one running lending service plus the handles a test needs to
+// drive it.
+type service struct {
+	t       *testing.T
+	handler http.Handler
+	pool    *pgxpool.Pool
+	engine  *donat.Engine
+	loans   *LoanLog
+	// memberID is the identity the member role acts as. Set by addMember, so
+	// a test that borrows always borrows as somebody the library knows.
+	memberID string
+}
+
+func newService(t *testing.T) *service {
+	t.Helper()
+	dsn := os.Getenv("LENDING_TEST_PG")
+	if dsn == "" {
+		t.Skip("set LENDING_TEST_PG to a migrated database to run the lending tests")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	// Each test gets its own log, so an assertion about handlers firing cannot
+	// be satisfied by an earlier test's events.
+	loans := &LoanLog{}
+	reg := donat.NewRegistry()
+	// The generated row type, not a substitute. A test that declared its own
+	// shape here proved only that the hook fired — the shipped handler takes
+	// gen.Loan, and when a column's generated type could not decode what
+	// Postgres renders, the real handler never ran while this test stayed
+	// green. Registering the same type the binary does is what makes the test
+	// about the service rather than about itself.
+	donat.On(reg, "on_loan_recorded", func(_ context.Context, ev donat.Event[gen.Loan]) error {
+		loans.record(LoanEvent{Op: ev.Op, Table: ev.Table.Name})
+		return nil
+	})
+
+	coreConfig, err := loadCoreConfig()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	// The metadata declares `render_loan_receipt` without a handler, so the
+	// engine refuses to start unless a function is registered for it. The test
+	// registers the same implementation the binary does, rather than a stub:
+	// a harness that resolved the action differently would be testing itself.
+	receipts := &Receipts{}
+	fns := donat.NewFunctions()
+	donat.WithFunction("render_loan_receipt", receipts.Render)(&donat.Config{Functions: fns})
+
+	eng, err := donat.New(ctx, donat.Config{
+		Backend:   donat.Postgres(pool),
+		Metadata:  coreConfig,
+		Registry:  reg,
+		Functions: fns,
+		Secrets: map[string]string{
+			"LENDING_S3_KEY":         env("LENDING_S3_KEY", "minioadmin"),
+			"LENDING_S3_SECRET":      env("LENDING_S3_SECRET", "minioadmin"),
+			"LENDING_SIGNING_SECRET": env("LENDING_SIGNING_SECRET", "dev-signing-secret"),
+		},
+		PoolSize: 2,
+	})
+	if err != nil {
+		t.Fatalf("donat.New: %v", err)
+	}
+
+	svc := &service{t: t, handler: eng.Handler(), pool: pool, engine: eng, loans: loans}
+	svc.reset()
+	return svc
+}
+
+// reset empties the library between tests. It talks to the database directly
+// on purpose: this is fixture setup, not behaviour under test.
+func (s *service) reset() {
+	s.t.Helper()
+	ctx := context.Background()
+	for _, stmt := range []string{
+		// The journal goes first, and by TRUNCATE ... CASCADE because its own
+		// tables reference each other. A Process left pointing at a loan this
+		// reset deleted would fail forever in whatever is driving it — which,
+		// in a deployment that embeds, is an engine running beside the host.
+		"TRUNCATE donat.process_events, donat.process_start_requests CASCADE",
+		"DELETE FROM public.loan_followup",
+		"DELETE FROM public.audit_entry",
+		"DELETE FROM public.loan",
+		"DELETE FROM public.copy",
+		"DELETE FROM public.book",
+		"DELETE FROM public.member",
+	} {
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			s.t.Fatalf("reset %q: %v", stmt, err)
+		}
+	}
+}
+
+// gql posts one operation as `role` and returns the decoded response, failing
+// the test if the request could not be made at all.
+//
+// It must only be called from the test goroutine: t.Fatalf terminates the
+// goroutine that calls it, so a failure raised from a worker would leave the
+// test hanging rather than failing. Concurrent callers use gqlErr.
+func (s *service) gql(role, query string, vars map[string]any) map[string]any {
+	s.t.Helper()
+	resp, err := s.gqlErr(role, query, vars)
+	if err != nil {
+		s.t.Fatalf("%v", err)
+	}
+	return resp
+}
+
+// gqlErr is the goroutine-safe form: it reports transport and decoding
+// problems as errors instead of failing the test from whichever goroutine
+// happened to hit them.
+func (s *service) gqlErr(role, query string, vars map[string]any) (map[string]any, error) {
+	payload := map[string]any{"query": query}
+	if len(vars) > 0 {
+		payload["variables"] = vars
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/graphql", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Donat-Role", role)
+	if role == roleMember {
+		req.Header.Set("X-Donat-User-Id", s.memberID)
+	}
+	rec := httptest.NewRecorder()
+	s.handler.ServeHTTP(rec, req)
+
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		return nil, fmt.Errorf("decode response (status %d): %w\nbody: %s",
+			rec.Code, err, rec.Body.String())
+	}
+	return out, nil
+}
+
+func errorsOf(resp map[string]any) []any {
+	if errs, ok := resp["errors"].([]any); ok {
+		return errs
+	}
+	return nil
+}
+
+func dataOf(t *testing.T, resp map[string]any) map[string]any {
+	t.Helper()
+	if errs := errorsOf(resp); errs != nil {
+		t.Fatalf("unexpected GraphQL errors: %v", errs)
+	}
+	data, ok := resp["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("response carried no data object: %v", resp)
+	}
+	return data
+}
+
+func errorMessage(resp map[string]any) string {
+	errs := errorsOf(resp)
+	if len(errs) == 0 {
+		return ""
+	}
+	first, ok := errs[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+	msg, _ := first["message"].(string)
+	return msg
+}
+
+func today() string { return time.Now().UTC().Format("2006-01-02") }
+
+func plusDays(n int) string {
+	return time.Now().UTC().AddDate(0, 0, n).Format("2006-01-02")
+}
+
+// ---------------------------------------------------------------------------
+// Fixture builders — librarian-side CRUD, which is ordinary and uncommanded.
+// ---------------------------------------------------------------------------
+
+func (s *service) addMember(name string, limit int) string {
+	s.t.Helper()
+	resp := s.gql(roleLibrarian, `
+		mutation ($name: String!, $limit: Int!) {
+		  insert_member(objects: [{ name: $name, loan_limit: $limit }]) {
+		    returning { id }
+		  }
+		}`, map[string]any{"name": name, "limit": limit})
+	id := firstReturnedID(s.t, dataOf(s.t, resp), "insert_member")
+	s.memberID = id
+	return id
+}
+
+func (s *service) addBook(title, author string) string {
+	s.t.Helper()
+	resp := s.gql(roleLibrarian, `
+		mutation ($title: String!, $author: String!) {
+		  insert_book(objects: [{ title: $title, author: $author }]) {
+		    returning { id }
+		  }
+		}`, map[string]any{"title": title, "author": author})
+	return firstReturnedID(s.t, dataOf(s.t, resp), "insert_book")
+}
+
+func (s *service) addCopy(bookID, label string) string {
+	s.t.Helper()
+	resp := s.gql(roleLibrarian, `
+		mutation ($book: uuid!, $label: String!) {
+		  insert_copy(objects: [{ book_id: $book, label: $label, status: "available" }]) {
+		    returning { id }
+		  }
+		}`, map[string]any{"book": bookID, "label": label})
+	return firstReturnedID(s.t, dataOf(s.t, resp), "insert_copy")
+}
+
+func firstReturnedID(t *testing.T, data map[string]any, root string) string {
+	t.Helper()
+	node, ok := data[root].(map[string]any)
+	if !ok {
+		t.Fatalf("%s returned no object: %v", root, data)
+	}
+	rows, ok := node["returning"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("%s returned no rows: %v", root, node)
+	}
+	row, _ := rows[0].(map[string]any)
+	id, _ := row["id"].(string)
+	if id == "" {
+		t.Fatalf("%s returned no id: %v", root, row)
+	}
+	return id
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+func (s *service) borrow(copyID string) map[string]any {
+	s.t.Helper()
+	return s.gql(roleMember, `
+		mutation ($copy: uuid!, $from: date!, $due: date!, $req: uuid!) {
+		  borrow_copy(copy_id: $copy, borrowed_on: $from, due_on: $due, request_id: $req) {
+		    loan_id
+		    copy_id
+		    due_on
+		    open_loans_before
+		  }
+		}`, map[string]any{"copy": copyID, "from": today(), "due": plusDays(14), "req": newRequestID()})
+}
+
+func (s *service) returnCopy(loanID string) map[string]any {
+	s.t.Helper()
+	return s.gql(roleMember, `
+		mutation ($loan: uuid!, $on: date!) {
+		  return_copy(loan_id: $loan, returned_on: $on) {
+		    loan_id
+		    copy_id
+		    copy_status
+		  }
+		}`, map[string]any{"loan": loanID, "on": today()})
+}
+
+func (s *service) extend(loanID string, due string) map[string]any {
+	s.t.Helper()
+	return s.gql(roleMember, `
+		mutation ($loan: uuid!, $due: date!) {
+		  extend_loan(loan_id: $loan, new_due_on: $due) {
+		    loan_id
+		    due_on
+		    extensions
+		  }
+		}`, map[string]any{"loan": loanID, "due": due})
+}
+
+func commandResult(t *testing.T, resp map[string]any, root string) map[string]any {
+	t.Helper()
+	data := dataOf(t, resp)
+	node, ok := data[root].(map[string]any)
+	if !ok {
+		t.Fatalf("%s returned no object: %v", root, data)
+	}
+	return node
+}

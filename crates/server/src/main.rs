@@ -16,8 +16,8 @@
 // with only the binary's reachability, so everything the integration tests
 // reach through the library facade was reported dead here.
 use donat_server::{
-    connector_webhook, connectors, cron, events, gql, jwt, mcp, migrate, processes, rest, state,
-    validate, ws,
+    codegen, connector_webhook, connectors, cron, events, gql, jwt, mcp, migrate, processes, rest,
+    state, validate, ws,
 };
 
 use std::net::SocketAddr;
@@ -137,6 +137,10 @@ enum Command {
     Migrate(MigrateArgs),
     /// Validate YAML metadata against the database, then exit.
     Validate(ValidateArgs),
+    /// Generate Go row structs from the catalog for the embedded SDK.
+    Codegen(CodegenArgs),
+    /// Dump `{metadata, catalog}` JSON for the embedded wasm-core host (core_init).
+    DumpCoreConfig(DumpCoreConfigArgs),
     /// Read-only diagnostics for one durable Process instance.
     #[command(subcommand)]
     Process(ProcessCommand),
@@ -193,6 +197,37 @@ struct ValidateArgs {
     /// Metadata source to validate.
     #[arg(long)]
     source: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct CodegenArgs {
+    /// `go` is the only target today.
+    #[arg(value_parser = ["go"])]
+    target: String,
+    /// Metadata directory (defaults to --metadata-dir).
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    /// Output directory for the generated file.
+    #[arg(long, default_value = "gen")]
+    out: PathBuf,
+    /// Go package name for the generated file.
+    #[arg(long, default_value = "donat_gen")]
+    package: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct DumpCoreConfigArgs {
+    /// Metadata directory (defaults to --metadata-dir).
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    /// Output file for the `{metadata, catalog}` JSON.
+    #[arg(long, default_value = "core-config.json")]
+    out: PathBuf,
+    /// Do not write: compare the existing file with what would be written and
+    /// exit non-zero if they differ. For CI, where a snapshot that has drifted
+    /// from its metadata is a defect rather than a thing to fix silently.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -480,6 +515,32 @@ async fn main() -> anyhow::Result<()> {
             require_consistent_metadata(&problems)?;
             return Ok(());
         }
+        Some(Command::Codegen(c)) => {
+            let dir = c
+                .metadata_dir
+                .clone()
+                .or_else(|| args.metadata_dir.clone())
+                .ok_or_else(|| anyhow::anyhow!("codegen needs --metadata-dir"))?;
+            let database_url = resolve_global_database_url(&args, &|name| std::env::var(name))?
+                .ok_or_else(|| anyhow::anyhow!("codegen needs --database-url"))?;
+            codegen::run_codegen(&database_url, &dir, &c.out, &c.package).await?;
+            return Ok(());
+        }
+        Some(Command::DumpCoreConfig(d)) => {
+            let dir = d
+                .metadata_dir
+                .clone()
+                .or_else(|| args.metadata_dir.clone())
+                .ok_or_else(|| anyhow::anyhow!("dump-core-config needs --metadata-dir"))?;
+            let database_url = resolve_global_database_url(&args, &|name| std::env::var(name))?
+                .ok_or_else(|| anyhow::anyhow!("dump-core-config needs --database-url"))?;
+            if d.check {
+                codegen::check_core_config(&database_url, &dir, &d.out).await?;
+            } else {
+                codegen::dump_core_config(&database_url, &dir, &d.out).await?;
+            }
+            return Ok(());
+        }
         Some(Command::Process(command)) => {
             let (instance_args, verify) = match command {
                 ProcessCommand::Inspect(args) => (args, false),
@@ -556,6 +617,16 @@ async fn main() -> anyhow::Result<()> {
     let mut metadata = match &args.metadata_dir {
         Some(dir) if dir.exists() => {
             let md = donat_metadata::load_metadata_dir(dir)?;
+            let in_process = donat_server::action::actions_without_a_handler(&md);
+            if !in_process.is_empty() {
+                anyhow::bail!(
+                    "actions {:?} declare no handler. A handler-less action is resolved \
+                     in-process by an embedded host that registers a function for it, and \
+                     this server has no such registry — give each one a `handler`, or serve \
+                     the metadata from an embedded host",
+                    in_process
+                );
+            }
             tracing::info!(dir = %dir.display(), "metadata loaded");
             md
         }

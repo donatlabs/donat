@@ -1,0 +1,9 @@
+[package]
+name = "donat-catalog-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure serde catalog snapshot types (no I/O); wasm-safe"
+
+[dependencies]
+serde = { workspace = true }

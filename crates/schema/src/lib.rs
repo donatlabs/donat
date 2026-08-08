@@ -19,6 +19,7 @@ mod plan;
 mod plan_mutation;
 mod predicate;
 mod process_effects;
+mod rule_catalog;
 mod v1;
 mod validators;
 
@@ -40,3 +41,4 @@ pub use process_effects::{
     ProcessEffectContract, ProcessEffectContractCatalog, ProcessEffectContractSource,
     ProcessSignalEffectContract,
 };
+pub use rule_catalog::compile_rule_catalog;

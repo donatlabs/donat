@@ -1,0 +1,53 @@
+# Push one of the caller's own loans out to a later due date.
+#
+# The smallest of the three, and the one that shows a rule doing arithmetic
+# rather than only gating: `extensions` is incremented by a declared rule, so
+# the counter the limit reads and the counter the write sets can never be
+# computed differently.
+name: extend_loan
+source: default
+permissions:
+  - role: member
+arguments:
+  - name: loan_id
+    type: uuid!
+  - name: new_due_on
+    type: date!
+steps:
+  - name: open_loan
+    select_one:
+      table: public.loan
+      by:
+        id: { arg: loan_id }
+        member_id: { session_variable: x-donat-user-id }
+        status: { literal: active }
+      returning: [id, due_on, extensions]
+      require_found: true
+
+  - name: may_extend
+    assert:
+      rule: within_extension_limit
+      with:
+        extensions: { step: open_loan, column: extensions }
+        maximum: { literal: 2 }
+      message: "this loan has already been extended the maximum number of times"
+
+  - name: extended
+    update:
+      table: public.loan
+      where:
+        id: { step: open_loan, column: id }
+        status: { literal: active }
+      set:
+        due_on: { arg: new_due_on }
+        extensions:
+          rule: add_int
+          with:
+            left: { step: open_loan, column: extensions }
+            right: { literal: 1 }
+      returning: [id, due_on, extensions]
+      require_affected: true
+result:
+  loan_id: { step: extended, column: id }
+  due_on: { step: extended, column: due_on }
+  extensions: { step: extended, column: extensions }

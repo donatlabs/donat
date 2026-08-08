@@ -1,0 +1,8 @@
+# The wasm core has no OS entropy source: `wasm32-unknown-unknown` under
+# wazero is instantiated with no WASI and no ambient imports. `getrandom`
+# is therefore pointed at a custom backend, which `crates/wasm-core`
+# implements by calling a `random_bytes` function the embedding host
+# exports (see `sdk/go/donat/wasmcore.go`). Scoped to the wasm target, so
+# native builds of the engine keep the ordinary OS backend.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="custom"']

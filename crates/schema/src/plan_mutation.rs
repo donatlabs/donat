@@ -4837,7 +4837,7 @@ fn complete_process_command_field(
     })
 }
 
-fn command_column(column: &donat_catalog::ColumnInfo) -> CommandColumn {
+fn command_column(column: &donat_catalog_types::ColumnInfo) -> CommandColumn {
     CommandColumn {
         name: column.name.clone(),
         // A domain-typed column keeps its exact database type for casts and
@@ -5414,7 +5414,7 @@ fn require_command_columns<'a>(
     columns: impl IntoIterator<Item = &'a String>,
     operation: &str,
     role: &str,
-    table: &donat_catalog::TableInfo,
+    table: &donat_catalog_types::TableInfo,
     path: &str,
 ) -> Result<(), PlanError> {
     for column in columns {

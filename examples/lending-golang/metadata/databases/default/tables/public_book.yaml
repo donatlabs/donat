@@ -1,0 +1,40 @@
+table:
+  name: book
+  schema: public
+array_relationships:
+  - name: copies
+    using:
+      foreign_key_constraint_on:
+        table:
+          schema: public
+          name: copy
+        column: book_id
+# The catalogue is public to anyone who can reach the library.
+select_permissions:
+  - role: member
+    permission:
+      columns: [id, title, author]
+      filter: {}
+      allow_aggregations: true
+  - role: librarian
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# Acquiring and withdrawing titles is ordinary CRUD: there is no lifecycle to
+# guard, so it needs no command.
+insert_permissions:
+  - role: librarian
+    permission:
+      check: {}
+      columns: [title, author]
+update_permissions:
+  - role: librarian
+    permission:
+      columns: [title, author]
+      filter: {}
+      check: {}
+delete_permissions:
+  - role: librarian
+    permission:
+      filter: {}

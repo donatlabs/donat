@@ -318,7 +318,7 @@ impl ProcessRuntime {
         &self,
         failing: FailingTransition,
         error: &anyhow::Error,
-        held: Option<&deadpool_postgres::Client>,
+        held: Option<&mut deadpool_postgres::Client>,
     ) -> anyhow::Result<TransitionConsumption> {
         let attempts = failing.attempts.saturating_add(1);
         let delay_milliseconds = transition_retry_delay_ms(failing.event_id, attempts);
@@ -341,7 +341,7 @@ impl ProcessRuntime {
         // fine — and a starved pool is one of the transient failures being
         // deferred, so asking the pool for another one is asking for the
         // condition that caused this.
-        let recorded = match held {
+        let recorded = match &held {
             Some(client) => client.query_opt(reschedule, &parameters).await,
             None => {
                 let client = self
@@ -365,7 +365,7 @@ impl ProcessRuntime {
         let attempts: i32 = recorded.get("attempts");
         if attempts >= TRANSITION_RETRY_MAX_ATTEMPTS {
             return self
-                .fail_instance(failing, "transition_retry_exhausted", error)
+                .fail_instance(failing, "transition_retry_exhausted", error, held)
                 .await;
         }
         tracing::warn!(
@@ -388,11 +388,17 @@ impl ProcessRuntime {
 
     /// End an instance whose transition cannot be applied, in a transaction of
     /// its own: the one that failed is already poisoned.
+    /// `held` is the connection the caller is already using, when it has one.
+    /// Taking a second while the first is still checked out is what
+    /// `defer_transition` documents and avoids: with the worker pool at half
+    /// the pool size, a burst of simultaneous failures can hold every
+    /// connection and then block waiting for one.
     async fn fail_instance(
         &self,
         failing: FailingTransition,
         code: &'static str,
         error: &anyhow::Error,
+        held: Option<&mut deadpool_postgres::Client>,
     ) -> anyhow::Result<TransitionConsumption> {
         tracing::error!(
             source = %self.source_name,
@@ -402,11 +408,18 @@ impl ProcessRuntime {
             error = format_args!("{error:#}"),
             "Process transition failed unrecoverably; failing the instance"
         );
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .context("failing an unrecoverable Process transition")?;
+        let mut owned;
+        let client = match held {
+            Some(client) => client,
+            None => {
+                owned = self
+                    .pool
+                    .get()
+                    .await
+                    .context("failing an unrecoverable Process transition")?;
+                &mut owned
+            }
+        };
         let transaction = client
             .transaction()
             .await
@@ -421,7 +434,7 @@ impl ProcessRuntime {
             .version
             .checked_add(1)
             .ok_or_else(|| anyhow!("Process instance version overflow"))?;
-        transaction
+        let updated = transaction
             .execute(
                 "
                 UPDATE donat.process_instances
@@ -444,6 +457,18 @@ impl ProcessRuntime {
             )
             .await
             .context("recording an unrecoverable Process transition failure")?;
+        // The UPDATE is guarded on the version this worker read. A concurrent
+        // writer that moved it matches nothing — and committing anyway would
+        // consume the event, record no failure, and leave the instance
+        // `running` with nothing left to advance it. `commit_failed_command`
+        // has always insisted on this; the two must agree.
+        if updated != 1 {
+            bail!(
+                "Process instance {} changed while its failure was being recorded; \
+                 the transition was not marked failed",
+                failing.instance_id
+            );
+        }
         consume_event(&transaction, &self.source_name, failing.event_id).await?;
         transaction
             .commit()
@@ -610,12 +635,14 @@ impl ProcessRuntime {
                 // Rolls back and gives the connection back to this scope, which
                 // the deferral then writes on rather than queueing for another.
                 drop(transaction);
-                return self.defer_transition(failing, &error, Some(&client)).await;
+                return self
+                    .defer_transition(failing, &error, Some(&mut client))
+                    .await;
             }
             Err(error) => {
                 drop(transaction);
                 return self
-                    .fail_instance(failing, "transition_failed", &error)
+                    .fail_instance(failing, "transition_failed", &error, Some(&mut client))
                     .await;
             }
         };
@@ -974,7 +1001,7 @@ impl ProcessRuntime {
         &self,
         event_kind: Option<&str>,
     ) -> anyhow::Result<Preparation> {
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
@@ -1061,7 +1088,7 @@ impl ProcessRuntime {
                     // against the head of the queue": the event steps aside so
                     // the other instances keep moving.
                     return self
-                        .defer_transition(failing, &error, Some(&client))
+                        .defer_transition(failing, &error, Some(&mut client))
                         .await
                         .map(Preparation::Failed);
                 }
@@ -1069,8 +1096,22 @@ impl ProcessRuntime {
                     // Report it rather than swallowing it: the consumer logs
                     // the failure and counts the tick as progress, so the loop
                     // moves straight on to the next instance.
+                    //
+                    // On the client this scope already holds, exactly as the
+                    // transient arm above does. Asking the pool for a second
+                    // one while the first is still alive waits — and the wait
+                    // is unbounded unless a deployment configured otherwise —
+                    // so a fault that fails every instance's preparation at
+                    // once, such as a redeploy that dropped a revision, would
+                    // park every transition worker on a connection none of
+                    // them can get.
                     return self
-                        .fail_instance(failing, "transition_preparation_failed", &error)
+                        .fail_instance(
+                            failing,
+                            "transition_preparation_failed",
+                            &error,
+                            Some(&mut client),
+                        )
                         .await
                         .map(Preparation::Failed);
                 }
@@ -3037,6 +3078,13 @@ async fn commit_wait_entry(
 /// match` is the Process saying that such a signal is not lost: entering the
 /// wait returns those exact correlated requests to `pending`, and the ordinary
 /// consumer matches them against the marker that now exists.
+///
+/// Deliberately `unmatched` only. A signal recorded `unexpected_state` found
+/// the instance and was refused by the state it was in; ADR 034 scopes this
+/// fallback to signals that matched no instance at all, and
+/// `signal_created_before_the_wait_is_receptive_is_not_buffered` guards the
+/// difference. Widening it here would accept an early outbox row merely
+/// because its worker polled after the instance reached the wait.
 async fn reopen_persisted_signals(
     transaction: &Transaction<'_>,
     source_name: &str,
@@ -4792,13 +4840,30 @@ fn is_transient(error: &anyhow::Error) -> bool {
                 return matches!(code, "40001" | "40P01" | "57P01" | "53300" | "55P03")
                     || code.starts_with("08");
             }
-            // A driver error with no SQLSTATE is a connection problem.
-            return true;
+            // A driver error with no SQLSTATE is usually a connection problem,
+            // but not always: a row-count mismatch or a parameter that will
+            // not serialise is deterministic, and retrying it burns every
+            // attempt over several minutes before failing the instance with
+            // the wrong cause. Those are decided here rather than waited out.
+            return !is_deterministic_driver_error(database);
         }
         cause
             .downcast_ref::<deadpool_postgres::PoolError>()
             .is_some()
     })
+}
+
+/// Whether a driver error carries no SQLSTATE because it never reached the
+/// server: the request itself was malformed or the response did not match what
+/// the caller asked for. Waiting does not change either.
+fn is_deterministic_driver_error(error: &tokio_postgres::Error) -> bool {
+    // tokio-postgres does not expose its error kinds, and the Display text is
+    // the only thing it gives a caller to distinguish them by.
+    let text = error.to_string();
+    text.contains("query returned an unexpected number of rows")
+        || text.contains("error serializing parameter")
+        || text.contains("invalid number of parameters")
+        || text.contains("cannot convert between the Rust type")
 }
 
 fn next_version(snapshot: &TransitionSnapshot) -> anyhow::Result<i64> {

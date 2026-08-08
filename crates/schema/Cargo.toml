@@ -7,7 +7,7 @@ description = "Planner: GraphQL operation + metadata + catalog -> IR, with permi
 
 [dependencies]
 donat-metadata = { path = "../metadata" }
-donat-catalog = { path = "../catalog" }
+donat-catalog-types = { path = "../catalog-types" }
 donat-rules = { path = "../rules" }
 donat-ir = { path = "../ir" }
 donat-storage = { path = "../storage" }
@@ -21,6 +21,9 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+# `tracing` is used only for diagnostics in the rule-catalog adapter; it is
+# a facade with a no-op default subscriber, so it compiles to wasm cleanly.
+tracing = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

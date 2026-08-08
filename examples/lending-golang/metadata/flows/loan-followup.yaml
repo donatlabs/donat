@@ -1,0 +1,37 @@
+# A durable flow the borrow command hands work to.
+#
+# It is deliberately the smallest Process that is still real: one state that
+# runs a command, then output. What it demonstrates is not the flow's shape but
+# where it can be started from — the embedded Go host compiles this definition
+# so that `borrow_copy` can start it, writes the journal row inside the borrow
+# statement, and then does nothing more. Carrying it forward is a runtime loop
+# that lives in donat-server; run one against the same database and the
+# follow-up row appears.
+name: loan_followup
+kind: process
+version: 1
+source: default
+permissions:
+  - role: member
+    owner_session_variable: x-donat-user-id
+owner:
+  type: string!
+  capture: { session_variable: x-donat-user-id }
+input:
+  - { name: loan_id, type: uuid! }
+output:
+  - { name: loan_id, type: uuid! }
+start_at: record
+states:
+  - id: record
+    command:
+      name: record_followup
+      run_as: librarian
+      arguments:
+        loan_id: { input: loan_id }
+        note: { literal: "borrowed" }
+      next: done
+  - id: done
+    output:
+      values:
+        loan_id: { input: loan_id }

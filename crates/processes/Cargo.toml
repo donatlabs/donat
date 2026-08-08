@@ -1,0 +1,16 @@
+[package]
+name = "donat-processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Durable Process compilation: metadata to a compiled catalog and its effect contracts; no I/O, wasm-safe"
+
+[dependencies]
+donat-connector-abi = { path = "../connector-abi" }
+donat-connector-catalog = { path = "../connector-catalog" }
+donat-ir = { path = "../ir" }
+donat-metadata = { path = "../metadata" }
+donat-rules = { path = "../rules" }
+donat-schema = { path = "../schema" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

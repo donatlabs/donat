@@ -1,0 +1,39 @@
+table:
+  name: customer
+  schema: public
+array_relationships:
+  - name: orders
+    using:
+      foreign_key_constraint_on:
+        column: customer_id
+        table:
+          name: orders
+          schema: public
+# A shopper sees only their own profile; staff see every customer.
+select_permissions:
+  - role: customer
+    permission:
+      columns:
+        - id
+        - name
+        - email
+      filter:
+        id:
+          _eq: X-Donat-User-Id
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+# A shopper may edit their own profile (id is fixed by the row filter + check).
+update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - name
+        - email
+      filter:
+        id:
+          _eq: X-Donat-User-Id
+      check:
+        id:
+          _eq: X-Donat-User-Id

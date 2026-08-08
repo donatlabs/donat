@@ -7,7 +7,7 @@
 
 use std::{borrow::Cow, collections::HashMap};
 
-use donat_catalog::ColumnInfo;
+use donat_catalog_types::ColumnInfo;
 use donat_ir::{BoolExp, CompareOp, Scalar, Table};
 use serde_json::Value as Json;
 

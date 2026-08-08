@@ -79,6 +79,24 @@ engine_is_up() {
     -d '{"query":"{ __typename }"}' >/dev/null 2>&1
 }
 
+# Refuse to start onto a port something else already answers on.
+#
+# The readiness loop below asks "is a stand up?" before it asks "is the one I
+# started still alive?", so an engine from another checkout holding this port
+# is taken for our own: ours fails to bind, exits, and the suite then runs a
+# whole pass against a binary from another tree — reporting a pass for code it
+# never loaded. Failing here is the difference between a confusing red and a
+# meaningless green.
+refuse_if_port_taken() {
+  local url="$1" name="$2"
+  if curl -fsS -m 2 -X POST "$url/v1/graphql" \
+       -H 'content-type: application/json' \
+       -d '{"query":"{ __typename }"}' >/dev/null 2>&1; then
+    echo "something already answers at $url — stop it, or move this stand with $name" >&2
+    exit 1
+  fi
+}
+
 # Every engine serving this stand's metadata, whatever wrote the pid file. A
 # stale pid file once left an older build holding the port while a new one
 # exited silently — and the suite then tested the wrong binary.
@@ -95,6 +113,10 @@ cmd_up() {
     echo "an engine is already serving this stand (pid $(engine_pids | tr '\n' ' ')); run 'stack.sh down' first" >&2
     exit 1
   fi
+  # `engine_pids` only finds engines serving *this* stand's metadata. An engine
+  # from another checkout on the same port is invisible to it and would be
+  # mistaken for ours the moment it answered.
+  refuse_if_port_taken "$PETSHOP_BASE_URL" PETSHOP_PORT
 
   echo "==> database, object storage and mock providers"
   # The bucket initializer is a one-shot container: `--wait` reads its exit as
@@ -133,15 +155,17 @@ cmd_up() {
   echo $! >"$pidfile"
 
   for _ in $(seq 1 60); do
-    if engine_is_up; then
-      echo "==> up: $PETSHOP_BASE_URL (log: $logfile)"
-      cmd_env
-      return 0
-    fi
+    # Liveness first: a stand that answers is only ours if the process we
+    # started is still running.
     if ! kill -0 "$(cat "$pidfile")" 2>/dev/null; then
       echo "engine exited during start-up; last lines:" >&2
       tail -30 "$logfile" >&2
       exit 1
+    fi
+    if engine_is_up; then
+      echo "==> up: $PETSHOP_BASE_URL (log: $logfile)"
+      cmd_env
+      return 0
     fi
     sleep 1
   done
@@ -179,8 +203,15 @@ cmd_logs() { tail -n "${2:-100}" -f "$logfile"; }
 # example seeds a few units, and its per-location inventory cannot be received
 # through any API surface (see provision.sql).
 cmd_provision() {
-  echo "==> provisioning the warehouse"
-  compose exec -T postgres psql -v ON_ERROR_STOP=1 -q -U postgres -d petshop_system \
+  # The database name comes from PETSHOP_PG_URL like everything else does.
+  # Hardcoding it here meant a stand pointed at another database migrated that
+  # one and then stocked the default — leaving the stand it actually serves
+  # with an empty warehouse, and failing on a missing table rather than on
+  # anything an operator had done wrong.
+  local db="${PETSHOP_PG_URL##*/}"
+  db="${db%%\?*}"
+  echo "==> provisioning the warehouse ($db)"
+  compose exec -T postgres psql -v ON_ERROR_STOP=1 -q -U postgres -d "$db" \
     <"$here/provision.sql"
 }
 
@@ -193,6 +224,7 @@ cmd_up_fast() {
     echo "the fast stand is already running (pid $(cat "$FAST_PID"))" >&2
     exit 1
   fi
+  refuse_if_port_taken "$PETSHOP_FAST_BASE_URL" PETSHOP_FAST_PORT
   echo "==> rewriting declared periods"
   python3 "$here/fast_metadata.py" "$example/metadata" "$FAST_METADATA"
 
@@ -201,10 +233,15 @@ cmd_up_fast() {
   cargo build --manifest-path "$repo/Cargo.toml" -p donat-server --bin donat
   binary="$repo/target/debug/donat"
 
+  # Same rule as the ordinary stand: the database name comes from the URL, so
+  # pointing this stand elsewhere creates and stocks the database it will
+  # actually serve.
+  local fast_db="${FAST_PG_URL##*/}"
+  fast_db="${fast_db%%\?*}"
   docker compose -f "$here/docker-compose.yml" exec -T postgres \
-    psql -q -U postgres -c "SELECT 1 FROM pg_database WHERE datname = 'petshop_fast'" \
+    psql -q -U postgres -tc "SELECT 1 FROM pg_database WHERE datname = '$fast_db'" \
     | grep -q 1 || docker compose -f "$here/docker-compose.yml" exec -T postgres \
-        psql -q -U postgres -c "CREATE DATABASE petshop_fast"
+        psql -q -U postgres -c "CREATE DATABASE $fast_db"
 
   engine_env
   # Its own providers, so a scripted answer here is never claimed by the
@@ -215,7 +252,7 @@ cmd_up_fast() {
   "$binary" migrate --migrations-dir "$example/migrations"
   "$binary" migrate --migrations-dir "$repo/migrations" \
     --metadata-dir "$FAST_METADATA" --source default
-  compose exec -T postgres psql -v ON_ERROR_STOP=1 -q -U postgres -d petshop_fast \
+  compose exec -T postgres psql -v ON_ERROR_STOP=1 -q -U postgres -d "$fast_db" \
     <"$here/provision.sql"
 
   DONAT_PORT="$FAST_PORT" \
@@ -228,6 +265,7 @@ cmd_up_fast() {
   echo $! >"$FAST_PID"
 
   for _ in $(seq 1 60); do
+    kill -0 "$(cat "$FAST_PID")" 2>/dev/null || { tail -30 "$FAST_LOG" >&2; exit 1; }
     if curl -fsS -m 2 -X POST "$PETSHOP_FAST_BASE_URL/v1/graphql" \
          -H 'content-type: application/json' -d '{"query":"{ __typename }"}' >/dev/null 2>&1; then
       echo "==> fast stand up: $PETSHOP_FAST_BASE_URL (log: $FAST_LOG)"
@@ -235,7 +273,6 @@ cmd_up_fast() {
       echo "export PETSHOP_FAST_PROVIDERS_URL=$PETSHOP_FAST_PROVIDERS_URL"
       return 0
     fi
-    kill -0 "$(cat "$FAST_PID")" 2>/dev/null || { tail -30 "$FAST_LOG" >&2; exit 1; }
     sleep 1
   done
   tail -30 "$FAST_LOG" >&2

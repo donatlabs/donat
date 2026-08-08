@@ -25,6 +25,10 @@ reasoning never has to be reconstructed.
 - [[decisions/003-never-embed-go-runtime-in-node]] — Node in-process only via a Rust core (napi-rs); a Go core means Node = sidecar forever
 - [[decisions/004-defer-embedded-sdk-until-conformance]] — sequencing: conformance → webhooks → embedded
 - [[decisions/005-wasm-compiler-core-over-cgo-or-go-rewrite]] — (proposed) the core-language resolution
+- [[decisions/006-cron-triggers-yaml-only]] — cron lives in YAML and stays multi-instance-safe through the Postgres journal
+- [[decisions/007-event-triggers-yaml-and-deploy-time-ddl]] — table event triggers: YAML metadata plus deploy-time trigger DDL
+- [[decisions/008-the-embedded-core-compiles-its-own-snapshot]] — the core compiles rules and commands at `core_init`; a command's hooks come from its resolved steps
+- [[decisions/009-connectors-are-not-a-go-extension-point]] — connectors are unreachable without the Process runtime, and would break the reviewed factory boundary even with it
 
 ## Architecture Overview (leading candidate)
 

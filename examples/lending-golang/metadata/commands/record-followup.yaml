@@ -1,0 +1,25 @@
+# The one step the follow-up Process performs.
+#
+# It runs as `librarian` rather than as the borrower: by the time a Process
+# reaches this state the caller's request is long finished, and a durable step
+# must name the authority it acts under rather than borrow one it no longer has.
+name: record_followup
+source: default
+permissions:
+  - role: librarian
+arguments:
+  - name: loan_id
+    type: uuid!
+  - name: note
+    type: string!
+steps:
+  - name: recorded
+    insert:
+      table: public.loan_followup
+      object:
+        loan_id: { arg: loan_id }
+        note: { arg: note }
+      returning: [id, loan_id, note]
+result:
+  followup_id: { step: recorded, column: id }
+  loan_id: { step: recorded, column: loan_id }

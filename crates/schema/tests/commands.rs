@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use donat_catalog::{Catalog, ColumnInfo, FunctionArg, FunctionInfo, RelationKind, TableInfo};
+use donat_catalog_types::{
+    Catalog, ColumnInfo, FunctionArg, FunctionInfo, RelationKind, TableInfo,
+};
 use donat_ir::{
     CommandExecutionStep, CommandExecutionValue, CommandResultValue, MutationRoot, Scalar, TypeRef,
     ValueScalar, ValueType,

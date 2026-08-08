@@ -1,0 +1,712 @@
+//! `donat codegen go`: generate Go row structs from the Postgres catalog.
+//!
+//! The pure `generate_go` turns a catalog snapshot + the set of tracked
+//! tables + an enum-label map into a single gofmt-ready Go source string.
+//! It performs no I/O so it is fully snapshot-testable. `run_codegen` wraps
+//! it with introspection and file writing.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use donat_catalog::{Catalog, ColumnInfo};
+use tokio_postgres::NoTls;
+
+/// Map of Postgres enum type name -> ordered labels.
+pub type EnumMap = BTreeMap<String, Vec<String>>;
+
+/// Tracks which imports the generated file needs.
+#[derive(Default)]
+struct Needs {
+    time: bool,
+    decimal: bool,
+    json: bool,
+}
+
+/// Go type for a Postgres `typname`. Records needed imports in `needs`.
+/// `enums` lets enum-typed columns resolve to their generated alias name.
+fn map_type(pg_type: &str, enums: &EnumMap, needs: &mut Needs) -> String {
+    // Array types: pg `typname` is the element name with a leading underscore.
+    if let Some(elem) = pg_type.strip_prefix('_') {
+        return format!("[]{}", map_type(elem, enums, needs));
+    }
+    if enums.contains_key(pg_type) {
+        return pascal(pg_type);
+    }
+    match pg_type {
+        "int2" => "int16".into(),
+        "int4" => "int32".into(),
+        "int8" => "int64".into(),
+        "float4" | "float8" => "float64".into(),
+        "numeric" => {
+            needs.decimal = true;
+            "decimal.Decimal".into()
+        }
+        "text" | "varchar" | "bpchar" | "name" => "string".into(),
+        "bool" => "bool".into(),
+        "uuid" => "string".into(),
+        "timestamptz" | "timestamp" => {
+            needs.time = true;
+            "time.Time".into()
+        }
+        // A `date` is rendered as "2026-08-20", which `time.Time` refuses:
+        // encoding/json parses only RFC 3339, and a date carries neither a
+        // time nor a zone to make one. Typing it `time.Time` produced a struct
+        // that could not decode the row it was generated from — an event
+        // handler taking it simply never ran.
+        "date" => "string".into(),
+        "json" | "jsonb" => {
+            needs.json = true;
+            "json.RawMessage".into()
+        }
+        _ => {
+            // Unknown: never fail codegen, fall back to raw JSON.
+            needs.json = true;
+            "json.RawMessage".into()
+        }
+    }
+}
+
+/// snake_case / lower_case identifier -> PascalCase Go identifier.
+fn pascal(s: &str) -> String {
+    s.split(['_', ' '])
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut ch = p.chars();
+            match ch.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + &ch.as_str().to_lowercase(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// Go type name for a table. `public` is unprefixed; other schemas are
+/// schema-prefixed so cross-schema same-named tables never collide.
+fn go_type_name(schema: &str, name: &str) -> String {
+    if schema == "public" {
+        pascal(name)
+    } else {
+        format!("{}{}", pascal(schema), pascal(name))
+    }
+}
+
+/// A column's Go type, made a pointer when the column is nullable.
+fn field_type(col: &ColumnInfo, enums: &EnumMap, needs: &mut Needs) -> String {
+    let base = map_type(&col.pg_type, enums, needs);
+    if col.nullable {
+        format!("*{base}")
+    } else {
+        base
+    }
+}
+
+/// Generate Go source for `tracked` tables `(schema, name)` found in `catalog`.
+/// Emit the Go source: table row structs, enum aliases, and the argument and
+/// result types of every declared action.
+///
+/// A `WithFunction` author otherwise hand-writes the structs that must agree
+/// with the metadata, which is exactly the drift codegen already prevents for
+/// table rows: a `json` tag that does not match a declared argument decodes to
+/// the zero value and the call succeeds with an empty field.
+pub fn generate_go(
+    catalog: &Catalog,
+    tracked: &[(String, String)],
+    enums: &EnumMap,
+    metadata: &donat_metadata::Metadata,
+    package: &str,
+) -> String {
+    let mut needs = Needs::default();
+    let mut body = String::new();
+
+    // Enum type aliases + label constants, deterministic by type name.
+    for (enum_name, labels) in enums {
+        let go_name = pascal(enum_name);
+        body.push_str(&format!("type {go_name} string\n\n"));
+        body.push_str("const (\n");
+        for label in labels {
+            body.push_str(&format!(
+                "\t{}{} {} = \"{}\"\n",
+                go_name,
+                pascal(label),
+                go_name,
+                label,
+            ));
+        }
+        body.push_str(")\n\n");
+    }
+
+    for (schema, name) in tracked {
+        let Some(table) = catalog.tables.get(&format!("{schema}.{name}")) else {
+            eprintln!("warning: tracked table {schema}.{name} not found in catalog; skipped");
+            continue;
+        };
+        body.push_str(&format!(
+            "type {} struct {{\n",
+            go_type_name(&table.schema, &table.name)
+        ));
+        for c in &table.columns {
+            body.push_str(&format!(
+                "\t{} {} `json:\"{}\"`\n",
+                pascal(&c.name),
+                field_type(c, enums, &mut needs),
+                c.name,
+            ));
+        }
+        body.push_str("}\n\n");
+    }
+
+    body.push_str(&action_types(metadata, &mut needs));
+
+    let mut out = String::new();
+    out.push_str("// Code generated by donat codegen go; DO NOT EDIT.\n\n");
+    out.push_str(&format!("package {package}\n\n"));
+
+    let mut imports: Vec<&str> = Vec::new();
+    if needs.json {
+        imports.push("\"encoding/json\"");
+    }
+    if needs.time {
+        imports.push("\"time\"");
+    }
+    if needs.decimal {
+        imports.push("\"github.com/shopspring/decimal\"");
+    }
+    if !imports.is_empty() {
+        out.push_str("import (\n");
+        for imp in imports {
+            out.push_str(&format!("\t{imp}\n"));
+        }
+        out.push_str(")\n\n");
+    }
+    out.push_str(&body);
+    out
+}
+
+/// SQL: every enum type's labels in sort order, user schemas only.
+const ENUMS_SQL: &str = "\
+SELECT t.typname, e.enumlabel \
+FROM pg_type t \
+JOIN pg_enum e ON e.enumtypid = t.oid \
+JOIN pg_namespace n ON t.typnamespace = n.oid \
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+ORDER BY t.typname, e.enumsortorder";
+
+async fn fetch_enums(client: &tokio_postgres::Client) -> Result<EnumMap> {
+    let rows = client
+        .query(ENUMS_SQL, &[])
+        .await
+        .context("querying pg_enum")?;
+    let mut map = EnumMap::new();
+    for row in rows {
+        let typname: String = row.get(0);
+        let label: String = row.get(1);
+        map.entry(typname).or_default().push(label);
+    }
+    Ok(map)
+}
+
+/// Collect tracked `(schema, name)` pairs from the metadata directory.
+/// `QualifiedTable::Name` defaults to the `public` schema.
+fn tracked_tables(metadata: &donat_metadata::Metadata) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for source in &metadata.sources {
+        for t in &source.tables {
+            out.push((t.table.schema().to_string(), t.table.name().to_string()));
+        }
+    }
+    out
+}
+
+/// Introspect the database, generate Go, and write `<out_dir>/donat_gen.go`.
+pub async fn run_codegen(
+    database_url: &str,
+    metadata_dir: &Path,
+    out_dir: &Path,
+    package: &str,
+) -> Result<()> {
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
+        .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
+    let tracked = tracked_tables(&metadata);
+
+    let (client, conn) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .context("connecting to database for codegen")?;
+    let conn = tokio::spawn(conn);
+    let catalog = donat_catalog::introspect(&client)
+        .await
+        .context("introspecting database")?;
+    let enums = fetch_enums(&client).await?;
+    conn.abort();
+
+    let source = generate_go(&catalog, &tracked, &enums, &metadata, package);
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("creating out dir {}", out_dir.display()))?;
+    let path = out_dir.join("donat_gen.go");
+    std::fs::write(&path, source).with_context(|| format!("writing {}", path.display()))?;
+    gofmt_in_place(&path);
+    tracing::info!(path = %path.display(), tables = tracked.len(), "Go types generated");
+    Ok(())
+}
+
+/// Emit the serialized `{ "metadata": <Metadata>, "catalog": <Catalog> }`
+/// JSON that the embedded wasm-core host (`donat.New` via `core_init`)
+/// consumes. Introspection happens here, deploy-time and host-side — exactly
+/// the snapshot the Go SDK hands to the wasm core (Spec 004). This is the
+/// "prepare the core config" step a Go host runs before serving.
+/// Verify that `out` is what `dump_core_config` would write right now.
+///
+/// A snapshot is generated from a metadata directory and a live catalog, and
+/// then committed — so it silently goes stale the moment either changes. The
+/// engine cannot notice: it boots from the snapshot and the snapshot is
+/// perfectly valid, just not current. This is the check that says so.
+pub async fn check_core_config(database_url: &str, metadata_dir: &Path, out: &Path) -> Result<()> {
+    let expected = core_config_json(database_url, metadata_dir).await?;
+    let actual = std::fs::read_to_string(out)
+        .with_context(|| format!("reading {} to check it", out.display()))?;
+    if actual.trim() == expected.trim() {
+        tracing::info!(path = %out.display(), "core config is current");
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} is stale: it does not match {} and the current database schema. \
+         Regenerate it with `donat dump-core-config --metadata-dir {}`",
+        out.display(),
+        metadata_dir.display(),
+        metadata_dir.display(),
+    )
+}
+
+/// The `{metadata, catalog}` JSON for a metadata directory and a live database.
+async fn core_config_json(database_url: &str, metadata_dir: &Path) -> Result<String> {
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
+        .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
+
+    let (client, conn) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .context("connecting to database for core-config dump")?;
+    let conn = tokio::spawn(conn);
+    let catalog = donat_catalog::introspect(&client)
+        .await
+        .context("introspecting database")?;
+    conn.abort();
+
+    let cfg = serde_json::json!({ "metadata": metadata, "catalog": catalog });
+    serde_json::to_string_pretty(&cfg).context("serializing core config")
+}
+
+pub async fn dump_core_config(database_url: &str, metadata_dir: &Path, out: &Path) -> Result<()> {
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
+        .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
+
+    let (client, conn) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .context("connecting to database for core-config dump")?;
+    let conn = tokio::spawn(conn);
+    let catalog = donat_catalog::introspect(&client)
+        .await
+        .context("introspecting database")?;
+    conn.abort();
+
+    let cfg = serde_json::json!({ "metadata": metadata, "catalog": catalog });
+    let json = serde_json::to_string_pretty(&cfg).context("serializing core config")?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating out dir {}", parent.display()))?;
+    }
+    std::fs::write(out, json).with_context(|| format!("writing {}", out.display()))?;
+    tracing::info!(path = %out.display(), tables = catalog.tables.len(), "core config written");
+    Ok(())
+}
+
+/// Best-effort `gofmt -w` on the generated file. The generated source is
+/// already valid Go; gofmt only aligns struct columns. If gofmt is not on
+/// PATH we leave the valid-but-unaligned file and log a hint.
+fn gofmt_in_place(path: &Path) {
+    match std::process::Command::new("gofmt")
+        .arg("-w")
+        .arg(path)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => tracing::warn!(status = ?s, "gofmt exited non-zero; left unformatted (valid) Go"),
+        Err(_) => tracing::info!("gofmt not found on PATH; generated valid Go is left unformatted"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Metadata with nothing declared: these cases are about column mapping,
+    /// and an action would only add noise to their snapshots.
+    fn empty_metadata() -> donat_metadata::Metadata {
+        serde_json::from_value(serde_json::json!({ "version": 3 })).expect("empty metadata")
+    }
+    use donat_catalog::TableInfo;
+
+    fn col(name: &str, pg_type: &str, nullable: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            pg_type: pg_type.into(),
+            pg_typmod: -1,
+            native_type: None,
+            nullable,
+            has_default: false,
+        }
+    }
+
+    fn catalog_with(table: TableInfo) -> Catalog {
+        let mut tables = BTreeMap::new();
+        tables.insert(format!("{}.{}", table.schema, table.name), table);
+        Catalog {
+            tables,
+            functions: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn scalars_basic() {
+        let t = TableInfo {
+            schema: "public".into(),
+            name: "test_t1".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
+            columns: vec![
+                col("c1", "int4", false),
+                col("c2", "text", false),
+                col("ok", "bool", false),
+            ],
+            primary_key: vec![],
+            foreign_keys: vec![],
+        };
+        let cat = catalog_with(t);
+        let out = generate_go(
+            &cat,
+            &[("public".into(), "test_t1".into())],
+            &EnumMap::new(),
+            &empty_metadata(),
+            "donat_gen",
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn scalars_all_types() {
+        let t = TableInfo {
+            schema: "public".into(),
+            name: "wide".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
+            columns: vec![
+                col("a", "int2", false),
+                col("b", "int8", false),
+                col("amount", "numeric", false),
+                col("ratio", "float8", false),
+                col("created_at", "timestamptz", false),
+                col("due_on", "date", false),
+                col("uid", "uuid", false),
+                col("payload", "jsonb", false),
+                col("weird", "tsvector", false), // unknown -> json.RawMessage
+            ],
+            primary_key: vec![],
+            foreign_keys: vec![],
+        };
+        let cat = catalog_with(t);
+        let out = generate_go(
+            &cat,
+            &[("public".into(), "wide".into())],
+            &EnumMap::new(),
+            &empty_metadata(),
+            "donat_gen",
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn nullable_columns_become_pointers() {
+        let t = TableInfo {
+            schema: "public".into(),
+            name: "nul".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
+            columns: vec![
+                col("id", "int4", false),
+                col("note", "text", true),
+                col("amount", "numeric", true),
+            ],
+            primary_key: vec![],
+            foreign_keys: vec![],
+        };
+        let cat = catalog_with(t);
+        let out = generate_go(
+            &cat,
+            &[("public".into(), "nul".into())],
+            &EnumMap::new(),
+            &empty_metadata(),
+            "donat_gen",
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn array_columns_become_slices() {
+        let t = TableInfo {
+            schema: "public".into(),
+            name: "arr".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
+            columns: vec![
+                col("ids", "_int4", false), // int4[] -> []int32
+                col("tags", "_text", true), // nullable text[] -> *[]string
+            ],
+            primary_key: vec![],
+            foreign_keys: vec![],
+        };
+        let cat = catalog_with(t);
+        let out = generate_go(
+            &cat,
+            &[("public".into(), "arr".into())],
+            &EnumMap::new(),
+            &empty_metadata(),
+            "donat_gen",
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn enum_types_emit_alias_and_consts() {
+        let t = TableInfo {
+            schema: "public".into(),
+            name: "task".into(),
+            relation_kind: donat_catalog::RelationKind::Table,
+            unique_keys: vec![],
+            columns: vec![
+                col("id", "int4", false),
+                col("status", "task_status", false), // enum
+                col("prev", "task_status", true),    // nullable enum -> pointer
+            ],
+            primary_key: vec![],
+            foreign_keys: vec![],
+        };
+        let cat = catalog_with(t);
+        let mut enums = EnumMap::new();
+        enums.insert(
+            "task_status".into(),
+            vec!["open".into(), "in_progress".into(), "done".into()],
+        );
+        let out = generate_go(
+            &cat,
+            &[("public".into(), "task".into())],
+            &enums,
+            &empty_metadata(),
+            "donat_gen",
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn multi_schema_tables_disambiguated() {
+        let mut tables = BTreeMap::new();
+        for (schema, name) in [("public", "user"), ("auth", "user")] {
+            tables.insert(
+                format!("{schema}.{name}"),
+                TableInfo {
+                    schema: schema.into(),
+                    name: name.into(),
+                    relation_kind: donat_catalog::RelationKind::Table,
+                    unique_keys: vec![],
+                    columns: vec![col("id", "int4", false)],
+                    primary_key: vec![],
+                    foreign_keys: vec![],
+                },
+            );
+        }
+        let cat = Catalog {
+            tables,
+            functions: BTreeMap::new(),
+        };
+        let tracked = vec![
+            ("public".into(), "user".into()),
+            ("auth".into(), "user".into()),
+        ];
+        let out = generate_go(
+            &cat,
+            &tracked,
+            &EnumMap::new(),
+            &empty_metadata(),
+            "donat_gen",
+        );
+        insta::assert_snapshot!(out);
+    }
+}
+
+/// Emit the Go types an action's Go implementation takes and returns.
+///
+/// Objects declared in `custom_types` become structs, and each action gets an
+/// `<Name>Args` struct built from its declared arguments — so `WithFunction`
+/// can be written against generated types rather than hand-copied ones.
+fn action_types(metadata: &donat_metadata::Metadata, needs: &mut Needs) -> String {
+    let mut out = String::new();
+
+    // Output objects first: an action's Args may reference one, and a reader
+    // meets the type before the function that returns it.
+    for obj in &metadata.custom_types.objects {
+        out.push_str(&format!("type {} struct {{\n", graphql_ident(&obj.name)));
+        for field in &obj.fields {
+            out.push_str(&format!(
+                "\t{} {} `json:\"{}\"`\n",
+                pascal(&field.name),
+                graphql_type(&field.type_, metadata, needs),
+                field.name,
+            ));
+        }
+        out.push_str("}\n\n");
+    }
+
+    for action in &metadata.actions {
+        if action.definition.arguments.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("type {}Args struct {{\n", pascal(&action.name)));
+        for arg in &action.definition.arguments {
+            out.push_str(&format!(
+                "\t{} {} `json:\"{}\"`\n",
+                pascal(&arg.name),
+                graphql_type(&arg.type_, metadata, needs),
+                arg.name,
+            ));
+        }
+        out.push_str("}\n\n");
+    }
+    out
+}
+
+/// Map a GraphQL type reference (`String!`, `[Int]`, `InvoicePdf`) to Go.
+///
+/// A nullable type becomes a pointer, the way a nullable column does, so an
+/// absent value is distinguishable from a zero one.
+fn graphql_type(type_ref: &str, metadata: &donat_metadata::Metadata, needs: &mut Needs) -> String {
+    let t = type_ref.trim();
+    if let Some(inner) = t.strip_suffix('!') {
+        return graphql_named(inner.trim(), metadata, needs);
+    }
+    // Nullable: a pointer, except for the types that already carry absence.
+    let inner = graphql_named(t, metadata, needs);
+    if inner.starts_with("[]") || inner == "json.RawMessage" {
+        inner
+    } else {
+        format!("*{inner}")
+    }
+}
+
+fn graphql_named(t: &str, metadata: &donat_metadata::Metadata, needs: &mut Needs) -> String {
+    if let Some(elem) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        return format!("[]{}", graphql_type(elem, metadata, needs));
+    }
+    if metadata.custom_types.objects.iter().any(|o| o.name == t) {
+        return graphql_ident(t);
+    }
+    match t {
+        "String" | "ID" | "uuid" | "text" => "string".into(),
+        "Int" | "int" | "int4" => "int32".into(),
+        "bigint" | "int8" => "int64".into(),
+        "Float" | "float8" => "float64".into(),
+        "Boolean" | "bool" | "boolean" => "bool".into(),
+        "timestamptz" | "timestamp" => {
+            needs.time = true;
+            "time.Time".into()
+        }
+        // See the note on `date` above: RFC 3339 cannot read a bare date.
+        "date" => "string".into(),
+        _ => {
+            // A custom scalar, an enum, or a type this generator does not know:
+            // raw JSON rather than a guess that would not round-trip.
+            needs.json = true;
+            "json.RawMessage".into()
+        }
+    }
+}
+
+#[cfg(test)]
+mod action_codegen_tests {
+    use super::*;
+
+    fn metadata_with_action() -> donat_metadata::Metadata {
+        serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "custom_types": {
+                "objects": [{
+                    "name": "InvoicePdf",
+                    "fields": [
+                        { "name": "url", "type": "String!" },
+                        { "name": "bytes", "type": "Int!" },
+                        { "name": "note", "type": "String" }
+                    ]
+                }]
+            },
+            "actions": [{
+                "name": "render_invoice_pdf",
+                "definition": {
+                    "arguments": [
+                        { "name": "invoice_id", "type": "uuid!" },
+                        { "name": "copies", "type": "Int" }
+                    ],
+                    "output_type": "InvoicePdf"
+                }
+            }]
+        }))
+        .expect("metadata with an action")
+    }
+
+    /// The structs a `WithFunction` author would otherwise hand-copy from the
+    /// YAML, where a mistyped tag silently decodes to a zero value.
+    #[test]
+    fn an_action_emits_its_argument_and_result_types() {
+        let out = generate_go(
+            &Catalog::default(),
+            &[],
+            &EnumMap::new(),
+            &metadata_with_action(),
+            "gen",
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    /// The generated tags must be the declared argument names verbatim, since
+    /// that is the whole point: matching them by hand is what goes wrong.
+    #[test]
+    fn generated_tags_are_the_declared_names() {
+        let out = generate_go(
+            &Catalog::default(),
+            &[],
+            &EnumMap::new(),
+            &metadata_with_action(),
+            "gen",
+        );
+        assert!(out.contains("`json:\"invoice_id\"`"), "{out}");
+        // A nullable argument is a pointer, so absent is distinguishable from
+        // the zero value a caller may legitimately send.
+        assert!(out.contains("Copies *int32"), "{out}");
+        assert!(out.contains("Url string"), "{out}");
+        assert!(out.contains("Note *string"), "{out}");
+    }
+}
+
+/// Go identifier for a name that is already a GraphQL type name.
+///
+/// `pascal` lowercases each segment's tail, which is right for a snake_case
+/// column (`order_item` -> `OrderItem`) and wrong for a type the author
+/// already spelled in Pascal case: it would turn `InvoicePdf` into
+/// `Invoicepdf`, so the generated struct no longer reads as the type the
+/// metadata names.
+fn graphql_ident(name: &str) -> String {
+    if name.contains('_') || name.contains(' ') {
+        return pascal(name);
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}

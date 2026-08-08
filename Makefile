@@ -1,12 +1,53 @@
 .PHONY: build test conformance db-up db-down db-logs conformance-backend \
 	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex \
-	petshop-up petshop-down petshop-system-tests
+	petshop-up petshop-down petshop-system-tests wasm-core go-test \
+	lending-up lending-down lending-system-tests
 
 build:
 	cargo build
 
 test:
 	cargo test
+
+# Rebuild the wasm core the Go SDK embeds. The blob is committed so that
+# `go get` works without a Rust toolchain, so it must be regenerated here
+# whenever any crate below `donat-wasm-core` changes.
+# The path remapping is what makes the blob reproducible across machines, and
+# that is what lets CI check the committed one against its sources: without it
+# the wasm carries the builder's absolute paths in panic messages, so two
+# correct builds differ and a byte comparison proves nothing. It also keeps a
+# developer's home directory out of a shipped artifact. RUSTFLAGS replaces the
+# config.toml rustflags rather than adding to them, so the getrandom backend
+# has to be repeated here.
+WASM_RUSTFLAGS = --cfg getrandom_backend="custom" \
+	--remap-path-prefix=$(CURDIR)=/donat \
+	--remap-path-prefix=$(HOME)/.cargo=/cargo
+
+wasm-core:
+	rustup target add wasm32-unknown-unknown
+	RUSTFLAGS='$(WASM_RUSTFLAGS)' cargo build -p donat-wasm-core \
+		--target wasm32-unknown-unknown --release
+	cp target/wasm32-unknown-unknown/release/donat_wasm_core.wasm sdk/go/donat/wasm/core.wasm
+
+# The Go host's own suite. CGO stays off: the SDK is `go get`-able and
+# builds a static binary, which is the property wazero was chosen for.
+go-test: wasm-core
+	cd sdk/go && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...
+
+# Both lending stands: the standalone engine and the Go host, from one
+# metadata directory. See tests-system-lending/README.md.
+lending-up:
+	tests-system-lending/stack.sh up
+
+lending-down:
+	tests-system-lending/stack.sh down
+
+# Black-box lending suite: every case against the standalone engine AND the Go
+# host. A disagreement between them is the bug it exists to find.
+lending-system-tests:
+	@test -d tests-system-lending/.venv || python3 -m venv tests-system-lending/.venv
+	@tests-system-lending/.venv/bin/pip install -q -r tests-system-lending/requirements.txt
+	@cd tests-system-lending && eval "$$(./stack.sh env)" && .venv/bin/python -m pytest
 
 # Native Postgres reference conformance suite. Spawns its own engine
 # instances, one database per suite.

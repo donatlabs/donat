@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use donat_catalog::Catalog;
+use donat_catalog_types::Catalog;
 use donat_ir::{MutationRoot, RootField};
 use donat_metadata::{Columns, Metadata, PermissionEntry, SelectPermission};
 use graphql_parser::query::{

@@ -1,0 +1,37 @@
+table:
+  name: member
+  schema: public
+# A member reads only their own record; a librarian reads the register.
+select_permissions:
+  - role: member
+    permission:
+      columns: [id, name, loan_limit]
+      filter:
+        id:
+          _eq: X-Donat-User-Id
+  - role: librarian
+    permission:
+      columns: "*"
+      filter: {}
+      allow_aggregations: true
+# The borrow command reads the caller's own loan limit. It is declared on the
+# command plane rather than reused from the select permission above so that
+# widening what a member may browse can never widen what a command may read.
+command_select_permissions:
+  - role: member
+    permission:
+      columns: [id, loan_limit]
+      filter:
+        id:
+          _eq: X-Donat-User-Id
+insert_permissions:
+  - role: librarian
+    permission:
+      check: {}
+      columns: [name, loan_limit]
+update_permissions:
+  - role: librarian
+    permission:
+      columns: [name, loan_limit]
+      filter: {}
+      check: {}
