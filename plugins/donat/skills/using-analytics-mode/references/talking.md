@@ -232,3 +232,42 @@ Discretion applies to *how* you work, never to *what is true*.
 > shoppers only for now — say if you'd rather it applied to everyone.
 
 A good hotel tells you the pool is closed on the way in, not at the poolside.
+
+---
+
+## Asking what was never their decision
+
+**Bad — a real question from a real session.**
+
+> Вам нужен готовый экран для просмотра клиентов и платежей, или вы его сами
+> сделаете? Я могу собрать вам рабочую админку из того же описания — отдельно
+> рисовать её не придётся.
+
+The second sentence answers the first. Nobody runs a business without somewhere
+to look things up, and it costs nothing extra — so the question hands them a
+decision that was never theirs and makes the offer sound uncertain.
+
+**Good.**
+
+> И последнее. Из этого же описания вы получите рабочую админку — отдельно
+> рисовать её не придётся. Кто в неё заходит, и что им нужно видеть сразу при
+> открытии?
+
+Same information, no decision transferred, and it collects the thing you
+actually need — the list columns.
+
+---
+
+## The same question, worth asking
+
+> В какой валюте эти суммы? 499 / 2999 / 5990 выглядят как рубли, но Stripe
+> рубли не проводит. Если это рубли, нужен другой провайдер — ЮKassa,
+> Тинькофф. Если доллары, идём дальше.
+
+This one earns its place. The answer changes what is *possible*, not just what
+you would have picked, and asking it now saves rebuilding the payment side
+later. Note the shape: the observation, the consequence, and both branches
+named — they can answer in one word.
+
+The distinction is the whole rule. **A question that changes what is possible
+is theirs. A question that only changes your default is yours.**

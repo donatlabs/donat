@@ -151,10 +151,43 @@ answer.*
 
 ---
 
-## 10. Reaching it
+## 10. Logging in
 
-> Who or what needs to talk to this besides your own screens? A mobile app, a
-> partner, a spreadsheet, an AI assistant?
+Do **not** ask which identity provider to use. That is your call — Auth0 unless
+something overrides it. Two questions are genuinely theirs:
+
+> Is there already something that handles logins for you, or are we starting
+> from nothing?
+
+> Does anyone sign in with a company account — Google Workspace, Microsoft —
+> rather than an email and a password?
+
+*What this decides: whether to point at an existing provider or stand one up,
+and whether the provider needs enterprise SSO. Never a users table with a
+password column.*
+
+---
+
+## 11. The back office
+
+Do **not** ask whether they want an admin screen. They do, it comes from the
+same declarations, and asking hands them a decision that was never theirs.
+State it, then ask what it should show:
+
+> You'll get a working back office out of this — nothing extra to design. Who
+> uses it, and what do they need to see the moment they open it?
+
+> Is there anything in there they should be able to look at but never change?
+
+*What this decides: which resources appear, the list columns, and which fields
+are read-only for that role.*
+
+---
+
+## 12. Reaching it
+
+> Who or what else needs to talk to this — a mobile app, a partner, a
+> spreadsheet, an AI assistant?
 
 *What this decides: which surfaces to mount — GraphQL, REST endpoints, MCP
 tools — and which roles they run as.*

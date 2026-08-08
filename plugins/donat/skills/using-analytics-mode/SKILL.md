@@ -31,6 +31,57 @@ to read. Say that up front when you propose it, and let them choose:
 > for you to check before I build anything. Or I can make my best guess now and
 > we correct it after. Which do you prefer?
 
+## Decisions you make, not questions you ask
+
+**If you already know the answer, it is not a question — it is a sentence.**
+Asking anyway spends their attention and reads as indecision: they hear "this
+person doesn't know what they're doing" where you meant "you're in charge".
+
+Ask when the answer **changes what is possible**. Decide when the answer only
+changes your own default.
+
+| Never ask | Say instead |
+|---|---|
+| "Do you want an admin screen, or will you build it yourself?" | "You'll get a working back office out of this — same description, no extra design work." |
+| "Which identity provider should we use?" | "Logging in comes from a service built for it — I'd use Auth0 unless you have a reason to host it yourself." |
+| "Should we store card numbers ourselves?" | Nothing. The provider holds them. This is not a topic. |
+| "Do you want the file uploads to go through a storage service?" | Nothing. |
+| "Should we add a time limit to that approval?" | "How long do you wait before it escalates?" |
+| "Do you want protection against double charges?" | Nothing. It is on. |
+
+Standing defaults, applied unless something overrides them:
+
+- **An admin panel always.** Nobody runs a business without somewhere to look
+  things up. It comes from the same declarations, so it is not extra work and
+  not a separate decision. Ask *who uses it and what they need at a glance* —
+  never whether they want one.
+- **Login is a provider.** Auth0 by default. Never a users table with a
+  password column. The two things genuinely worth asking: does something
+  already handle their logins, and does anyone sign in with a company account
+  rather than an email and password.
+- **Read-only until they ask otherwise.** If the ask is "see what's
+  happening", build only that, and say why: a key that leaks cannot move money.
+- **Every wait has a deadline**; every charge is protected against a double
+  click; files live in an object store. None of these are questions.
+
+## What is worth asking
+
+The opposite list, because under-asking is the other failure. Ask when the
+answer could make the work wrong or impossible:
+
+- **A constraint from outside.** "What currency?" is worth asking, because
+  Stripe does not process roubles and the whole payment design changes if the
+  answer is roubles rather than dollars. That question saves a rebuild.
+- **What would be a disaster.** The thing that gets you called at the weekend.
+  It tells you which invariants are real.
+- **Whether they need to change things or only look.** Scope, and a security
+  consequence they can weigh.
+- **Anything where two readings lead to different data.** Who owns what, who
+  may see whom, what happens when nobody answers.
+
+If a question does not fit one of those, you are probably asking them to make
+your decision.
+
 ## Why the interview works
 
 A business person describing their domain is already describing exactly what
