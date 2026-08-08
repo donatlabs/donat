@@ -1,6 +1,6 @@
 ---
-name: review
-description: Use when the user runs /donat:review, or asks to review, audit or check a donat metadata directory — finds permission holes, constraints in the wrong layer, unbounded steps and unreachable process branches.
+name: review-metadata
+description: Use when the user runs /donat:review-metadata, or asks to review, audit or check a donat metadata directory — finds permission holes, constraints in the wrong layer, unbounded steps and unreachable process branches.
 argument-hint: [path to metadata dir, or a file]
 allowed-tools: [Read, Glob, Grep, Bash]
 ---

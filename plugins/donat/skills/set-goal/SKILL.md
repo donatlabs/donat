@@ -1,6 +1,6 @@
 ---
-name: goal
-description: Use when the user runs /donat:goal, or at the start of a piece of donat work, to fix what "done" means in one sentence. Once fixed, drive toward it and stop asking at every step.
+name: set-goal
+description: Use when the user runs /donat:set-goal, or at the start of a piece of donat work, to fix what "done" means in one sentence. Once fixed, drive toward it and stop asking at every step.
 argument-hint: [what you are trying to end up with]
 allowed-tools: [Read, Write, Edit, Glob, Grep, Bash]
 ---
@@ -72,12 +72,28 @@ have a recommendation, you have an answer; state it and go.
 | An outside constraint that changes what is possible | "these amounts are in roubles" — Stripe cannot process them |
 | An artifact only they can give you | Stripe price ids, the Auth0 tenant, a real bank account |
 
-The last one is not a question, it is a **list**. Hand it over and keep going
-on everything that does not depend on it:
+The last one is not a question, it is a **list** — and a list of nouns is
+homework with no instructions. Each item needs what it is, where to click,
+what it looks like when they find it, and how to send it. Anything secret is
+never sent at all: they paste it themselves, into a place you point at.
 
-> To take real money I need three things from you: the price ids from Stripe,
-> your Auth0 tenant, and which account payouts land in. Until then the stand
-> runs on test keys, and everything else carries on.
+> Three things before we can take real money. None of them blocks anything
+> today — the stand runs on test keys and I'm carrying on with the rest.
+>
+> **The plan identifiers at your payment provider.** In their dashboard, under
+> products: open a plan, and the price inside it has its own identifier. I need
+> three, and which plan each one is. Message them over — they aren't secret.
+> Anything marked *secret* on their side, don't send at all.
+>
+> **Your identity provider account.** The application settings there show a
+> domain and a client id — both fine to send. The client secret is not: you'll
+> paste that in yourself and I'll show you where.
+>
+> **The payout account** is set up inside their dashboard; nothing to send me.
+> Just tell me when it's filled in.
+
+Worked versions of each, plus what to do when a secret arrives in the chat
+anyway, are in `using-analytics-mode`'s `references/asking-for-things.md`.
 
 ### Never stop for these
 
@@ -117,7 +133,7 @@ finished goal is a decision point that belongs to them:
 
 ## If there is no goal yet
 
-`/donat:goal` with no argument: ask the two questions that produce one, then
+`/donat:set-goal` with no argument: ask the two questions that produce one, then
 write it.
 
 > What do you want to be able to do at the end of this that you can't do now?

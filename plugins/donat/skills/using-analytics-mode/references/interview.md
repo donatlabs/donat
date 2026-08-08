@@ -50,20 +50,20 @@ Put up the table instead, **already filled with your best guess**, and ask what
 is wrong. Correcting a table is faster and more accurate than answering eight
 open questions, and it makes the gaps visible.
 
-> Пробегусь по табличке — для каждой записи, кто что может. Я заполнил как
-> мне кажется правильным, скажите, где не так.
+> Let me run through a table — for each record, who can do what. I've filled
+> it in the way I think it should be; tell me where it's wrong.
 >
-> | Запись | Клиент | Оператор |
+> | Record | Client | Operator |
 > |---|---|---|
-> | Тариф | видит | видит |
-> | Клиент | видит и меняет только себя | видит всех, не меняет |
-> | Подписка | видит свою | видит все, не меняет |
-> | Платёж | видит свои | видит все, не меняет |
+> | Plan | sees | sees |
+> | Client | sees and edits only themselves | sees all, edits none |
+> | Subscription | sees their own | sees all, edits none |
+> | Payment | sees their own | sees all, edits none |
 >
-> Три вопроса к ней:
-> — кто заводит клиента: он сам при регистрации, или вы вручную?
-> — что-нибудь здесь вообще удаляется, или только помечается закрытым?
-> — есть запись, которую видно, но трогать нельзя даже владельцу?
+> Three questions about it:
+> — who creates a client: they do, when they sign up, or you by hand?
+> — is anything here actually deleted, or only marked closed?
+> — is there a record they can see but must never touch, even their own?
 
 *What this decides: every select/insert/update/delete permission at once, plus
 the presets. Four cells per record, and the ones people forget are the create
@@ -77,12 +77,13 @@ the direction that matters.
 
 Then, per record, the one that decides masks:
 
-> Есть что-то в этой записи, что человек видеть не должен, хотя саму запись
-> видит? Себестоимость, внутренняя заметка, чей-то телефон?
+> Is there anything on that record they shouldn't see, even though they see
+> the record itself? A cost price, an internal note, someone's phone number?
 
 And the one that separates "cannot see" from "sees an error":
 
-> Может ли клиент найти чужую запись — поиском или подобрав номер?
+> Could a client find someone else's record — by searching, or by guessing a
+> number?
 
 *What this decides: a well-built system returns nothing rather than "access
 denied", so an outsider cannot even confirm the record exists. Worth saying out
@@ -92,18 +93,18 @@ loud once, because it looks like a bug to people.*
 
 ## 4. When the right to change runs out
 
-For every row in the matrix that says "меняет", one follow-up:
+For every cell in the matrix that says "edits", one follow-up:
 
-> До какого момента это можно менять? Что должно произойти, чтобы стало
-> нельзя?
+> Up to what point can they change this? What has to happen for it to stop
+> being editable?
 
 *What this decides: the state filter on the update permission — a basket
 editable while open, a subscription editable until it is cancelled. Without
 this the permission is "may edit forever", which is almost never what they
 meant.*
 
-> Когда он это создаёт, есть что-то, что система должна подставить сама, а не
-> доверять ему вписать?
+> When they create one of these, is there anything the system should fill in
+> itself rather than trusting them to type it?
 
 *What this decides: presets. Anything the system fills in cannot be forged.*
 
@@ -207,9 +208,9 @@ Do **not** ask whether they want screens. They do, they come from the same
 declarations, and asking hands them a decision that was never theirs. State it,
 then ask what it should show:
 
-> Из этого же описания вы получите работающую платформу — отдельно рисовать
-> ничего не придётся. Кто в неё заходит, и что каждому нужно видеть сразу при
-> открытии?
+> You'll get a working platform out of this same description — nothing extra
+> to design. Who goes into it, and what does each of them need to see the
+> moment they open it?
 
 Say *platform*, not *admin panel*: a client managing their own subscription and
 an operator reviewing every client are two roles in one platform, not a product

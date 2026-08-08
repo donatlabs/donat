@@ -8,21 +8,19 @@ description: Use when setting up a local donat stand, wiring CI, deploying, writ
 ## The order, and why it is the order
 
 ```sh
-donat migrate  --migrations-dir engine-migrations   # the engine's own donat.* schema
-donat migrate  --migrations-dir migrations          # this application's schema
-donat migrate  --migrations-dir engine-migrations \
-               --metadata-dir metadata --source default   # Process revisions, if any
+donat migrate  --migrations-dir /usr/share/donat/migrations   # the engine's own donat.* schema
+donat migrate  --migrations-dir migrations                     # this application's schema
+donat migrate  --migrations-dir /usr/share/donat/migrations \
+               --metadata-dir metadata --source default        # Process revisions, if any
 donat validate --metadata-dir metadata              # metadata against the real schema
 donat serve                                         # reads both, runs neither
 ```
 
-The first line surprises people: **the image contains the binary and nothing
-else**, so the engine's own schema — cron state, command claims, Process
-journals — arrives from the donat repository's top-level `migrations/`, not
-from the container. Both sets share one history table, which is why every
-migration is timestamped rather than numbered. See
-`donat-schema-and-migrations` for how to get those files into a standalone
-application without them drifting from the image tag.
+The first line is the engine's own schema — cron state, command claims, Process
+journals — which ships **inside the image** at `/usr/share/donat/migrations`, beside
+the binary that applies it. Nothing to vendor and nothing to mount. Both sets
+share one history table, which is why every migration is timestamped rather
+than numbered.
 
 `validate` checks metadata against the schema **as it actually is**, so running
 it before `migrate` passes for the wrong reason. Both belong in CI and in the
@@ -153,7 +151,7 @@ permission, not a bypass.
 | `validate` fails on an expression | a nullable column read without `not_null:` / `when_present:` — see `donat-validators` |
 | Upsert rejected | `on_conflict.constraint` does not name a real unique constraint |
 | `revision ... is not deployed as active`, retrying forever | the Process deploy step was skipped — the `migrate` that also reads `--metadata-dir` |
-| An error naming a `donat.*` table nobody recognises | the engine's own migrations were not applied, or a vendored copy drifted from the image tag |
+| An error naming a `donat.*` table nobody recognises | the engine's own migrations were not applied — the `migrate` run against `/usr/share/donat/migrations` is missing |
 | Duplicate provider effect | a mutating connector operation with no `provider_idempotent` evidence, or a retry window longer than the provider's key retention |
 | Process parked forever | a `wait` with no `deadline`/`on_timeout`, or a `request` error class with no route |
 

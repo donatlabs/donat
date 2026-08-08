@@ -71,7 +71,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
-        donat migrate --migrations-dir /engine-migrations &&
+        donat migrate --migrations-dir /usr/share/donat/migrations &&
         donat migrate --migrations-dir /app-migrations
     depends_on:
       postgres:
@@ -79,7 +79,6 @@ services:
     environment:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
-      - ../../migrations:/engine-migrations:ro
       - ./migrations:/app-migrations:ro
     restart: "no"
 
@@ -95,7 +94,7 @@ services:
     command:
       - "migrate"
       - "--migrations-dir"
-      - "/engine-migrations"
+      - "/usr/share/donat/migrations"
       - "--metadata-dir"
       - "/metadata"
       - "--source"
@@ -119,7 +118,6 @@ services:
       PETSHOP_PAYOUT_BASE_URL: http://mock-providers:8099
       PETSHOP_PAYOUT_API_TOKEN: petshop-payout-token
     volumes:
-      - ../../migrations:/engine-migrations:ro
       - ./metadata:/metadata:ro
     restart: "no"
 
