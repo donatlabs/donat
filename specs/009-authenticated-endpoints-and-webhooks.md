@@ -166,6 +166,57 @@ webhooks:
     idempotency_key: { json_pointer: /id }
 ```
 
+### How it reaches the command
+
+Every link already exists, which is why this is compilation rather than
+implementation.
+
+1. The request arrives at `/api/rest/hooks/stripe`.
+2. The signature is verified over the raw bytes, before parsing.
+3. The session is constructed from `run_as` instead of from headers.
+4. The body is bound to the operation's variables.
+5. The saved operation executes — and **the operation is the command**, because
+   a command is already an ordinary GraphQL mutation. `mutation {
+   record_stripe_invoice_event(event_id: …, amount_minor: …) { … } }` is the
+   same call a client would make, subject to the same `permissions` list.
+6. The command's steps write; its `signal_process` effect, if declared,
+   releases a parked wait in that same transaction.
+
+Step 5 is the part worth being explicit about: nothing invokes commands
+specially here. `crates/conformance/tests/petshop_process.rs:185` calls one as
+`mutation {{ start_checkout(cart_id: …, request_id: …) }}` over plain HTTP, and
+this route reaches it the same way, having established a role differently.
+
+### The one genuinely new binding
+
+Existing REST binding is **flat** — "path params, query-string keys, and
+JSON-body keys bind the operation's GraphQL variables". Provider payloads are
+not flat: the amount lives at `/data/object/amount_paid`.
+
+So `arguments: { x: { json_pointer: … } }` is a real addition rather than a
+rename, and it is the only part of the sugar that is. It is also the same
+`json_pointer` vocabulary a connector's `response` already uses, so it is a new
+place for an existing idea rather than a new idea.
+
+### Why a command, and not any operation
+
+Deliberate, for one reason: **a command is the only thing in the format that
+can write the row and signal a waiting process in one transaction.** Anything
+else can do one or the other, and a webhook that records an event without
+resuming the flow it was supposed to resume is the failure this shape exists to
+make unrepresentable.
+
+Two consequences worth stating rather than discovering:
+
+- The idempotency key is the command's own, so replay protection is a
+  mechanism that already exists and is already tested.
+- Guards are the command's own, so a webhook cannot write something a caller
+  of the same command could not.
+
+The narrowness costs nothing, because the §4 form binds **any** saved
+operation. A deployment that wants a plain mutation, or a query, or something
+with no idempotency at all, writes that form and is not arguing with the sugar.
+
 ### It is sugar, and that is the whole point
 
 A `webhooks` entry **compiles to** exactly what §4 describes: an endpoint with
