@@ -103,8 +103,21 @@ pub async fn dispatch(
     let (endpoint, path_params) = match routing.chosen {
         Some((ep, params)) => (ep.clone(), params),
         None => {
-            if routing.url_matched {
-                let allow = routing.allowed_methods.join(", ");
+            // No endpoint matched. Only owned fields survive past this point,
+            // so the engine lock is released before the await below — session
+            // resolution may call an external auth hook, and a held read lock
+            // would stall a metadata reload for the duration.
+            let url_matched = routing.url_matched;
+            let allow = routing.allowed_methods.join(", ");
+            drop(engine);
+            // Session resolution used to precede routing for every request,
+            // and for this arm it still must: without it, a request with no
+            // valid role learns whether a route exists (404 vs 401), which
+            // the old order never disclosed.
+            if let Err((status, errors)) = gql::resolve_session(&state, &headers).await {
+                return (status, axum::Json(errors)).into_response();
+            }
+            if url_matched {
                 return (
                     StatusCode::METHOD_NOT_ALLOWED,
                     axum::Json(rest_error(
