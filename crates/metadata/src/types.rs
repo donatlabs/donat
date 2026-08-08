@@ -2247,6 +2247,10 @@ pub struct RestEndpoint {
     /// HTTP methods this endpoint answers, e.g. `["GET"]` or `["POST", "PUT"]`.
     pub methods: Vec<String>,
     pub definition: RestEndpointDefinition,
+    /// How a caller with no JWT proves itself, and what it runs as. Absent
+    /// means the role comes from headers exactly as it does on /v1/graphql.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticate: Option<EndpointAuthentication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
 }
@@ -2261,6 +2265,121 @@ pub struct RestEndpointDefinition {
 pub struct RestEndpointQuery {
     pub collection_name: String,
     pub query_name: String,
+}
+
+/// How a caller proves who it is on an endpoint that no browser drives.
+///
+/// A provider posting a callback cannot present a JWT, and the alternatives —
+/// the admin secret, or the unauthorized role — are respectively not a
+/// permission and a public mutation. So the endpoint declares a credential it
+/// can verify, and names the role a verified request runs as.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointAuthentication {
+    #[serde(flatten)]
+    pub credential: EndpointCredential,
+    /// The role a verified request runs as. An ordinary declared role: it
+    /// resolves through its own table permissions and escalates nothing.
+    pub run_as: String,
+    /// Session variables a verified request carries, beyond the role.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_variables: BTreeMap<String, String>,
+    /// Refused before verification, so an oversized body is never hashed.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Which payloads this endpoint acts on. A verified request matching none
+    /// of them is acknowledged and does nothing — see the 204 rule. Empty
+    /// means "everything the operation accepts".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept: Vec<PayloadPredicate>,
+}
+
+fn default_max_body_bytes() -> usize {
+    65_536
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum EndpointCredential {
+    /// A digest over the exact bytes, which is why verification has to happen
+    /// before the body is parsed: re-serializing a parsed document produces
+    /// different bytes and a valid signature fails.
+    Signature(SignatureScheme),
+    /// A constant compared in constant time. Replayable, and it does not
+    /// survive a log leak — offered for senders that provide nothing better.
+    SharedSecret(SharedSecretScheme),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureScheme {
+    /// Header carrying the digest.
+    pub header: String,
+    pub algorithm: SignatureAlgorithm,
+    #[serde(default)]
+    pub encoding: SignatureEncoding,
+    /// Stripped from the header value before decoding, e.g. `sha256=`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// What goes into the digest. `{body}` is the exact request bytes and
+    /// `{timestamp}` the value named by `timestamp`. A method with no body
+    /// signs `{path}` and `{query}` instead — which is why this is a template
+    /// rather than a flag.
+    #[serde(default = "default_signed_payload")]
+    pub signed_payload: String,
+    /// Where the timestamp comes from, when the template uses one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<TimestampSource>,
+    /// How far the timestamp may be from now. Absent means unchecked, which
+    /// makes the signature replayable — set it whenever the sender provides a
+    /// timestamp at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance_seconds: Option<u64>,
+    pub secret: SecretRef,
+}
+
+fn default_signed_payload() -> String {
+    "{body}".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureAlgorithm {
+    HmacSha256,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureEncoding {
+    #[default]
+    Hex,
+    Base64,
+}
+
+/// Where a signed timestamp is read from. Some senders put it in a header of
+/// its own; others fold it into the signature header as `t=…,v1=…`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TimestampSource {
+    /// A header carrying the timestamp on its own.
+    Header { header: String },
+    /// A `key=value` pair inside the signature header itself.
+    SignatureHeaderField { field: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedSecretScheme {
+    pub header: String,
+    pub secret: SecretRef,
+}
+
+/// A guard on the parsed payload, evaluated only after verification.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadPredicate {
+    pub json_pointer: String,
+    pub equals: String,
 }
 
 /// An inherited role combines the permissions of its parents.
@@ -3106,5 +3225,154 @@ impl StorageGc {
         self.every_days == default_gc_days()
             && self.pending_ttl_days == default_gc_days()
             && self.orphan_grace_days == default_gc_days()
+    }
+}
+
+#[cfg(test)]
+mod endpoint_authentication_tests {
+    use super::*;
+
+    /// The shape a user writes for a signature-authenticated callback, in the
+    /// spelling the spec documents. If this stops deserializing, the spec is
+    /// wrong or the format broke — either way it is not a detail.
+    #[test]
+    fn signature_scheme_round_trips_from_yaml() {
+        let yaml = r#"
+name: stripe_events
+url: hooks/stripe
+methods: [POST]
+definition:
+  query:
+    collection_name: hooks
+    query_name: RecordStripeInvoiceEvent
+authenticate:
+  signature:
+    header: Stripe-Signature
+    algorithm: hmac_sha256
+    encoding: hex
+    signed_payload: "{timestamp}.{body}"
+    timestamp:
+      signature_header_field:
+        field: t
+    tolerance_seconds: 300
+    secret:
+      value_from_env: STRIPE_WEBHOOK_SECRET
+  run_as: billing
+  max_body_bytes: 65536
+  accept:
+    - json_pointer: /type
+      equals: invoice.paid
+"#;
+        let endpoint: RestEndpoint = serde_yaml::from_str(yaml).expect("endpoint parses");
+        let auth = endpoint.authenticate.expect("authenticate present");
+        assert_eq!(auth.run_as, "billing");
+        assert_eq!(auth.max_body_bytes, 65_536);
+        assert_eq!(auth.accept.len(), 1);
+        assert_eq!(auth.accept[0].json_pointer, "/type");
+        match auth.credential {
+            EndpointCredential::Signature(scheme) => {
+                assert_eq!(scheme.header, "Stripe-Signature");
+                assert_eq!(scheme.algorithm, SignatureAlgorithm::HmacSha256);
+                assert_eq!(scheme.encoding, SignatureEncoding::Hex);
+                assert_eq!(scheme.signed_payload, "{timestamp}.{body}");
+                assert_eq!(scheme.tolerance_seconds, Some(300));
+                assert_eq!(scheme.secret.value_from_env, "STRIPE_WEBHOOK_SECRET");
+            }
+            other => panic!("expected a signature scheme, got {other:?}"),
+        }
+    }
+
+    /// The defaults are the safe reading: a body bound even when nobody said
+    /// so, hex encoding, and the whole body signed.
+    #[test]
+    fn signature_defaults_are_the_conservative_ones() {
+        let yaml = r#"
+signature:
+  header: X-Hub-Signature-256
+  algorithm: hmac_sha256
+  secret:
+    value_from_env: GITHUB_WEBHOOK_SECRET
+run_as: integrations
+"#;
+        let auth: EndpointAuthentication = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(auth.max_body_bytes, 65_536);
+        assert!(auth.accept.is_empty(), "no accept list means accept all");
+        match auth.credential {
+            EndpointCredential::Signature(s) => {
+                assert_eq!(s.encoding, SignatureEncoding::Hex);
+                assert_eq!(s.signed_payload, "{body}");
+                assert!(s.timestamp.is_none());
+                assert!(
+                    s.tolerance_seconds.is_none(),
+                    "absent tolerance stays absent rather than inventing a window"
+                );
+            }
+            other => panic!("expected a signature scheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_secret_is_the_other_credential() {
+        let yaml = r#"
+shared_secret:
+  header: X-Api-Key
+  secret:
+    value_from_env: PARTNER_KEY
+run_as: partner
+"#;
+        let auth: EndpointAuthentication = serde_yaml::from_str(yaml).expect("parses");
+        match auth.credential {
+            EndpointCredential::SharedSecret(s) => {
+                assert_eq!(s.header, "X-Api-Key");
+                assert_eq!(s.secret.value_from_env, "PARTNER_KEY");
+            }
+            other => panic!("expected a shared secret, got {other:?}"),
+        }
+    }
+
+    /// An endpoint with no `authenticate` block is the existing behaviour, and
+    /// every deployment has these. Silence here means the role still comes
+    /// from headers.
+    #[test]
+    fn absent_authentication_is_the_existing_endpoint() {
+        let yaml = r#"
+name: list_products
+url: products
+methods: [GET]
+definition:
+  query:
+    collection_name: petshop
+    query_name: Products
+"#;
+        let endpoint: RestEndpoint = serde_yaml::from_str(yaml).expect("parses");
+        assert!(endpoint.authenticate.is_none());
+    }
+
+    /// A misspelled key is a deploy failure rather than a silently ignored
+    /// one — the difference between an endpoint that is unauthenticated and an
+    /// endpoint that only looks authenticated.
+    #[test]
+    fn unknown_keys_are_refused() {
+        let yaml = r#"
+signature:
+  header: X-Sig
+  algorithm: hmac_sha256
+  secret:
+    value_from_env: K
+  toleranceSeconds: 300
+run_as: billing
+"#;
+        let parsed: Result<EndpointAuthentication, _> = serde_yaml::from_str(yaml);
+        assert!(parsed.is_err(), "a camelCase near-miss must not be ignored");
+    }
+
+    #[test]
+    fn a_credential_is_required() {
+        let yaml = "run_as: billing\n";
+        let parsed: Result<EndpointAuthentication, _> = serde_yaml::from_str(yaml);
+        assert!(
+            parsed.is_err(),
+            "run_as with no credential would authenticate nobody as a role"
+        );
     }
 }
