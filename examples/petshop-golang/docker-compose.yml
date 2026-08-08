@@ -8,9 +8,10 @@ version: "3.9"
 # by one-shot `donat migrate` runs using the prebuilt engine image; the Go app
 # never runs DDL — it only serves GraphQL and fires the in-process event hooks.
 #
-# Two migrate services, because this example carries no copy of the platform's
-# own DDL: the engine's migrations come from the engine image, so the helper
-# functions the error decoder pins cannot drift from a stale local copy.
+# Two migrate services. The platform's own catalog is mounted from the
+# repository's top-level `migrations/` — the image carries the binary and
+# nothing else — so the helper functions the error decoder pins cannot drift
+# from a stale local copy.
 
 services:
   db:
@@ -31,8 +32,8 @@ services:
       timeout: 3s
       retries: 20
 
-  # One-shot: the platform's own deploy-time catalog, straight from the engine
-  # image, so there is exactly one copy of it anywhere.
+  # One-shot: the platform's own deploy-time catalog, mounted from the
+  # repository so there is exactly one copy of it anywhere.
   migrate-platform:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     command: ["migrate", "--migrations-dir", "/migrations"]
@@ -41,6 +42,8 @@ services:
         condition: service_healthy
     environment:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/petshop_golang
+    volumes:
+      - ../../migrations:/migrations:ro
     restart: "no"
 
   # One-shot: the petshop DDL and demo seed, then exit.
