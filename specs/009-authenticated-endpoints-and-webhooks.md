@@ -87,12 +87,15 @@ rest_endpoints:
       # Verified over the exact raw body, before it is parsed.
       signature:
         header: Stripe-Signature
-        scheme: hmac_sha256
+        algorithm: hmac_sha256
         encoding: hex
-        # Literal text with {body} and {timestamp} substituted; providers
-        # differ, and this is the difference.
+        # Literal text with {body}, {timestamp}, {path} and {query}
+        # substituted; providers differ, and this is the difference.
         signed_payload: "{timestamp}.{body}"
-        timestamp_from: header_field   # Stripe puts it in the same header
+        # Stripe folds the timestamp into the signature header as `t=…`;
+        # senders with a header of their own use `header: { header: X-Ts }`.
+        timestamp:
+          signature_header_field: { field: t }
         tolerance_seconds: 300
         secret: { value_from_env: STRIPE_WEBHOOK_SECRET }
       # What the request runs as once the signature verifies. An ordinary
@@ -146,8 +149,10 @@ webhooks:
     authenticate:
       signature:
         header: Stripe-Signature
-        scheme: hmac_sha256
+        algorithm: hmac_sha256
         signed_payload: "{timestamp}.{body}"
+        timestamp:
+          signature_header_field: { field: t }
         tolerance_seconds: 300
         secret: { value_from_env: STRIPE_WEBHOOK_SECRET }
       run_as: billing
