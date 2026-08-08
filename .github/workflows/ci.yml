@@ -238,6 +238,16 @@ jobs:
   lending-example:
     name: Lending example (commands, rules, in-process handlers)
     runs-on: ubuntu-latest
+    # The example's storage backend resolves its credentials from the
+    # environment, and every command that reads the metadata directory —
+    # `migrate --metadata-dir`, `validate`, `dump-core-config` — resolves them
+    # too. Declared once for the job rather than per step: an unset one is a
+    # deploy failure by design, so a step that forgets them fails for a reason
+    # that has nothing to do with what it was testing.
+    env:
+      LENDING_S3_KEY: minioadmin
+      LENDING_S3_SECRET: minioadmin
+      LENDING_SIGNING_SECRET: dev-signing-secret
     services:
       postgres:
         image: postgres:16
@@ -283,9 +293,6 @@ jobs:
         env:
           URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
           DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:15432/lending
-          LENDING_S3_KEY: minioadmin
-          LENDING_S3_SECRET: minioadmin
-          LENDING_SIGNING_SECRET: dev-signing-secret
       - name: Metadata must be consistent with the database
         run: ./target/debug/donat --database-url "$URL" validate --metadata-dir examples/lending-golang/metadata
         env:
