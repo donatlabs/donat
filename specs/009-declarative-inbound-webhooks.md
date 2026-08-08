@@ -246,6 +246,78 @@ A and B are mechanical once the declarative form is settled.
 
 Sizes are read off the code, not measured by having written it.
 
+## 8b. How to build it
+
+Implementation order, in the loop this repository uses: a failing conformance
+case first, then the code that makes it pass. Sizes from §8.
+
+### Step 0 — the case that fails
+
+Before touching the engine, add to
+`crates/conformance/fixtures/` and `crates/conformance/tests/process_inbound.rs`
+a case that signs a body for a **`module: http`** instance and expects a
+delivery row. It fails because `RegistryInstance::Http` has no inbound path at
+all, and that failure is the specification of everything below.
+
+Keep the existing Stripe cases untouched and passing throughout. They are the
+compatibility contract.
+
+### Step A — inbound as a connector capability
+
+| File | Change |
+|---|---|
+| `crates/metadata/src/types.rs` | The `inbound:` block: `signature` (header, scheme, encoding, prefix, `signed_payload`, tolerance, secret) and `triggers[]` with `select` and `output`. Reuse the existing response-mapping types for `output` rather than defining a parallel set. |
+| `crates/server/src/connectors/mod.rs` | Lift `CompiledWebhookTrigger` out of the Stripe variant into a `CompiledInboundTriggers` map carried by every `RegistryInstance`. `trigger_spec_handle` and `trigger_configuration_fingerprint` take a `TriggerId` and look it up. `WebhookInstance` exposes the set; `raw_body_max_bytes` becomes the maximum across it. |
+| `crates/server/src/connectors/http.rs` | Verification for the declared scheme, over the exact raw bytes. This is the file that currently has no inbound path; when it does, the feature is general. |
+| `crates/server/src/connectors/stripe.rs` | `verify_completed_webhook` returns `(TriggerId, VerifiedInboundEvent)` instead of one event. Its own signature scheme stays built in. |
+| `crates/server/src/connector_webhook.rs` | The ordering inversion. 404-before-body-read for an undeclared instance stays exactly where it is; verification still precedes any parse; the trigger is resolved from the verified event, not from the instance. |
+
+The fingerprint rule is the one to get right and the easiest to lose: **each
+trigger keeps its own**, so adding a second does not disturb a revision pinned
+against the first. Assert it in a test before writing the code.
+
+### Step B — Stripe's three events
+
+Purely additive, in `stripe.rs`, expressed in the declarative form step A
+introduced rather than as new hand-written normalizers. Plus
+`subscription_id: string!` on `checkout.session.completed`, rejected when the
+session is in subscription mode and the field is absent.
+
+Verify each against a signed fixture body: correct output including the
+epoch-to-`timestamptz` conversion, wrong `data.object.object` rejected, null
+subscription rejected.
+
+### Step C — a trigger may invoke a command
+
+| File | Change |
+|---|---|
+| `crates/metadata/src/types.rs` | `on_event` on a trigger: `command`, `run_as`, `arguments` mapped from `{ event: <field> }`, `idempotency_key`. |
+| `crates/server/src/processes/inbound.rs` | Where `InboundOutcome::Unmatched` is produced, dispatch to the declared command instead — **inside the same transaction** that writes the delivery audit and the dedupe row. Unmatched stays the outcome when no `on_event` is declared. |
+
+The command is invoked through the ordinary path, so `run_as` resolves against
+that role's table permissions and a command the role may not call is refused.
+Nothing here may reach around the permission model; if it seems to need to, the
+design is wrong rather than the invariant.
+
+### Step D — the tests from §7
+
+Written last only in the sense of being completed last. The `module: http`
+case from step 0 is what closes the loop: when it passes, inbound webhooks are
+an engine capability rather than a Stripe one.
+
+### Verifying the whole thing
+
+```sh
+cargo build -p donat-server --bin donat          # the harness uses this binary
+cargo test -p donat-conformance --test process_inbound
+cargo test -p donat-server
+make conformance                                  # suites regress together
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Rebuild the binary before re-running conformance; the harness runs the one on
+disk, not the one you just edited.
+
 ## 9. Deliberately out of scope
 
 Proration and mid-period plan changes. Refunds and chargebacks. A dunning
