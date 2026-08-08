@@ -69,6 +69,11 @@ Standing defaults, applied unless something overrides them:
   happening", build only that, and say why: a key that leaks cannot move money.
 - **Every wait has a deadline**; every charge is protected against a double
   click; files live in an object store. None of these are questions.
+- **One Go program, with tests.** The engine runs inside the application, so
+  there is one binary rather than a service to operate, and the few parts no
+  declaration can express are small named functions rather than a second
+  system. Unit and integration tests come with it, not after. Say this; do not
+  offer it as an option. See `donat-embedded-go`.
 
 ## What is worth asking
 

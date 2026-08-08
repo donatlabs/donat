@@ -62,7 +62,10 @@ Mode first, then architecture, then the domain skill.
 2. `donat-app-architecture` — sets which layer the answer belongs in. Almost
    every task needs this before the specific skill.
 3. `declaring-not-coding` — on anything that will produce a file. Fixes which
-   primitive the requirement becomes, and forbids solving it with code.
+   primitive the requirement becomes, and forbids solving it with code. On a
+   new application, pair it with `donat-embedded-go`: the default shape is one
+   Go program with the engine inside it, which is what makes "a named function"
+   available as the step before "a separate service".
 4. The domain skill: `donat-tables-and-permissions`, `donat-validators`,
    `donat-rules`, `donat-commands`, `donat-processes`, `donat-connectors`,
    `donat-schema-and-migrations`, `donat-api-surfaces`,
