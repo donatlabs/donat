@@ -163,6 +163,26 @@ serves GraphQL from the same binary with no cgo. Its
 [system tests](tests-system-lending) run every case against both the
 standalone engine and the embedded host, and fail if the two disagree.
 
+### Building with a coding agent
+
+The metadata format is the product surface, and an agent that does not know it
+will write a service where a declaration belongs. This repository is also a
+[Claude Code plugin marketplace](plugins/donat):
+
+```
+/plugin marketplace add donatlabs/donat
+/plugin install donat@donat
+```
+
+It installs skills for the whole declarative surface — permissions and
+validators, rules, commands, durable Processes, connectors, files, the REST and
+MCP surfaces, and the embedded Go host — each pointing at the worked example in
+this repository. It also carries the rules that are not negotiable: no admin
+role, and a requirement becomes a declaration or an escalation, never a script.
+
+For OpenAI Codex, [`plugins/donat/codex`](plugins/donat/codex) ships the same
+material as an `AGENTS.md` section plus prompts.
+
 ### From source
 
 ```sh

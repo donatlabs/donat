@@ -1,0 +1,34 @@
+{
+  "name": "donat",
+  "version": "0.1.0",
+  "description": "How to build an application on donat: migrations, tracked tables, per-role permissions, validators, rules, commands, durable processes, connectors, and the REST/MCP surfaces generated from them.",
+  "author": { "name": "donat" },
+  "homepage": "https://github.com/donatlabs/donat",
+  "repository": "https://github.com/donatlabs/donat",
+  "license": "Apache-2.0",
+  "keywords": [
+    "graphql",
+    "postgres",
+    "declarative",
+    "permissions",
+    "durable-execution",
+    "mcp",
+    "rest"
+  ],
+  "skills": "./skills/",
+  "hooks": {},
+  "interface": {
+    "displayName": "donat",
+    "shortDescription": "Build declarative applications on the donat engine",
+    "longDescription": "Patterns for declaring an application on donat: SQL migrations for what binds every writer, YAML metadata for per-role permissions, validators, rules, transactional commands, durable processes and connector contracts, plus the GraphQL, REST and MCP surfaces generated from them.",
+    "developerName": "donat",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Scaffold a new donat application.",
+      "Add a table with per-role permissions to this donat app.",
+      "Review this metadata directory for permission holes."
+    ],
+    "websiteURL": "https://github.com/donatlabs/donat"
+  }
+}
