@@ -20,6 +20,28 @@ use crate::processes::{
     compile_process_source_catalog,
 };
 
+/// The credentials `serve` will resolve at boot, checked here instead.
+///
+/// `validate` is the documented gate between `migrate` and serving, so a
+/// deployment that passes it expects to start. Without this it could pass on
+/// metadata that is perfectly consistent with the database and still fail
+/// seconds later on an environment variable nobody set — the single most
+/// common deploy mistake, found in the one place least able to report it well.
+///
+/// Only the registries that *resolve* secrets are built. Neither reaches the
+/// network: this answers "is the deployment configured", not "is the provider
+/// up", which is not a question a deploy-time gate should block on.
+fn missing_deployment_secrets(metadata: &Metadata) -> Vec<String> {
+    let mut problems = Vec::new();
+    if let Err(error) = ConnectorRegistry::build(metadata) {
+        problems.push(format!("connector configuration: {error}"));
+    }
+    if let Err(error) = donat_storage::StorageRegistry::build(metadata) {
+        problems.push(format!("storage configuration: {error}"));
+    }
+    problems
+}
+
 pub struct SourceProcessDeployment {
     pub source_catalog: donat_catalog::Catalog,
     pub processes: CompiledSourceProcessCatalog,
@@ -58,7 +80,7 @@ pub async fn compile_source_process_deployment(
     let rules = crate::state::compile_rule_catalog(&metadata)
         .map_err(|error| anyhow::anyhow!("{}: {}", error.path, error.message))?;
     let connectors = ConnectorRegistry::build(&selected_metadata)?;
-    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+    let (client, connection) = tokio_postgres::connect(database_url, crate::pgtls::connector())
         .await
         .context("connecting to selected source for Process deployment")?;
     let connection = tokio::spawn(connection);
@@ -93,6 +115,7 @@ async fn check_consistency_inner(
         .into_iter()
         .map(|error| error.to_string())
         .collect::<Vec<_>>();
+    problems.extend(missing_deployment_secrets(&validation_metadata));
     if !problems.is_empty() {
         return Ok(problems);
     }
@@ -105,7 +128,7 @@ async fn check_consistency_inner(
         }
     };
 
-    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+    let (client, connection) = tokio_postgres::connect(database_url, crate::pgtls::connector())
         .await
         .context("connecting to database for validate")?;
     let connection = tokio::spawn(connection);

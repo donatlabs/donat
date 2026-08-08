@@ -227,6 +227,36 @@ the functions you write for logic no declaration can express.
 3. Start the engine behind your normal TLS, auth, rate-limit and observability
    edge.
 
+It connects to a managed database the way anything else does: `sslmode` in the
+connection URL, `verify-full` included, with a private CA named in
+`DONAT_PG_SSL_ROOT_CERT`. And it stops the way an orchestrator expects — on
+`SIGTERM` it reports itself **not ready** while still serving, so your balancer
+can take it out of rotation, and only then drains the requests in flight and
+lets each background worker finish the item it holds.
+
+Point your readiness probe at `/readyz` and your liveness probe at `/healthz`.
+Neither touches the database on purpose: a liveness probe that fails on an
+unreachable database asks for a restart that cannot help, and a readiness probe
+that follows a blip empties every replica at once.
+
+| Knob | Default | What it bounds |
+|---|---|---|
+| `pool_settings.statement_timeout` (per source) | 30s | Any single statement. `0` removes it; `DONAT_PG_STATEMENT_TIMEOUT_SECONDS` sets the default. |
+| `pool_settings.verify_connections` (per source) | `true` | Proves a pooled connection alive before handing it out — one round trip, and no failed query when a proxy reaps an idle socket. |
+| `DONAT_REQUEST_TIMEOUT_SECONDS` | 60 | Every request-response surface. Websocket subscriptions are exempt. `0` removes it. |
+| `DONAT_UPSTREAM_MAX_BODY_BYTES` | 16 MiB | How much an action handler or remote schema may return. Session and key-set responses are fixed at 1 MiB. |
+| `DONAT_SHUTDOWN_READINESS_DELAY_SECONDS` | 5 | How long the replica keeps serving after reporting not ready. `0` stops accepting immediately. |
+| `DONAT_SHUTDOWN_GRACE_SECONDS` | 25 | How long draining may take before the process exits anyway. |
+| `DONAT_PG_SSL_ROOT_CERT` | host trust store | The certificates a Postgres TLS connection will accept. |
+| `DONAT_LOG_FORMAT` | human | `json` emits structured logs, with the request span — and your own `x-request-id` — as fields. |
+
+Nothing here needs an admin surface. A stuck instance is read with
+`donat process inspect --source <name> --instance <uuid>`, and
+`donat process verify-history` checks that its recorded history still agrees
+with itself. Both are read-only, and there is deliberately no CLI that cancels,
+retries or replays: recovery is an explicit declared command, called the way
+any other caller calls one.
+
 Webhook handlers should be idempotent: event and cron delivery is at least
 once. So is a Process activity — which is why an idempotency key is part of
 the declaration rather than an afterthought.

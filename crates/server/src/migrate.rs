@@ -43,7 +43,7 @@ pub async fn run_migrate(database_url: &str, dir: &Path) -> Result<()> {
         tracing::warn!(dir = %dir.display(), "no .sql migrations found");
         return Ok(());
     }
-    let (mut client, conn) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+    let (mut client, conn) = tokio_postgres::connect(database_url, crate::pgtls::connector())
         .await
         .context("connecting to database for migrate")?;
     let conn = tokio::spawn(conn);

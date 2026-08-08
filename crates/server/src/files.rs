@@ -327,14 +327,18 @@ async fn finalize_upload(
 // ---------------------------------------------------------------------------
 
 /// Start the collector, or nothing when no table declares an attachment.
-pub fn spawn(state: SharedState) {
+pub fn spawn(
+    state: SharedState,
+    shutdown: tokio_util::sync::CancellationToken,
+    tasks: &tokio_util::task::TaskTracker,
+) {
     if state.storage.is_empty() {
         return;
     }
-    tokio::spawn(async move { run(state).await });
+    tasks.spawn(async move { run(state, shutdown).await });
 }
 
-async fn run(state: SharedState) {
+async fn run(state: SharedState, shutdown: tokio_util::sync::CancellationToken) {
     // Days by declaration, seconds by environment: the interval is a
     // deployment's policy, but a test needs to watch one pass finish.
     let interval = match std::env::var("DONAT_FILES_GC_INTERVAL_SECONDS")
@@ -352,9 +356,18 @@ async fn run(state: SharedState) {
         if let Err(error) = collect(&state).await {
             tracing::warn!(error = %error, "file collection failed");
         }
-        tokio::time::sleep(interval).await;
+        // An object the pass did not reach stays claimed by its row, so the
+        // next start collects it. Nothing is lost by stopping here.
+        if !crate::shutdown::idle(interval, &shutdown).await {
+            tracing::info!("file collector stopped");
+            return;
+        }
     }
 }
+
+/// How many candidates one query considers. Also the signal that there may be
+/// more behind it: a short batch is the end of the queue.
+const COLLECT_BATCH: usize = 500;
 
 /// One collection pass. Returns how many objects it reclaimed.
 pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
@@ -369,38 +382,23 @@ pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
     //    the extra grace on top of it.
     //
     //    Batched, but drained: a pass that stopped after one batch would delete
-    //    at most 500 objects per interval, which a caller can out-create by
-    //    orders of magnitude. SKIP LOCKED keeps two engine replicas from
-    //    fighting over the same rows.
+    //    at most `COLLECT_BATCH` objects per interval, which a caller can
+    //    out-create by orders of magnitude. Candidates are only listed here —
+    //    each one is claimed inside `reclaim`, which is what keeps two engine
+    //    replicas off the same row.
     loop {
-        // `FOR UPDATE SKIP LOCKED` holds its locks only for the life of a
-        // transaction. Outside one they are released as the statement ends, so
-        // two replicas would select the same rows and delete the same objects
-        // — the fight this clause is here to prevent.
-        let tx = client.transaction().await?;
-        let pending = tx
+        let pending = client
             .query(
-                "SELECT id, backend, object_key FROM donat.file_uploads \
+                "SELECT id FROM donat.file_uploads \
                  WHERE state = 'pending' AND expires_at < now() - ($1 || ' days')::interval \
-                 ORDER BY expires_at LIMIT 500 FOR UPDATE SKIP LOCKED",
-                &[&gc.pending_ttl_days.to_string()],
+                 ORDER BY expires_at LIMIT $2",
+                &[&gc.pending_ttl_days.to_string(), &(COLLECT_BATCH as i64)],
             )
             .await?;
-        if pending.is_empty() {
-            break;
-        }
         let batch = pending.len();
-        let mut removed = 0;
-        for row in pending {
-            removed += reclaim_in(state, &tx, row).await? as usize;
-        }
-        tx.commit().await?;
-        reclaimed += removed;
-        // A storage outage leaves every row in place by design, so the next
-        // query returns the same batch. Without this the pass would spin on it
-        // until the interval came round again, hammering a store that is
-        // already failing. Stopping leaves the retry to the next pass.
-        if batch < 500 || removed == 0 {
+        let progressed = reclaim_all(state, &mut client, pending).await?;
+        reclaimed += progressed;
+        if !drain_continues(batch, progressed) {
             break;
         }
     }
@@ -410,33 +408,30 @@ pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
     //    rather than a scan of the whole database.
     for attachment in state.storage.attachments() {
         let sql = format!(
-            "SELECT f.id, f.backend, f.object_key FROM donat.file_uploads f \
+            "SELECT f.id FROM donat.file_uploads f \
              WHERE f.attachment = $1 AND f.state = 'claimed' \
                AND f.claimed_at < now() - ($2 || ' days')::interval \
                AND NOT EXISTS (SELECT 1 FROM {schema}.{table} t WHERE t.{column} = f.id) \
-             ORDER BY f.claimed_at LIMIT 500 FOR UPDATE SKIP LOCKED",
+             ORDER BY f.claimed_at LIMIT $3",
             schema = quote_ident(&attachment.schema),
             table = quote_ident(&attachment.table),
             column = quote_ident(&attachment.column),
         );
         loop {
-            let tx = client.transaction().await?;
-            let orphans = tx
-                .query(&sql, &[&attachment.key, &gc.orphan_grace_days.to_string()])
+            let orphans = client
+                .query(
+                    &sql,
+                    &[
+                        &attachment.key,
+                        &gc.orphan_grace_days.to_string(),
+                        &(COLLECT_BATCH as i64),
+                    ],
+                )
                 .await?;
-            if orphans.is_empty() {
-                break;
-            }
             let batch = orphans.len();
-            let mut removed = 0;
-            for row in orphans {
-                removed += reclaim_in(state, &tx, row).await? as usize;
-            }
-            tx.commit().await?;
-            reclaimed += removed;
-            // As above: no progress on a full batch means storage is refusing,
-            // and retrying it in a tight loop helps nobody.
-            if batch < 500 || removed == 0 {
+            let progressed = reclaim_all(state, &mut client, orphans).await?;
+            reclaimed += progressed;
+            if !drain_continues(batch, progressed) {
                 break;
             }
         }
@@ -444,17 +439,61 @@ pub async fn collect(state: &SharedState) -> anyhow::Result<usize> {
     Ok(reclaimed)
 }
 
+/// Whether the drain should ask for another batch.
+///
+/// A short batch is the end of the queue. A full batch that reclaimed nothing
+/// means every candidate is either held by another replica or currently
+/// unreclaimable — an unreachable object store, most likely. Asking again
+/// would re-read the same rows forever, holding a pooled connection and
+/// retrying each object on its own 20-second timeout; the next scheduled pass
+/// is the right place to try again.
+fn drain_continues(batch: usize, reclaimed: usize) -> bool {
+    batch >= COLLECT_BATCH && reclaimed > 0
+}
+
+/// Reclaim each candidate, counting the ones that were actually collected.
+async fn reclaim_all(
+    state: &SharedState,
+    client: &mut deadpool_postgres::Client,
+    candidates: Vec<tokio_postgres::Row>,
+) -> anyhow::Result<usize> {
+    let mut reclaimed = 0;
+    for row in candidates {
+        let id: Uuid = row.get("id");
+        reclaimed += reclaim(state, client, id).await? as usize;
+    }
+    Ok(reclaimed)
+}
+
 /// Delete one object, then its row.
 ///
-/// The order is deliberate: a storage failure leaves the row in place, so the
-/// next pass retries instead of forgetting an object nobody can reach any more.
-/// A missing object counts as deleted — that is the state the row was claiming.
-async fn reclaim_in(
+/// The row is claimed for the whole sequence with `FOR UPDATE SKIP LOCKED`, so
+/// a second replica collecting at the same moment skips it rather than
+/// deleting the same object twice. The claim has to be a transaction: outside
+/// one, every statement commits on its own and the lock is gone before the
+/// object is.
+///
+/// The order inside it is deliberate: a storage failure leaves the row in
+/// place, so the next pass retries instead of forgetting an object nobody can
+/// reach any more. A missing object counts as deleted — that is the state the
+/// row was claiming.
+async fn reclaim(
     state: &SharedState,
-    client: &deadpool_postgres::Transaction<'_>,
-    row: tokio_postgres::Row,
+    client: &mut deadpool_postgres::Client,
+    id: Uuid,
 ) -> anyhow::Result<bool> {
-    let id: Uuid = row.get("id");
+    let transaction = client.transaction().await?;
+    let Some(row) = transaction
+        .query_opt(
+            "SELECT backend, object_key FROM donat.file_uploads \
+             WHERE id = $1 FOR UPDATE SKIP LOCKED",
+            &[&id],
+        )
+        .await?
+    else {
+        // Another replica holds it, or it is already gone.
+        return Ok(false);
+    };
     let backend: String = row.get("backend");
     let object_key: String = row.get("object_key");
 
@@ -487,14 +526,42 @@ async fn reclaim_in(
         }
     };
     if !removed {
+        // Releases the claim; the row stays for the next pass.
+        transaction.rollback().await?;
         return Ok(false);
     }
-    client
+    transaction
         .execute("DELETE FROM donat.file_uploads WHERE id = $1", &[&id])
         .await?;
+    transaction.commit().await?;
     Ok(true)
 }
 
 fn quote_ident(ident: &str) -> String {
     donat_sqlgen::quote_ident(ident)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COLLECT_BATCH, drain_continues};
+
+    /// The drain keeps going while there is more to collect, and stops when
+    /// there is not — including the case that used to spin forever: a full
+    /// batch that reclaims nothing because the object store is unreachable.
+    #[test]
+    fn a_drain_that_cannot_progress_stops() {
+        // More behind this batch, and progress being made: ask again.
+        assert!(drain_continues(COLLECT_BATCH, COLLECT_BATCH));
+        assert!(drain_continues(COLLECT_BATCH, 1));
+
+        // A short batch is the end of the queue.
+        assert!(!drain_continues(COLLECT_BATCH - 1, COLLECT_BATCH - 1));
+        assert!(!drain_continues(0, 0));
+
+        // A full batch that collected nothing: every candidate is held by
+        // another replica or currently unreclaimable. Asking again would
+        // re-read the same rows until the object store comes back, one
+        // 20-second timeout at a time, holding a pooled connection throughout.
+        assert!(!drain_continues(COLLECT_BATCH, 0));
+    }
 }

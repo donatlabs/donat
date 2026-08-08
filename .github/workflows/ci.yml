@@ -10,6 +10,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Cheap, no services, and the first thing to go red on a mechanical mistake.
+  # The toolchain is pinned in rust-toolchain.toml, so what counts as formatted
+  # and what clippy warns about are properties of the repository rather than of
+  # whichever stable happened to be current on the runner.
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - name: Formatting
+        run: cargo fmt --all --check
+      # --all-targets covers tests and benches: a lint that only fires in test
+      # code is still a lint, and those files are read as often as any other.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   test:
     name: Workspace tests
     runs-on: ubuntu-latest
@@ -419,7 +441,7 @@ jobs:
 
   artifacts:
     name: Build artifact (${{ matrix.target.name }})
-    needs: [test, backend-core-gate, mixed-backend-conformance, petshop-system]
+    needs: [lint, test, backend-core-gate, mixed-backend-conformance, petshop-system]
     strategy:
       matrix:
         target:

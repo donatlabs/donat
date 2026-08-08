@@ -295,7 +295,8 @@ impl Dialect for SqliteDialect {
 
     fn json_object(&self, pairs: &[(String, String)]) -> String {
         // json1's json_object('k', v, …): keys quoted, values inlined.
-        let chunked = pairs.len() > SQLITE_JSON_OBJECT_PAIRS && Self::keys_are_path_expressible(pairs);
+        let chunked =
+            pairs.len() > SQLITE_JSON_OBJECT_PAIRS && Self::keys_are_path_expressible(pairs);
         let split = if chunked {
             pairs.len().min(SQLITE_JSON_OBJECT_PAIRS)
         } else {
@@ -995,7 +996,9 @@ mod tests {
         );
         for (key, value) in pairs.iter() {
             assert!(
-                sql.contains(&format!("'\"{key}\":' || coalesce(to_json({value})::text, 'null')")),
+                sql.contains(&format!(
+                    "'\"{key}\":' || coalesce(to_json({value})::text, 'null')"
+                )),
                 "the wide form must carry {key} with its value: {sql}"
             );
         }
@@ -1010,7 +1013,11 @@ mod tests {
             .map(|i| {
                 (
                     format!("f{i}"),
-                    if i == 3 { "NULL".to_owned() } else { format!("_t0.c{i}") },
+                    if i == 3 {
+                        "NULL".to_owned()
+                    } else {
+                        format!("_t0.c{i}")
+                    },
                 )
             })
             .collect();
@@ -1039,7 +1046,8 @@ mod tests {
         // Narrow objects keep the call every existing snapshot was written
         // against, and the hot path with it.
         assert!(
-            d.json_object(&pairs[..50]).starts_with("json_build_object("),
+            d.json_object(&pairs[..50])
+                .starts_with("json_build_object("),
             "fifty pairs still fit one call"
         );
     }

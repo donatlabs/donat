@@ -50,8 +50,9 @@ Grep pattern="<concept>" path="crates" output_mode="files_with_matches"
 # Transport/auth: crates/server/src/
 ```
 
-**Check current status:** `tests/donat/COVERAGE.md` (live), `PLAN.md`
-(milestone context), `knowledgebase/` (design notes + ADRs).
+**Check current status:** `crates/conformance/tests/` and its fixtures (the
+executable contract), `PLAN.md` (milestone context), `knowledgebase/` (design
+notes + ADRs).
 
 Output: research summary with file paths, fixture paths, and the suite
 selectors that will prove the feature.

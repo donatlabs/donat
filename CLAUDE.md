@@ -35,6 +35,9 @@ conformance harness (`crates/conformance`).
 | Validate metadata vs DB | `donat validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
 | Conformance suite | `make conformance` (or `cargo test -p donat-conformance [--test <module>]`) |
 | Review snapshot changes | `cargo insta review` |
+| Format and lint gates (CI blocks on both) | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
+| Inspect one Process instance | `donat process inspect --source <name> --instance <uuid>` (read-only) |
+| Check one instance's history | `donat process verify-history --source <name> --instance <uuid>` (read-only, non-zero exit on inconsistency) |
 
 The conformance harness needs Postgres (`postgis/postgis:16-3.4`) at
 `PG_URL` (default `postgresql://postgres:postgres@127.0.0.1:15432/postgres`).
@@ -116,6 +119,15 @@ fresh verification before completion.
 - **Every change needs tests**: unit/insta in the touched crate AND the
   conformance crate green (`make conformance`) after rebuilding the engine
   binary.
+- **The toolchain is pinned** in `rust-toolchain.toml`, because `cargo fmt
+  --check` and `clippy -D warnings` are CI gates and both change meaning
+  between releases. Bumping it is a deliberate commit that carries whatever
+  reformatting the new toolchain wants.
+- **A background loop must be drainable.** Wait with
+  `donat_server::shutdown::idle`, never a bare `tokio::time::sleep`: a loop
+  that cannot observe the shutdown token cannot be drained on `SIGTERM`, which
+  is what a rolling deployment needs (see
+  `knowledgebase/operations/decisions/001-*`).
 
 ## Agents
 

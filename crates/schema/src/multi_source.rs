@@ -236,7 +236,8 @@ impl CompiledMultiSourceSchema {
         let unknown_role = denied_role_name(&roles);
         let backend_variants_differ = backend_variants_can_differ(metadata);
         let standard = compose_role_schemas(&children, &roles, backend_variants_differ)?;
-        let unknown_standard = compose_role_schema(&children, &unknown_role, backend_variants_differ)?;
+        let unknown_standard =
+            compose_role_schema(&children, &unknown_role, backend_variants_differ)?;
 
         // Relay decides how a query is planned, never how a schema is
         // rendered — the schema builder does not read the flag. So the Relay
