@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "donat",
+  "description": "Skills and patterns for building applications on the donat engine",
+  "owner": {
+    "name": "donat",
+    "url": "https://github.com/donatlabs/donat"
+  },
+  "plugins": [
+    {
+      "name": "donat",
+      "description": "How to build an application on donat: migrations, tracked tables, per-role permissions, validators, rules, commands, durable processes, connectors, and the REST/MCP surfaces generated from them.",
+      "version": "0.1.0",
+      "source": "./plugins/donat",
+      "author": { "name": "donat" },
+      "homepage": "https://github.com/donatlabs/donat",
+      "license": "Apache-2.0",
+      "category": "development",
+      "keywords": ["graphql", "postgres", "declarative", "permissions", "durable-execution", "mcp"]
+    }
+  ]
+}
