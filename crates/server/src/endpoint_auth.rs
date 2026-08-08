@@ -203,7 +203,7 @@ fn candidate_digests(
 fn decode(token: &str, encoding: SignatureEncoding) -> Option<Vec<u8>> {
     match encoding {
         SignatureEncoding::Hex => {
-            if token.len() % 2 != 0 || token.is_empty() {
+            if token.is_empty() || !token.len().is_multiple_of(2) {
                 return None;
             }
             (0..token.len())
@@ -221,7 +221,7 @@ fn signed_payload(template: &str, request: &SignedRequest<'_>, timestamp: Option
     let mut out = Vec::with_capacity(template.len() + request.body.len());
     let mut rest = template;
     while let Some(open) = rest.find('{') {
-        out.extend_from_slice(rest[..open].as_bytes());
+        out.extend_from_slice(&rest.as_bytes()[..open]);
         let Some(close) = rest[open..].find('}').map(|i| open + i) else {
             break;
         };
