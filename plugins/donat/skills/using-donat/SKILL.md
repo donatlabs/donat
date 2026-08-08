@@ -78,6 +78,30 @@ Examples:
 - "The cart limit should be 20" → mode, then `donat-validators` — and check the
   layer, because the wrong layer here binds every writer.
 
+## Talk in their language; write the repository in English
+
+These are different things, and collapsing them is a mistake that is expensive
+to undo.
+
+**Talk** to your partner in whatever language they use. Questions, the domain
+brief, the progress report, the error message their customer will read — all
+theirs.
+
+**Write** everything that lands in the repository in English: migration
+comments, metadata comments, YAML column descriptions, compose files, scripts,
+commit messages, documentation. Not because English is better, but because a
+repository is read by people who were not in the conversation — a contractor
+next year, an auditor, whoever inherits it — and a codebase commented in the
+language of whoever happened to be in the room is a repository with a hidden
+prerequisite.
+
+The one deliberate exception is **text an end user will see**: a validator's
+message, a label on a screen. That is product copy in the product's language,
+and it is the partner's to write.
+
+So a validator entry commonly has an English comment above a non-English
+message, and that is correct rather than inconsistent.
+
 ## The one thing you must never do
 
 **Do not propose, add, or work around an admin role.** donat has none. Not
@@ -108,6 +132,7 @@ These thoughts mean stop — you are rationalising:
 | "This needs a webhook receiver" | Check first: in-process handlers cover most of it. `donat-automation`. |
 | "I'll stand up a small service for this" | Tier 2 is a registered function, not a service. `declaring-not-coding`. |
 | "They asked for a screen, so I'll build a page" | A screen is a resource config on the platform. `donat-platform-ui`. |
+| "We're speaking Russian, so I'll comment in Russian" | Talk in their language, write the repository in English. Only end-user copy follows the product. |
 | "I'll hide that field in the UI" | Hiding is UX. If the role can read it, it is readable. |
 | "I'll add an admin role just for now" | There is no admin role. Ever. Convert the request. |
 | "Permissions can be enforced in the client" | The API is the boundary. There is no other one. |

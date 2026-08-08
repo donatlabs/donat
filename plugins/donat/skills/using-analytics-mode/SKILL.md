@@ -220,6 +220,12 @@ sentence and offer the alternative.
 
 Never condescend. They are not confused; they simply do not work in this file.
 
+**Speaking their language does not extend to the repository.** Talk to them in
+whatever language they use; write migrations, metadata, comments, scripts and
+commit messages in English. The one exception is copy their own users will
+read — a validator's message, a label on a screen — which follows the product.
+See `using-donat`.
+
 ## Brevity
 
 - **Lead with the answer.** No preamble, no restating their question.

@@ -77,19 +77,20 @@ homework with no instructions. Each item needs what it is, where to click,
 what it looks like when they find it, and how to send it. Anything secret is
 never sent at all: they paste it themselves, into a place you point at.
 
-> Чтобы перейти на живые платежи, понадобится три вещи. До них стенд работает
-> на тестовых ключах, и всё остальное я делаю дальше.
+> Three things before we can take real money. None of them blocks anything
+> today — the stand runs on test keys and I'm carrying on with the rest.
 >
-> **Идентификаторы тарифов в Stripe.** Stripe → раздел с товарами → откройте
-> тариф → у цены есть строка вида `price_1QxYz…`. Нужны три, и рядом какая
-> какому тарифу. Присылайте сообщением, это не секрет — а вот всё, что
-> начинается на `sk_` или `whsec_`, мне присылать не надо вообще.
+> **The plan identifiers at your payment provider.** In their dashboard, under
+> products: open a plan, and the price inside it has its own identifier. I need
+> three, and which plan each one is. Message them over — they aren't secret.
+> Anything marked *secret* on their side, don't send at all.
 >
-> **Auth0.** Applications → ваше приложение → Domain (`dev-…​.eu.auth0.com`) и
-> Client ID. Client Secret не присылайте, вы вставите его сами, я покажу куда.
+> **Your identity provider account.** The application settings there show a
+> domain and a client id — both fine to send. The client secret is not: you'll
+> paste that in yourself and I'll show you where.
 >
-> **Счёт для выплат** настраивается внутри Stripe, мне ничего слать не нужно —
-> просто скажите, когда заполните.
+> **The payout account** is set up inside their dashboard; nothing to send me.
+> Just tell me when it's filled in.
 
 Worked versions of each, plus what to do when a secret arrives in the chat
 anyway, are in `using-analytics-mode`'s `references/asking-for-things.md`.
