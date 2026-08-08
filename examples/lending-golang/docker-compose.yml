@@ -5,11 +5,12 @@ version: "3.9"
 #
 #   docker compose up
 #
-# Two one-shot migrate services rather than one, because this example carries
-# no copy of the platform's DDL. `migrate-platform` applies the engine's own
-# migrations from its image; `migrate-domain` applies the four tables in this
-# directory. The Go app never runs DDL — it serves GraphQL and fires the
-# in-process event hooks.
+# Two one-shot migrate services rather than one, because this example declares
+# commands and a durable Process: the engine's own journals have to be applied
+# explicitly. `migrate-platform` applies the repository's top-level
+# `migrations/` — mounted from the checkout, since the image carries only the
+# binary — and `migrate-domain` applies the four tables in this directory. The
+# Go app never runs DDL: it serves GraphQL and fires the in-process event hooks.
 
 services:
   db:
@@ -30,8 +31,8 @@ services:
       timeout: 3s
       retries: 20
 
-  # The platform's own deploy-time catalog, applied from the engine image so
-  # there is exactly one copy of it and it cannot drift.
+  # The platform's own deploy-time catalog. Mounted from the repository rather
+  # than copied here, so there is exactly one copy of it and it cannot drift.
   migrate-platform:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
     command: ["migrate", "--migrations-dir", "/migrations"]
@@ -40,6 +41,8 @@ services:
         condition: service_healthy
     environment:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
+    volumes:
+      - ../../migrations:/migrations:ro
     restart: "no"
 
   # This library's four tables.
