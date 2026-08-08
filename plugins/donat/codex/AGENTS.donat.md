@@ -101,7 +101,7 @@ Detailed patterns live in `~/.codex/donat/skills/*/SKILL.md` (installed by
 | login, users, SSO, mapping token claims to roles | `donat-authentication` |
 | schedules, row-change hooks, inbound webhooks, actions | `donat-automation` |
 | the engine embedded in a Go program; in-process functions | `donat-embedded-go` |
-| an admin panel as resource configs, not components | `donat-admin-ui` |
+| the platform's screens as resource configs, not components | `donat-platform-ui` |
 | layer model, directory layout, deploy pipeline | `donat-app-architecture` |
 | migrations, naming, what the database owns | `donat-schema-and-migrations` |
 | tracking, relationships, filter vs check, `_exists` | `donat-tables-and-permissions` |

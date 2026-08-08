@@ -67,7 +67,7 @@ Mode first, then architecture, then the domain skill.
    `donat-rules`, `donat-commands`, `donat-processes`, `donat-connectors`,
    `donat-schema-and-migrations`, `donat-api-surfaces`,
    `donat-file-attachments`, `donat-authentication`, `donat-automation`,
-   `donat-admin-ui`, `donat-embedded-go`, `donat-deploy-and-verify`.
+   `donat-embedded-go`, `donat-platform-ui`, `donat-deploy-and-verify`.
 
 Examples:
 
@@ -107,7 +107,7 @@ These thoughts mean stop — you are rationalising:
 | "A trigger is the quickest way" | A rule in a trigger has left the permission model. |
 | "This needs a webhook receiver" | Check first: in-process handlers cover most of it. `donat-automation`. |
 | "I'll stand up a small service for this" | Tier 2 is a registered function, not a service. `declaring-not-coding`. |
-| "They asked for a screen, so I'll build a page" | A screen is a resource config. `donat-admin-ui`. |
+| "They asked for a screen, so I'll build a page" | A screen is a resource config on the platform. `donat-platform-ui`. |
 | "I'll hide that field in the UI" | Hiding is UX. If the role can read it, it is readable. |
 | "I'll add an admin role just for now" | There is no admin role. Ever. Convert the request. |
 | "Permissions can be enforced in the client" | The API is the boundary. There is no other one. |

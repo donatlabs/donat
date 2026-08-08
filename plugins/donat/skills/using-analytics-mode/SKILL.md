@@ -42,7 +42,7 @@ changes your own default.
 
 | Never ask | Say instead |
 |---|---|
-| "Do you want an admin screen, or will you build it yourself?" | "You'll get a working back office out of this — same description, no extra design work." |
+| "Do you want an admin screen, or will you build it yourself?" | "You'll get a working platform out of this — same description, no extra design work." |
 | "Which identity provider should we use?" | "Logging in comes from a service built for it — I'd use Auth0 unless you have a reason to host it yourself." |
 | "Should we store card numbers ourselves?" | Nothing. The provider holds them. This is not a topic. |
 | "Do you want the file uploads to go through a storage service?" | Nothing. |
@@ -52,10 +52,15 @@ changes your own default.
 
 Standing defaults, applied unless something overrides them:
 
-- **An admin panel always.** Nobody runs a business without somewhere to look
-  things up. It comes from the same declarations, so it is not extra work and
-  not a separate decision. Ask *who uses it and what they need at a glance* —
-  never whether they want one.
+- **A platform always.** Nobody runs a business without somewhere to do the
+  work and look things up. It comes from the same declarations, so it is not
+  extra work and not a separate decision. Ask *who uses it and what they need
+  at a glance* — never whether they want one.
+
+  Call it **the platform**, never "the admin panel". Everything people do —
+  a client managing their own subscription, an operator reviewing every
+  client — is an action within one platform, told apart by role. And "admin"
+  already means something else here, something that does not exist.
 - **Login is a provider.** Auth0 by default. Never a users table with a
   password column. The two things genuinely worth asking: does something
   already handle their logins, and does anyone sign in with a company account
@@ -233,10 +238,12 @@ Never condescend. They are not confused; they simply do not work in this file.
 | Hidden failure | A problem softened into "some limitations" instead of named |
 | Interview by paragraph | Six questions at once; they answer two |
 
-## The admin question
+## The "someone who sees everything" question
 
-They will ask for an admin who can see everything. Almost everyone does, and it
-is a reasonable thing to want. Do not lecture, and do not comply.
+They will ask for an account that sees everything — often calling it an admin.
+Almost everyone does, and it is a reasonable thing to want. Do not lecture, and
+do not comply. Note that this is a different subject from the platform: the
+platform is where everyone works, and it has no privileged door.
 
 > There's deliberately no "sees everything" account here — the system can't
 > express one, which is what stops a leaked key from being a total breach. So

@@ -1,16 +1,33 @@
 ---
-name: donat-admin-ui
-description: Use when someone asks for an admin panel, back office or internal UI over a donat application. Build it as TypeScript resource configs, not components - the config is derived from the metadata you already wrote.
+name: donat-platform-ui
+description: Use when someone needs screens over a donat application - the platform its users and operators work in. Build it as TypeScript resource configs, not components; the config is derived from the metadata you already wrote.
 ---
 
-# The admin UI is a config, not a codebase
+# The platform is a config, not a codebase
 
 A frontend request is not an exception to `declaring-not-coding`. The same
-discipline extends past the API boundary: an admin panel is a set of
-**resource definitions in TypeScript**, and the pages, routes, navigation,
-tables, forms and filters are generated from them.
+discipline extends past the API boundary: the platform is a set of **resource
+definitions in TypeScript**, and the pages, routes, navigation, tables, forms
+and filters are generated from them.
 
 You do not write a list page. You declare a resource that has a list.
+
+## Call it the platform
+
+Not "the admin panel", not "the back office". What you are building is the
+place the business runs — a client manages their own subscription there, an
+operator looks at every client, someone in finance reconciles. Those are all
+*actions within the platform*, told apart by role, not by which tool they open.
+
+Two reasons this wording is load-bearing, not decoration:
+
+- **"Admin panel" sounds like a side tool** bolted on for internal use, and it
+  invites a design where the real product is elsewhere and this thing gets a
+  privileged shortcut. It does not get one.
+- **"Admin" is already taken, and means the opposite.** There is no admin role
+  in donat. A reader who hears "admin panel" and "no admin role" in the same
+  session has to work out that these are unrelated. Say *platform*, and the
+  collision disappears.
 
 ## The shape
 
@@ -46,7 +63,7 @@ export const venueResource = defineResource('venue', {
 ```ts
 // refinest-app.ts
 const definition = defineAppDefinition(
-  { name: 'my-admin', plugins: [fieldTypesPlugin(), fileStoragePlugin({ /* … */ })] },
+  { name: 'my-platform', plugins: [fieldTypesPlugin(), fileStoragePlugin({ /* … */ })] },
   (setup) => {
     setup.use('app.groups', contentGroup, peopleGroup);
     setup.use('app.01-venue', venueResource);
@@ -63,10 +80,10 @@ every resource.
 ## Derive the config from the metadata you already wrote
 
 This is the part that makes it cheap and keeps the two halves honest. Every
-line of the admin config has a source in the donat metadata — do not invent it
+line of the platform config has a source in the donat metadata — do not invent it
 from the database, and do not invent it from the screen.
 
-| donat metadata | Admin config |
+| donat metadata | Platform config |
 |---|---|
 | tracked table | `defineResource('<table>', …)` |
 | the role's `select` `columns` mask | which fields exist at all |
@@ -81,11 +98,11 @@ from the database, and do not invent it from the screen.
 | a saved query / REST endpoint | not needed; the provider talks GraphQL |
 
 The last row is the important one. **A row filter has no UI counterpart.** The
-admin does not filter by owner; the server does, because the request runs as a
-role. If you find yourself adding a `where` to the config to hide other
+platform does not filter by owner; the server does, because the request runs as
+a role. If you find yourself adding a `where` to the config to hide other
 people's rows, the permission is missing and you are papering over it.
 
-## The admin never re-implements permissions
+## The platform never re-implements permissions
 
 It runs as a declared role and sees exactly what that role sees. Everything
 else follows:
@@ -95,9 +112,10 @@ else follows:
   allows it, and if the API allows it the UI hiding it changes nothing.
 - **If a screen needs data the role cannot read, fix the role** — deliberately,
   with the reason written down — or accept that the screen cannot exist.
-- **Do not add a service account for the admin.** There is no admin role in
-  donat. The back office is one or more ordinary roles: `staff`, `support`,
-  `billing`.
+- **Do not add a service account for the platform.** There is no admin role in
+  donat. The people who run the business are ordinary roles — `operator`,
+  `support`, `billing` — each with an explicit list of what it may read and
+  write. One platform, several roles, no privileged one.
 
 A Hasura-shaped data provider works against donat unchanged: the engine accepts
 `x-hasura-role` and `x-hasura-admin-secret` alongside its own headers
@@ -139,10 +157,15 @@ Hold yourself to those three. If a component fails any of them, escalate
 instead — plain sentence for your partner, forwardable spec for the engineer,
 per `declaring-not-coding`.
 
-## Asking a non-technical partner about the UI
+## Asking a non-technical partner about the platform
 
 The screens follow from what you already asked about permissions. A few extra
 questions, in their language:
+
+> - Когда оператор открывает список площадок, что ему нужно видеть сразу?
+>   Три-четыре колонки, не всё подряд.
+
+(Ask in their language, whatever it is. The four below are the shape.)
 
 > - When someone opens the list of venues, what do they need to see at a
 >   glance? Three or four columns, not everything.
@@ -157,9 +180,9 @@ is the framework's; content is the config's; access is the permission's.
 
 Report back as a screen walkthrough, not a component tree:
 
-> Venues now has its own entry under Content. The list shows name, address and
-> whether it's a check-in point. Opening one gives you the full form; the event
-> it belongs to is filled in automatically and can't be edited by hand.
+> Площадки теперь свой раздел в платформе, под «Содержимым». В списке —
+> название, адрес и отметка, идёт ли там регистрация. Открываешь одну — полная
+> карточка; мероприятие подставляется само и руками не меняется.
 
 ## Checklist
 

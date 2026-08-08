@@ -24,10 +24,10 @@ Three lines. Their words, not yours.
 **What we are building:** a subscription billing system where customers
 subscribe to a plan, are charged monthly, and lose access when payment fails.
 
-**Done means:** a real customer can pick a plan, pay with a card, see their
-subscription and their payments, and an operator can see all of it. Failed
-payment closes access; a repeated charge from the provider does not charge
-twice.
+**Done means:** a real customer can pick a plan, pay with a card, and see their
+subscription and payments in the platform; an operator can see all of it there
+too. Failed payment closes access; a repeated charge from the provider does not
+charge twice.
 
 **Not in this:** refunds, plan trials, invoicing by email, anyone changing
 prices from the app.
@@ -53,12 +53,12 @@ confirmation, and then stop asking about direction.
 better than they do — that is why they are talking to you. Say what you are
 doing and do it:
 
-> Next I'm wiring the payments, then the back office — the admin is thin until
-> there are real subscriptions in it.
+> Next I'm wiring the payments, then the operator's side of the platform — it
+> is thin until there are real subscriptions in it.
 
 Not:
 
-> Shall I do payments first, or the admin? I'd start with payments.
+> Shall I do payments first, or the operator screens? I'd start with payments.
 
 The second sentence of that pair proves the question was unnecessary. If you
 have a recommendation, you have an answer; state it and go.
@@ -82,7 +82,7 @@ on everything that does not depend on it:
 ### Never stop for these
 
 - Which order to do the remaining work in.
-- Anything already covered by a standing default — the admin panel, the
+- Anything already covered by a standing default — the platform, the
   identity provider, read-only first, deadlines on waits, protection against
   double charges. See `using-analytics-mode`.
 - "Shall I continue?"

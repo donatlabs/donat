@@ -51,7 +51,7 @@ model into somewhere nobody reviews.
 | A cron script, a shell job, a "small worker" | A process deadline usually replaces it outright. See `donat-automation`. |
 | A webhook receiver for a provider | The engine verifies and routes provider callbacks itself |
 | A client-side check | The API is the security boundary. There is no other one. |
-| A hand-written admin page or form | A resource config generates it. See `donat-admin-ui`. |
+| A hand-written page or form | A resource config generates it. See `donat-platform-ui`. |
 | A middleware or proxy that filters rows | Same. |
 | A one-off script to fix data | A migration. It is versioned, reviewed and applied once. |
 
@@ -86,7 +86,7 @@ Name the primitive **before** you write anything.
 | "attach a document to it" | a file column plus `storage.yaml` |
 | "show total including tax on the record" | a computed field |
 | "people need to log in" | an identity provider plus a claim mapping — never a users table and a password column |
-| "we need a screen to manage these" | a resource config — see `donat-admin-ui`, not a page component |
+| "we need a screen to manage these" | a resource config on the platform — see `donat-platform-ui`, not a page component |
 
 If a requirement does not land anywhere on this table, that is a signal to
 stop, not a licence to invent.

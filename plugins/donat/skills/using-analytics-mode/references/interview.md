@@ -201,14 +201,19 @@ password column.*
 
 ---
 
-## 11. The back office
+## 11. The platform
 
-Do **not** ask whether they want an admin screen. They do, it comes from the
-same declarations, and asking hands them a decision that was never theirs.
-State it, then ask what it should show:
+Do **not** ask whether they want screens. They do, they come from the same
+declarations, and asking hands them a decision that was never theirs. State it,
+then ask what it should show:
 
-> You'll get a working back office out of this — nothing extra to design. Who
-> uses it, and what do they need to see the moment they open it?
+> Из этого же описания вы получите работающую платформу — отдельно рисовать
+> ничего не придётся. Кто в неё заходит, и что каждому нужно видеть сразу при
+> открытии?
+
+Say *platform*, not *admin panel*: a client managing their own subscription and
+an operator reviewing every client are two roles in one platform, not a product
+plus a side tool.
 
 > Is there anything in there they should be able to look at but never change?
 
