@@ -13,6 +13,7 @@ pub mod commands;
 pub mod connector_webhook;
 pub mod connectors;
 pub mod cron;
+pub mod endpoint_auth;
 pub mod events;
 pub mod files;
 pub mod gql;

@@ -33,9 +33,24 @@ So there is an order of preference, and you go down it, never sideways:
 | A SQL function **declared** as a `computed_fields` entry | The one place a function is a donat primitive rather than a hiding place. |
 | `docker-compose.yml`, env samples | The stand, not the product. |
 | The domain brief and documentation | For your partner to read. |
-| Requests you run to verify | `curl`, GraphQL documents. Checks, not product. |
+| The requests you run to verify | `curl`, GraphQL documents. You must actually run them. |
+| A script that replays those requests | Only where someone will run it — see below. |
 
 Everything else is an escalation. Not a judgement call — an escalation.
+
+**About the verification script.** Encoding the checks in `scripts/verify.sh`
+is allowed and often good: it makes the refusals repeatable, and it is the
+natural home for "this role gets nothing back". Two conditions.
+
+It is never a substitute for having run them. A script that exists but has not
+been run proves nothing, and writing one is a comfortable way to feel finished.
+
+And it needs a reader. In tech mode, your partner runs it — ship it. In
+analytics mode, ask whether it earns its place: a shell script in the
+repository of someone who cannot read shell is one more thing they cannot
+maintain, in a project whose whole promise is that they can read what governs
+their business. Running the checks yourself and reporting scenarios may be the
+better trade. Decide, rather than defaulting.
 
 ## What is code, even when it does not look like it
 

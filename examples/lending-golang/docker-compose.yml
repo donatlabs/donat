@@ -35,14 +35,12 @@ services:
   # than copied here, so there is exactly one copy of it and it cannot drift.
   migrate-platform:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
-    command: ["migrate", "--migrations-dir", "/migrations"]
+    command: ["migrate", "--migrations-dir", "/usr/share/donat/migrations"]
     depends_on:
       db:
         condition: service_healthy
     environment:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@db:5432/lending
-    volumes:
-      - ../../migrations:/migrations:ro
     restart: "no"
 
   # This library's four tables.

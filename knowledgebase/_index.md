@@ -24,6 +24,11 @@ The engine as a process: what bounds a request, how it reaches its database,
 how it drains on `SIGTERM`, and what an operator may inspect without a
 permission bypass. 5 decisions. **Status: in progress (August 2026).**
 
+### [[platform/research-what-a-platform-needs|Platform direction]]
+What separates an engine you deploy from a platform a business is built on,
+written after a week of the engine being used to build one. 1 research note.
+**Status: draft, August 2026.**
+
 ## Cross-cutting
 
 - [[security-audit|Security & dependency audit]] — SQL-gen injection review, ranked findings (internal-microservice threat model), library assessment (2026-06-13)

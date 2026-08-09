@@ -23,9 +23,14 @@ carries an already applied history onto the new versions, joining on the
 migration name, and applies nothing twice. It refuses to guess when a name
 does not identify exactly one migration on both sides.
 
+These files also ship inside the published image, at
+`/usr/share/donat/migrations`, so an application deploying the engine applies
+them without vendoring a copy that could drift from the binary beside it:
+
 ```sh
-donat migrate --migrations-dir migrations   # apply pending DDL
-donat validate --metadata-dir metadata      # check YAML metadata vs DB
+donat migrate --migrations-dir /usr/share/donat/migrations   # the engine's own schema
+donat migrate --migrations-dir migrations                    # the application's
+donat validate --metadata-dir metadata                       # metadata vs DB
 ```
 
 Deploy order: `migrate` (schema) → `validate` (metadata vs schema) →

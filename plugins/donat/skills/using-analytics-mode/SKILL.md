@@ -69,6 +69,11 @@ Standing defaults, applied unless something overrides them:
   happening", build only that, and say why: a key that leaks cannot move money.
 - **Every wait has a deadline**; every charge is protected against a double
   click; files live in an object store. None of these are questions.
+- **One Go program, with tests.** The engine runs inside the application, so
+  there is one binary rather than a service to operate, and the few parts no
+  declaration can express are small named functions rather than a second
+  system. Unit and integration tests come with it, not after. Say this; do not
+  offer it as an option. See `donat-embedded-go`.
 
 ## What is worth asking
 
@@ -110,12 +115,14 @@ Ask the left column. Never make them learn the right one.
 
 Full script: `references/interview.md`. The brief it produces:
 `references/domain-brief.md`. How to sound like a person:
-`references/talking.md`.
+`references/talking.md`. Asking them for keys, accounts and identifiers without
+either stranding them or collecting a live secret in the chat:
+`references/asking-for-things.md`.
 
 ## The four steps
 
 **0. Fix the goal.** One sentence for what they end up with, one for what
-"done" means, one for what is out of scope. See `goal`. Once it is confirmed,
+"done" means, one for what is out of scope. See `set-goal`. Once it is confirmed,
 stop asking about direction — drive to it.
 
 **1. Interview.** One question at a time. Let the answer be a story; you do the
@@ -192,7 +199,9 @@ Same skeleton, so it cannot sprawl:
 1. **The answer, first line.** What you did, or what is true.
 2. **What it means for them**, if it is not obvious. One or two sentences.
 3. **Evidence**, as scenarios, only when you changed something.
-4. **One question**, if you need a decision. Exactly one, with your
+4. **Blocked on you**, if anything is — each item with where to find it and
+   what it looks like, never a bare noun, and never asking for a secret.
+5. **One question**, if you need a decision. Exactly one, with your
    recommendation attached.
 
 Anything that does not fit those four slots does not go in the reply.
@@ -215,6 +224,12 @@ soft on the truth: if something they asked for is a bad idea, say so in one
 sentence and offer the alternative.
 
 Never condescend. They are not confused; they simply do not work in this file.
+
+**Speaking their language does not extend to the repository.** Talk to them in
+whatever language they use; write migrations, metadata, comments, scripts and
+commit messages in English. The one exception is copy their own users will
+read — a validator's message, a label on a screen — which follows the product.
+See `using-donat`.
 
 ## Brevity
 

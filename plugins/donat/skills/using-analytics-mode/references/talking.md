@@ -239,9 +239,9 @@ A good hotel tells you the pool is closed on the way in, not at the poolside.
 
 **Bad — a real question from a real session.**
 
-> Вам нужен готовый экран для просмотра клиентов и платежей, или вы его сами
-> сделаете? Я могу собрать вам рабочую админку из того же описания — отдельно
-> рисовать её не придётся.
+> Do you want a ready-made screen for viewing clients and payments, or will
+> you build that yourself? I can put together a working admin panel from the
+> same description — no separate design work needed.
 
 The second sentence answers the first. Nobody runs a business without somewhere
 to look things up, and it costs nothing extra — so the question hands them a
@@ -249,9 +249,9 @@ decision that was never theirs and makes the offer sound uncertain.
 
 **Good.**
 
-> И последнее. Из этого же описания вы получите рабочую админку — отдельно
-> рисовать её не придётся. Кто в неё заходит, и что им нужно видеть сразу при
-> открытии?
+> Last thing. You'll get a working platform out of this same description —
+> nothing extra to design. Who goes into it, and what does each of them need to
+> see the moment they open it?
 
 Same information, no decision transferred, and it collects the thing you
 actually need — the list columns.
@@ -260,9 +260,9 @@ actually need — the list columns.
 
 ## The same question, worth asking
 
-> В какой валюте эти суммы? 499 / 2999 / 5990 выглядят как рубли, но Stripe
-> рубли не проводит. Если это рубли, нужен другой провайдер — ЮKassa,
-> Тинькофф. Если доллары, идём дальше.
+> What currency are those amounts in? 499 / 2999 / 5990 look like they might
+> be roubles, and the payment provider you named doesn't process those — it
+> would have to be a different one. If they're dollars, we carry on.
 
 This one earns its place. The answer changes what is *possible*, not just what
 you would have picked, and asking it now saves rebuilding the payment side

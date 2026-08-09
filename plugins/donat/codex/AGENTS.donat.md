@@ -47,6 +47,14 @@ writers, the other is bypassed by any other role.
 - `X-Donat-Admin-Secret` is transport authentication — it only permits a
   request to *assert* a role. It is never a permission.
 - Secrets in metadata are always `value_from_env:`, never literals.
+- **Talk in the partner's language; write the repository in English.** Comments,
+  metadata descriptions, scripts, docs and commit messages are English whatever
+  language the conversation is in — a repository is read by people who were not
+  in the room. The one exception is copy an end user will see, such as a
+  validator's message, which follows the product.
+- **Never accept a secret in a message.** Identifiers and public keys can be
+  pasted; anything a provider calls secret, private or signing is pasted by the
+  partner into a place you point at, never sent to you.
 
 ### The loop
 

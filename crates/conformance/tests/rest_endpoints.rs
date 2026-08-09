@@ -21,6 +21,7 @@ fn rest_endpoints() {
         "create_pet_string_id.yaml",
         "method_not_allowed.yaml",
         "unknown_endpoint.yaml",
+        "unknown_endpoint_requires_role.yaml",
     ] {
         s.check_query_f(&format!("{REST}/{f}"), Transport::Http);
     }

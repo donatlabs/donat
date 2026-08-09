@@ -162,11 +162,6 @@ per `declaring-not-coding`.
 The screens follow from what you already asked about permissions. A few extra
 questions, in their language:
 
-> - Когда оператор открывает список площадок, что ему нужно видеть сразу?
->   Три-четыре колонки, не всё подряд.
-
-(Ask in their language, whatever it is. The four below are the shape.)
-
 > - When someone opens the list of venues, what do they need to see at a
 >   glance? Three or four columns, not everything.
 > - What do they search or filter by most?
@@ -180,9 +175,10 @@ is the framework's; content is the config's; access is the permission's.
 
 Report back as a screen walkthrough, not a component tree:
 
-> Площадки теперь свой раздел в платформе, под «Содержимым». В списке —
-> название, адрес и отметка, идёт ли там регистрация. Открываешь одну — полная
-> карточка; мероприятие подставляется само и руками не меняется.
+> Venues now have their own section in the platform, under Content. The list
+> shows the name, the address, and whether check-in happens there. Open one and
+> you get the full form; the event it belongs to is filled in automatically and
+> can't be edited by hand.
 
 ## Checklist
 
