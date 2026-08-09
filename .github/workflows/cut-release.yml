@@ -1,0 +1,126 @@
+name: Cut a release
+
+# Turns "make a release" into one dispatch from the Actions tab. The input is
+# the version; everything else — tagging the head of main, and thereby the
+# image build, the Docker Hub mirror, the Go SDK tag and the post-publish
+# smoke — follows from the tag push the way it already does.
+#
+# A release stays a deliberate human act: this is dispatch-only, and it
+# refuses rather than guesses. What it removes is the by-hand `git tag` whose
+# small mistakes are all ones we have already made once — a tag on the wrong
+# commit, a version that does not match the plugin manifests, a duplicate.
+#
+# The tag is pushed with RELEASE_TOKEN, not GITHUB_TOKEN, and that is not a
+# preference: events caused by GITHUB_TOKEN do not trigger workflows, so a tag
+# it pushed would publish nothing. RELEASE_TOKEN is a fine-grained PAT with
+# contents:read-write on this repository. Absent, this job fails with that
+# explanation instead of half-releasing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v0.5.0 (the leading v is required)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    name: Validate and tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: The token must exist before anything happens
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [[ -z "$RELEASE_TOKEN" ]]; then
+            echo "::error::RELEASE_TOKEN is not configured. A tag pushed with" \
+              "GITHUB_TOKEN triggers no workflows, so the release would tag" \
+              "and publish nothing. Add a fine-grained PAT with contents" \
+              "read/write as the RELEASE_TOKEN secret."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: The version must be well-formed and new
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::'$VERSION' is not vMAJOR.MINOR.PATCH"; exit 1; }
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::$VERSION already exists, on $(git rev-parse --short "$VERSION")"
+            exit 1
+          fi
+          latest=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+          if [[ -n "$latest" ]] && [[ "$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]]; then
+            echo "::error::$VERSION sorts below the latest tag $latest"
+            exit 1
+          fi
+
+      - name: The plugin manifests must agree with it
+        env:
+          VERSION: ${{ inputs.version }}
+        # The three manifests are read by different consumers and drift
+        # independently — bumping one and not the others has already happened.
+        # A release is the moment that drift becomes permanent, so it is the
+        # moment to refuse.
+        run: |
+          bare="${VERSION#v}"
+          fail=0
+          for probe in \
+            "plugins/donat/.claude-plugin/plugin.json:.version" \
+            "plugins/donat/.codex-plugin/plugin.json:.version" \
+            ".claude-plugin/marketplace.json:.plugins[0].version"; do
+            file="${probe%%:*}"; path="${probe#*:}"
+            found=$(jq -r "$path" "$file")
+            if [[ "$found" != "$bare" ]]; then
+              echo "::error file=$file::declares $found, releasing $bare"
+              fail=1
+            fi
+          done
+          if [[ "$fail" == 1 ]]; then
+            echo "::error::Bump the plugin manifests to $bare on main first," \
+              "then dispatch again."
+            exit 1
+          fi
+
+      - name: CI must be green on the commit being tagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          conclusion=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" \
+            --jq '[.check_runs[] | select(.name != "Validate and tag")] |
+                  if length == 0 then "none"
+                  elif all(.conclusion == "success" or .conclusion == "skipped") then "success"
+                  else "failing" end')
+          case "$conclusion" in
+            success) ;;
+            none) echo "::error::no check runs on $sha — has CI run on main?"; exit 1 ;;
+            *) echo "::error::checks on $sha are not green"; exit 1 ;;
+          esac
+
+      - name: Tag and push
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
+          {
+            echo "## Released $VERSION"
+            echo
+            echo "Tagged \`$(git rev-parse --short HEAD)\` on main. The image"
+            echo "build, the Docker Hub mirror, the Go SDK tag and the"
+            echo "post-publish smoke follow from the tag push — watch them in"
+            echo "the Actions tab."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -141,3 +141,84 @@ jobs:
             docker buildx imagetools create \
               -t "${tag/${GHCR_IMAGE}/${DOCKERHUB_IMAGE}}" "$tag"
           done
+
+  # The published artifact, exercised the way a user meets it: `docker compose
+  # up` on an example, against the image the manifest job just pushed —
+  # anonymously, because that is how a user pulls it.
+  #
+  # This job exists because both of its failure modes have already happened.
+  # The ghcr package sat private from its first publish, so every documented
+  # `docker compose up` failed at the pull for anyone outside the repository;
+  # and the REST example could not boot for weeks (`donat.check_violation` is
+  # checked at serve time, and the compose never applied the engine's own
+  # migrations) — masked by exactly that private image. A release that only
+  # builds proves the build; this proves the release.
+  smoke:
+    name: Smoke the published image
+    needs: manifest
+    runs-on: ubuntu-latest
+    # No packages permission on purpose: the pull must succeed with no
+    # credentials at all, or the package visibility has regressed.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the published version tag
+        id: version
+        # The metadata action strips the leading `v`, so the image tag for
+        # `v1.2.3` is `1.2.3`. A manual dispatch has no version tag and
+        # smokes `latest` instead.
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "engine_tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "engine_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: The image must be pullable anonymously
+        run: |
+          docker logout ghcr.io 2>/dev/null || true
+          docker pull "${GHCR_IMAGE}:${ENGINE_TAG}"
+        env:
+          ENGINE_TAG: ${{ steps.version.outputs.engine_tag }}
+
+      - name: The engine's migrations must be inside it
+        run: |
+          count=$(docker run --rm --entrypoint sh "${GHCR_IMAGE}:${ENGINE_TAG}" \
+            -c 'ls /usr/share/donat/migrations/*.sql | wc -l')
+          test "$count" -ge 12 || { echo "expected >=12 migrations, found $count"; exit 1; }
+        env:
+          ENGINE_TAG: ${{ steps.version.outputs.engine_tag }}
+
+      - name: The REST example must come up from the published image
+        working-directory: examples/petshop-rest
+        run: docker compose up -d --quiet-pull --wait --wait-timeout 180
+        env:
+          ENGINE_TAG: ${{ steps.version.outputs.engine_tag }}
+
+      - name: It must serve, refuse, and answer
+        working-directory: examples/petshop-rest
+        run: |
+          for _ in $(seq 1 30); do
+            curl -sf -m 2 localhost:8080/healthz >/dev/null && break
+            sleep 2
+          done
+          curl -sf -m 5 localhost:8080/healthz
+
+          # The seeded catalogue, as the anonymous role.
+          body=$(curl -sf -m 5 'localhost:8080/api/rest/pets?limit=3' \
+            -H 'X-Donat-Admin-Secret: petshop-secret' -H 'X-Donat-Role: anonymous')
+          grep -q '"name":"Rex"' <<< "$body" || { echo "unexpected pets body: $body"; exit 1; }
+
+          # A permission is proven by what it refuses: a role-less request to
+          # an unknown path gets the role error, never a 404 to enumerate by.
+          refusal=$(curl -sf -m 5 localhost:8080/api/rest/does/not/exist \
+            -H 'X-Donat-Admin-Secret: petshop-secret')
+          grep -q 'x-donat-role header is required' <<< "$refusal" \
+            || { echo "expected the role-required refusal, got: $refusal"; exit 1; }
+
+      - name: Engine logs on failure
+        if: failure()
+        working-directory: examples/petshop-rest
+        run: docker compose logs --tail 50
