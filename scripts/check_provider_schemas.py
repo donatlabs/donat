@@ -152,8 +152,50 @@ def server_prefixes(schema: dict) -> list[tuple[str, ...]]:
     return prefixes
 
 
+def is_discovery(schema: dict) -> bool:
+    """Whether this is a Google API Discovery document rather than OpenAPI.
+
+    Google does not publish OpenAPI for its workspace APIs; it publishes this,
+    which carries the same two facts the audit needs — the path and the HTTP
+    method — under different keys.
+    """
+    return "discoveryVersion" in schema or (
+        "resources" in schema and "servicePath" in schema
+    )
+
+
+def discovery_index(schema: dict) -> dict[tuple[str, ...], set[str]]:
+    """The Discovery document's methods, as the same path → methods table.
+
+    A method's `path` is relative to `servicePath`, and our declarations carry
+    the whole path from the origin, so the two are joined here — the Discovery
+    equivalent of an OpenAPI server prefix.
+    """
+    table: dict[tuple[str, ...], set[str]] = {}
+    prefix = normalise(schema.get("servicePath") or "")
+    prefix = tuple(part for part in prefix if part)
+
+    def walk(node: dict) -> None:
+        for method in (node.get("methods") or {}).values():
+            if not isinstance(method, dict):
+                continue
+            path, verb = method.get("path"), method.get("httpMethod")
+            if not isinstance(path, str) or not isinstance(verb, str):
+                continue
+            table.setdefault(prefix + normalise(path), set()).add(verb.upper())
+        # Discovery nests resources inside resources.
+        for child in (node.get("resources") or {}).values():
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(schema)
+    return table
+
+
 def index(schema: dict) -> dict[tuple[str, ...], set[str]]:
     """Every path the schema publishes, mapped to the methods it allows."""
+    if is_discovery(schema):
+        return discovery_index(schema)
     table: dict[tuple[str, ...], set[str]] = {}
     paths = schema.get("paths")
     if not isinstance(paths, dict):
@@ -185,12 +227,37 @@ def index(schema: dict) -> dict[tuple[str, ...], set[str]]:
     return table
 
 
+def lookup(
+    table: dict[tuple[str, ...], set[str]], components: tuple[str, ...]
+) -> set[str] | None:
+    """The methods the schema allows on this path, exact match preferred.
+
+    A schema placeholder also matches a literal we compiled in, because a
+    placeholder position accepts any value: Gmail publishes
+    `users/{userId}/messages` and this workspace declares `users/me/messages`,
+    where `me` is a documented value of that very parameter. Exact keys are
+    tried first, so a genuinely distinct static route — `/users/settings`
+    beside `/users/{id}` — still resolves to itself rather than to the
+    placeholder.
+    """
+    exact = table.get(components)
+    if exact is not None:
+        return exact
+    matched: set[str] = set()
+    for key, methods in table.items():
+        if len(key) != len(components):
+            continue
+        if all(k == c or k == "*" for k, c in zip(key, components)):
+            matched |= methods
+    return matched or None
+
+
 def verdict(
     table: dict[tuple[str, ...], set[str]], path: str, method: str
 ) -> tuple[str, str]:
     """How the schema accounts for one declared operation."""
     components = normalise(path)
-    allowed = table.get(components)
+    allowed = lookup(table, components)
     if allowed is None:
         return ("path-absent", "no path of this shape in the schema")
     if method.upper() not in allowed:
@@ -260,8 +327,21 @@ def main() -> int:
             uncovered.append((name, len(operations)))
             continue
 
-        body = fetch(entry["url"], args.cache, args.refresh)
-        schema = parse(body) if body else None
+        # A provider may publish one document per API rather than one for all
+        # of them — PayPal ships Orders, Billing and Reporting separately — so
+        # an entry may name several and their tables are merged.
+        urls = entry["url"] if isinstance(entry["url"], list) else [entry["url"]]
+        merged: dict[tuple[str, ...], set[str]] = {}
+        failed = False
+        for url in urls:
+            body = fetch(url, args.cache, args.refresh)
+            one = parse(body) if body else None
+            if not one:
+                failed = True
+                continue
+            for key, methods in index(one).items():
+                merged.setdefault(key, set()).update(methods)
+        schema = None if failed and not merged else merged
         if not schema:
             # Registered but unreadable is not the same as unregistered. Left in
             # `uncovered` alone it would read as "no schema exists", and
@@ -270,7 +350,7 @@ def main() -> int:
             unreachable.append(name)
             uncovered.append((name, len(operations)))
             continue
-        table = index(schema)
+        table = merged
         if not table:
             print(f"  ! {name}: schema published no paths", file=sys.stderr)
             unreachable.append(name)

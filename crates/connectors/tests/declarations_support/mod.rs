@@ -19,9 +19,9 @@ use donat_connectors::providers::{
     eventbrite, freshdesk, github, gitlab, google_calendar, google_drive, google_gmail,
     google_sheets, grafana, harvest, hubspot, intercom, jira, jotform, linear, mailchimp,
     mattermost, mercado_pago, microsoft_excel, microsoft_onedrive, microsoft_outlook,
-    microsoft_teams, monday, notion, openai, paddle, pagerduty, pipedrive, postmark, salesforce,
-    sendgrid, sentry, shopify, slack, surveymonkey, telegram, todoist, trello, twilio, typeform,
-    uptimerobot, woocommerce, xero, zendesk, zoho_crm, zoom,
+    microsoft_teams, monday, notion, openai, paddle, pagerduty, paypal, pipedrive, postmark,
+    salesforce, sendgrid, sentry, shopify, slack, surveymonkey, telegram, todoist, trello, twilio,
+    typeform, uptimerobot, woocommerce, xero, zendesk, zoho_crm, zoom,
 };
 use donat_connectors::sdk::{Connector, Operation};
 
@@ -151,6 +151,11 @@ pub fn executable_operations() -> Vec<(&'static str, Vec<Operation>)> {
         // Batch J (spec 026).
         ("paddle", executable(paddle::connector())),
         ("mercado_pago", executable(mercado_pago::connector())),
+        // PayPal was missing from this list until the schema audit compared it
+        // against the compiled module table and found ten executable operations
+        // nothing walked: no projection assertion, no audit. It is the drift
+        // this module's header warns about, caught once.
+        ("paypal", executable(paypal::connector())),
         ("xero", executable(xero::connector())),
         // Batch K (spec 027).
         ("gitlab", executable(gitlab::connector())),

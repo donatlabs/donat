@@ -61,6 +61,32 @@
     "url": "https://api.mailchimp.com/schema/3.0/Swagger.json?expand",
     "note": "Mailchimp's published Swagger, served from its own API host."
   },
+  "google_calendar": {
+    "url": "https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest",
+    "note": "Google publishes a Discovery document rather than OpenAPI; same two facts."
+  },
+  "google_drive": {
+    "url": "https://www.googleapis.com/discovery/v1/apis/drive/v3/rest",
+    "note": "Google Discovery."
+  },
+  "google_gmail": {
+    "url": "https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest",
+    "note": "Google Discovery."
+  },
+  "google_sheets": {
+    "url": "https://www.googleapis.com/discovery/v1/apis/sheets/v4/rest",
+    "note": "Google Discovery."
+  },
+  "paypal": {
+    "url": [
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/checkout_orders_v2.json",
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/billing_subscriptions_v1.json",
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/reporting_transactions_v1.json",
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/payments_payment_v2.json",
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/invoicing_v2.json"
+    ],
+    "note": "PayPal publishes one document per API, so this connector's surface spans five of them."
+  },
   "intercom": {
     "url": "https://raw.githubusercontent.com/intercom/Intercom-OpenAPI/main/descriptions/2.11/api.intercom.io.yaml",
     "note": "Intercom's published OpenAPI, version 2.11."

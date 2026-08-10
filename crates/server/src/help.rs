@@ -39,6 +39,8 @@ pub enum Topic {
     Capabilities,
     /// One local capability in full.
     Capability(String),
+    /// Everything, in one pass — the whole surface as a single document.
+    Everything,
 }
 
 impl Topic {
@@ -50,6 +52,7 @@ impl Topic {
     pub fn parse(path: &[String]) -> Result<Self, HelpError> {
         match path {
             [] => Ok(Self::Root),
+            [section] if section == "all" => Ok(Self::Everything),
             [section] if section == "connectors" => Ok(Self::Connectors),
             [section] if section == "capabilities" => Ok(Self::Capabilities),
             [name] => Self::guess(name),
@@ -123,6 +126,21 @@ pub fn render(topic: &Topic, format: Format) -> Result<String, HelpError> {
                 .ok_or_else(|| HelpError::UnknownTopic(name.clone()))?;
             capability_detail(&mut out, capability, format);
         }
+        // Every page in one pass. This is what `--format markdown` is for:
+        // one command produces the whole reference for a build, and because it
+        // walks the same tables as every other topic it cannot describe a
+        // connector this binary does not have.
+        Topic::Everything => {
+            root(&mut out, format);
+            connector_index(&mut out, format);
+            for module in compiled_modules() {
+                connector(&mut out, module.declaration(), format);
+            }
+            capability_index(&mut out, format);
+            for capability in local::capabilities() {
+                capability_detail(&mut out, capability, format);
+            }
+        }
     }
     Ok(out)
 }
@@ -180,8 +198,8 @@ fn root(out: &mut String, format: Format) {
     let _ = writeln!(
         out,
         "\nRead one with `donat help connectors <name>` or `donat help capabilities <name>`;\n\
-         a bare `donat help <name>` finds either. `--format markdown` writes the same\n\
-         thing as a document.\n"
+         a bare `donat help <name>` finds either. `donat help all --format markdown`\n\
+         writes the whole reference as one document.\n"
     );
     let _ = writeln!(
         out,
@@ -443,16 +461,39 @@ fn capability_index(out: &mut String, format: Format) {
          {} of them.\n",
         capabilities.len()
     );
+    if format == Format::Markdown {
+        let _ = writeln!(out, "| capability | operations |");
+        let _ = writeln!(out, "|---|---|");
+    }
     for capability in capabilities {
-        let _ = writeln!(
-            out,
-            "  {:<20} {:>3} operations",
-            capability.name(),
-            capability.operations().len()
-        );
+        match format {
+            Format::Markdown => {
+                let _ = writeln!(
+                    out,
+                    "| `{}` | {} |",
+                    capability.name(),
+                    capability.operations().len()
+                );
+            }
+            Format::Text => {
+                let _ = writeln!(
+                    out,
+                    "  {:<20} {:>3} operations",
+                    capability.name(),
+                    capability.operations().len()
+                );
+            }
+        }
     }
 }
 
+/// One capability, with the bounds each of its operations is held to.
+///
+/// The bounds are the whole point of printing this: a local operation has no
+/// provider to refuse it, so what stops a bad input is a declared ceiling, and
+/// an operator sizing a job needs to read those before running it rather than
+/// after being refused. `unit` is printed with `max_units` because a count
+/// with no unit is a number nobody can act on.
 fn capability_detail(out: &mut String, capability: &LocalCapability, format: Format) {
     heading(
         out,
@@ -461,9 +502,62 @@ fn capability_detail(out: &mut String, capability: &LocalCapability, format: For
         &format!("Capability `{}`", capability.name()),
     );
     let _ = writeln!(out, "\nversion: {}", capability.version());
+    let _ = writeln!(
+        out,
+        "\nRuns in the engine's own process — no provider, no network, no credential."
+    );
     heading(out, format, 2, "Operations");
     for operation in capability.operations() {
-        let _ = writeln!(out, "\n  {}", operation.id());
-        let _ = writeln!(out, "    effect: {:?}", operation.effect_class());
+        let bounds = operation.bounds();
+        match format {
+            Format::Markdown => {
+                let _ = writeln!(out, "\n### `{}`\n", operation.id());
+                let _ = writeln!(out, "- effect: `{:?}`", operation.effect_class());
+                let _ = writeln!(out, "- deadline: {:?}", bounds.cpu_deadline());
+                let _ = writeln!(
+                    out,
+                    "- input at most {}, output at most {}",
+                    bytes(bounds.max_input_bytes()),
+                    bytes(bounds.max_output_bytes())
+                );
+                let _ = writeln!(out, "- at most {} {}", bounds.max_units(), bounds.unit());
+            }
+            Format::Text => {
+                let _ = writeln!(out, "\n  {}", operation.id());
+                let _ = writeln!(
+                    out,
+                    "    effect: {:?}    deadline: {:?}",
+                    operation.effect_class(),
+                    bounds.cpu_deadline()
+                );
+                let _ = writeln!(
+                    out,
+                    "    input:  at most {}",
+                    bytes(bounds.max_input_bytes())
+                );
+                let _ = writeln!(
+                    out,
+                    "    output: at most {}, and at most {} {}",
+                    bytes(bounds.max_output_bytes()),
+                    bounds.max_units(),
+                    bounds.unit()
+                );
+            }
+        }
+    }
+}
+
+/// A byte ceiling an operator can read at a glance.
+fn bytes(value: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+    if value >= MIB && value.is_multiple_of(MIB) {
+        format!("{} MiB", value / MIB)
+    } else if value >= MIB {
+        format!("{:.1} MiB", value as f64 / MIB as f64)
+    } else if value >= KIB {
+        format!("{} KiB", value / KIB)
+    } else {
+        format!("{value} B")
     }
 }

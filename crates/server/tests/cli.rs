@@ -151,3 +151,52 @@ fn markdown_help_is_structured_as_markdown() {
     assert!(text.contains("### `issue.list`"), "{text}");
     assert!(text.contains("```yaml"), "{text}");
 }
+
+/// A capability page carries the bounds each operation is held to.
+///
+/// A local operation has no provider to refuse it, so a declared ceiling is
+/// the only thing that stops a bad input. An operator sizing a job needs to
+/// read those before running it, not after being refused.
+#[test]
+fn a_capability_page_prints_the_bounds_its_operations_are_held_to() {
+    let output = help(&["capabilities", "local.document"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("pdf.render"), "{text}");
+    assert!(text.contains("at most"), "{text}");
+    assert!(
+        text.contains("pages"),
+        "the unit is named beside the count: {text}"
+    );
+}
+
+/// `donat help all` renders every page in one pass, so the whole reference for
+/// a build is one command — and, walking the same tables, it cannot describe a
+/// connector this binary does not have.
+#[test]
+fn help_all_renders_every_connector_and_capability() {
+    let output = help(&["all", "--format", "markdown"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+
+    let index = stdout(&help(&["connectors"]));
+    let modules: Vec<&str> = index
+        .lines()
+        .skip_while(|line| !line.contains("modules compiled"))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        .collect();
+    assert!(modules.len() > 50, "the index parsed to {modules:?}");
+    for module in modules {
+        assert!(
+            text.contains(&format!("# Connector `{module}`")),
+            "`donat help all` skipped `{module}`"
+        );
+    }
+    for capability in ["local.document", "local.echo"] {
+        assert!(
+            text.contains(&format!("# Capability `{capability}`")),
+            "`donat help all` skipped `{capability}`"
+        );
+    }
+}
