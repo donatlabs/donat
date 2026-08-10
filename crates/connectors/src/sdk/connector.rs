@@ -51,6 +51,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::sdk::auth::{AuthPlan, Credential};
+use crate::sdk::effect::EffectClass;
 use crate::sdk::operation::{
     MAX_HEADER_VALUE_BYTES, Operation, OperationError, Origin, validate_semver_core,
 };
@@ -564,6 +565,31 @@ impl Connector {
         self.operations
             .iter()
             .find(|operation| operation.id() == id)
+    }
+
+    /// An operation safe to send once, purely to see whether the provider
+    /// accepts this deployment's credential.
+    ///
+    /// Derived rather than declared, from the two properties that make an
+    /// operation safe to spend on a question: it is `ReadOnly`, so sending it
+    /// changes nothing at the provider; and it needs no input, so the probe
+    /// invents no identifier that could turn a credential answer into a
+    /// "no such record" answer. The first such operation in declaration order
+    /// is taken, which is stable because the declaration is.
+    ///
+    /// `None` is an ordinary answer: a connector whose every read needs an id
+    /// has nothing that can be sent blind, and the caller reports that it could
+    /// not probe rather than inventing an argument.
+    pub fn auth_probe(&self) -> Option<&Operation> {
+        self.operations.iter().find(|operation| {
+            operation.is_executable()
+                && operation.effect_class() == Some(EffectClass::ReadOnly)
+                && operation
+                    .project()
+                    .inputs()
+                    .iter()
+                    .all(|input| !input.required())
+        })
     }
 
     pub fn trigger(&self, name: &str) -> Option<&Trigger> {

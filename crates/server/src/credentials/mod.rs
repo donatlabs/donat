@@ -49,6 +49,7 @@ pub mod cli;
 pub mod declaration;
 pub mod keys;
 pub mod oauth;
+pub mod probe;
 pub mod refresh;
 pub mod runtime;
 mod seal;
@@ -62,5 +63,6 @@ pub use oauth::{
     CredentialErrorClass, CredentialFailure, HttpTokenExchange, TokenExchange, TokenGrant,
     TokenRequest,
 };
+pub use probe::{ProbeOutcome, ProbeVerdict};
 pub use runtime::{CredentialRuntime, CredentialRuntimeError};
 pub use store::{CredentialRow, CredentialSummary};
