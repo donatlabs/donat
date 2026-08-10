@@ -18,6 +18,7 @@ pub mod endpoint_auth;
 pub mod events;
 pub mod files;
 pub mod gql;
+pub mod help;
 pub mod jwt;
 pub mod local;
 pub mod mcp;

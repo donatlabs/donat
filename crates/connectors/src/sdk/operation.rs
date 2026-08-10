@@ -188,6 +188,15 @@ impl Origin {
         Ok(Self { url })
     }
 
+    /// The origin as written, for a diagnostic or for `donat help`.
+    ///
+    /// An origin is a compiled constant with no credential in it —
+    /// [`Origin::parse`] refuses a URL carrying a username or a password — so
+    /// this is safe to print anywhere.
+    pub fn as_str(&self) -> &str {
+        self.url.as_str().trim_end_matches('/')
+    }
+
     /// Whether a URL — typically one a provider offered as a continuation —
     /// is on this exact origin.
     pub fn contains(&self, url: &Url) -> bool {
@@ -441,28 +450,6 @@ impl Operation {
 
     pub const fn method(&self) -> HttpMethod {
         self.method
-    }
-
-    /// The declared path template, `{parameter}` placeholders intact.
-    ///
-    /// Read-back of declaration material, for an audit that compares what this
-    /// workspace says a provider's surface is against what the provider
-    /// publishes. It renders nothing and reaches nothing: a request is still
-    /// only ever built by `plan_request` and its siblings.
-    pub fn path_template(&self) -> &str {
-        &self.path_template
-    }
-
-    /// The query parameter names this operation declares, bound and static
-    /// alike, in declaration order.
-    ///
-    /// Names only. A static entry's *value* is deliberately not published
-    /// here — the audit this exists for asks whether a provider documents a
-    /// parameter, not what we send in it.
-    pub fn query_keys(&self) -> impl Iterator<Item = &str> {
-        self.query.iter().map(|entry| match entry {
-            QueryEntry::Static { key, .. } | QueryEntry::Input { key, .. } => key.as_str(),
-        })
     }
 
     /// The declared effect class, or `None` for an operation that has not been

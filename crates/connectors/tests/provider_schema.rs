@@ -38,15 +38,19 @@ fn declarations() -> JsonValue {
     for (module, operations) in executable_operations() {
         let mut entries = Vec::new();
         for operation in operations {
-            let mut query: Vec<&str> = operation.query_keys().collect();
+            // The projection is the declaration's own published read-back, so
+            // the audit compares the same description a Process binds against
+            // rather than a second one assembled here.
+            let projection = operation.project();
+            let mut query: Vec<&str> = projection.query().iter().map(|entry| entry.key()).collect();
             query.sort_unstable();
             query.dedup();
             entries.push(json!({
-                "id": operation.id(),
-                "method": operation.method().as_str(),
-                "path_template": operation.path_template(),
+                "id": projection.id(),
+                "method": projection.method(),
+                "path_template": projection.path_template(),
                 "query": query,
-                "effect": operation.effect_class().map(|class| format!("{class:?}")),
+                "effect": projection.effect_class().map(|class| format!("{class:?}")),
             }));
         }
         entries.sort_by(|left, right| {

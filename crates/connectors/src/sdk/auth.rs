@@ -385,6 +385,30 @@ pub struct AuthPlan {
 }
 
 impl AuthPlan {
+    /// The plan's name, for an operator reading `donat help`.
+    ///
+    /// A stable label rather than `Debug`: the derived form spells the private
+    /// `AuthKind` and its fields, which would put a header name — and, for the
+    /// reader, something that looks like it might be a credential — into
+    /// ordinary help output. This says only which plan applies.
+    pub const fn label(&self) -> &'static str {
+        match self.kind {
+            AuthKind::ApiKeyHeader { .. } => "api key in a header",
+            AuthKind::ApiKeyQuery { .. } => "api key in a query parameter",
+            AuthKind::ApiKeyQueryPair { .. } => "two query parameters",
+            AuthKind::ApiKeyPathSegment { .. } => "api key in a path segment",
+            AuthKind::Bearer => "Bearer",
+            AuthKind::ApiKeyAuthorizationScheme { .. } => "Authorization, provider scheme",
+            AuthKind::ApiKeyAuthorizationParameter { .. } => "Authorization, provider parameter",
+            AuthKind::AuthorizationCredential => "Authorization, credential verbatim",
+            AuthKind::Basic { .. } => "HTTP Basic",
+            AuthKind::BasicSecretUsername { .. } => "HTTP Basic, secret as username",
+            AuthKind::OAuth2ClientCredentials { .. } => "OAuth2 client credentials",
+            AuthKind::OAuth2AuthorizationCode { .. } => "OAuth2 authorization code",
+            AuthKind::AwsSigV4 { .. } => "AWS SigV4",
+        }
+    }
+
     /// A fixed header name carrying the secret value.
     pub fn api_key_header(name: &str) -> Result<Self, OperationError> {
         if name.eq_ignore_ascii_case("authorization") {

@@ -102,7 +102,12 @@ fn parse_enabled_apis(raw: Option<&str>) -> EnabledApis {
 #[derive(Parser, Debug)]
 #[command(
     name = "donat",
-    about = "GraphQL engine over Postgres (Donat v2-compatible)"
+    about = "GraphQL engine over Postgres (Donat v2-compatible)",
+    // `help` is ours: it describes the integration surface, not the flags.
+    // clap would otherwise claim the name for a second usage printer, which is
+    // what `--help` already is — and `donat <subcommand> --help` still reaches
+    // the per-subcommand usage that the generated subcommand would have given.
+    disable_help_subcommand = true
 )]
 struct Args {
     /// Donat v2 metadata directory (version: 3 format). Optional.
@@ -142,6 +147,9 @@ enum Command {
     Migrate(MigrateArgs),
     /// Validate YAML metadata against the database, then exit.
     Validate(ValidateArgs),
+    /// Describe this binary's integration surface: connectors, their
+    /// operations, and the local capabilities. Reads no database.
+    Help(HelpArgs),
     /// Generate Go row structs from the catalog for the embedded SDK.
     Codegen(CodegenArgs),
     /// Dump `{metadata, catalog}` JSON for the embedded wasm-core host (core_init).
@@ -277,6 +285,18 @@ struct ValidateArgs {
     /// Metadata source to validate.
     #[arg(long)]
     source: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct HelpArgs {
+    /// What to read: nothing for the contents, `connectors`, `capabilities`,
+    /// or a name — `donat help github` finds the connector by itself.
+    #[arg(value_name = "TOPIC")]
+    topic: Vec<String>,
+    /// `text` (the default) or `markdown`, which prints the same content as a
+    /// document to redirect into a file.
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -593,6 +613,19 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             require_consistent_metadata(&problems)?;
+            return Ok(());
+        }
+        // Reads the compiled declarations and nothing else: no database, no
+        // metadata directory, no network. It answers the same on a laptop with
+        // no deployment as it does in production, which is the point of it.
+        Some(Command::Help(h)) => {
+            let format = match h.format.as_str() {
+                "text" => donat_server::help::Format::Text,
+                "markdown" | "md" => donat_server::help::Format::Markdown,
+                other => anyhow::bail!("unknown --format `{other}`; use `text` or `markdown`"),
+            };
+            let topic = donat_server::help::Topic::parse(&h.topic)?;
+            print!("{}", donat_server::help::render(&topic, format)?);
             return Ok(());
         }
         Some(Command::Codegen(c)) => {
