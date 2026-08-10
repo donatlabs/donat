@@ -171,10 +171,17 @@ def index(schema: dict) -> dict[tuple[str, ...], set[str]]:
         if not methods:
             continue
         components = normalise(path)
-        table.setdefault(components, set()).update(methods)
-        # The same path as seen from the origin, for each declared server.
-        for prefix in prefixes:
-            table.setdefault(prefix + components, set()).update(methods)
+        if prefixes:
+            # Only as seen from the origin. Indexing the bare path *as well*
+            # would accept a declaration that had dropped the version segment —
+            # `/models` where the provider serves `/v1/models` — which is
+            # exactly the class of mistake this audit exists to catch. Every
+            # match in the current register survives the stricter rule, so the
+            # looser one was buying nothing.
+            for prefix in prefixes:
+                table.setdefault(prefix + components, set()).update(methods)
+        else:
+            table.setdefault(components, set()).update(methods)
     return table
 
 
@@ -240,7 +247,7 @@ def main() -> int:
         )
         return 2
 
-    covered, uncovered, findings = [], [], []
+    covered, uncovered, findings, unreachable = [], [], [], []
     total_ops = matched_ops = 0
 
     for module in declarations["modules"]:
@@ -256,11 +263,17 @@ def main() -> int:
         body = fetch(entry["url"], args.cache, args.refresh)
         schema = parse(body) if body else None
         if not schema:
+            # Registered but unreadable is not the same as unregistered. Left in
+            # `uncovered` alone it would read as "no schema exists", and
+            # `--strict` would pass because a schema nobody could fetch produced
+            # no findings — the audit going quiet exactly when it stopped working.
+            unreachable.append(name)
             uncovered.append((name, len(operations)))
             continue
         table = index(schema)
         if not table:
             print(f"  ! {name}: schema published no paths", file=sys.stderr)
+            unreachable.append(name)
             uncovered.append((name, len(operations)))
             continue
 
@@ -309,7 +322,13 @@ def main() -> int:
         print(f"\n  {len(uncovered)} connectors, {total_unverifiable} operations.")
         print("  These need a recorded response or a live smoke test instead.")
 
-    if args.strict and findings:
+    if unreachable:
+        print(
+            f"\nwarning: {len(unreachable)} registered schema(s) could not be read: "
+            f"{', '.join(sorted(unreachable))}",
+            file=sys.stderr,
+        )
+    if args.strict and (findings or unreachable):
         return 1
     return 0
 
