@@ -1608,9 +1608,9 @@ pub(crate) mod jira_module {
 #[cfg(test)]
 fn wired_plans() -> Vec<(&'static Connector, PaginationLookup)> {
     use donat_connectors::providers::{
-        freshdesk, google_calendar, google_drive, google_gmail, google_sheets, microsoft_excel,
-        microsoft_onedrive, microsoft_outlook, microsoft_teams, pipedrive, salesforce, woocommerce,
-        zendesk,
+        box_platform, discord, dropbox, dropbox_content, freshdesk, google_calendar, google_drive,
+        google_gmail, google_sheets, mailchimp, mattermost, microsoft_excel, microsoft_onedrive,
+        microsoft_outlook, microsoft_teams, pipedrive, salesforce, woocommerce, zendesk, zoom,
     };
 
     vec![
@@ -1662,35 +1662,18 @@ fn wired_plans() -> Vec<(&'static Connector, PaginationLookup)> {
         // Batch I (spec 025). Box walks a marker and an offset, Mattermost and
         // Mailchimp walk the regimes their providers publish, and Zoom walks a
         // page token that ends on an empty string.
-        (
-            batch_i::box_platform::connector(),
-            batch_i::box_platform::pagination,
-        ),
-        (
-            batch_i::mattermost::connector(),
-            batch_i::mattermost::pagination,
-        ),
-        (
-            batch_i::mailchimp::connector(),
-            batch_i::mailchimp::pagination,
-        ),
-        (batch_i::zoom::connector(), batch_i::zoom::pagination),
+        (box_platform::connector(), box_platform::pagination),
+        (mattermost::connector(), mattermost::pagination),
+        (mailchimp::connector(), mailchimp::pagination),
+        (zoom::connector(), zoom::pagination),
         // Dropbox spends its cursor on a *different route*, and Discord's
         // continuation is the id of the last item of a bare array; neither is a
         // plan in the SDK's closed set, so both declare none and every attempt
         // of theirs is one request.
-        (batch_i::dropbox::connector(), no_pagination),
-        (batch_i::dropbox_content::connector(), no_pagination),
-        (batch_i::discord::connector(), no_pagination),
+        (dropbox::connector(), no_pagination),
+        (dropbox_content::connector(), no_pagination),
+        (discord::connector(), no_pagination),
     ]
-}
-
-/// The Batch I modules, named once so the table above reads as one list.
-#[cfg(test)]
-mod batch_i {
-    pub(super) use donat_connectors::providers::{
-        box_platform, discord, dropbox, dropbox_content, mailchimp, mattermost, zoom,
-    };
 }
 
 /// The two Batch G declarations a deployment completes, held for the plan

@@ -1,0 +1,67 @@
+# cargo-audit configuration.
+#
+# The CI gate runs `cargo audit --deny warnings`, so an informational advisory
+# (unmaintained, unsound, yanked) fails the build exactly like a vulnerability
+# does. That strictness is deliberate and stays. This file is the *only* place
+# an advisory is excused, and every entry below carries the reason it is here.
+#
+# The rule for adding an entry, from
+# [[096-the-document-renderers-advisories-are-ignored-by-name-with-a-reachability-argument]]:
+#
+#   1. There must be no upgrade. Check that the direct dependency is already at
+#      its newest published version and that the fix is genuinely unavailable —
+#      not merely inconvenient.
+#   2. There must be a reachability argument written down: what untrusted input
+#      would have to reach the vulnerable code, and what stops it.
+#   3. It is reviewed when the renderer's dependencies are next bumped. An
+#      entry that has become removable is removed.
+#
+# Every entry below is a transitive dependency of `typst`, the spec 019
+# document renderer, and of nothing else. None is a direct dependency of this
+# workspace and none can be selected independently of it.
+
+[advisories]
+ignore = [
+    # --- Vulnerabilities -------------------------------------------------
+    #
+    # Both are `quick-xml` 0.38.4, reached only as
+    #   typst -> typst-library -> hayagriva -> citationberg -> quick-xml
+    # which is Typst's CSL bibliography-style parser. `citationberg` 0.7.0 is
+    # the newest published release and still requires quick-xml 0.38, so there
+    # is no version of this tree that resolves the advisory; our own direct
+    # users of quick-xml (`calamine`, `phonenumber`) are already on the fixed
+    # 0.41.0.
+    #
+    # Reachability: both advisories are denial-of-service shaped — quadratic
+    # time on duplicate attribute names, and unbounded allocation on namespace
+    # declarations — so exploiting either needs attacker-controlled XML. The
+    # renderer cannot be given any. Its Typst world (`local/document/world.rs`)
+    # serves exactly one map, `template.files()`, which is the deployment's own
+    # frozen template set; there is no filesystem handle, no package storage
+    # and no HTTP client behind it. Request data reaches a render only through
+    # `sys.inputs` as a `Dict`, which is not a file and cannot name one, and a
+    # `bibliography(..)` call is refused at load unless its argument is a
+    # string literal already present in that frozen set
+    # ([[050-a-document-template-is-deployment-metadata-and-the-renderer-is-a-closed-world]]).
+    # The worst available outcome is therefore a deployment slowing down its
+    # own renderer with a bibliography file it checked in itself.
+    "RUSTSEC-2026-0194", # quick-xml: quadratic time on duplicate attributes
+    "RUSTSEC-2026-0195", # quick-xml: unbounded namespace allocation
+
+    # --- Unmaintained ----------------------------------------------------
+    #
+    # None of these is a vulnerability. Each is a crate its own author has
+    # marked unmaintained, and each arrives under `typst` at that crate's
+    # newest published version. They are listed one by one rather than by
+    # blanket-disabling the `unmaintained` class, so a *new* unmaintained crate
+    # anywhere in the workspace still fails the gate.
+    "RUSTSEC-2025-0141", # bincode 1.x, via syntect -> two-face -> typst-library
+    "RUSTSEC-2024-0320", # yaml-rust, via syntect (same path)
+    "RUSTSEC-2024-0436", # paste, a proc-macro, via biblatex -> hayagriva
+    "RUSTSEC-2026-0206", # rustybuzz, text shaping, via krilla -> typst-pdf
+    "RUSTSEC-2026-0192", # ttf-parser, via fontdb -> krilla-svg -> typst-pdf
+    # atomic-polyfill is target-gated: `heapless` 0.7 selects it only for
+    # targets without native atomics, so it is not compiled for any platform
+    # this engine ships on. It appears in `cargo tree` only under `--target all`.
+    "RUSTSEC-2023-0089", # atomic-polyfill, via heapless -> postcard -> icu_provider
+]
