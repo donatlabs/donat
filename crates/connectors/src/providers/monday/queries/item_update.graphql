@@ -1,0 +1,11 @@
+# monday: "This mutation allows you to update multiple column values of a
+# specific Item (row)."
+mutation ItemUpdate($board_id: ID!, $item_id: ID!, $column_values: JSON!) {
+  change_multiple_column_values(
+    board_id: $board_id
+    item_id: $item_id
+    column_values: $column_values
+  ) {
+    id
+  }
+}

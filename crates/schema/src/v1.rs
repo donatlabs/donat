@@ -8,7 +8,9 @@ use donat_ir::*;
 use donat_metadata::Columns;
 use serde_json::Value as Json;
 
-use crate::plan::{PlanError, Planner, Session, TableCtx, is_session_var_name};
+use crate::plan::{
+    PlanError, Planner, Session, TableCtx, is_session_var_name, update_permits_column,
+};
 
 fn parse_table(args: &Json, path: &str) -> Result<donat_metadata::QualifiedTable, PlanError> {
     let table = args
@@ -392,6 +394,10 @@ impl<'a> Planner<'a> {
             crate::validators::ValidatorOp::Update,
             "$",
         )?;
+        // The v1 surface writes the same tables under the same permissions,
+        // so it is held to the same value contract. A validator a caller can
+        // step around by changing endpoint is not a validator.
+        validators.normalize_sets(&mut sets)?;
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
         let file_claims = self.file_claims_for_sets(&ctx.entry.table, &sets, session, "$");
 
@@ -404,7 +410,7 @@ impl<'a> Planner<'a> {
             predicate,
             check: None,
             check_path: "$".to_string(),
-            validators,
+            validators: validators.rows,
             file_claims,
             output,
         })
@@ -552,7 +558,7 @@ impl<'a> Planner<'a> {
                 )
             })
             .collect();
-        let rows: Vec<Vec<Option<Scalar>>> = objects
+        let mut rows: Vec<Vec<Option<Scalar>>> = objects
             .iter()
             .map(|object| {
                 let map = object.as_object().unwrap();
@@ -576,7 +582,7 @@ impl<'a> Planner<'a> {
         };
 
         // v1 on_conflict: { constraint | constraint_on, action: update|ignore }.
-        let on_conflict = match args.get("on_conflict") {
+        let mut on_conflict = match args.get("on_conflict") {
             None | Some(Json::Null) => None,
             Some(_) if self.capabilities.upsert == UpsertKind::None => {
                 return Err(PlanError::validation(
@@ -591,23 +597,28 @@ impl<'a> Planner<'a> {
                     .ok_or_else(|| PlanError::validation(path, "on_conflict needs a constraint"))?
                     .to_string();
                 let action = oc.get("action").and_then(Json::as_str).unwrap_or("update");
-                let update_columns = if action == "ignore" {
-                    vec![]
-                } else {
-                    // `update` re-applies every inserted column...
-                    columns.clone()
+                // `update` names no columns, so the planner chooses them: it
+                // re-applies every inserted column *the role may update*. A
+                // column outside the update permission — or every column, when
+                // the role holds no update permission at all — is not
+                // re-applied, because `col = EXCLUDED.col` on an existing row
+                // is an update and this is the only permission that admits
+                // one. The same permission's filter gates which existing rows
+                // may change, and its presets are applied.
+                let update_perm =
+                    self.resolve_role_perm(&ctx.entry.update_permissions, &session.role, |_| true);
+                let update_columns = match (action, update_perm) {
+                    ("ignore", _) | (_, None) => vec![],
+                    (_, Some(permission)) => columns
+                        .iter()
+                        .filter(|column| update_permits_column(permission, column))
+                        .cloned()
+                        .collect(),
                 };
-                // ...restricted by the role's update permission, whose
-                // filter also gates which existing rows may change.
                 let mut predicate = None;
                 let mut set_ops = vec![];
                 if !update_columns.is_empty()
-                    && let Some(update_perm) = ctx
-                        .entry
-                        .update_permissions
-                        .iter()
-                        .find(|p| p.role == session.role)
-                        .map(|p| &p.permission)
+                    && let Some(update_perm) = update_perm
                 {
                     if !update_perm.filter.is_null()
                         && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
@@ -640,13 +651,41 @@ impl<'a> Planner<'a> {
             }
         };
 
-        let validators = self.resolved_validators(
+        let mut validators = self.resolved_validators(
             &ctx,
             &ctx.entry.insert_permissions,
             perm,
             crate::validators::ValidatorOp::Insert,
             "$",
         )?;
+        // An upsert writes its DO UPDATE rows under the role's update
+        // permission — whose columns, filter and presets this path already
+        // merged above — so it is held to that permission's value contract
+        // too, exactly as the GraphQL upsert is (`plan_mutation.rs`). Holding
+        // it to both lists is the only choice that cannot under-enforce:
+        // which branch a row took is not visible to the gate.
+        if on_conflict
+            .as_ref()
+            .is_some_and(|conflict| !conflict.update_columns.is_empty())
+            && let Some(update_perm) =
+                self.resolve_role_perm(&ctx.entry.update_permissions, &session.role, |_| true)
+        {
+            let update_validators = self.resolved_validators(
+                &ctx,
+                &ctx.entry.update_permissions,
+                update_perm,
+                crate::validators::ValidatorOp::UpsertUpdate,
+                "$",
+            )?;
+            validators.rows.extend(update_validators.rows);
+            validators.phone.extend(update_validators.phone);
+        }
+        validators.normalize_rows(&typed_columns, &mut rows)?;
+        // The DO UPDATE branch's presets land in the same columns as the rows,
+        // so one number gets one spelling whichever branch wrote it.
+        if let Some(conflict) = on_conflict.as_mut() {
+            validators.normalize_sets(&mut conflict.set_ops)?;
+        }
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
         let file_claims = self.file_claims(&ctx.entry.table, &typed_columns, &rows, session, "$");
 
@@ -661,7 +700,7 @@ impl<'a> Planner<'a> {
             on_conflict,
             check,
             check_path: "$".to_string(),
-            validators,
+            validators: validators.rows,
             file_claims,
             output,
         })

@@ -1,0 +1,58 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 028 §4).
+#
+# `metadata` withholds one instance's API key while another instance's
+# resolves: startup must name only the unavailable variable. Cal.com's origin,
+# paths and three `cal-api-version` pins are all compiled constants of the
+# declaration, so neither instance configures a setting. `refused_metadata`
+# enables the booking cancel: it is a `POST`, which spec 010 §7's
+# `NaturalMethod` does not admit whatever its effect is, and Cal.com publishes
+# no consequence of a second send for ADR 063 to admit either — so it is
+# inventory-only and startup must name its exact metadata path.
+metadata:
+  version: 3
+  connectors:
+    - name: cal_com_present
+      module: cal_com
+      config:
+        endpoint_identity: cal_com_conformance
+        credential_identity: cal_com_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: booking.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: cal_com_missing
+      module: cal_com
+      config:
+        endpoint_identity: cal_com_conformance
+        credential_identity: cal_com_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: cal_com_refused
+      module: cal_com
+      config:
+        endpoint_identity: cal_com_conformance
+        credential_identity: cal_com_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: booking.cancel
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `cal_com_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `booking.cancel` on module `cal_com`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

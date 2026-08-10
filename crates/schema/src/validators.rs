@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use donat_catalog_types::{Catalog, ColumnInfo};
 use donat_ir::RowValidator;
-use donat_metadata::{PermissionValidator, Source, TableEntry};
+use donat_metadata::{PermissionValidator, PhoneRegion, Source, TableEntry};
 use donat_rules::{
     RuleDefinition, RuleType, SqlBinding, SqlBindings, SqlExpression, compile_catalog,
     lower_postgres,
@@ -57,6 +57,136 @@ impl ValidatorOp {
 
 type ValidatorKey = (String, String, ValidatorOp);
 
+/// One compiled `phone` entry.
+///
+/// Unlike the other spellings this never becomes SQL. The planner applies it
+/// to the value it is about to put in the statement: a rejection is a plan
+/// error carrying the entry's message, and an acceptance replaces the value
+/// with its E.164 form. The region is a [`PhoneRegion`], which can only be
+/// built by parsing a declared region code — the type is the proof that
+/// nothing on the request can reach it.
+#[derive(Debug, Clone)]
+pub(crate) struct PhoneCheck {
+    pub(crate) column: String,
+    pub(crate) region: PhoneRegion,
+    pub(crate) message: String,
+    pub(crate) error_path: String,
+}
+
+impl PhoneCheck {
+    /// The E.164 form of one submitted value, or `None` when there is nothing
+    /// to normalize because the caller sent a null.
+    ///
+    /// A rejection carries the entry's own message under `validation-failed`,
+    /// which is the shape every validator reports with — the caller cannot
+    /// tell from the response that this one was evaluated in Rust.
+    fn normalize(&self, value: &serde_json::Value) -> Result<Option<serde_json::Value>, PlanError> {
+        if value.is_null() {
+            return Ok(None);
+        }
+        let refused = || PlanError::validation(&self.error_path, self.message.clone());
+        let submitted = value.as_str().ok_or_else(refused)?;
+        let normalized =
+            donat_metadata::normalize_phone(submitted, &self.region).map_err(|_| refused())?;
+        Ok(Some(serde_json::Value::String(normalized)))
+    }
+}
+
+/// One permission's compiled value contract: the gates the statement carries,
+/// and the checks the planner runs before there is a statement.
+///
+/// They travel together because they are one ordered `validate` list, and
+/// because every consumer that asks "does this permission constrain values"
+/// must see both halves — a caller that only looked at `rows` would treat a
+/// phone-only list as no list at all.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompiledValidators {
+    pub(crate) rows: Vec<RowValidator>,
+    pub(crate) phone: Vec<PhoneCheck>,
+}
+
+impl CompiledValidators {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.phone.is_empty()
+    }
+
+    /// Check and rewrite the values an insert is about to carry.
+    ///
+    /// This runs on the planner's own data, before any SQL exists, and it is
+    /// the whole runtime cost of a `phone` validator: one parse per submitted
+    /// value. The statement it produces is the statement it would have
+    /// produced anyway, with a normalized literal in place of the submitted
+    /// one.
+    ///
+    /// A column the caller did not write, and a null, are not violations —
+    /// there is no value to reject. Presence is declared with a `not_null`
+    /// entry, exactly as it is for every other spelling.
+    pub(crate) fn normalize_rows(
+        &self,
+        columns: &[(String, String)],
+        rows: &mut [Vec<Option<donat_ir::Scalar>>],
+    ) -> Result<(), PlanError> {
+        for check in &self.phone {
+            let Some(index) = columns.iter().position(|(name, _)| name == &check.column) else {
+                continue;
+            };
+            for row in rows.iter_mut() {
+                let Some(slot) = row.get_mut(index) else {
+                    continue;
+                };
+                let Some(value) = slot.as_ref() else { continue };
+                if let Some(normalized) = check.normalize(value.as_json())? {
+                    *slot = Some(donat_ir::Scalar::Json(normalized));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The same, for the `_set` shape an update writes.
+    ///
+    /// `_inc` and `_append` are not reached: neither is expressible over the
+    /// text column a phone number lives in.
+    pub(crate) fn normalize_sets(&self, sets: &mut [donat_ir::SetOp]) -> Result<(), PlanError> {
+        for check in &self.phone {
+            for set in sets.iter_mut() {
+                let donat_ir::SetOp::Set { column, value, .. } = set else {
+                    continue;
+                };
+                if column != &check.column {
+                    continue;
+                }
+                if let Some(normalized) = check.normalize(value.as_json())? {
+                    *value = donat_ir::Scalar::Json(normalized);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn with_error_path(&self, error_path: &str) -> Self {
+        Self {
+            rows: self
+                .rows
+                .iter()
+                .map(|validator| RowValidator {
+                    sql: validator.sql.clone(),
+                    message: validator.message.clone(),
+                    error_path: error_path.to_owned(),
+                })
+                .collect(),
+            phone: self
+                .phone
+                .iter()
+                .map(|check| PhoneCheck {
+                    error_path: error_path.to_owned(),
+                    ..check.clone()
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Compiled validators for one source, keyed by table, role and operation.
 ///
 /// A key that failed to compile retains its diagnostic instead of disappearing:
@@ -65,7 +195,7 @@ type ValidatorKey = (String, String, ValidatorOp);
 /// author wrote.
 #[derive(Debug, Default)]
 pub(crate) struct ValidatorIndex {
-    compiled: HashMap<ValidatorKey, Result<Vec<RowValidator>, String>>,
+    compiled: HashMap<ValidatorKey, Result<CompiledValidators, String>>,
     errors: Vec<String>,
 }
 
@@ -90,17 +220,10 @@ impl ValidatorIndex {
         role: &str,
         op: ValidatorOp,
         error_path: &str,
-    ) -> Result<Vec<RowValidator>, PlanError> {
+    ) -> Result<CompiledValidators, PlanError> {
         match self.compiled.get(&(table.to_owned(), role.to_owned(), op)) {
-            None => Ok(Vec::new()),
-            Some(Ok(validators)) => Ok(validators
-                .iter()
-                .map(|validator| RowValidator {
-                    sql: validator.sql.clone(),
-                    message: validator.message.clone(),
-                    error_path: error_path.to_owned(),
-                })
-                .collect()),
+            None => Ok(CompiledValidators::default()),
+            Some(Ok(validators)) => Ok(validators.with_error_path(error_path)),
             Some(Err(message)) => Err(PlanError::validation(error_path, message.clone())),
         }
     }
@@ -321,13 +444,19 @@ fn catalog_columns<'a>(catalog: &'a Catalog, entry: &TableEntry) -> Option<&'a [
 /// later comparison over a nullable column can type check, because the rule
 /// profile refuses operations on nullable operands and has no flow-sensitive
 /// refinement to discover the guard on its own.
+///
+/// A `phone` entry is compiled the same way and lands somewhere else: it
+/// resolves its declared region once, here, and the planner evaluates it in
+/// Rust over the submitted value. Ordering therefore holds among entries of
+/// the same kind, and a phone rejection precedes any expression gate — see the
+/// module documentation of `phone` in `donat-metadata`.
 fn compile_validators(
     table: &str,
     role: &str,
     op: ValidatorOp,
     validators: &[PermissionValidator],
     columns: &[ColumnInfo],
-) -> Result<Vec<RowValidator>, String> {
+) -> Result<CompiledValidators, String> {
     let where_ = format!("{} {} permission on {table}", role, op.label());
     let mut environment = BTreeMap::new();
     for column in columns {
@@ -336,11 +465,27 @@ fn compile_validators(
         }
     }
 
-    let mut compiled = Vec::with_capacity(validators.len());
+    let mut compiled = CompiledValidators::default();
     for (index, validator) in validators.iter().enumerate() {
         let at = format!("{where_}, validate[{index}]");
         if validator.message.trim().is_empty() {
             return Err(format!("{at}: a validator message cannot be empty"));
+        }
+        if let Some(phone) = &validator.phone {
+            if validator.expression.is_some() || validator.not_null.is_some() {
+                return Err(format!(
+                    "{at}: a validator declares `phone` or one of `expression` and `not_null`, not both"
+                ));
+            }
+            if validator.when_present.is_some() {
+                return Err(format!(
+                    "{at}: `when_present` scopes an `expression`; a `phone` validator already ignores a value that is not there"
+                ));
+            }
+            compiled
+                .phone
+                .push(compile_phone(&at, phone, &validator.message, columns)?);
+            continue;
         }
         match (&validator.not_null, &validator.expression) {
             (Some(_), Some(_)) => {
@@ -350,7 +495,7 @@ fn compile_validators(
             }
             (None, None) => {
                 return Err(format!(
-                    "{at}: a validator must declare `expression` or `not_null`"
+                    "{at}: a validator must declare `expression`, `not_null` or `phone`"
                 ));
             }
             (Some(_), None) if validator.when_present.is_some() => {
@@ -373,7 +518,7 @@ fn compile_validators(
                 if let Some(type_) = rule_type(column) {
                     environment.insert(column_name.clone(), type_.into_inner());
                 }
-                compiled.push(RowValidator {
+                compiled.rows.push(RowValidator {
                     sql: format!(
                         "{} IS NOT NULL",
                         donat_sqlgen::rule_qualified_column(op.row_alias(), column_name)
@@ -444,7 +589,7 @@ fn compile_validators(
                     Some(guard) => format!("CASE WHEN {guard} THEN TRUE ELSE ({sql}) END"),
                     None => sql,
                 };
-                compiled.push(RowValidator {
+                compiled.rows.push(RowValidator {
                     sql,
                     message: validator.message.clone(),
                     error_path: String::new(),
@@ -453,6 +598,47 @@ fn compile_validators(
         }
     }
     Ok(compiled)
+}
+
+/// Compile one `phone` entry.
+///
+/// Everything that can be settled at deploy time is settled here: the column
+/// exists and holds text, and the declared region resolves. What is left for
+/// request time is one parse of one string.
+///
+/// The operation is not a parameter, unlike every other spelling: this check
+/// reads the value the caller submitted rather than a column of a CTE, and
+/// that value is the same whichever statement will carry it.
+fn compile_phone(
+    at: &str,
+    phone: &donat_metadata::PhoneValidator,
+    message: &str,
+    columns: &[ColumnInfo],
+) -> Result<PhoneCheck, String> {
+    let column = columns
+        .iter()
+        .find(|column| column.name == phone.column)
+        .ok_or_else(|| format!("{at}: `phone` names unknown column '{}'", phone.column))?;
+    // The normalized value is an E.164 string, so the column has to be able
+    // to hold one. A numeric column would silently lose the leading `+` and
+    // the country code's leading zeros.
+    if !matches!(
+        column.pg_type.as_str(),
+        "text" | "varchar" | "bpchar" | "citext"
+    ) {
+        return Err(format!(
+            "{at}: column '{}' is {}, and a phone number is stored as its E.164 text",
+            phone.column, column.pg_type
+        ));
+    }
+    let region = PhoneRegion::parse(&phone.region).map_err(|error| format!("{at}: {error}"))?;
+    Ok(PhoneCheck {
+        column: phone.column.clone(),
+        region,
+        message: message.to_owned(),
+        // Filled in by `ValidatorIndex::get`, which knows the operation's path.
+        error_path: String::new(),
+    })
 }
 
 /// The rule type of one catalogue column, or `None` when the column has no
@@ -528,6 +714,21 @@ mod tests {
             expression: expression.map(str::to_owned),
             not_null: not_null.map(str::to_owned),
             when_present: when_present.map(str::to_owned),
+            phone: None,
+            message: message.to_owned(),
+        }
+    }
+
+    /// A `phone` entry over the same table, for the tests that mix spellings.
+    fn phone_validator(column: &str, region: &str, message: &str) -> PermissionValidator {
+        PermissionValidator {
+            expression: None,
+            not_null: None,
+            when_present: None,
+            phone: Some(donat_metadata::PhoneValidator {
+                column: column.to_owned(),
+                region: region.to_owned(),
+            }),
             message: message.to_owned(),
         }
     }
@@ -540,6 +741,7 @@ mod tests {
             validators,
             &columns(),
         )
+        .map(|compiled| compiled.rows)
     }
 
     /// The case that must never reach a request: a comparison over a nullable
@@ -722,6 +924,79 @@ mod tests {
         assert!(error.contains("message"), "{error}");
     }
 
+    /// A `phone` entry produces no SQL at all — that is the point of it. What
+    /// it produces is a resolved region and a column name for the planner to
+    /// apply before it builds the statement.
+    #[test]
+    fn a_phone_validator_compiles_to_a_check_and_no_gate() {
+        let compiled = compile_validators(
+            "public.contact",
+            "user",
+            ValidatorOp::Insert,
+            &[phone_validator(
+                "phone",
+                "DE",
+                "phone must be a valid number",
+            )],
+            &[column("phone", "text", true)],
+        )
+        .expect("a phone validator over a text column compiles");
+
+        assert!(
+            compiled.rows.is_empty(),
+            "a phone validator adds nothing to the statement"
+        );
+        assert_eq!(compiled.phone.len(), 1);
+        assert_eq!(compiled.phone[0].column, "phone");
+        assert_eq!(compiled.phone[0].region.as_str(), "DE");
+        assert_eq!(compiled.phone[0].message, "phone must be a valid number");
+    }
+
+    /// Everything a `phone` entry cannot do is a deployment error, named where
+    /// it was written. In particular a region that could only be resolved from
+    /// a request refuses publication instead of being resolved from one.
+    #[test]
+    fn a_phone_validator_that_cannot_be_evaluated_refuses_publication() {
+        let columns = [column("phone", "text", true), column("age", "int4", true)];
+        let compile_one = |validator: PermissionValidator| {
+            compile_validators(
+                "public.contact",
+                "user",
+                ValidatorOp::Insert,
+                &[validator],
+                &columns,
+            )
+            .expect_err("this declaration cannot be evaluated")
+        };
+
+        let error = compile_one(phone_validator("absent", "DE", "m"));
+        assert!(error.contains("unknown column 'absent'"), "{error}");
+        assert!(error.contains("validate[0]"), "{error}");
+
+        let error = compile_one(phone_validator("age", "DE", "m"));
+        assert!(error.contains("E.164 text"), "{error}");
+
+        for deferred in ["X-Donat-Region", "de", "DEU", ""] {
+            let error = compile_one(phone_validator("phone", deferred, "m"));
+            assert!(error.contains("is not a region code"), "{error}");
+        }
+
+        let mut both = phone_validator("phone", "DE", "m");
+        both.expression = Some("size(phone) >= 3".to_owned());
+        let error = compile_one(both);
+        assert!(error.contains("not both"), "{error}");
+
+        let mut scoped = phone_validator("phone", "DE", "m");
+        scoped.when_present = Some("phone".to_owned());
+        let error = compile_one(scoped);
+        assert!(error.contains("already ignores"), "{error}");
+
+        let mut unnamed = phone_validator("phone", "DE", "  ");
+        unnamed.message = "  ".to_owned();
+        let error = compile_one(unnamed);
+        assert!(error.contains("message"), "{error}");
+    }
+
     /// An expression over a column the profile cannot type fails with the
     /// profile's own diagnostic, rather than a type invented here.
     #[test]
@@ -889,6 +1164,7 @@ tables:
             expression: Some("quantity <= 20".to_owned()),
             not_null: None,
             when_present: None,
+            phone: None,
             message: "a cart line is limited to 20 units".to_owned(),
         }];
 
@@ -909,12 +1185,16 @@ tables:
         )
         .expect("the same list compiles against the insert alias");
 
-        assert!(upd[0].sql.contains(r#""upd"."quantity""#), "{}", upd[0].sql);
         assert!(
-            upsert[0].sql.contains(r#""ins"."quantity""#),
+            upd.rows[0].sql.contains(r#""upd"."quantity""#),
             "{}",
-            upsert[0].sql
+            upd.rows[0].sql
         );
-        assert_eq!(upd[0].message, upsert[0].message);
+        assert!(
+            upsert.rows[0].sql.contains(r#""ins"."quantity""#),
+            "{}",
+            upsert.rows[0].sql
+        );
+        assert_eq!(upd.rows[0].message, upsert.rows[0].message);
     }
 }

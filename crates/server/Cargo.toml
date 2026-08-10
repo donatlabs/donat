@@ -25,6 +25,7 @@ donat-sqlgen = { path = "../sqlgen" }
 donat-backend = { path = "../backend" }
 donat-connector-abi = { path = "../connector-abi" }
 donat-connector-catalog = { path = "../connector-catalog" }
+donat-connectors = { path = "../connectors" }
 graphql-parser = { workspace = true }
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }
@@ -42,6 +43,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 refinery = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 croner = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -55,6 +57,7 @@ rustls-native-certs = { workspace = true }
 webpki-roots = { workspace = true }
 donat-storage = { path = "../storage" }
 sha2 = { workspace = true }
+ring = { workspace = true }
 base64 = { workspace = true }
 hmac = "0.12"
 url = "2"
@@ -62,3 +65,7 @@ url = "2"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 insta = { workspace = true }
+# The SDK's local provider stub: an integration test asserts the exact request
+# that reached the wire, including the applied credential header. The feature is
+# dev-only, so the stub's HTTP server stays out of the `donat` binary.
+donat-connectors = { path = "../connectors", features = ["testing"] }

@@ -1,0 +1,101 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 026 §4).
+#
+# PayPal is the first connector whose credential is an OAuth2
+# *client-credentials* token: two ordinary `SecretRef`s, no `config.oauth2`
+# block, and no stored credential at all.
+#
+# `metadata` withholds one instance's client secret while another instance's
+# resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables the refund. PayPal publishes `PayPal-Request-Id`
+# for it and a replay example — "resulting in a 200 OK response with the
+# existing refund details" — but publishes no retention in the Payments v2
+# reference its own idempotency guide sends you to, so the class is a near-miss
+# rather than `ExplicitKey` and the operation is not executable. That is the
+# refusal a payments deployment meets first, and it is deliberately the one that
+# moves money.
+# `horizon_metadata` declares a send horizon one millisecond past PayPal's
+# shortest documented key retention — Orders v2's "The server stores keys for 6
+# hours" — less the clock safety margin. Past that point the same key is a
+# second order, not a replay.
+# No document may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: paypal_present
+      module: paypal
+      config:
+        endpoint_identity: paypal_conformance
+        credential_identity: paypal_conformance_credential
+        secrets:
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: order.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: paypal_missing
+      module: paypal
+      config:
+        endpoint_identity: paypal_conformance
+        credential_identity: paypal_conformance_credential
+        secrets:
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: paypal_refused
+      module: paypal
+      config:
+        endpoint_identity: paypal_conformance
+        credential_identity: paypal_conformance_credential
+        secrets:
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: refund.create
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+horizon_metadata:
+  version: 3
+  connectors:
+    - name: paypal_horizon
+      module: paypal
+      config:
+        endpoint_identity: paypal_conformance
+        credential_identity: paypal_conformance_credential
+        settings:
+          send_horizon_ms: "21540001"
+        secrets:
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: order.create
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `paypal_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `refund.create` on module `paypal`: connector operation is inventory-only and cannot be enabled by a deployment"
+  refused_horizon: "connectors.yaml[0].config.settings.send_horizon_ms: the `paypal` connector refuses this value: the send horizon must fit inside PayPal's shortest documented key retention (six hours, Orders v2) less the clock safety margin"
+  output_excludes: "connector-present-secret-sentinel"

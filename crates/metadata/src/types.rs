@@ -71,6 +71,35 @@ pub struct Metadata {
     /// task — out of the deployment.
     #[serde(default, skip_serializing_if = "StorageMetadata::is_empty")]
     pub storage: StorageMetadata,
+    /// Document templates from the optional `documents.yaml` section: the PDF,
+    /// email, spreadsheet, and calendar sources `local.document` renders. Each
+    /// is read and frozen at load, and pinned into the definition revision of
+    /// every process that renders with it (spec 019 §2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub templates: Vec<crate::documents::DocumentTemplate>,
+    /// Media derivatives from the optional `media.yaml` section: the code
+    /// templates `local.code` renders and the image targets `local.image`
+    /// re-encodes into. Both are deploy-time declarations — what a code may
+    /// carry and which media types a decoder is ever offered are not decisions
+    /// a request gets to make (spec 022 §1 and §2).
+    #[serde(default, skip_serializing_if = "crate::media::MediaMetadata::is_empty")]
+    pub media: crate::media::MediaMetadata,
+    /// Ingest schemas from the optional `ingest.yaml` section: the columns
+    /// `local.ingest` reads an uploaded spreadsheet or CSV with. There is no
+    /// inference, so this declaration is the only thing that decides what a
+    /// file a stranger uploaded means (spec 020 §2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingest_schemas: Vec<crate::ingest::IngestSchema>,
+    /// Recurrence policies from the optional `recurrence.yaml` section: the
+    /// zone `local.recurrence` reads a rule's wall-clock times in, what it does
+    /// at the two local times a DST transition breaks, and the window and
+    /// occurrence ceilings every expansion is bounded by. A rule is data; none
+    /// of these is (spec 021 §3).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::recurrence::RecurrenceMetadata::is_empty"
+    )]
+    pub recurrence: crate::recurrence::RecurrenceMetadata,
 }
 
 /// One named deployment instance of a connector module compiled into the
@@ -112,6 +141,73 @@ pub struct ConnectorConfig {
     pub webhook_secret: Option<SecretRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// Authorization-code OAuth2, for providers that will not accept a static
+    /// API key. Absent for every connector that authenticates with a
+    /// [`SecretRef`], which is most of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth2: Option<ConnectorOauth2>,
+    /// The non-secret deploy-time values one hand-written connector needs
+    /// beyond the fields above: an Airtable base, a Twilio account SID, an AWS
+    /// Region, a bucket and its versioning, a queue and its type.
+    ///
+    /// The map is open here and closed in the compiled module that reads it:
+    /// this type cannot know which keys `aws_sqs` requires, and a module that
+    /// accepted an unknown key would be describing configuration nothing reads
+    /// (`knowledgebase/declarative-saas/decisions/034-*`). Every module's own
+    /// validator therefore names its required keys and refuses the rest, before
+    /// a listener opens. Nothing secret belongs here — a secret is a
+    /// [`SecretRef`] in [`ConnectorConfig::secrets`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, String>,
+    /// The further named secrets a connector's credential contract declares —
+    /// AWS's access key, secret access key, and optional session token — each
+    /// one a [`SecretRef`] resolved at startup exactly like `secret_key`.
+    ///
+    /// A connector that authenticates with a single key keeps using
+    /// [`ConnectorConfig::secret_key`]; this map exists because a signed AWS
+    /// request needs more than one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, SecretRef>,
+}
+
+/// The deploy-time half of an authorization-code OAuth2 credential.
+///
+/// It declares where tokens come from and what they are allowed to do; it
+/// never holds a token. The tokens themselves are obtained by the deploy-time
+/// `donat connector authorize` command and kept sealed in the source-local
+/// `donat.connector_credential` table, because they are the one credential the
+/// engine has to write rather than read.
+///
+/// The two endpoints are fixed here, at deploy time, exactly as a connector
+/// base URL is. Nothing at runtime can move them: not process input, not a
+/// role, not the provider's own token response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorOauth2 {
+    /// Where the operator is sent to approve the authorization. Used only by
+    /// the CLI; the serving binary never builds this URL.
+    pub authorization_endpoint: String,
+    /// The one origin a code or a refresh token may be exchanged at. Recorded
+    /// on the stored row and bound into its sealing AAD.
+    pub token_endpoint: String,
+    /// Called by `donat connector credentials revoke` before the row is
+    /// deleted, when the provider publishes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+    /// The registered redirect the provider will send the operator back to.
+    /// A redirect arriving from any other host aborts the authorization.
+    pub redirect_uri: String,
+    pub client_id: SecretRef,
+    /// Absent for a public client that authenticates with PKCE alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<SecretRef>,
+    /// What this instance asks for, and what the granted set must cover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// How long before expiry an access token is treated as already expired.
+    /// Defaults to 60 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_skew_seconds: Option<u64>,
 }
 
 /// A configured HTTP base URL. A literal URL is non-secret metadata; a value
@@ -1373,6 +1469,15 @@ pub struct ProcessRequestState {
     pub next: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_error: Option<ProcessErrorRoutes>,
+    /// See [`ProcessRequestActivity::at_most_once`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub at_most_once: bool,
+    /// See [`ProcessRequestActivity::on_ambiguous`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ambiguous: Option<String>,
+    /// See [`ProcessRequestActivity::template_pin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_pin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1387,6 +1492,53 @@ pub struct ProcessRequestActivity {
     pub retry: ProcessRetry,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_error: Option<ProcessErrorRoutes>,
+    /// The opt-in that admits a provider mutation with no idempotency
+    /// mechanism (`EffectClass::AtMostOnce`, ADR 063).
+    ///
+    /// It promises what its name says and nothing more: the engine sends this
+    /// request **at most once**. It never retries the send, and after a worker
+    /// loss it refuses to send again rather than risk a second one. What it
+    /// cannot promise is that the request was sent at all — see
+    /// [`Self::on_ambiguous`], which is why that field is mandatory here.
+    ///
+    /// It is per-activity rather than per-connector because the trade is a
+    /// property of the flow, not of the operation: the same send is acceptable
+    /// in a Process that can reconcile it afterwards and unacceptable in one
+    /// that cannot. Compilation refuses it on an operation that does not need
+    /// it, and refuses an operation that needs it without it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub at_most_once: bool,
+    /// Where the Process goes when the send's outcome cannot be known.
+    ///
+    /// This is not an error route. `on_error` routes *failures* — the engine
+    /// knows what happened and which class it was. An ambiguous send is the
+    /// other thing: the send was authorized, the worker that owned it was lost,
+    /// and no outcome was ever recorded. Neither success nor failure is known,
+    /// so neither vocabulary can carry it honestly, and it gets a destination
+    /// of its own. Required whenever [`Self::at_most_once`] is declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ambiguous: Option<String>,
+    /// `<template>@<content hash>`, stamped by the loader onto a
+    /// `local.document` activity from the template it selects.
+    ///
+    /// It *is* serialized, which is the whole point — the process definition
+    /// fingerprint is taken over the serialized process, so editing a template
+    /// file changes the revision of every process that renders with it (spec
+    /// 019 §7 `pdf_template_is_pinned_by_hash`).
+    ///
+    /// And it deserializes, because a serialized process is read back: the
+    /// canonical definition of every revision is persisted as JSON and decoded
+    /// again at boot to recompile revisions that still have in-flight
+    /// instances. A serialize-only field under `deny_unknown_fields` makes that
+    /// decode fail — the running deployment stops booting the moment a new
+    /// revision is cut.
+    ///
+    /// Derived, never declared: the *loader* refuses a declared pin by name
+    /// (`refuse_declared_template_pins`), which is a better refusal than an
+    /// unknown field inside an untagged enum, and the only one that can tell a
+    /// deployment's YAML apart from the engine's own persisted definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_pin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2002,8 +2154,23 @@ pub struct CronTrigger {
     pub name: String,
     /// Webhook URL ({{ENV}} templates allowed).
     pub webhook: String,
-    /// Standard 5-field cron expression, evaluated in UTC.
+    /// Standard 5-field cron expression. Evaluated in UTC unless `timezone`
+    /// names a zone to read its wall-clock fields in.
     pub schedule: String,
+    /// IANA zone (`Europe/Berlin`) the `schedule` is read in. Absent means
+    /// UTC, which is what every schedule meant before this field existed and
+    /// what the Donat export — which has no such field — still means.
+    ///
+    /// A zone makes the schedule a *wall-clock* one: `0 9 * * 1-5` fires at
+    /// local 09:00 on both sides of a DST transition, at a different UTC
+    /// instant each side. That is only well defined once [`CronDstPolicy`]
+    /// says what the two broken wall-clock times do, so a zone requires one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// What this schedule does at the wall-clock times a DST transition
+    /// breaks. Required with `timezone`, refused without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<CronDstPolicy>,
     /// Static JSON body sent to the webhook (under the envelope's `payload`).
     /// Donat tolerates an absent or explicitly null payload; both mean "no
     /// payload" — we normalize to JSON null here and emit `{}`-or-null at
@@ -2021,6 +2188,54 @@ pub struct CronTrigger {
     pub headers: Vec<ActionHeader>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+}
+
+/// What a zoned schedule does at the two wall-clock times a DST transition
+/// breaks: the local time that does not happen at all in spring, and the one
+/// that happens twice in autumn.
+///
+/// Both are stated. There is no default and no library behaviour to inherit:
+/// "09:00 every weekday" and "02:30 every night" are different promises, and
+/// only the author of the schedule knows whether a missed nightly run should
+/// be made up late or dropped. A schedule declared in a zone therefore carries
+/// this, or it is refused at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronDstPolicy {
+    /// The spring gap: what to do with a local time that does not exist.
+    pub skipped_time: DstSkippedTime,
+    /// The autumn overlap: which of the two instants carrying the local time
+    /// is the run.
+    pub repeated_time: DstRepeatedTime,
+}
+
+/// The spring transition skips an hour of wall-clock time; a schedule that
+/// names a time inside it has no instant to fire at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DstSkippedTime {
+    /// Fire once at the instant the gap ends — the run is late by the length
+    /// of the gap, never lost. For work that must happen every day.
+    FireAfterGap,
+    /// Do not fire. The occurrence is reported as skipped (a log line at
+    /// materialization), never dropped in silence. For work where a late run
+    /// is worse than none, and for a schedule dense enough that the next one
+    /// is along shortly.
+    Skip,
+}
+
+/// The autumn transition repeats an hour of wall-clock time; a schedule that
+/// names a time inside it has two instants to choose from, and takes exactly
+/// one of them — a run declared once a day happens once a day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DstRepeatedTime {
+    /// The first (earlier, pre-transition) instant: the run keeps its usual
+    /// distance from the runs before it.
+    FireAtFirst,
+    /// The second (later, post-transition) instant: the run keeps its usual
+    /// distance from the runs after it, and from the rest of the new day.
+    FireAtSecond,
 }
 
 /// Retry/timeout policy for scheduled triggers (Donat `RetryConfST`).
@@ -2801,9 +3016,9 @@ pub struct SelectPermission {
 /// `check` is a predicate over the session and the row and answers whether the
 /// role may write it. A validator answers a different question — whether the
 /// value itself is acceptable — over the row as written, and carries its own
-/// message. Exactly one of `expression` and `not_null` is present; which one,
-/// and what the referenced columns must be, is settled against the catalogue
-/// during deploy-time compilation rather than here.
+/// message. Exactly one of `expression`, `not_null` and `phone` is present;
+/// which one, and what the referenced columns must be, is settled against the
+/// catalogue during deploy-time compilation rather than here.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionValidator {
@@ -2823,7 +3038,34 @@ pub struct PermissionValidator {
     /// inside the expression would not make the other arm type check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when_present: Option<String>,
+    /// A column that must hold a phone number, and the region national
+    /// spellings are read in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<PhoneValidator>,
     pub message: String,
+}
+
+/// The `phone` spelling of a validator entry.
+///
+/// It differs from the other spellings in two ways, and both are deliberate.
+/// It is evaluated in Rust before the statement is built rather than lowered
+/// to SQL, because validity is a property of a versioned numbering-plan
+/// database that no predicate can express. And it *normalizes*: the value that
+/// reaches the column is the number's E.164 form, so one number in several
+/// spellings is one stored value.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhoneValidator {
+    /// The column carrying the number.
+    pub column: String,
+    /// The default region for a number written without an international
+    /// prefix, as an uppercase CLDR region code (`DE`, `US`, `GB`).
+    ///
+    /// It is deploy-time data and only ever that: it is resolved once, when
+    /// metadata is compiled, and no header, role, session variable or
+    /// submitted value can reach it. A number written with a `+` prefix names
+    /// its own country and ignores this.
+    pub region: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

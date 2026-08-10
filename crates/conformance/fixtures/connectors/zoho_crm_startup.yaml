@@ -1,0 +1,125 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 023 §4).
+#
+# `metadata` withholds one instance's OAuth2 client secret while another
+# instance's resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an inventory-only operation — Zoho documents its
+# upsert as repeat-safe over a `POST`, which spec 010 §7 admits for neither
+# mutating class — and startup must name the exact metadata path.
+# `scope_metadata` configures the `eu` data centre with a token endpoint at
+# Zoho's US accounts host: Zoho serves one org from one data centre, so startup
+# must name `config.oauth2.token_endpoint`. None of the three may disclose a
+# resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: zoho_crm_present
+      module: zoho_crm
+      config:
+        endpoint_identity: zoho_crm_conformance
+        credential_identity: zoho_crm_conformance_credential
+        settings:
+          region: eu
+        oauth2:
+          authorization_endpoint: https://accounts.zoho.eu/oauth/v2/auth
+          token_endpoint: https://accounts.zoho.eu/oauth/v2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - ZohoCRM.modules.deals.READ
+      operations:
+        - name: record.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: zoho_crm_missing
+      module: zoho_crm
+      config:
+        endpoint_identity: zoho_crm_conformance
+        credential_identity: zoho_crm_conformance_credential
+        settings:
+          region: eu
+        oauth2:
+          authorization_endpoint: https://accounts.zoho.eu/oauth/v2/auth
+          token_endpoint: https://accounts.zoho.eu/oauth/v2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - ZohoCRM.modules.deals.READ
+      operations:
+        - name: record.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+refused_metadata:
+  version: 3
+  connectors:
+    - name: zoho_crm_refused
+      module: zoho_crm
+      config:
+        endpoint_identity: zoho_crm_conformance
+        credential_identity: zoho_crm_conformance_credential
+        settings:
+          region: eu
+        oauth2:
+          authorization_endpoint: https://accounts.zoho.eu/oauth/v2/auth
+          token_endpoint: https://accounts.zoho.eu/oauth/v2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - ZohoCRM.modules.deals.ALL
+      operations:
+        - name: record.upsert
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+scope_metadata:
+  version: 3
+  connectors:
+    - name: zoho_crm_scoped
+      module: zoho_crm
+      config:
+        endpoint_identity: zoho_crm_conformance
+        credential_identity: zoho_crm_conformance_credential
+        settings:
+          region: eu
+        oauth2:
+          authorization_endpoint: https://accounts.zoho.com/oauth/v2/auth
+          token_endpoint: https://accounts.zoho.com/oauth/v2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - ZohoCRM.modules.deals.READ
+      operations:
+        - name: record.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `zoho_crm_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `record.upsert` on module `zoho_crm`: connector operation is inventory-only and cannot be enabled by a deployment"
+  module_refusal: "connectors.yaml[0].config.oauth2.token_endpoint: the `zoho_crm` connector is configured for the `eu` data centre"
+  output_excludes: "connector-present-secret-sentinel"

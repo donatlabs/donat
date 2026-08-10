@@ -518,7 +518,7 @@ fn source_public_probe_family_pairs() -> Vec<SourcePublicProbeFamily> {
     npm_fields["entrypoints"] = serde_json::json!(["probe.js"]);
     npm_fields["dependencies"][0]["disposition"]["value"]["replacement"] =
         serde_json::json!("donat.value.contract.probe");
-    npm_fields["dependencies"][0]["dependency"] = serde_json::json!("n8n-workflow-probe");
+    npm_fields["dependencies"][0]["dependency"] = serde_json::json!("vendor-workflow-sdk-probe");
     npm_fields["admission"]["value"]["findings"] = serde_json::json!(["finding.probe"]);
     npm_fields["safety_findings"]["findings"][0]["finding_id"] = serde_json::json!("finding.probe");
     npm_fields["safety_findings"]["findings"][0]["kind"] = serde_json::json!("port.probe");
@@ -2522,7 +2522,7 @@ fn positive_source_loader_branches_have_exact_generated_material_bytes_and_shape
         [
             (
                 "npm-verified",
-                "334b89a4be9b4a88f9e6757d8ef340172f1e0f5579a4952a39bf0d943a392c15",
+                "ec2eac67e85bb18074f055c3d09d272d060954f7031d80ae8ca730e3f70dc3e6",
             ),
             (
                 "provider-repository-reviewed-use",
@@ -2538,15 +2538,15 @@ fn positive_source_loader_branches_have_exact_generated_material_bytes_and_shape
             ),
             (
                 "npm-absent-mismatch-written-grant",
-                "d0bb3f415a791624c8f8245ed379afb57211feade8256219124cf5f053199725",
+                "ac508fd4c8c662e5ed4a50085a19c4789c7a29861c9147bd780f4df12b7b7888",
             ),
             (
                 "npm-rejected-and-verified-provenance",
-                "ba5458b068e6a73a81eea809b09c9b286642f85cf6c5e527dde497ac8b926ec2",
+                "3de659a76f8fa6d211f7e79fe3da04fc880cb4ac722e75450c1950a5fad46b53",
             ),
             (
                 "npm-rejected-provenance",
-                "5ae41f8977e6f0fae690526ccc1b56c3346a2f6a1389dcae88b3ccc86bb2ac52",
+                "852019eb48b970c88ee2efa478906eee2b376a0fa68ba8ce96d6d3517b4c3ea1",
             ),
             (
                 "provider-permissive-terms",
@@ -2956,6 +2956,13 @@ fn positive_semantic_projection_cases() -> Vec<(&'static str, serde_json::Value)
         }
     });
 
+    // ADR 063. The third effect class is a tagged unit like `read_only`, and it
+    // is a public branch of the semantic material, so one compiler-valid case
+    // has to traverse it.
+    let mut at_most_once = baseline.clone();
+    at_most_once["operations"][0]["effect"] =
+        serde_json::json!({"kind": "at_most_once", "value": null});
+
     vec![
         ("baseline", baseline),
         (
@@ -2964,6 +2971,7 @@ fn positive_semantic_projection_cases() -> Vec<(&'static str, serde_json::Value)
         ),
         ("request-and-response-shapes", request_and_response_shapes),
         ("idempotency-bindings", idempotency_bindings),
+        ("at-most-once", at_most_once),
         ("pagination-none", pagination_none),
         ("pagination-offset-limit", pagination_offset_limit),
         ("pagination-page-number", pagination_page_number),
@@ -3726,6 +3734,10 @@ fn positive_semantic_loader_branches_have_fixed_public_pipeline_hashes() {
             (
                 "idempotency-bindings",
                 "aa50dcdb3f34d87edad85d3b837e384c344ec643390fb387cb78ad02dc66345c",
+            ),
+            (
+                "at-most-once",
+                "1d2f33029297e3db6a0e4f8ad8619d2e918fa64068f9c0124988e9788e4d38f1",
             ),
             (
                 "pagination-none",

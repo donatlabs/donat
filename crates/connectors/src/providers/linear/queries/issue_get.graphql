@@ -1,0 +1,20 @@
+# Linear: `issue(id: String!): Issue!` — "The identifier of the issue to
+# retrieve." The selection set is fixed here and is the whole of what this
+# operation can ever ask for.
+query IssueGet($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    title
+    description
+    url
+    priority
+    createdAt
+    updatedAt
+    state {
+      id
+      name
+      type
+    }
+  }
+}

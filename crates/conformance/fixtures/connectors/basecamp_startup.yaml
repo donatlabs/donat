@@ -1,0 +1,126 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 024 §3).
+#
+# `metadata` withholds one instance's OAuth2 client secret while another
+# instance's resolves. `refused_metadata` enables the batch's sharpest
+# inventory-only operation: Basecamp marks `POST /todos/{id}/completion.json`
+# `x-basecamp-idempotent: {"natural": true}` in its own published API
+# description — a genuine repeat-safe write, over a method spec 010 §7 does not
+# admit for `NaturalMethod` — so `todo.complete` wants a class that keeps the
+# retry, and that class does not exist. `account_metadata` names an account id
+# Basecamp's own grammar does not admit ("Basecamp account ID (numeric
+# string)"), which is a startup refusal rather than a path this connector would
+# have rendered. None of the three may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: basecamp_present
+      module: basecamp
+      config:
+        endpoint_identity: basecamp_conformance
+        credential_identity: basecamp_conformance_credential
+        settings:
+          account_id: "999999999"
+          user_agent: Donat (integrations@example.test)
+        oauth2:
+          authorization_endpoint: https://launchpad.37signals.com/authorization/new
+          token_endpoint: https://launchpad.37signals.com/authorization/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes: []
+      operations:
+        - name: todo.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: basecamp_missing
+      module: basecamp
+      config:
+        endpoint_identity: basecamp_conformance
+        credential_identity: basecamp_conformance_credential
+        settings:
+          account_id: "999999999"
+          user_agent: Donat (integrations@example.test)
+        oauth2:
+          authorization_endpoint: https://launchpad.37signals.com/authorization/new
+          token_endpoint: https://launchpad.37signals.com/authorization/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes: []
+      operations:
+        - name: todo.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+refused_metadata:
+  version: 3
+  connectors:
+    - name: basecamp_refused
+      module: basecamp
+      config:
+        endpoint_identity: basecamp_conformance
+        credential_identity: basecamp_conformance_credential
+        settings:
+          account_id: "999999999"
+          user_agent: Donat (integrations@example.test)
+        oauth2:
+          authorization_endpoint: https://launchpad.37signals.com/authorization/new
+          token_endpoint: https://launchpad.37signals.com/authorization/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes: []
+      operations:
+        - name: todo.complete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+account_metadata:
+  version: 3
+  connectors:
+    - name: basecamp_account
+      module: basecamp
+      config:
+        endpoint_identity: basecamp_conformance
+        credential_identity: basecamp_conformance_credential
+        settings:
+          account_id: 999999999/../111111111
+          user_agent: Donat (integrations@example.test)
+        oauth2:
+          authorization_endpoint: https://launchpad.37signals.com/authorization/new
+          token_endpoint: https://launchpad.37signals.com/authorization/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes: []
+      operations:
+        - name: todo.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `basecamp_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `todo.complete` on module `basecamp`: connector operation is inventory-only and cannot be enabled by a deployment"
+  module_refusal: "connectors.yaml[0].config.settings.account_id: the `basecamp` connector refuses this value"
+  output_excludes: "connector-present-secret-sentinel"

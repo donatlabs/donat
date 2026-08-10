@@ -1,0 +1,9 @@
+# monday: "Creates and adds a new update to an item." An update is monday's
+# comment.
+mutation UpdateCreate($item_id: ID!, $body: String!) {
+  create_update(item_id: $item_id, body: $body) {
+    id
+    body
+    created_at
+  }
+}

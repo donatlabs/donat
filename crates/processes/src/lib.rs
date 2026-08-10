@@ -394,6 +394,14 @@ pub struct CompiledProcessRequestState {
     pub operation: OperationId,
     pub input: BTreeMap<String, ProcessValue>,
     pub provider_idempotent: bool,
+    /// The activity declared the ADR 063 opt-in, and the compiled operation is
+    /// the class that requires it. The two are checked against each other at
+    /// compilation and again before every send, so a revision can never run an
+    /// at-most-once operation as if it were repeatable.
+    pub at_most_once: bool,
+    /// Where an outcome nobody can know goes. Present exactly when
+    /// [`Self::at_most_once`] is set.
+    pub on_ambiguous: Option<String>,
     pub schedule_to_start_ms: u64,
     pub start_to_close_ms: u64,
     pub retry: ProcessRetry,
@@ -411,6 +419,8 @@ impl std::fmt::Debug for CompiledProcessRequestState {
             .field("operation", &self.operation.as_str())
             .field("input", &self.input)
             .field("provider_idempotent", &self.provider_idempotent)
+            .field("at_most_once", &self.at_most_once)
+            .field("on_ambiguous", &self.on_ambiguous)
             .field("schedule_to_start_ms", &self.schedule_to_start_ms)
             .field("start_to_close_ms", &self.start_to_close_ms)
             .field("retry", &self.retry)
@@ -1506,6 +1516,11 @@ fn state_transitions(state: &ProcessState) -> Vec<(&str, bool)> {
         ProcessStateOperation::Request { request } => {
             targets.push((request.next.as_str(), true));
             push_error_transitions(&mut targets, request.on_error.as_ref(), false);
+            // An ambiguous send produced no output, exactly as a failure route
+            // produced none: the destination gets the instance, not a result.
+            if let Some(ambiguous) = &request.on_ambiguous {
+                targets.push((ambiguous.as_str(), false));
+            }
         }
         ProcessStateOperation::When { when } => {
             targets.extend(when.cases.iter().map(|case| (case.next.as_str(), true)));
@@ -1527,6 +1542,9 @@ fn state_transitions(state: &ProcessState) -> Vec<(&str, bool)> {
             ProcessForEachState::Request { request, next, .. } => {
                 targets.push((next.as_str(), true));
                 push_error_transitions(&mut targets, request.on_error.as_ref(), true);
+                if let Some(ambiguous) = &request.on_ambiguous {
+                    targets.push((ambiguous.as_str(), true));
+                }
             }
         },
         ProcessStateOperation::Output { .. } | ProcessStateOperation::Fail { .. } => {}
@@ -1972,6 +1990,8 @@ fn compile_request_state(
         &request.timeout,
         &request.retry,
         request.on_error.as_ref(),
+        request.at_most_once,
+        request.on_ambiguous.as_deref(),
         state_id,
         item_key,
         context,
@@ -1985,6 +2005,8 @@ fn compile_request_state(
             operation: compiled.operation,
             input: compiled.input,
             provider_idempotent: compiled.provider_idempotent,
+            at_most_once: compiled.at_most_once,
+            on_ambiguous: compiled.on_ambiguous,
             schedule_to_start_ms: compiled.schedule_to_start_ms,
             start_to_close_ms: compiled.start_to_close_ms,
             retry: compiled.retry,
@@ -2001,6 +2023,8 @@ struct CompiledProcessRequestActivity {
     operation: OperationId,
     input: BTreeMap<String, ProcessValue>,
     provider_idempotent: bool,
+    at_most_once: bool,
+    on_ambiguous: Option<String>,
     schedule_to_start_ms: u64,
     start_to_close_ms: u64,
     retry: ProcessRetry,
@@ -2018,6 +2042,8 @@ fn compile_request(
     timeout: &donat_metadata::ProcessTimeout,
     retry: &ProcessRetry,
     on_error: Option<&ProcessErrorRoutes>,
+    at_most_once: bool,
+    on_ambiguous: Option<&str>,
     state_id: &str,
     item_key: Option<&str>,
     context: &mut CompileContext<'_, '_>,
@@ -2067,6 +2093,21 @@ fn compile_request(
     )?;
     validate_binding_map(input, &input_contract, context, &format!("{path}.input"))?;
     validate_error_routes(on_error, &format!("{path}.on_error"))?;
+    let at_most_once_effect = matches!(
+        resolved.spec.effect,
+        donat_connector_catalog::OperationEffect::AtMostOnce
+    );
+    validate_at_most_once(
+        at_most_once_effect,
+        at_most_once,
+        on_ambiguous,
+        on_error,
+        item_key.is_none(),
+        retry,
+        connector,
+        operation,
+        path,
+    )?;
     let schedule_to_start = parse_duration(
         &timeout.schedule_to_start,
         &format!("{path}.timeout.schedule_to_start"),
@@ -2086,6 +2127,7 @@ fn compile_request(
     }
     let maximum_send_horizon_ms = compile_retry_horizon(
         retry,
+        at_most_once,
         schedule_to_start,
         start_to_close,
         &format!("{path}.retry"),
@@ -2103,6 +2145,15 @@ fn compile_request(
                 return Err(validation(
                     format!("{path}.idempotency_key"),
                     "read-only connector operations must remain headerless",
+                ));
+            }
+            false
+        }
+        donat_connector_catalog::OperationEffect::AtMostOnce => {
+            if idempotency_key.is_some() {
+                return Err(validation(
+                    format!("{path}.idempotency_key"),
+                    "an at-most-once operation binds no provider key; its safety is the send that is never repeated",
                 ));
             }
             false
@@ -2182,6 +2233,8 @@ fn compile_request(
             operation: compiled_operation,
             input: input.clone(),
             provider_idempotent,
+            at_most_once,
+            on_ambiguous: on_ambiguous.map(str::to_owned),
             schedule_to_start_ms: schedule_to_start,
             start_to_close_ms: start_to_close,
             retry: retry.clone(),
@@ -2258,8 +2311,104 @@ fn validate_error_routes(routes: Option<&ProcessErrorRoutes>, path: &str) -> Res
     Ok(())
 }
 
+/// ADR 063. Every refusal that reads the activity's own at-most-once
+/// declaration, in one place, so the order the messages arrive in is the order
+/// a reader would ask the questions.
+#[allow(clippy::too_many_arguments)]
+fn validate_at_most_once(
+    at_most_once_effect: bool,
+    at_most_once: bool,
+    on_ambiguous: Option<&str>,
+    on_error: Option<&ProcessErrorRoutes>,
+    // A standalone request state, rather than one fan-out item's activity. The
+    // two route their failures differently, which is why only one of them needs
+    // `on_error` to be executable at all.
+    standalone_state: bool,
+    retry: &ProcessRetry,
+    connector: &str,
+    operation: &str,
+    path: &str,
+) -> Result<(), PlanError> {
+    // A declaration the runtime ignores is a defect (ADR 034), in both
+    // directions: the opt-in on an operation whose provider absorbs a duplicate
+    // would change nothing, and the route without the opt-in is unreachable.
+    if at_most_once && !at_most_once_effect {
+        return Err(validation(
+            format!("{path}.at_most_once"),
+            format!(
+                "connector operation `{connector}.{operation}` publishes an idempotency contract, so an at-most-once opt-in would change nothing"
+            ),
+        ));
+    }
+    if on_ambiguous.is_some() && !at_most_once {
+        return Err(validation(
+            format!("{path}.on_ambiguous"),
+            "an ambiguous-outcome route is reachable only for an at-most-once activity",
+        ));
+    }
+    if !at_most_once_effect {
+        return Ok(());
+    }
+    if !at_most_once {
+        return Err(validation(
+            format!("{path}.at_most_once"),
+            format!(
+                "connector operation `{connector}.{operation}` publishes no idempotency mechanism; an activity may reference it only by declaring `at_most_once: true`"
+            ),
+        ));
+    }
+    if on_ambiguous.is_none() {
+        return Err(validation(
+            format!("{path}.on_ambiguous"),
+            "an at-most-once activity must declare where an unknown outcome goes; `on_error` routes failures, and a send that may or may not have happened is not one",
+        ));
+    }
+    // ...and it must still say where a *failure* goes. This class is where the
+    // omission is certain rather than merely likely: `retry_on` is empty and
+    // `max_attempts` is one below, so the first ordinary failure — a provider
+    // that answered `400`, a credential the seam refused — is terminal at once.
+    // The transition consumer places it on a compiled error route and refuses
+    // when the state has none, leaving the instance sitting `running` with
+    // nothing that can advance it, which is the ADR 034 defect: a definition
+    // that compiles and the runtime cannot execute.
+    //
+    // A fan-out item is exempt because its failure is executable without a
+    // route: it falls back to the fan-out state's own `next` and is collected in
+    // the item journal either way.
+    if standalone_state && on_error.is_none() {
+        return Err(validation(
+            format!("{path}.on_error"),
+            "an at-most-once activity must also declare `on_error`: it retries nothing, so its first ordinary failure is terminal, and a failure with no declared route leaves the instance running with nowhere to go",
+        ));
+    }
+    // The sharpest interaction in this class. A retryable failure class means a
+    // *second provider attempt*, and the second attempt is precisely what this
+    // class refuses: the send authorization is claimed once and the worker that
+    // finds it claimed reports an unknown outcome instead of sending. So there
+    // is no retryable class an at-most-once activity may still name, and there
+    // is no attempt budget above one — either would promise a retry the runtime
+    // will not make.
+    if !retry.retry_on.is_empty() {
+        return Err(validation(
+            format!("{path}.retry.retry_on"),
+            "an at-most-once activity retries nothing: every retryable class is a second provider attempt, and this operation may be sent once",
+        ));
+    }
+    if retry.max_attempts != 1 {
+        return Err(validation(
+            format!("{path}.retry.max_attempts"),
+            format!(
+                "an at-most-once activity has exactly one attempt; `max_attempts` is {}",
+                retry.max_attempts
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn compile_retry_horizon(
     retry: &ProcessRetry,
+    at_most_once: bool,
     schedule_to_start_ms: u64,
     start_to_close_ms: u64,
     path: &str,
@@ -2270,7 +2419,10 @@ fn compile_retry_horizon(
             "retry max_attempts must be greater than zero",
         ));
     }
-    if retry.retry_on.is_empty() {
+    // An at-most-once activity is the one activity whose `retry_on` is empty,
+    // and it is empty because nothing about it is retryable (ADR 063). Every
+    // other activity must name at least one class it will try again on.
+    if retry.retry_on.is_empty() && !at_most_once {
         return Err(validation(
             format!("{path}.retry_on"),
             "retry_on must not be empty",
@@ -3161,6 +3313,8 @@ fn compile_request_activity(
         &request.timeout,
         &request.retry,
         request.on_error.as_ref(),
+        request.at_most_once,
+        request.on_ambiguous.as_deref(),
         state_id,
         Some(item_key),
         context,
@@ -3174,6 +3328,8 @@ fn compile_request_activity(
             operation: compiled.operation,
             input: compiled.input,
             provider_idempotent: compiled.provider_idempotent,
+            at_most_once: compiled.at_most_once,
+            on_ambiguous: compiled.on_ambiguous,
             schedule_to_start_ms: compiled.schedule_to_start_ms,
             start_to_close_ms: compiled.start_to_close_ms,
             retry: compiled.retry,

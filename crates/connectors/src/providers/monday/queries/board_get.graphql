@@ -1,0 +1,15 @@
+# monday: "Returns an array containing metadata about one or a collection of
+# boards."
+query BoardGet($ids: [ID!]) {
+  boards(ids: $ids) {
+    id
+    name
+    state
+    board_kind
+    description
+    workspace {
+      id
+      name
+    }
+  }
+}

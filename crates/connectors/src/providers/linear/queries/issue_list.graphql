@@ -1,0 +1,26 @@
+# Linear: `issues(filter: IssueFilter, first: Int, after: String): IssueConnection!`
+# — "A cursor to be used with first for forward pagination" and "The number of
+# items to forward paginate (used with after). Defaults to 50." The filter is a
+# typed variable, so it is data the provider validates against its own schema; it
+# cannot add a field to the selection set below.
+query IssueList($filter: IssueFilter, $first: Int!, $after: String) {
+  issues(filter: $filter, first: $first, after: $after) {
+    nodes {
+      id
+      identifier
+      title
+      url
+      priority
+      updatedAt
+      state {
+        id
+        name
+        type
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}

@@ -1,0 +1,88 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 028 §3).
+#
+# Clockify's credential is one `X-Api-Key` and its workspace is the first scoped
+# segment of every path it renders. The workspace is *not* a secret — Clockify
+# prints it in its own web URLs — so it is `config.settings` material with a
+# grammar of its own, and a mistyped one is a startup refusal here rather than a
+# request into a workspace this connector was never configured for.
+#
+# `metadata` withholds one instance's key while another instance's resolves.
+# `refused_metadata` enables the `PUT` whose second send Clockify never
+# described: `NaturalMethod` is admitted on the provider's own repeat statement
+# rather than on the method, and there is none. `account_metadata` names a
+# workspace id Clockify's own grammar does not admit.
+metadata:
+  version: 3
+  connectors:
+    - name: clockify_present
+      module: clockify
+      config:
+        endpoint_identity: clockify_conformance
+        credential_identity: clockify_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          workspace_id: 64a687e29ae1f428e7ebe303
+      operations:
+        - name: project.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: clockify_missing
+      module: clockify
+      config:
+        endpoint_identity: clockify_conformance
+        credential_identity: clockify_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          workspace_id: 64a687e29ae1f428e7ebe303
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: clockify_refused
+      module: clockify
+      config:
+        endpoint_identity: clockify_conformance
+        credential_identity: clockify_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          workspace_id: 64a687e29ae1f428e7ebe303
+      operations:
+        - name: time_entry.update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+account_metadata:
+  version: 3
+  connectors:
+    - name: clockify_account
+      module: clockify
+      config:
+        endpoint_identity: clockify_conformance
+        credential_identity: clockify_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          workspace_id: 64a687e29ae1f428e7ebe303/../deadbeefdeadbeefdeadbeef
+      operations:
+        - name: project.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `clockify_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `time_entry.update` on module `clockify`: connector operation is inventory-only and cannot be enabled by a deployment"
+  module_refusal: "connectors.yaml[0].config.settings.workspace_id: the `clockify` connector refuses this value"
+  output_excludes: "connector-present-secret-sentinel"

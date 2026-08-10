@@ -261,6 +261,10 @@ enum PreparedTransition {
     Request(PreparedRequestTransition),
     RequestSuccess(PreparedRequestSuccessTransition),
     RequestFailure(PreparedRequestFailureTransition),
+    /// The one at-most-once send was already authorized and its outcome was
+    /// never recorded. Same shape as a failure, different destination and a
+    /// different word in the journal, because it is not one (ADR 063).
+    RequestAmbiguous(PreparedRequestFailureTransition),
     When(PreparedWhenTransition),
     Output(PreparedOutputTransition),
     Fail(PreparedFailTransition),
@@ -279,6 +283,7 @@ impl PreparedTransition {
             Self::Request(prepared) => &prepared.snapshot,
             Self::RequestSuccess(prepared) => &prepared.snapshot,
             Self::RequestFailure(prepared) => &prepared.snapshot,
+            Self::RequestAmbiguous(prepared) => &prepared.snapshot,
             Self::When(prepared) => &prepared.snapshot,
             Self::Output(prepared) => &prepared.snapshot,
             Self::Fail(prepared) => &prepared.snapshot,
@@ -553,7 +558,28 @@ impl ProcessRuntime {
                     }
                 }
                 PreparedTransition::RequestFailure(prepared) => {
-                    commit_request_failure(&transaction, &self.source_name, &prepared).await?;
+                    commit_request_failure(
+                        &transaction,
+                        &self.source_name,
+                        &prepared,
+                        "activity_error_routed",
+                    )
+                    .await?;
+                    TransitionConsumption::Advanced {
+                        instance_id: prepared.snapshot.instance_id,
+                        event_id: prepared.snapshot.event_id,
+                        from_state: prepared.snapshot.current_state.clone(),
+                        to_state: prepared.next,
+                    }
+                }
+                PreparedTransition::RequestAmbiguous(prepared) => {
+                    commit_request_failure(
+                        &transaction,
+                        &self.source_name,
+                        &prepared,
+                        "activity_ambiguous_routed",
+                    )
+                    .await?;
                     TransitionConsumption::Advanced {
                         instance_id: prepared.snapshot.instance_id,
                         event_id: prepared.snapshot.event_id,
@@ -1822,6 +1848,26 @@ impl ProcessRuntime {
                 snapshot.current_state
             );
         }
+        // The opt-in is pinned with the revision, and the live operation must
+        // still be the class that required it. A deployment that turned an
+        // at-most-once operation into an idempotent one — or the reverse —
+        // stops this instance rather than sending under the wrong promise.
+        let at_most_once = matches!(
+            dependency.spec.effect,
+            donat_connector_catalog::OperationEffect::AtMostOnce
+        );
+        if at_most_once != state.at_most_once {
+            bail!(
+                "Process request state `{}` has a mismatched at-most-once effect",
+                snapshot.current_state
+            );
+        }
+        if state.at_most_once && state.on_ambiguous.is_none() {
+            bail!(
+                "Process request state `{}` is at-most-once with no ambiguous route",
+                snapshot.current_state
+            );
+        }
 
         let input = Json::Object(
             evaluate_process_values(&state.input, &context)?
@@ -2306,6 +2352,28 @@ impl ProcessRuntime {
                 .and_then(Json::as_str)
                 .ok_or_else(|| anyhow!("Process activity safe error has no class"))?
         };
+        // ADR 063. An ambiguous at-most-once send takes its own destination and
+        // is matched by code, not by class: no `on_error` route and no fallback
+        // can claim it, because the class it carries describes only how the
+        // engine stopped, not what the provider did.
+        if is_ambiguous_send(&stored_error) {
+            let next = state.on_ambiguous.clone().ok_or_else(|| {
+                anyhow!(
+                    "Process request state `{}` refused an at-most-once send with no ambiguous route",
+                    snapshot.current_state
+                )
+            })?;
+            return Ok(PreparedTransition::RequestAmbiguous(
+                PreparedRequestFailureTransition {
+                    snapshot,
+                    activity_job_id,
+                    attempt,
+                    lease_generation,
+                    next,
+                    error_kind: AMBIGUOUS_ROUTE_KIND.to_owned(),
+                },
+            ));
+        }
         let routes = state.on_error.as_ref().ok_or_else(|| {
             anyhow!(
                 "Process request state `{}` has no compiled error route",
@@ -2672,6 +2740,22 @@ fn fanout_failure_output(
         Json::String(activity_key.to_owned()),
     );
     Ok(Json::Object(output))
+}
+
+/// The route kind an ambiguous at-most-once outcome is recorded under.
+///
+/// It is deliberately not one of the [`ProcessErrorKind`] names: nothing may
+/// declare `kinds: [ambiguous]` in an `on_error` route and catch this.
+const AMBIGUOUS_ROUTE_KIND: &str = "ambiguous";
+
+/// Whether a stored safe error is the engine's refusal to make a second
+/// at-most-once send.
+///
+/// Matched on the Donat-owned code rather than on the class, because no class
+/// in the closed set means "unknown": the class only says the activity will not
+/// try again.
+fn is_ambiguous_send(error: &Json) -> bool {
+    error.get("code").and_then(Json::as_str) == Some(super::activity::PROVIDER_SEND_AMBIGUOUS)
 }
 
 fn fanout_request_error_route(
@@ -3370,6 +3454,7 @@ async fn commit_request_failure(
     transaction: &Transaction<'_>,
     source_name: &str,
     prepared: &PreparedRequestFailureTransition,
+    outcome: &str,
 ) -> anyhow::Result<()> {
     let version = next_version(&prepared.snapshot)?;
     let updated = transaction
@@ -3416,8 +3501,7 @@ async fn commit_request_failure(
                 definition_revision,
                 redacted_context
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                    'activity_error_routed', $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ",
             &[
                 &source_name,
@@ -3428,6 +3512,7 @@ async fn commit_request_failure(
                 &prepared.lease_generation,
                 &prepared.snapshot.current_state,
                 &prepared.next,
+                &outcome,
                 &prepared.snapshot.revision,
                 &json!({
                     "error_kind": prepared.error_kind,
@@ -3943,7 +4028,14 @@ async fn commit_fanout_request_completion(
             }
         }
         Err(error) => {
-            let error_kind = if prepared.snapshot.event_kind == "retry_exhausted" {
+            // ADR 063, per item: one fan-out item's send is one logical
+            // activity, so one item can be ambiguous while its siblings
+            // succeeded. It takes the activity's ambiguous route, never an
+            // error route.
+            let ambiguous = is_ambiguous_send(error);
+            let error_kind = if ambiguous {
+                AMBIGUOUS_ROUTE_KIND
+            } else if prepared.snapshot.event_kind == "retry_exhausted" {
                 "retry_exhausted"
             } else {
                 error
@@ -3969,7 +4061,16 @@ async fn commit_fanout_request_completion(
                     true,
                     &fanout_logical_activity_id(&prepared.snapshot, &prepared.item_key_identity),
                 )?,
-                route: fanout_request_error_route(request, error_kind, &prepared.state.next),
+                route: if ambiguous {
+                    request.on_ambiguous.clone().ok_or_else(|| {
+                        anyhow!(
+                            "Process fan-out state `{}` refused an at-most-once send with no ambiguous route",
+                            prepared.snapshot.current_state
+                        )
+                    })?
+                } else {
+                    fanout_request_error_route(request, error_kind, &prepared.state.next)
+                },
                 error_kind: error_kind.to_owned(),
             })
         }
@@ -4130,7 +4231,14 @@ async fn commit_fanout_item_completion(
     let mut failed_items = Vec::new();
     let mut ordered_results = Vec::new();
     let mut next = state.next.clone();
-    let mut failure_route_selected = false;
+    // ADR 063. The collected fan-out has one destination, and an ambiguous item
+    // claims it ahead of any failed one — exactly as the single-activity
+    // consumer consults the ambiguous route before any `on_error` route or
+    // fallback. Latching on the first failure alone would let a sibling's error
+    // route absorb an unknown outcome, which is the one thing no failure route
+    // may claim. Among equals the first item still wins, so the destination
+    // stays a function of the item journal's order.
+    let mut selected_route_is_ambiguous: Option<bool> = None;
     for row in rows {
         let stored_item: Json = row.get("item_json");
         let stored_status: String = row.get("status");
@@ -4156,11 +4264,16 @@ async fn commit_fanout_item_completion(
                         .cloned()
                         .ok_or_else(|| anyhow!("fan-out failure has no output"))?,
                 );
-                if !failure_route_selected
-                    && let Some(route) = failure.get("route").and_then(Json::as_str)
-                {
+                let ambiguous =
+                    failure.get("error_kind").and_then(Json::as_str) == Some(AMBIGUOUS_ROUTE_KIND);
+                let supersedes = match selected_route_is_ambiguous {
+                    None => true,
+                    Some(false) => ambiguous,
+                    Some(true) => false,
+                };
+                if supersedes && let Some(route) = failure.get("route").and_then(Json::as_str) {
                     next = route.to_owned();
-                    failure_route_selected = true;
+                    selected_route_is_ambiguous = Some(ambiguous);
                 }
             }
             other => bail!("terminal Process fan-out retained unfinished item `{other}`"),

@@ -1,0 +1,62 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 027 §3).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable. The
+# `account_email` is the HTTP Basic *username* Bitbucket publishes for an API
+# token, and it completes this declaration.
+# `refused_metadata` enables a name this binary was never built with: every
+# operation Bitbucket declares here is executable.
+metadata:
+  version: 3
+  connectors:
+    - name: bitbucket_present
+      module: bitbucket
+      config:
+        endpoint_identity: bitbucket_conformance
+        credential_identity: bitbucket_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          account_email: ci@donat-conformance.example.test
+      operations:
+        - name: repository.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: bitbucket_missing
+      module: bitbucket
+      config:
+        endpoint_identity: bitbucket_conformance
+        credential_identity: bitbucket_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          account_email: ci@donat-conformance.example.test
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: bitbucket_refused
+      module: bitbucket
+      config:
+        endpoint_identity: bitbucket_conformance
+        credential_identity: bitbucket_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          account_email: ci@donat-conformance.example.test
+      operations:
+        - name: issue.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `bitbucket_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `issue.delete` on module `bitbucket`: connector operation is not compiled into this binary"
+  output_excludes: "connector-present-secret-sentinel"

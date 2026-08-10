@@ -49,6 +49,31 @@ The work is a command; the schedule is the deadline; nothing polls.
 **Ask which it is:** *"is this 'at a particular time', or 'if nothing happens
 within a while'?"* The second is far more common and much cheaper.
 
+## A cron schedule that means a local time
+
+A `schedule:` with no `timezone:` is UTC, which is what every existing trigger
+is. "09:00 for the customer" is a different thing, and it needs the zone —
+otherwise it drifts by an hour twice a year:
+
+```yaml
+- name: send_reminders
+  webhook: '{{REMINDER_URL}}'
+  schedule: "0 9 * * 1-5"
+  timezone: Europe/Berlin
+  dst:
+    skipped_time: fire_after_gap   # or: skip
+    repeated_time: fire_at_first   # or: fire_at_second
+```
+
+`dst` is **required** with `timezone` and refused without it; metadata that
+omits it does not load. That is deliberate: on the spring transition the local
+time may not exist and on the autumn one it happens twice, and only the author
+knows whether a missed nightly run should be made up late (`fire_after_gap`) or
+dropped (`skip`, which is logged, never silent). `repeated_time` picks which of
+the two instants is *the* run — it fires once either way.
+
+**Ask:** *"on the night the clocks change, should this run late or not at all?"*
+
 ## Event triggers — reacting to a write
 
 Declared on the table, fired after the write commits.

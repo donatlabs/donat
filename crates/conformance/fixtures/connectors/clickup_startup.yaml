@@ -1,0 +1,53 @@
+# Donat-owned connector startup fixture (spec 010 §12).
+#
+# `refused_metadata` enables an operation this deployment may not reach —
+# ClickUp publishes "Delete a task from your Workspace" and nothing about a
+# second send, so `task.delete` is inventory-only.
+metadata:
+  version: 3
+  connectors:
+    - name: clickup_present
+      module: clickup
+      config:
+        endpoint_identity: clickup_conformance
+        credential_identity: clickup_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: task.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: clickup_missing
+      module: clickup
+      config:
+        endpoint_identity: clickup_conformance
+        credential_identity: clickup_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: clickup_refused
+      module: clickup
+      config:
+        endpoint_identity: clickup_conformance
+        credential_identity: clickup_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: task.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `clickup_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `task.delete` on module `clickup`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

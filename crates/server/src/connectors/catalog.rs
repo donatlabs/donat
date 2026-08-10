@@ -14,6 +14,11 @@ use donat_connector_catalog::{
     RetryAfterPolicy, StableSemver, StatusRange, StepBounds, TriggerSpec, VersionedProcessorRef,
     value_contract_material, value_contract_sha256,
 };
+use donat_connectors::sdk::{
+    EffectClass, IdempotencyBinding, MAX_HTTP_BODY_BYTES, MAX_REQUEST_HEADER_BYTES,
+    OperationProjection, Origin, PaginationBudget, RequestBodyProjection, ValueSource,
+    operation::MAX_RESPONSE_JSON_DEPTH,
+};
 use donat_ir::{
     TypeRef, TypedValue, VALUE_TYPE_LANGUAGE_VERSION, ValueContractCatalog, ValueContractField,
     ValueObjectContract, ValueScalar, ValueType,
@@ -293,6 +298,401 @@ pub(super) fn compile_http_operation_spec(
     spec.validate()
         .map_err(|error| format!("catalog operation is invalid: {error}"))?;
     Ok(Some(spec))
+}
+
+/// The catalog snapshot of one hand-written connector operation, built from the
+/// SDK's own projection of the declaration this instance was compiled against.
+///
+/// Nothing about the provider is restated here. The method, path, query,
+/// headers, statuses, contracts, and effect all arrive in the projection; what
+/// this function adds is the deployment's half — which instance, which origin,
+/// which capacity — and the translation into catalog types. That split is the
+/// point: a connector module stays the single description of its provider, and
+/// a reviewer changing a request shape changes exactly one file
+/// (`knowledgebase/declarative-saas/decisions/049-*`).
+///
+/// `walk` is the budget this instance's executor will really spend when the
+/// module declared a continuation plan for this operation, and `None` when it
+/// declared none. It is published rather than assumed because the bounds below
+/// are part of what a deployment can read back about an operation, and bounds
+/// that said "one call" while the executor walked sixteen pages would be a
+/// second, wrong description of the same behaviour.
+pub(super) fn compile_provider_operation_spec(
+    definition: ConnectorDefinition,
+    instance: &ConnectorInstance,
+    resolved_origin: &Origin,
+    projection: &OperationProjection,
+    capacity: &donat_metadata::ConnectorCapacity,
+    walk: Option<&PaginationBudget>,
+) -> Result<OperationSpec, String> {
+    let connector = ConnectorId::parse(definition.module_name)
+        .map_err(|_| "connector module name is not a canonical ABI ID".to_owned())?;
+    let operation_id = OperationId::parse(projection.id())
+        .map_err(|_| "connector operation name is not a canonical ABI ID".to_owned())?;
+    let origin = OriginId::parse(&format!("instance.{}", instance.name))
+        .map_err(|_| "connector instance name cannot form a canonical origin ID".to_owned())?;
+
+    let input = projected_contract(
+        projection
+            .inputs()
+            .iter()
+            .map(|field| (field.name(), field.scalar().clone(), field.required())),
+    );
+    let output = projected_contract(
+        projection
+            .outputs()
+            .iter()
+            .map(|field| (field.name(), field.scalar().clone(), field.required())),
+    );
+    let input_contract_sha256 = contract_hash(&input)?;
+    let output_contract_sha256 = contract_hash(&output)?;
+
+    let url = resolved_origin.as_url();
+    let host = url
+        .host_str()
+        .ok_or_else(|| "a resolved connector origin has a host".to_owned())?;
+    let port = url
+        .port_or_known_default()
+        .and_then(NonZeroU16::new)
+        .ok_or_else(|| "a resolved connector origin has a known port".to_owned())?;
+
+    let query = projection
+        .query()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| CompiledQueryBinding {
+            name: entry.key().to_ascii_lowercase(),
+            binding: projected_binding(index, "query", entry.value(), &input),
+        })
+        .collect();
+    let mut headers = projection
+        .headers()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| CompiledHeaderBinding {
+            name: entry.name().to_ascii_lowercase(),
+            binding: projected_binding(index, "header", entry.value(), &input),
+        })
+        .collect::<Vec<_>>();
+    headers.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let request = match projection.body() {
+        RequestBodyProjection::None => CompiledRequestShape::None,
+        RequestBodyProjection::Json { inputs } => CompiledRequestShape::Json {
+            bindings: inputs.clone(),
+        },
+        // A processor body is bytes a named function in this binary assembles,
+        // in the media type the provider documents. It binds to no single input
+        // field, and the processor's own shape is deliberately not described
+        // here — a caller cannot supply one either way.
+        RequestBodyProjection::Processor { .. } => CompiledRequestShape::RawBytes {
+            binding: String::new(),
+        },
+    };
+    let response = CompiledResponseShape::Json {
+        mappings: projection
+            .outputs()
+            .iter()
+            .filter_map(|field| {
+                field.pointer().map(|pointer| ResponseMapping {
+                    pointer: pointer.to_owned(),
+                    target: field.name().to_owned(),
+                })
+            })
+            .collect(),
+    };
+
+    // Every bound below is one the SDK really holds to. The transport ceilings
+    // are its own constants, and the JSON depth is the decoder's recursion
+    // limit. How many calls one attempt makes is the declaration's: an
+    // operation with a continuation plan spends that plan's budget, and an
+    // operation without one is a single request.
+    let transport_bytes = u64_to_nonzero_u32(MAX_HTTP_BODY_BYTES as u64, "connector body ceiling")?;
+    let header_bytes =
+        u64_to_nonzero_u32(MAX_REQUEST_HEADER_BYTES as u64, "connector header ceiling")?;
+    let one = NonZeroU32::new(1).expect("one is nonzero");
+    let deadline_ms = nonzero_u64(
+        u64::try_from(projection.deadline().as_millis())
+            .map_err(|_| "connector operation deadline exceeds u64".to_owned())?,
+        "operation deadline",
+    )?;
+    // The credential the auth plan applies is one more header than the
+    // declaration carries.
+    let maximum_headers = u32::try_from(headers.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| "connector header count exceeds u32".to_owned())?;
+
+    let spec = OperationSpec {
+        connector,
+        connector_version: parse_stable_semver(definition.semantic_version)?,
+        operation: operation_id,
+        operation_version: parse_stable_semver(projection.version())?,
+        runtime_abi_epoch: definition.runtime_abi,
+        value_language_epoch: VALUE_TYPE_LANGUAGE_VERSION,
+        input,
+        input_contract_sha256,
+        output,
+        output_contract_sha256,
+        credential: None,
+        origins: vec![FixedOrigin {
+            origin,
+            scheme: HttpsOnly,
+            host: host.to_owned(),
+            port,
+            network_policy: NetworkPolicy::PublicOnly,
+        }],
+        steps: vec![CompiledStepSpec {
+            step: REQUEST_STEP,
+            method: projection.method().to_owned(),
+            origin,
+            path: projection.path_template().to_owned(),
+            query,
+            headers,
+            credential_action: None,
+            request,
+            success_statuses: projection
+                .success_statuses()
+                .iter()
+                .copied()
+                .map(|status| StatusRange {
+                    minimum: status,
+                    maximum: status,
+                })
+                .collect(),
+            response,
+            selected_response_headers: Vec::new(),
+            bounds: StepBounds {
+                maximum_headers,
+                maximum_header_bytes: header_bytes,
+                maximum_url_bytes: transport_bytes,
+                maximum_request_bytes: transport_bytes,
+                maximum_response_bytes: transport_bytes,
+                maximum_json_depth: nonzero_u32(MAX_RESPONSE_JSON_DEPTH, "maximum JSON depth")?,
+                // A JSON node costs at least one byte of a bounded body.
+                maximum_json_nodes: transport_bytes,
+                maximum_inline_binary_bytes: one,
+                deadline_ms,
+            },
+        }],
+        pre_request_transforms: Vec::new(),
+        post_response_transforms: Vec::new(),
+        operation_processor: None,
+        effect: compile_projected_effect(projection)?,
+        pagination: PaginationPlan::None,
+        error_map: closed_class_error_map()?,
+        capacity: CapacityDefaults {
+            maximum_in_flight: nonzero_u32(capacity.max_in_flight, "maximum in-flight")?,
+        },
+        rate: RateDefaults {
+            burst: nonzero_u32(capacity.rate_limit.burst, "rate burst")?,
+            refill_interval_ms: rate_refill_interval_ms(
+                capacity.rate_limit.permits,
+                &capacity.rate_limit.per,
+            )?,
+        },
+        serialization_key_default: None,
+        bounds: OperationBounds {
+            maximum_calls: walk.map_or(Ok(one), |budget| {
+                nonzero_u32(budget.max_calls(), "maximum calls")
+            })?,
+            maximum_pages: walk.map_or(Ok(one), |budget| {
+                nonzero_u32(budget.max_pages(), "maximum pages")
+            })?,
+            maximum_items: walk.map_or(Ok(one), |budget| {
+                u64_to_nonzero_u32(budget.max_items() as u64, "maximum items")
+            })?,
+            maximum_aggregate_request_bytes: transport_bytes,
+            maximum_aggregate_response_bytes: walk.map_or(Ok(transport_bytes), |budget| {
+                u64_to_nonzero_u32(
+                    budget.max_aggregate_bytes() as u64,
+                    "maximum aggregate response bytes",
+                )
+            })?,
+            maximum_output_canonical_bytes: transport_bytes,
+            // The transport follows none.
+            maximum_redirects: 0,
+            deadline_ms,
+        },
+        resolved_fact_values: Vec::new(),
+    };
+    spec.validate()
+        .map_err(|error| format!("catalog operation is invalid: {error}"))?;
+    Ok(spec)
+}
+
+/// One value contract, from the projection's own typed fields. No metadata
+/// declaration is consulted: a hand-written connector types its contract in
+/// Rust, so there is no name here to resolve against `rules.types`.
+fn projected_contract<'field>(
+    fields: impl Iterator<Item = (&'field str, ValueScalar, bool)>,
+) -> ValueContractCatalog {
+    ValueContractCatalog {
+        roots: fields
+            .map(|(name, scalar, required)| {
+                (
+                    name.to_owned(),
+                    ValueContractField {
+                        required,
+                        type_ref: TypeRef {
+                            nullable: !required,
+                            value_type: ValueType::Scalar { scalar },
+                        },
+                    },
+                )
+            })
+            .collect(),
+        named_objects: BTreeMap::new(),
+    }
+}
+
+fn projected_binding(
+    index: usize,
+    kind: &str,
+    source: &ValueSource,
+    input: &ValueContractCatalog,
+) -> CompiledBinding {
+    match source {
+        ValueSource::Static(value) => CompiledBinding {
+            field: format!("static_{kind}_{index}"),
+            source: CompiledBindingSource::Constant {
+                value: TypedValue::String(value.clone()),
+            },
+            required: true,
+            default: None,
+            mapping: None,
+        },
+        ValueSource::Input(name) => CompiledBinding {
+            field: name.clone(),
+            source: CompiledBindingSource::Input,
+            required: input.roots.get(name).is_some_and(|field| field.required),
+            default: None,
+            mapping: None,
+        },
+    }
+}
+
+/// The catalog effect one admitted SDK class compiles to.
+///
+/// The catalog's effect answers two runtime questions. Does this operation need
+/// a stable key bound into its request and retained by the provider? An
+/// `ExplicitKey` answers yes, and carries the evidence with it.
+/// `ReadOnly` and `NaturalMethod` both answer no — a naturally idempotent `PUT`
+/// or `DELETE` against a fixed resource identity has no key to bind, and the
+/// repeat-safety the SDK admitted it on is the provider's own statement rather
+/// than a retention window this runtime has to stay inside. The SDK keeps the
+/// two classes apart, because the evidence behind them differs and a reviewer
+/// must see which one an operation stands on.
+///
+/// And: may this operation be sent more than once at all? Every class above
+/// answers yes — a repeat is absorbed by the provider or changes nothing.
+/// `AtMostOnce` answers no, which is a fact the process compiler and the
+/// activity worker both act on, so it is a class of its own here rather than a
+/// footnote on `ReadOnly` (ADR 063).
+fn compile_projected_effect(projection: &OperationProjection) -> Result<OperationEffect, String> {
+    match projection.effect_class() {
+        Some(EffectClass::ReadOnly | EffectClass::ProviderIdempotentNaturalMethod) => {
+            Ok(OperationEffect::ReadOnly)
+        }
+        // ADR 063. This one answers "no key" like the two above, and the
+        // catalog still keeps it apart from them, because the runtime acts on
+        // the difference: an at-most-once operation is sent once and its
+        // activity must have said what an unknown outcome means.
+        Some(EffectClass::AtMostOnce) => Ok(OperationEffect::AtMostOnce),
+        Some(EffectClass::ProviderIdempotentExplicitKey) => {
+            let evidence = projection.explicit_key().ok_or_else(|| {
+                "an explicit-key operation carries the evidence it was admitted on".to_owned()
+            })?;
+            let retention = evidence.retention();
+            Ok(OperationEffect::ProviderIdempotent {
+                side_effect_steps: vec![ProviderIdempotentStep {
+                    step: REQUEST_STEP,
+                    fixed_binding: match evidence.binding() {
+                        IdempotencyBinding::Header(name) => FixedIdempotencyBinding::Header {
+                            name: name.as_str().to_ascii_lowercase(),
+                        },
+                        IdempotencyBinding::BodyPointer(pointer) => {
+                            FixedIdempotencyBinding::BodyField {
+                                pointer: pointer.clone(),
+                            }
+                        }
+                    },
+                    scope: retention.scope().to_owned(),
+                    minimum_retention_ms: duration_ms(
+                        retention.minimum(),
+                        "idempotency retention",
+                    )?,
+                    clock_safety_margin_ms: duration_ms(
+                        retention.clock_safety_margin(),
+                        "idempotency clock margin",
+                    )?,
+                }],
+            })
+        }
+        // Neither is ever published: `admit_operation` refused both before this
+        // function could be reached, and this arm keeps that true by
+        // construction rather than by reading the caller.
+        Some(EffectClass::Pure | EffectClass::InventoryOnly) | None => Err(format!(
+            "connector operation `{}` is not executable and cannot be published",
+            projection.id()
+        )),
+    }
+}
+
+fn duration_ms(duration: std::time::Duration, field: &str) -> Result<NonZeroU64, String> {
+    nonzero_u64(
+        u64::try_from(duration.as_millis()).map_err(|_| format!("{field} exceeds u64"))?,
+        field,
+    )
+}
+
+/// The closed class-to-code table a hand-written connector answers with.
+///
+/// A module's ordered rules decide *which* of the eight classes a provider
+/// response reaches, and they are not restated here: restating them is the
+/// second description of one provider this design refuses, and nothing at
+/// runtime reads this map — the module classifies its own failures. What is
+/// published is the part that is complete and cannot disagree: every class, and
+/// the Donat-owned code it carries.
+fn closed_class_error_map() -> Result<ErrorMap, String> {
+    Ok(ErrorMap {
+        rules: Vec::new(),
+        fallback: CompleteErrorFallback {
+            transport: generic_error_action(
+                donat_connector_abi::ConnectorErrorClass::Transport,
+                "connector_transport",
+            )?,
+            timeout: generic_error_action(
+                donat_connector_abi::ConnectorErrorClass::Timeout,
+                "connector_timeout",
+            )?,
+            http_429: generic_error_action(
+                donat_connector_abi::ConnectorErrorClass::Http429,
+                "connector_rate_limited",
+            )?,
+            http_5xx: generic_error_action(
+                donat_connector_abi::ConnectorErrorClass::Http5xx,
+                "connector_unavailable",
+            )?,
+            authentication: generic_error_action(
+                donat_connector_abi::ConnectorErrorClass::Authentication,
+                "connector_authentication",
+            )?,
+            validation: generic_error_action(
+                donat_connector_abi::ConnectorErrorClass::Validation,
+                "connector_validation",
+            )?,
+            permanent: generic_error_action(
+                donat_connector_abi::ConnectorErrorClass::Permanent,
+                "connector_permanent",
+            )?,
+            invariant: generic_error_action(
+                donat_connector_abi::ConnectorErrorClass::Invariant,
+                "connector_invariant",
+            )?,
+        },
+    })
 }
 
 fn contract_hash(contract: &ValueContractCatalog) -> Result<[u8; 32], String> {

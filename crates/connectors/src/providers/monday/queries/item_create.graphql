@@ -1,0 +1,13 @@
+# monday: "Creates a new item. Returns `Item`."
+mutation ItemCreate($board_id: ID!, $group_id: String, $item_name: String!, $column_values: JSON) {
+  create_item(
+    board_id: $board_id
+    group_id: $group_id
+    item_name: $item_name
+    column_values: $column_values
+  ) {
+    id
+    name
+    url
+  }
+}

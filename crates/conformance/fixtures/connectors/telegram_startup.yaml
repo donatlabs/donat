@@ -1,0 +1,61 @@
+# Donat-owned connector startup fixture (spec 010 §12: every connector adds a
+# native conformance fixture proving startup validation and redaction).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an operation this deployment may not reach: startup
+# must name the exact metadata path. Neither may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: telegram_present
+      module: telegram
+      config:
+        endpoint_identity: telegram_conformance
+        credential_identity: telegram_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        webhook_secret:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_WEBHOOK_SECRET
+      operations:
+        - name: chat.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: telegram_missing
+      module: telegram
+      config:
+        endpoint_identity: telegram_conformance
+        credential_identity: telegram_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        webhook_secret:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_WEBHOOK_SECRET
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: telegram_refused
+      module: telegram
+      config:
+        endpoint_identity: telegram_conformance
+        credential_identity: telegram_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        webhook_secret:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_WEBHOOK_SECRET
+      operations:
+        - name: message.edit_text
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `telegram_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `message.edit_text` on module `telegram`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

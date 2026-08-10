@@ -1,0 +1,6 @@
+# monday: "Deletes an item (or subitem) and its nested subitems."
+mutation ItemDelete($item_id: ID!) {
+  delete_item(item_id: $item_id) {
+    id
+  }
+}

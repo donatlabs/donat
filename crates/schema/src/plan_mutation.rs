@@ -42,7 +42,7 @@ use serde_json::{Map as JsonMap, Value as Json};
 use crate::commands::{CompiledCommand, command_retention_seconds};
 use crate::plan::{
     Fragments, MutationKind, PlanError, Planner, Session, TableCtx, field_not_found, flatten,
-    is_session_var_name, unexpected_arg, value_to_json,
+    is_session_var_name, unexpected_arg, update_permits_column, value_to_json,
 };
 use crate::process_effects::{FinalizedCommandEffect, FinalizedCompiledCommand};
 
@@ -3774,7 +3774,7 @@ impl<'a> Planner<'a> {
             })
             .collect();
 
-        let rows: Vec<Vec<Option<Scalar>>> = objects
+        let mut rows: Vec<Vec<Option<Scalar>>> = objects
             .iter()
             .map(|object| {
                 let map = object.as_object().unwrap();
@@ -3801,25 +3801,41 @@ impl<'a> Planner<'a> {
             &check_path,
         )?;
         // An upsert writes through the same CTE with the role's update
-        // permission applied (presets and filter are already merged in
-        // `parse_on_conflict`), so the rows it touches must satisfy that
-        // permission's value contract too. Holding an upsert to both lists is
-        // stricter than holding it to whichever branch fired per row, and it
-        // is the only choice that cannot under-enforce: which branch a row
-        // took is not visible to the gate.
+        // permission applied — its columns, filter and presets are all merged
+        // in `parse_on_conflict`, which refuses a column that permission does
+        // not name — so the rows it touches must satisfy that permission's
+        // value contract too. Holding an upsert to both lists is stricter than
+        // holding it to whichever branch fired per row, and it is the only
+        // choice that cannot under-enforce: which branch a row took is not
+        // visible to the gate.
         if on_conflict
             .as_ref()
             .is_some_and(|c| !c.update_columns.is_empty())
             && let Some(update_perm) =
                 self.resolve_role_perm(&ctx.entry.update_permissions, &session.role, |_| true)
         {
-            validators.extend(self.resolved_validators(
+            let update_validators = self.resolved_validators(
                 ctx,
                 &ctx.entry.update_permissions,
                 update_perm,
                 crate::validators::ValidatorOp::UpsertUpdate,
                 &check_path,
-            )?);
+            )?;
+            validators.rows.extend(update_validators.rows);
+            validators.phone.extend(update_validators.phone);
+        }
+        // Before the statement exists, and on the planner's own values: a
+        // rejected number never reaches SQL and an accepted one reaches it in
+        // its E.164 form. This is the only place the insert's rows are
+        // rewritten, so the literal, the file claims below and the statement
+        // all see the same value.
+        validators.normalize_rows(&typed_columns, &mut rows)?;
+        // The DO UPDATE branch writes the update permission's presets into the
+        // same columns as the rows above. Normalizing only the rows would put
+        // two spellings of one number in one column depending on which branch
+        // fired, which is the uniqueness the check exists to establish.
+        if let Some(conflict) = on_conflict.as_mut() {
+            validators.normalize_sets(&mut conflict.set_ops)?;
         }
         let output =
             self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
@@ -3858,7 +3874,7 @@ impl<'a> Planner<'a> {
             on_conflict,
             check,
             check_path,
-            validators,
+            validators: validators.rows,
             file_claims,
             output,
         })
@@ -4092,17 +4108,34 @@ impl<'a> Planner<'a> {
             Some(w) => Some(self.parse_bool_exp(w, ctx, session, false, path)?),
         };
 
-        // DO UPDATE acts as an update: the role's update-permission filter
-        // restricts which existing rows may be updated, and its presets
-        // are applied.
+        // DO UPDATE writes an existing row, which is an update: the role's
+        // update permission is what says which columns those may be, its
+        // filter restricts which existing rows may change, and its presets are
+        // applied. A role with no update permission may name no column here,
+        // and a role whose permission lists columns may name only those — the
+        // enum this argument takes its values from is that list, so a column
+        // outside it is refused exactly as an unknown one is. Without the gate
+        // an insert permission alone would reach an existing row's column
+        // through `col = EXCLUDED.col`, past the filter, the presets and the
+        // validators of the permission that governs writing it.
+        let update_perm =
+            self.resolve_role_perm(&ctx.entry.update_permissions, &session.role, |_| true);
+        if !update_columns.is_empty() {
+            let erroneous = || {
+                PlanError::validation(&format!("{path}.args.on_conflict"), "erroneous column name")
+            };
+            let permission = update_perm.ok_or_else(erroneous)?;
+            if !update_columns
+                .iter()
+                .all(|col| update_permits_column(permission, col))
+            {
+                return Err(erroneous());
+            }
+        }
+
         let mut set_ops = vec![];
         if !update_columns.is_empty()
-            && let Some(update_perm) = ctx
-                .entry
-                .update_permissions
-                .iter()
-                .find(|p| p.role == session.role)
-                .map(|p| &p.permission)
+            && let Some(update_perm) = update_perm
         {
             if !update_perm.filter.is_null()
                 && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
@@ -4348,6 +4381,10 @@ impl<'a> Planner<'a> {
             crate::validators::ValidatorOp::Update,
             "$",
         )?;
+        // Same as an insert: the value the statement will set is normalized
+        // here, before the statement is built, so the file claims below and
+        // the rendered SQL both see the E.164 form.
+        validators.normalize_sets(&mut sets)?;
         let output =
             self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
@@ -4362,7 +4399,7 @@ impl<'a> Planner<'a> {
             predicate,
             check,
             check_path: "$".to_string(),
-            validators,
+            validators: validators.rows,
             file_claims,
             output,
         })
@@ -4549,12 +4586,12 @@ impl<'a> Planner<'a> {
         permission: &T,
         op: crate::validators::ValidatorOp,
         error_path: &str,
-    ) -> Result<Vec<donat_ir::RowValidator>, PlanError>
+    ) -> Result<crate::validators::CompiledValidators, PlanError>
     where
         T: HasValidators,
     {
         if permission.validators().is_empty() {
-            return Ok(Vec::new());
+            return Ok(crate::validators::CompiledValidators::default());
         }
         let table = format!("{}.{}", ctx.info.schema, ctx.info.name);
         let Some(role) = Planner::declaring_role(list, permission) else {

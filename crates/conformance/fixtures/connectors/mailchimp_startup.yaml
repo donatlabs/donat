@@ -1,0 +1,60 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 025 §4).
+#
+# The `server` setting is Mailchimp's data centre, which is this connector's host label and
+# therefore deploy-time configuration. `refused_metadata` enables the `POST` member create,
+# which this connector deliberately does not declare: it is the same effect as the `PUT`
+# upsert with a worse contract.
+metadata:
+  version: 3
+  connectors:
+    - name: mailchimp_present
+      module: mailchimp
+      config:
+        endpoint_identity: mailchimp_conformance
+        credential_identity: mailchimp_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          server: us19
+      operations:
+        - name: list.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: mailchimp_missing
+      module: mailchimp
+      config:
+        endpoint_identity: mailchimp_conformance
+        credential_identity: mailchimp_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          server: us19
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: mailchimp_refused
+      module: mailchimp
+      config:
+        endpoint_identity: mailchimp_conformance
+        credential_identity: mailchimp_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          server: us19
+      operations:
+        - name: member.create
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `mailchimp_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `member.create` on module `mailchimp`: connector operation is not compiled into this binary"
+  output_excludes: "connector-present-secret-sentinel"

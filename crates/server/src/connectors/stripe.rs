@@ -1,34 +1,60 @@
-//! Narrow Stripe Checkout connector.
+//! Narrow Stripe Checkout connector: the reference processor-backed connector.
 //!
 //! Only `checkout.create_session` and the signed
 //! `checkout.session.completed` inbound shape live here.  This is not a
 //! generic Stripe API client: callers cannot select a URL, method, header, or
 //! request schema.  The production transport always uses Stripe's fixed API
 //! origin; the loopback origin below is compiled only for crate-local tests.
+//!
+//! The request is an SDK declaration and travels the shared SDK transport, and
+//! the credential is applied by the SDK's `Bearer` plan rather than by a header
+//! this module formats.  What stays hand-written is the part a declaration
+//! cannot express: Stripe's Checkout API takes form-encoded pairs with indexed
+//! repeated keys (`line_items[0][price]`), so the body is assembled by a
+//! processor here and handed to the declaration as bytes.  The processor
+//! chooses nothing else — not the method, origin, path, query, or any header
+//! name.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use donat_connector_abi::{BoundedString, Hash256, VerifiedInboundEvent};
+use donat_connectors::sdk::{
+    AuthPlan, Connector, Credential, CredentialSpec, Effect, ExplicitKeyEvidence, HostResolver,
+    HttpTransport, IdempotencyBinding, Operation as SdkOperation, Origin, OriginSpec,
+    RawHttpResponse, ReqwestTransport, Secret, SignatureEncoding, SystemResolver,
+    TransportErrorKind, Trigger, WebhookVerifier,
+};
 use donat_ir::TypedValue;
 use donat_metadata::{ConnectorConfig, ConnectorOperation, ConnectorOperationProfile};
-use futures_util::StreamExt;
-use hmac::{Hmac, Mac};
+// HMAC now lives behind the SDK's verifier; the alias survives for the
+// crate-local tests that sign a fixture body.
+#[cfg(test)]
+use hmac::Hmac;
 use reqwest::{
-    Client, StatusCode, Url,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER},
+    StatusCode, Url,
+    header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use donat_connector_abi::TriggerId;
+use donat_connector_catalog::TriggerSpec;
+use futures_util::future::BoxFuture;
+use serde::Serialize;
+
 use super::{
-    ConnectorDefinition, ConnectorErrorClass, ConnectorFailure, ConnectorModule, ConnectorSuccess,
-    WebhookRejection, canonical_json_sha256, http::MAX_HTTP_BODY_BYTES,
+    CompiledWebhookTrigger, ConnectorDefinition, ConnectorErrorClass, ConnectorFailure,
+    ConnectorModule, ConnectorRegistryError, ConnectorSuccess, ModuleContext, RegisteredConnector,
+    STRIPE_DEFINITION, WebhookInstance, WebhookRejection, canonical_json_sha256, catalog,
+    http::MAX_HTTP_BODY_BYTES,
 };
+use crate::state::ConnectorConfigError;
 
 pub const CREATE_CHECKOUT_SESSION_OPERATION: &str = "checkout.create_session";
 pub const COMPLETED_WEBHOOK_OPERATION: &str = "checkout.completed_webhook";
@@ -38,8 +64,137 @@ pub const STRIPE_TRIGGER_VERSION: &str = "1.0.0";
 
 const STRIPE_API_ORIGIN: &str = "https://api.stripe.com";
 const WEBHOOK_TIMESTAMP_TOLERANCE: i64 = 300;
+/// The SemVer core of the declared request shape, which changes when this
+/// module's request does.  `STRIPE_OPERATION_VERSION` remains the deployment
+/// identity that enters the configuration fingerprint.
+const CHECKOUT_REQUEST_SHAPE_VERSION: &str = "1.0.0";
+/// Stripe documents this header as the idempotency key binding for every
+/// Checkout Session create.
+const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 
+#[cfg(test)]
 type HmacSha256 = Hmac<Sha256>;
+
+/// This module's static declaration (spec 010 §4): the reference
+/// processor-backed connector, on Stripe's one fixed API origin.
+pub(crate) fn connector() -> &'static Connector {
+    static CONNECTOR: std::sync::LazyLock<Connector> = std::sync::LazyLock::new(|| {
+        Connector::declare(
+            STRIPE_DEFINITION.module_name,
+            STRIPE_DEFINITION.semantic_version,
+        )
+        .origin(OriginSpec::fixed(STRIPE_API_ORIGIN).expect("Stripe's fixed API origin is valid"))
+        .credential(CredentialSpec::for_plan(AuthPlan::bearer()))
+        .operation(checkout_session_declaration(None).expect("the Checkout declaration is valid"))
+        .trigger(
+            Trigger::webhook(
+                COMPLETED_WEBHOOK_TRIGGER,
+                STRIPE_TRIGGER_VERSION,
+                completed_webhook_verification(),
+            )
+            .expect("the Checkout completion trigger is valid")
+            .with_raw_body_max_bytes(MAX_HTTP_BODY_BYTES)
+            .expect("the shared body ceiling is a valid trigger ceiling"),
+        )
+        .build()
+        .expect("the Stripe declaration is valid")
+    });
+    &CONNECTOR
+}
+
+/// Stripe's inbound signature scheme: one `Stripe-Signature` header carrying
+/// `t=<unix seconds>` and one or more `v1=<hex>` digests of
+/// `<timestamp>.<raw body>`, accepted inside a five-minute window.
+fn completed_webhook_verification() -> WebhookVerifier {
+    WebhookVerifier::hmac_timestamped("Stripe-Signature")
+        .expect("a static header name is valid")
+        .signature_element("v1")
+        .timestamp_element("t")
+        .separator(".")
+        .encoding(SignatureEncoding::Hex)
+        .tolerance(Duration::from_secs(WEBHOOK_TIMESTAMP_TOLERANCE as u64))
+        .build()
+        .expect("the Stripe signature scheme is a valid declaration")
+}
+
+/// The documented Checkout Session create: one POST, on Stripe's fixed origin,
+/// with a form-encoded body this module's processor assembles.
+///
+/// `api_version` is deployment material — the account's pinned API version —
+/// so the static declaration is built without it and one instance's compiled
+/// operation is built with it.
+fn checkout_session_declaration(
+    api_version: Option<&str>,
+) -> Result<SdkOperation, donat_connectors::sdk::operation::OperationError> {
+    let mut builder =
+        SdkOperation::post(CREATE_CHECKOUT_SESSION_OPERATION, "/v1/checkout/sessions")
+            .version(CHECKOUT_REQUEST_SHAPE_VERSION)
+            .processor_body("application/x-www-form-urlencoded")
+            .success_statuses([StatusCode::OK])
+            // Stripe documents `Idempotency-Key` on every POST, keys retained
+            // for 24 hours and unique per account, so a Checkout create is
+            // `ProviderIdempotent::ExplicitKey` and a durable activity may send
+            // it again after an ambiguous loss. The clock safety margin is
+            // Donat policy rather than provider evidence, and is strictly
+            // smaller than the documented retention.
+            .effect(Effect::provider_idempotent_explicit_key(
+                ExplicitKeyEvidence::documented(
+                    IdempotencyBinding::header(IDEMPOTENCY_KEY.as_str())?,
+                    "stripe account",
+                    Duration::from_secs(24 * 60 * 60),
+                    Duration::from_secs(300),
+                    "Stripe documents the Idempotency-Key header on POST requests and retains saved keys for 24 hours",
+                )?,
+            ));
+    if let Some(api_version) = api_version {
+        builder = builder.static_header("Stripe-Version", api_version);
+    }
+    builder.build()
+}
+
+/// This module's own deploy-time metadata rules.
+pub(crate) fn validate_instance_metadata(
+    instance: &donat_metadata::ConnectorInstance,
+    path: &str,
+    errors: &mut Vec<ConnectorConfigError>,
+) {
+    let config = &instance.config;
+    if config.secret_key.is_none() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.secret_key"),
+            "secret_key is required for the stripe connector",
+        ));
+    }
+    if config.webhook_secret.is_none() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.webhook_secret"),
+            "webhook_secret is required for the stripe connector",
+        ));
+    }
+    // Stripe authenticates with a secret key, so this module has no request to
+    // put an OAuth2 access token on. A declaration nothing reads is a defect
+    // ([[034-a-declaration-the-runtime-ignores-is-a-defect]]), so it is refused
+    // here rather than accepted and ignored.
+    if config.oauth2.is_some() {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.oauth2"),
+            "the stripe connector authenticates with `secret_key` and cannot apply an OAuth2 \
+             credential; remove `config.oauth2`",
+        ));
+    }
+    if config.api_version.as_deref().is_none_or(str::is_empty) {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.config.api_version"),
+            "api_version is required for the stripe connector",
+        ));
+    }
+    if let Err(error) = validate_stripe_instance_metadata(config, &instance.operations) {
+        errors.push(ConnectorConfigError::new(
+            format!("{path}.operations"),
+            error.to_string(),
+        ));
+    }
+}
 
 /// The small, typed checkout input accepted by the compiled operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,14 +389,17 @@ pub(crate) fn validate_stripe_instance_metadata(
 /// The compiled Stripe Checkout module.  Its secrets remain private and are
 /// resolved only from the named environment variables in deployment metadata.
 pub struct StripeConnector {
-    secret_key: String,
-    webhook_secret: String,
-    api_version: String,
-    transport: StripeTransport,
-}
-
-struct StripeTransport {
-    base_url: Url,
+    /// The API key, held as an SDK credential: this module never formats an
+    /// `Authorization` header itself, it declares the plan that applies one.
+    credential: Credential,
+    /// The inbound signing secret, held so it can authenticate raw bytes and
+    /// not so it can be read: the SDK's verifier takes a [`Secret`] and gives
+    /// nothing back.
+    webhook_secret: Secret,
+    origin: Origin,
+    /// The one declared request this connector can make.
+    checkout_session: SdkOperation,
+    transport: ReqwestTransport,
 }
 
 impl StripeConnector {
@@ -334,11 +492,22 @@ impl StripeConnector {
         {
             return Err(StripeConfigError::new("stripe fixed API origin is invalid"));
         }
+        let origin = {
+            let mut origin = base_url.clone();
+            origin.set_path("/");
+            Origin::parse(origin.as_str())
+                .map_err(|_| StripeConfigError::new("stripe fixed API origin is invalid"))?
+        };
+        // The same declaration the static connector publishes, plus this
+        // deployment's pinned API version.
+        let checkout_session = checkout_session_declaration(Some(&api_version))
+            .map_err(|_| StripeConfigError::new("stripe api_version is invalid"))?;
         Ok(Self {
-            secret_key,
-            webhook_secret,
-            api_version,
-            transport: StripeTransport { base_url },
+            credential: Credential::secret(secret_key),
+            webhook_secret: Secret::new(webhook_secret),
+            origin,
+            checkout_session,
+            transport: ReqwestTransport::new(),
         })
     }
 
@@ -351,15 +520,14 @@ impl StripeConnector {
         if deadline <= tokio::time::Instant::now() {
             return Err(timeout_failure());
         }
-        // A first public-only lookup occurs before we construct the outbound
-        // body, then `post_checkout_session` repeats and pins a fresh result
-        // immediately before connecting. The fixed host is not caller input,
-        // but the same rebinding defense still applies to production traffic.
-        self.transport.resolve_under_deadline(deadline).await?;
-        let idempotency_key = HeaderValue::from_str(idempotency_key)
-            .map_err(|_| invariant_failure("connector activity idempotency key is invalid"))?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {}", self.secret_key))
-            .map_err(|_| invariant_failure("stripe secret key is invalid"))?;
+        // A first lookup occurs before we construct the outbound body, then a
+        // second one immediately before connecting pins the result the
+        // transport uses. The fixed host is not caller input, but the same
+        // rebinding defense still applies to production traffic.
+        self.resolve_under_deadline(deadline).await?;
+        // Stripe's Checkout API is form-encoded with indexed repeated keys, so
+        // the body is assembled here rather than by a JSON template. Every key
+        // is a literal written from Stripe's published contract.
         let body = {
             let mut form = url::form_urlencoded::Serializer::new(String::new());
             form.append_pair("mode", input.mode.as_str());
@@ -383,17 +551,76 @@ impl StripeConnector {
                 "Stripe Checkout request exceeds the 1 MiB limit",
             ));
         }
-        let response = self
-            .transport
-            .post_checkout_session(
-                &authorization,
-                &self.api_version,
-                &idempotency_key,
-                body,
-                deadline,
-            )
-            .await?;
+        let mut deployment = HeaderMap::new();
+        deployment.insert(
+            IDEMPOTENCY_KEY,
+            HeaderValue::from_str(idempotency_key)
+                .map_err(|_| invariant_failure("connector activity idempotency key is invalid"))?,
+        );
+        let mut request = self.checkout_session.plan_processor_request(
+            &self.origin,
+            &JsonValue::Null,
+            &deployment,
+            body,
+        )?;
+        AuthPlan::bearer().apply(&self.credential, &mut request, None)?;
+
+        let destination = self.resolve_under_deadline(deadline).await?;
+        let response = tokio::time::timeout_at(
+            deadline,
+            self.transport
+                .execute(request.into_prepared()?, &destination, deadline),
+        )
+        .await
+        .map_err(|_| timeout_failure())?
+        .map_err(|error| match error.kind() {
+            TransportErrorKind::Transport => transport_failure(),
+            TransportErrorKind::Timeout => timeout_failure(),
+            TransportErrorKind::ResponseTooLarge => {
+                validation_failure("Stripe Checkout response exceeds the 1 MiB limit")
+            }
+        })?;
+        self.validate_peer(&destination, response.peer())?;
         decode_checkout_response(response)
+    }
+
+    async fn resolve_under_deadline(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<IpAddr>, ConnectorFailure> {
+        let url = self.origin.as_url();
+        let host = url
+            .host_str()
+            .expect("validated Stripe API origin has host");
+        let port = url
+            .port_or_known_default()
+            .expect("validated Stripe API origin has port");
+        tokio::time::timeout_at(deadline, SystemResolver.resolve(host, port))
+            .await
+            .map_err(|_| timeout_failure())?
+            .map_err(|_| transport_failure())
+    }
+
+    /// The connection must land on one of the addresses this request already
+    /// resolved, so a name cannot resolve to one address for validation and
+    /// another for transport. Egress reachability itself is a network-layer
+    /// concern.
+    fn validate_peer(
+        &self,
+        destination: &[IpAddr],
+        peer: Option<SocketAddr>,
+    ) -> Result<(), ConnectorFailure> {
+        let Some(peer) = peer else {
+            return Err(invariant_failure(
+                "connector transport could not verify the connected peer",
+            ));
+        };
+        if !destination.contains(&peer.ip()) {
+            return Err(invariant_failure(
+                "connector transport connected to an unresolved peer",
+            ));
+        }
+        Ok(())
     }
 
     pub fn verify_completed_webhook(
@@ -426,28 +653,14 @@ impl StripeConnector {
         raw_body: &[u8],
         now: i64,
     ) -> Result<VerifiedInboundEvent, WebhookRejection> {
-        if raw_body.len() > MAX_HTTP_BODY_BYTES {
-            return Err(WebhookRejection::PayloadTooLarge);
-        }
-        let signature = headers
-            .get("stripe-signature")
-            .and_then(|value| value.to_str().ok())
-            .ok_or(WebhookRejection::MissingSignature)?;
-        let (timestamp, signatures) = parse_stripe_signature(signature)?;
-        if now.abs_diff(timestamp) > WEBHOOK_TIMESTAMP_TOLERANCE as u64 {
-            return Err(WebhookRejection::TimestampOutOfTolerance);
-        }
-        let mut mac = HmacSha256::new_from_slice(self.webhook_secret.as_bytes())
-            .expect("HMAC accepts arbitrary non-empty key bytes");
-        mac.update(timestamp.to_string().as_bytes());
-        mac.update(b".");
-        mac.update(raw_body);
-        if !signatures
-            .iter()
-            .any(|candidate| mac.clone().verify_slice(candidate).is_ok())
-        {
-            return Err(WebhookRejection::InvalidSignature);
-        }
+        // The declared trigger owns the raw-body ceiling and the signature
+        // scheme; this module supplies the secret and the receiving clock. The
+        // scheme it declares is the one Stripe publishes: HMAC-SHA256 over
+        // `<timestamp>.<raw body>`, hex, inside a five-minute window.
+        connector()
+            .trigger(COMPLETED_WEBHOOK_TRIGGER)
+            .expect("the Stripe declaration publishes its completion trigger")
+            .verify(headers, raw_body, &self.webhook_secret, now)?;
 
         // Signature verification above intentionally precedes every JSON
         // operation. A malformed or hostile unverified payload is never
@@ -521,6 +734,261 @@ impl StripeConnector {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The deployment-selected instance this module publishes to the registry.
+// ---------------------------------------------------------------------------
+
+/// A selected Stripe Checkout operation. The operation name is still checked
+/// at dispatch even after startup validation so a future job cannot reach an
+/// unenabled provider capability.
+struct CompiledStripeOperation {
+    configuration_fingerprint: String,
+    serialization_key_input: Option<String>,
+}
+
+/// One deployment-selected instance of the `stripe` module.
+pub(crate) struct StripeInstance {
+    connector: StripeConnector,
+    operations: BTreeMap<String, CompiledStripeOperation>,
+    webhook: CompiledWebhookTrigger,
+}
+
+/// Compile one instance of this module from validated deployment metadata.
+pub(crate) fn build_registered_instance(
+    context: &mut ModuleContext<'_>,
+) -> Result<Box<dyn RegisteredConnector>, ConnectorRegistryError> {
+    let instance = context.instance;
+    let invalid = |message: String| ConnectorRegistryError::InvalidConfiguration {
+        instance: instance.name.clone(),
+        message,
+    };
+    validate_stripe_instance_metadata(&instance.config, &instance.operations)
+        .map_err(|error| invalid(error.to_string()))?;
+    let connector = StripeConnector::from_metadata_config(&instance.config)
+        .map_err(|error| invalid(error.to_string()))?;
+    let webhook_spec = catalog::compile_stripe_checkout_completed_trigger_spec(
+        context.metadata,
+        context.definition,
+    )
+    .map_err(invalid)?;
+    let webhook = CompiledWebhookTrigger {
+        source_name: context.source_name.to_owned(),
+        spec: Arc::new(webhook_spec),
+        configuration_fingerprint: stripe_webhook_configuration_fingerprint(
+            context.definition,
+            &instance.config,
+        ),
+    };
+    let mut operations = BTreeMap::new();
+    for operation in &instance.operations {
+        // The declaration is the gate, at build as well as at validation: an
+        // operation this connector does not declare, or declares as
+        // inventory-only, never becomes a registry instance.
+        context
+            .connector
+            .admit_operation(&operation.name)
+            .map_err(|rejection| invalid(rejection.message().to_owned()))?;
+        let compiled = CompiledStripeOperation {
+            configuration_fingerprint: stripe_configuration_fingerprint(
+                context.definition,
+                &instance.config,
+                operation,
+            ),
+            serialization_key_input: operation
+                .capacity()
+                .and_then(|capacity| capacity.serialize_by.as_ref())
+                .map(|binding| binding.input.clone()),
+        };
+        if operations
+            .insert(operation.name.clone(), compiled)
+            .is_some()
+        {
+            return Err(invalid(format!(
+                "connector operation `{}` is declared more than once",
+                operation.name
+            )));
+        }
+    }
+    Ok(Box::new(StripeInstance {
+        connector,
+        operations,
+        webhook,
+    }))
+}
+
+impl RegisteredConnector for StripeInstance {
+    fn execute<'a>(
+        &'a self,
+        operation: &'a str,
+        input: JsonValue,
+        idempotency_key: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<ConnectorSuccess, ConnectorFailure>> {
+        Box::pin(async move {
+            if !self.operations.contains_key(operation) {
+                return Err(ConnectorFailure::new(
+                    ConnectorErrorClass::Invariant,
+                    "connector_invariant",
+                    "connector operation is not declared",
+                ));
+            }
+            if operation != CREATE_CHECKOUT_SESSION_OPERATION {
+                return Err(ConnectorFailure::new(
+                    ConnectorErrorClass::Invariant,
+                    "connector_invariant",
+                    "connector operation is not compiled into this binary",
+                ));
+            }
+            execute_checkout_from_json(&self.connector, input, idempotency_key, deadline).await
+        })
+    }
+
+    fn configuration_fingerprint(&self, operation: &str) -> Option<&str> {
+        self.operations
+            .get(operation)
+            .map(|operation| operation.configuration_fingerprint.as_str())
+    }
+
+    fn serialization_key_input(&self, operation: &str) -> Option<&str> {
+        self.operations
+            .get(operation)
+            .and_then(|operation| operation.serialization_key_input.as_deref())
+    }
+
+    fn webhook(&self) -> Option<WebhookInstance<'_>> {
+        Some(WebhookInstance {
+            source_name: &self.webhook.source_name,
+            // Stripe is the one module whose Process-owned inbound transaction
+            // has landed, so its verified deliveries are correlated and
+            // acknowledged rather than answered with `503` (spec 013 §0).
+            delivery: super::WebhookDelivery::Correlated {
+                trigger: self.webhook.spec.as_ref(),
+                connector: &self.connector,
+            },
+        })
+    }
+
+    fn trigger_spec(&self, source_name: &str, trigger: TriggerId) -> Option<Arc<TriggerSpec>> {
+        (self.webhook.source_name == source_name && self.publishes(trigger))
+            .then(|| self.webhook.spec.clone())
+    }
+
+    fn trigger_configuration_fingerprint(&self, trigger: TriggerId) -> Option<&str> {
+        self.publishes(trigger)
+            .then_some(self.webhook.configuration_fingerprint.as_str())
+    }
+}
+
+impl StripeInstance {
+    /// Whether this instance's compiled trigger is the one being asked for.
+    fn publishes(&self, trigger: TriggerId) -> bool {
+        matches!(
+            self.webhook.spec.as_ref(),
+            TriggerSpec::Webhook {
+                trigger: candidate,
+                ..
+            } if *candidate == trigger
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct StripeConfigurationFingerprint<'a> {
+    module_name: &'a str,
+    module_semantic_version: &'a str,
+    runtime_abi: u32,
+    operation_name: &'a str,
+    operation_version: &'a str,
+    endpoint_identity: &'a str,
+    credential_identity: &'a str,
+    api_version: &'a str,
+    secret_key_environment: &'a str,
+    webhook_secret_environment: &'a str,
+    capacity: &'a donat_metadata::ConnectorCapacity,
+}
+
+#[derive(Serialize)]
+struct StripeWebhookConfigurationFingerprint<'a> {
+    module_name: &'a str,
+    module_semantic_version: &'a str,
+    runtime_abi: u32,
+    trigger_name: &'a str,
+    trigger_version: &'a str,
+    endpoint_identity: &'a str,
+    credential_identity: &'a str,
+    api_version: &'a str,
+    webhook_secret_environment: &'a str,
+}
+
+fn stripe_configuration_fingerprint(
+    definition: ConnectorDefinition,
+    config: &ConnectorConfig,
+    operation: &ConnectorOperation,
+) -> String {
+    let secret_key_environment = &config
+        .secret_key
+        .as_ref()
+        .expect("Stripe secret key was validated before fingerprinting")
+        .value_from_env;
+    let webhook_secret_environment = &config
+        .webhook_secret
+        .as_ref()
+        .expect("Stripe webhook secret was validated before fingerprinting")
+        .value_from_env;
+    let api_version = config
+        .api_version
+        .as_deref()
+        .expect("Stripe API version was validated before fingerprinting");
+    let capacity = operation
+        .capacity()
+        .expect("Stripe operation capacity was validated before fingerprinting");
+    let canonical = StripeConfigurationFingerprint {
+        module_name: definition.module_name,
+        module_semantic_version: definition.semantic_version,
+        runtime_abi: definition.runtime_abi,
+        operation_name: &operation.name,
+        operation_version: STRIPE_OPERATION_VERSION,
+        endpoint_identity: &config.endpoint_identity,
+        credential_identity: &config.credential_identity,
+        api_version,
+        secret_key_environment,
+        webhook_secret_environment,
+        capacity,
+    };
+    let bytes = serde_json::to_vec(&canonical)
+        .expect("validated Stripe fingerprint fields always serialize to JSON");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn stripe_webhook_configuration_fingerprint(
+    definition: ConnectorDefinition,
+    config: &ConnectorConfig,
+) -> String {
+    let webhook_secret_environment = &config
+        .webhook_secret
+        .as_ref()
+        .expect("Stripe webhook secret was validated before fingerprinting")
+        .value_from_env;
+    let api_version = config
+        .api_version
+        .as_deref()
+        .expect("Stripe API version was validated before fingerprinting");
+    let canonical = StripeWebhookConfigurationFingerprint {
+        module_name: definition.module_name,
+        module_semantic_version: definition.semantic_version,
+        runtime_abi: definition.runtime_abi,
+        trigger_name: COMPLETED_WEBHOOK_TRIGGER,
+        trigger_version: STRIPE_TRIGGER_VERSION,
+        endpoint_identity: &config.endpoint_identity,
+        credential_identity: &config.credential_identity,
+        api_version,
+        webhook_secret_environment,
+    };
+    let bytes = serde_json::to_vec(&canonical)
+        .expect("validated Stripe webhook fingerprint fields serialize");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 impl ConnectorModule for StripeConnector {
     fn definition(&self) -> ConnectorDefinition {
         ConnectorDefinition {
@@ -531,140 +999,9 @@ impl ConnectorModule for StripeConnector {
     }
 }
 
-impl StripeTransport {
-    async fn post_checkout_session(
-        &self,
-        authorization: &HeaderValue,
-        api_version: &str,
-        idempotency_key: &HeaderValue,
-        body: Vec<u8>,
-        deadline: tokio::time::Instant,
-    ) -> Result<StripeResponse, ConnectorFailure> {
-        let destination = self.resolve_under_deadline(deadline).await?;
-        let mut url = self.base_url.clone();
-        url.set_path("/v1/checkout/sessions");
-        url.set_query(None);
-        let host = url
-            .host_str()
-            .expect("validated Stripe API origin has host");
-        let port = url
-            .port_or_known_default()
-            .expect("validated Stripe API origin has port");
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(timeout_failure());
-        }
-        let addresses = destination
-            .iter()
-            .copied()
-            .map(|address| SocketAddr::new(address, port))
-            .collect::<Vec<_>>();
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .retry(reqwest::retry::never())
-            .timeout(remaining)
-            .resolve_to_addrs(host, &addresses)
-            .build()
-            .map_err(|_| transport_failure())?;
-        let response = client
-            .post(url)
-            .header(AUTHORIZATION, authorization)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header("Stripe-Version", api_version)
-            .header("Idempotency-Key", idempotency_key)
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    timeout_failure()
-                } else {
-                    transport_failure()
-                }
-            })?;
-        let peer = response.remote_addr();
-        self.validate_peer(&destination, peer)?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let mut stream = response.bytes_stream();
-        let mut body = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                if error.is_timeout() {
-                    timeout_failure()
-                } else {
-                    transport_failure()
-                }
-            })?;
-            if body.len().saturating_add(chunk.len()) > MAX_HTTP_BODY_BYTES {
-                return Err(validation_failure(
-                    "Stripe Checkout response exceeds the 1 MiB limit",
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(StripeResponse {
-            status,
-            headers,
-            body,
-        })
-    }
-
-    async fn resolve_under_deadline(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<Vec<IpAddr>, ConnectorFailure> {
-        let host = self
-            .base_url
-            .host_str()
-            .expect("validated Stripe API origin has host");
-        let port = self
-            .base_url
-            .port_or_known_default()
-            .expect("validated Stripe API origin has port");
-        let addresses = tokio::time::timeout_at(deadline, tokio::net::lookup_host((host, port)))
-            .await
-            .map_err(|_| timeout_failure())?
-            .map_err(|_| transport_failure())?
-            .map(|address| address.ip())
-            .collect::<Vec<_>>();
-        if addresses.is_empty() {
-            return Err(transport_failure());
-        }
-        Ok(addresses)
-    }
-
-    /// The connection must land on one of the addresses this request already
-    /// resolved, so a name cannot resolve to one address for validation and
-    /// another for transport. Egress reachability itself is a network-layer
-    /// concern.
-    fn validate_peer(
-        &self,
-        destination: &[IpAddr],
-        peer: Option<SocketAddr>,
-    ) -> Result<(), ConnectorFailure> {
-        let Some(peer) = peer else {
-            return Err(invariant_failure(
-                "connector transport could not verify the connected peer",
-            ));
-        };
-        if !destination.contains(&peer.ip()) {
-            return Err(invariant_failure(
-                "connector transport connected to an unresolved peer",
-            ));
-        }
-        Ok(())
-    }
-}
-
-struct StripeResponse {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Vec<u8>,
-}
-
-fn decode_checkout_response(response: StripeResponse) -> Result<CheckoutSession, ConnectorFailure> {
+fn decode_checkout_response(
+    response: RawHttpResponse,
+) -> Result<CheckoutSession, ConnectorFailure> {
     if response.status != StatusCode::OK {
         return Err(match response.status.as_u16() {
             408 => timeout_failure(),
@@ -673,7 +1010,7 @@ fn decode_checkout_response(response: StripeResponse) -> Result<CheckoutSession,
                 "connector_http_429",
                 "Stripe rate limited the Checkout request",
             )
-            .with_retry_after(retry_after(&response.headers)),
+            .with_retry_after(retry_after(response.headers())),
             401 | 403 => ConnectorFailure::new(
                 ConnectorErrorClass::Authentication,
                 "connector_http_authentication",
@@ -699,7 +1036,7 @@ fn decode_checkout_response(response: StripeResponse) -> Result<CheckoutSession,
         status: String,
         expires_at: i64,
     }
-    let session: Session = serde_json::from_slice(&response.body)
+    let session: Session = serde_json::from_slice(response.body())
         .map_err(|_| validation_failure("Stripe returned malformed Checkout Session JSON"))?;
     if session.id.is_empty() || session.url.is_empty() || session.status.is_empty() {
         return Err(validation_failure(
@@ -712,46 +1049,6 @@ fn decode_checkout_response(response: StripeResponse) -> Result<CheckoutSession,
         status: session.status,
         expires_at: session.expires_at,
     })
-}
-
-fn parse_stripe_signature(value: &str) -> Result<(i64, Vec<Vec<u8>>), WebhookRejection> {
-    let mut timestamp = None;
-    let mut signatures = Vec::new();
-    for part in value.split(',') {
-        let Some((name, value)) = part.split_once('=') else {
-            continue;
-        };
-        match name.trim() {
-            "t" if timestamp.is_none() => {
-                timestamp = value.trim().parse::<i64>().ok();
-            }
-            "v1" => {
-                if let Some(bytes) = decode_hex(value.trim()) {
-                    signatures.push(bytes);
-                }
-            }
-            _ => {}
-        }
-    }
-    match (timestamp, signatures.is_empty()) {
-        (Some(timestamp), false) => Ok((timestamp, signatures)),
-        _ => Err(WebhookRejection::InvalidSignature),
-    }
-}
-
-fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    if value.len() != 64 || !value.len().is_multiple_of(2) {
-        return None;
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)?;
-            let low = (pair[1] as char).to_digit(16)?;
-            Some(((high << 4) | low) as u8)
-        })
-        .collect()
 }
 
 fn valid_rate_period(value: &str) -> bool {
@@ -1129,9 +1426,9 @@ mod tests {
                 .create_checkout_session(checkout_input(), "activity-stable-key", deadline())
                 .await
                 .expect_err("the local provider status is not a Checkout success");
-            assert_eq!(failure.class, expected);
+            assert_eq!(failure.class(), expected);
             if expected == ConnectorErrorClass::Http429 {
-                assert_eq!(failure.retry_after, Some(Duration::from_secs(7)));
+                assert_eq!(failure.retry_after(), Some(Duration::from_secs(7)));
             }
         }
         assert_eq!(

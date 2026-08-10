@@ -1,0 +1,66 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 024 §3).
+#
+# Trello is the one module in the workspace whose credential is *two* secrets:
+# its key names the application and its token names the authorization, and
+# neither authenticates alone. `metadata` withholds the second half while the
+# first resolves, so startup must name only the unavailable variable and never
+# the value it did resolve. `refused_metadata` enables an operation this
+# deployment may not reach — Trello publishes "Delete a Card" and nothing about a
+# second send, so `card.delete` is inventory-only.
+metadata:
+  version: 3
+  connectors:
+    - name: trello_present
+      module: trello
+      config:
+        endpoint_identity: trello_conformance
+        credential_identity: trello_conformance_credential
+        secrets:
+          api_key:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          api_token:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: card.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: trello_missing
+      module: trello
+      config:
+        endpoint_identity: trello_conformance
+        credential_identity: trello_conformance_credential
+        secrets:
+          api_key:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          api_token:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: trello_refused
+      module: trello
+      config:
+        endpoint_identity: trello_conformance
+        credential_identity: trello_conformance_credential
+        secrets:
+          api_key:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          api_token:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: card.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `trello_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `card.delete` on module `trello`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

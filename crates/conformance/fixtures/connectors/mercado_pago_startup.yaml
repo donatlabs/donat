@@ -1,0 +1,58 @@
+# Donat-owned connector startup fixture (spec 010 §12: every connector adds a
+# native conformance fixture proving startup validation and redaction).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables the refund — `refund.create`, which Mercado Pago
+# publishes an idempotency header for but no retention, so the class is a
+# near-miss rather than `ExplicitKey` and the operation is not executable — and
+# startup must name the exact metadata path. Neither may disclose a resolved
+# value.
+metadata:
+  version: 3
+  connectors:
+    - name: mercado_pago_present
+      module: mercado_pago
+      config:
+        endpoint_identity: mercado_pago_conformance
+        credential_identity: mercado_pago_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: payment.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: mercado_pago_missing
+      module: mercado_pago
+      config:
+        endpoint_identity: mercado_pago_conformance
+        credential_identity: mercado_pago_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: mercado_pago_refused
+      module: mercado_pago
+      config:
+        endpoint_identity: mercado_pago_conformance
+        credential_identity: mercado_pago_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: refund.create
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `mercado_pago_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `refund.create` on module `mercado_pago`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

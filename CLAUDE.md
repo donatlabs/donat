@@ -38,6 +38,8 @@ conformance harness (`crates/conformance`).
 | Format and lint gates (CI blocks on both) | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
 | Inspect one Process instance | `donat process inspect --source <name> --instance <uuid>` (read-only) |
 | Check one instance's history | `donat process verify-history --source <name> --instance <uuid>` (read-only, non-zero exit on inconsistency) |
+| Authorize an OAuth2 connector instance | `donat connector authorize --source <name> --instance <name>` (deploy-time only; needs `DONAT_CREDENTIAL_KEY`) |
+| Inspect / remove stored credentials | `donat connector credentials list --source <name>` (read-only, non-zero exit when a configured instance has none), `... credentials revoke --source <name> --instance <name> --subject <id>` |
 
 The conformance harness needs Postgres (`postgis/postgis:16-3.4`) at
 `PG_URL` (default `postgresql://postgres:postgres@127.0.0.1:15432/postgres`).

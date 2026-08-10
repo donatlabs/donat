@@ -3012,6 +3012,21 @@ pub(crate) const AGGREGATE_COLUMN_OPS: &[&str] = &[
     "var_pop",
 ];
 
+/// Whether an update permission admits writing this database column.
+///
+/// The one reading of "which columns may this role update", shared by the
+/// update path and by the `DO UPDATE` branch of an upsert — which is an update
+/// written through an insert and is held to the same list.
+pub(crate) fn update_permits_column(
+    permission: &donat_metadata::UpdatePermission,
+    column: &str,
+) -> bool {
+    match &permission.columns {
+        Columns::Star => true,
+        Columns::List(columns) => columns.iter().any(|allowed| allowed == column),
+    }
+}
+
 pub(crate) fn field_not_found(path: &str, field: &str, type_name: &str) -> PlanError {
     PlanError::validation(
         path,

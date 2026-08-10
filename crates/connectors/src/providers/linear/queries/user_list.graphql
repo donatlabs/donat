@@ -1,0 +1,16 @@
+# Linear: `users(filter: UserFilter, first: Int, after: String): UserConnection!`.
+query UserList($first: Int!, $after: String) {
+  users(first: $first, after: $after) {
+    nodes {
+      id
+      name
+      displayName
+      email
+      active
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}

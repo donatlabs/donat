@@ -16,6 +16,7 @@ members = [
     "crates/sqlgen",
     "crates/wasm-core",
     "crates/backend",
+    "crates/connectors",
     "crates/server",
     "crates/conformance",
 ]
@@ -66,6 +67,119 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 croner = "3"
+# The IANA time zone database. Without it every scheduled thing is UTC-only,
+# because a wall-clock schedule ("09:00 on weekdays") is not expressible
+# without the rules that say what the offset is on a given day. The embedded
+# database version decides when a schedule fires, so the crate — and with it
+# the tzdb release it carries — is pinned exactly rather than floating.
+chrono-tz = "=0.10.4"
+# Phone numbers: parsing, per-region validity and E.164 normalization, from a
+# port of the standard metadata-driven library. A phone validator has to answer
+# "is this a real number of its type" before the statement is built, which no
+# amount of SQL or regex does correctly. The `+9.0.33` build metadata is the
+# embedded libphonenumber database version — it decides which numbers are
+# valid, so it is pinned exactly rather than floating.
+phonenumber = "=0.3.10"
 uuid = "1"
 sha2 = "0.10"
+# AES-256-GCM for the one credential the engine writes back (spec 011). `ring`
+# is already in the binary — rustls uses it as its provider — so sealing a
+# stored token adds an import rather than a new cryptographic implementation.
+ring = "0.17"
 ryu-js = "=1.0.2"
+# Document rendering (spec 019). Each of these renders bytes from declared
+# metadata and declared input, and each is pinned exactly, because the bytes a
+# renderer produces are the product: a patch release that changes a glyph
+# advance or a ZIP field order changes every rendered invoice, and `Pure` is
+# admitted on two renders being byte-identical.
+#
+# `typst` is the PDF typesetter. Its `World` is the sandbox boundary, so the
+# compiler is taken bare — no `typst-kit`, no package registry, no font
+# discovery — and `crates/connectors/src/local/document/world.rs` implements
+# the trait itself. The fonts are ours too, embedded from
+# `crates/connectors/assets/fonts` (see root `THIRD_PARTY_NOTICES.md`): the
+# compiler's own bundle mixes four licenses, and only two OFL families are
+# wanted.
+typst = "=0.15.1"
+typst-layout = "=0.15.1"
+typst-pdf = "=0.15.1"
+# MJML → responsive HTML. `default-features = false` is not cosmetic: the
+# default set is only the parser and the renderer, but the crate also offers
+# `http-loader` and `local-loader` includes, and a template that could fetch a
+# URL or read a file at render time is neither `Pure` nor closed.
+mrml = { version = "=6.0.1", default-features = false, features = ["parse", "render"] }
+# `.xlsx` writing. `zlib` is deliberately not enabled: the pure-Rust deflate
+# path is what makes one input produce one byte-identical archive on every
+# platform the engine is built for.
+rust_xlsxwriter = "=0.97.1"
+# iCalendar building. The `parser` default feature stays on — reading back what
+# we wrote is how the calendar tests assert on properties rather than on a
+# hand-rolled line splitter.
+icalendar = "=0.17.13"
+# Zip, on both sides of the feature line. Spec 019's renderer tests take a
+# written `.xlsx` back apart to show a cell is inert; spec 020's reader opens an
+# uploaded one, and opens it *before* a parser does — the entry count, the
+# declared uncompressed size of every member, and the bytes that actually come
+# out are all read here, because a compression ratio checked after
+# decompression has already paid for the decompression.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+# Spreadsheet ingest (spec 020). Pinned exactly for a reason the writing
+# direction shares: what a reader decides — that a serial is a date under *this*
+# workbook's epoch, that a formula cell yields its cached value, that a shared
+# string is the text it was — is the product, and a patch release that changes
+# any of it changes what an import means. Default features off on purpose: the
+# `dates` and `chrono` features add a second date conversion beside the one this
+# workspace already reads its epochs through, and `picture` decodes embedded
+# images out of a file a stranger uploaded.
+calamine = { version = "=0.36.0", default-features = false }
+# CSV reading, for the half of spec 020 that has no archive and no date system.
+csv = "1"
+
+# Media derivatives (spec 022). Pinned exactly for the same reason the document
+# backends are: the bytes are the product, and `Pure` is admitted on two renders
+# of one input being byte-identical.
+#
+# `qrcode` is taken bare. Its `image` and `svg` renderers are convenience, and
+# both output shapes this capability produces — a PNG raster and an SVG path —
+# are written in `crates/connectors/src/local/code.rs`, so the module grid is
+# the only thing the crate decides and the file layout is the only thing we do.
+# Encoding is driven through `qrcode::bits`, because capacity has to be answered
+# *before* a symbol is rendered rather than by letting a constructor pick a
+# larger version (spec 022 §1).
+qrcode = { version = "=0.14.1", default-features = false }
+# Linear symbologies (Code128, Code39, EAN-13). `default-features = false`
+# drops the `ascii`, `json`, and `svg` generators the same way, leaving the
+# crate to answer one question — which modules are dark — and this workspace to
+# decide what that becomes.
+barcoders = { version = "=2.0.0", default-features = false, features = ["std"] }
+# The decoder, and the one crate in this workspace that is fed bytes a stranger
+# uploaded. The feature list is the format allowlist at the link level: a format
+# that is not compiled in cannot be decoded however a caller spells its media
+# type, and SVG is not a raster format at all, so there is nothing here that
+# could open one (spec 022 §2).
+image = { version = "=0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
+
+# Recurrence (spec 021 §3). RFC 5545 recurrence rules — the thing every
+# subscription, booking, shift and lesson schedule needs and almost nobody
+# implements correctly by hand. Pinned exactly for the reason the renderers
+# are: the occurrence list *is* the product, and a patch release that changes
+# which instants a rule yields changes when a deployment thinks things happen.
+#
+# `default-features = false` keeps two things out. `cli-tool` is a binary and
+# a `clap` dependency this workspace has no use for; `exrule` admits `EXRULE`,
+# which RFC 5545 deprecated and whose interaction with a bounded expansion is
+# one more thing to reason about for no declared need. What is left is the
+# parser, the validator, and the iterator.
+rrule = { version = "=0.14.0", default-features = false }
+
+# Debug builds keep file and line for panics and backtraces, but not the full
+# variable-inspection tables. Those tables are most of `target/debug/deps`,
+# which repeatedly filled this machine's disk during parallel work; a debugger
+# session that needs them can pass `--config 'profile.dev.debug=true'`.
+[profile.dev]
+debug = "line-tables-only"

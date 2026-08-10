@@ -22,7 +22,7 @@ use donat_ir::TypedValue;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    connectors::WebhookRejection,
+    connectors::{VerifiedDelivery, WebhookRejection},
     processes::{
         InvalidSignatureStatus, persist_invalid_from_engine, persist_verified_from_engine,
     },
@@ -54,16 +54,17 @@ pub async fn receive(
         return StatusCode::NOT_FOUND.into_response();
     };
     let source_name = connector.source_name().to_owned();
-    let (trigger_id, raw_body_max_bytes) = match connector.trigger() {
-        TriggerSpec::Webhook {
-            trigger,
-            raw_body_max_bytes,
-            ..
-        } => (*trigger, raw_body_max_bytes.get() as usize),
-        TriggerSpec::Poll { .. } => {
+    // A trigger this deployment can correlate publishes a catalog snapshot; one
+    // that only verifies publishes none, and answers `503` below rather than
+    // borrowing the correlated path's machinery.
+    let trigger_id = match connector.trigger() {
+        None => None,
+        Some(TriggerSpec::Webhook { trigger, .. }) => Some(*trigger),
+        Some(TriggerSpec::Poll { .. }) => {
             return StatusCode::NOT_FOUND.into_response();
         }
     };
+    let raw_body_max_bytes = connector.raw_body_max_bytes();
 
     let headers = request.headers().clone();
     let raw_body = match to_bytes(request.into_body(), raw_body_max_bytes).await {
@@ -75,12 +76,19 @@ pub async fn receive(
     let verification = connector.verify(&headers, &raw_body);
 
     match verification {
-        Ok(event) => {
-            let Some(trigger) =
+        // A verified delivery of a connector whose Process-owned inbound
+        // transaction has not landed yet (spec 013 §0). It is authentic, and
+        // there is nowhere to put it: nothing is parsed beyond what the
+        // signature needed, nothing is stored, and the answer is the one the
+        // route matrix names.
+        Ok(VerifiedDelivery::Unacknowledged) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok(VerifiedDelivery::Correlated(event)) => {
+            let event = *event;
+            let Some(trigger) = trigger_id.and_then(|trigger_id| {
                 state
                     .connectors
                     .trigger_spec_handle(&source_name, &instance, trigger_id)
-            else {
+            }) else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
             let engine = state.engine_snapshot().await;
@@ -107,6 +115,11 @@ pub async fn receive(
             }
         }
         Err(WebhookRejection::PayloadTooLarge) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        // A rejection of a connector with no inbound transaction is the same
+        // `400` a correlated one earns, and it writes no audit row: this batch
+        // delivers verification and rejection, and the audit belongs to the
+        // transaction that does not exist yet.
+        Err(_) if trigger_id.is_none() => StatusCode::BAD_REQUEST.into_response(),
         Err(rejection) => {
             let status = match rejection {
                 WebhookRejection::MissingSignature => InvalidSignatureStatus::Missing,

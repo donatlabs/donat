@@ -1,0 +1,60 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 025 §4).
+#
+# Mattermost is self-hosted: the deployment names the whole origin, and the module refuses
+# one it may not send a bearer token to. `refused_metadata` enables an operation this binary
+# was not built with — Mattermost's post update is a `PUT` whose repeat consequence it
+# publishes nothing about, so it is not declared at all.
+metadata:
+  version: 3
+  connectors:
+    - name: mattermost_present
+      module: mattermost
+      config:
+        endpoint_identity: mattermost_conformance
+        credential_identity: mattermost_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          server_origin: https://chat.donat-conformance.test
+      operations:
+        - name: channel.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: mattermost_missing
+      module: mattermost
+      config:
+        endpoint_identity: mattermost_conformance
+        credential_identity: mattermost_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          server_origin: https://chat.donat-conformance.test
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: mattermost_refused
+      module: mattermost
+      config:
+        endpoint_identity: mattermost_conformance
+        credential_identity: mattermost_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          server_origin: https://chat.donat-conformance.test
+      operations:
+        - name: post.update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `mattermost_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `post.update` on module `mattermost`: connector operation is not compiled into this binary"
+  output_excludes: "connector-present-secret-sentinel"

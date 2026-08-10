@@ -871,6 +871,42 @@ impl S3Backend {
         (url, headers)
     }
 
+    /// A presigned PUT for bytes the engine produced itself.
+    ///
+    /// A client upload writes to a staging key and is copied to its final key
+    /// once the engine has verified it (see [`AttachmentSpec::staging_key`]).
+    /// An engine-produced artifact needs neither: the engine already holds the
+    /// bytes and already knows their size, so it writes them straight to the
+    /// final key. The size and media type are signed into the URL, exactly as
+    /// they are for an upload, so the object store itself refuses a body of
+    /// another size or type.
+    pub fn presign_produced_put(
+        &self,
+        object_key: &str,
+        media_type: &str,
+        byte_size: u64,
+        at: DateTime<Utc>,
+        expires: u32,
+    ) -> (String, Vec<(String, String)>) {
+        let headers = vec![
+            ("Content-Length".to_string(), byte_size.to_string()),
+            ("Content-Type".to_string(), media_type.to_string()),
+        ];
+        let url = presign_v4_with(
+            &self.signing_key(at),
+            &self.credential_encoded(at),
+            &self.credential_scope(at),
+            &amz_date(at),
+            expires,
+            &self.origin,
+            &self.host,
+            &self.canonical_uri(object_key),
+            "PUT",
+            &headers,
+        );
+        (url, headers)
+    }
+
     /// `/` for virtual-hosted buckets, `/<bucket>/` for path style — the part
     /// the SQL half prepends to a stored object key.
     pub fn uri_prefix(&self) -> String {
@@ -1010,6 +1046,43 @@ storage:
             .download_url_sql(attachment)
             .unwrap();
         assert_ne!(first, next_window, "a new window must re-sign");
+    }
+
+    /// An artifact the engine produced goes to the attachment's *final* key,
+    /// with its size and type signed in — there is nothing to stage, because
+    /// the bytes never passed through a caller.
+    #[test]
+    fn a_produced_artifact_is_written_to_the_attachments_own_key() {
+        let registry = registry();
+        let attachment = registry.attachment("public.pet.photo").expect("attachment");
+        let Some(Backend::S3(s3)) = registry.backend_for(attachment) else {
+            panic!("the test backend is S3");
+        };
+        let id = Uuid::from_u128(9);
+        let object_key = attachment.object_key(id);
+        assert_eq!(object_key, format!("public.pet.photo/{id}"));
+        assert!(
+            !object_key.ends_with(".part"),
+            "engine-produced bytes need no staging key"
+        );
+
+        let at = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
+        let (url, headers) = s3.presign_produced_put(&object_key, "application/pdf", 1_024, at, 60);
+        assert!(url.starts_with(&format!("{}/donat-test/{object_key}?", s3.origin)));
+        assert!(url.contains("X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost"));
+        assert_eq!(
+            headers,
+            vec![
+                ("Content-Length".to_string(), "1024".to_string()),
+                ("Content-Type".to_string(), "application/pdf".to_string()),
+            ]
+        );
+        assert_ne!(
+            url,
+            s3.presign_produced_put(&object_key, "application/pdf", 1_025, at, 60)
+                .0,
+            "the size is signed, so the store refuses a body of another size"
+        );
     }
 
     /// The window is capped at half the lifetime, so even a URL minted at the

@@ -425,6 +425,7 @@ Effects, pagination, and errors are branch-complete:
 ```text
 OperationEffectMaterialV1 =
   tagged "read_only" null |
+  tagged "at_most_once" null |
   tagged "provider_idempotent" {"side_effect_steps":[{
     "clock_safety_margin_ms":u64-string,
     "fixed_binding":
@@ -1060,6 +1061,7 @@ OperationBounds.maximum_output_canonical_bytes|semantic|OperationBoundsMaterialV
 OperationBounds.maximum_redirects|semantic|OperationBoundsMaterialV1.maximum_redirects|normalized|scalar|required|u8
 OperationBounds.deadline_ms|semantic|OperationBoundsMaterialV1.deadline_ms|normalized|scalar|required|u64-string
 OperationEffect::ReadOnly|semantic|OperationEffectMaterialV1{kind=read_only}.kind|normalized|scalar|required|read_only
+OperationEffect::AtMostOnce|semantic|OperationEffectMaterialV1{kind=at_most_once}.kind|normalized|scalar|required|at_most_once
 OperationEffect::ProviderIdempotent|semantic|OperationEffectMaterialV1{kind=provider_idempotent}.kind|normalized|scalar|required|provider_idempotent
 OperationEffect::ProviderIdempotent.side_effect_steps|semantic|OperationEffectMaterialV1{kind=provider_idempotent}.value.side_effect_steps|normalized|step|nonempty_array|NonEmptyVec<ProviderIdempotentStepMaterialV1>
 ProviderIdempotentStep.step|semantic|ProviderIdempotentStepMaterialV1.step|normalized|scalar|required|CompiledStepId

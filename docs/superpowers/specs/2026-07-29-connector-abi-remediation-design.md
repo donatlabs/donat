@@ -734,9 +734,9 @@ This design does not add or change:
   `donat-value-contract`;
 - recursion, nested connectors, streams, unbounded collections, or fresh
   per-page budgets;
-- n8n `If`, `Switch`, `Merge`, `Code`, `Wait`, loops, workflow items,
-  paired items, subworkflows, AI nodes, send-and-wait, or any other
-  logical/workflow node;
+- workflow constructs of any kind: conditionals, switches, merges, loops,
+  waits, item and paired-item models, subworkflows, AI orchestration,
+  send-and-wait, or any other logical node;
 - business decisions, branching, database work, waits, retries, or
   orchestration owned by Rules, Commands, and Processes.
 

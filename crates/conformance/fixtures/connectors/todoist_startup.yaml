@@ -1,0 +1,54 @@
+# Donat-owned connector startup fixture (spec 010 §12).
+#
+# `refused_metadata` enables the operation whose second send Todoist publishes
+# outright, and it is a refusal rather than the same one absent task: "Returns
+# `NOT_FOUND` when the task does not exist." So `task.delete` is inventory-only
+# and a deployment that enables it never serves.
+metadata:
+  version: 3
+  connectors:
+    - name: todoist_present
+      module: todoist
+      config:
+        endpoint_identity: todoist_conformance
+        credential_identity: todoist_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: task.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: todoist_missing
+      module: todoist
+      config:
+        endpoint_identity: todoist_conformance
+        credential_identity: todoist_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: todoist_refused
+      module: todoist
+      config:
+        endpoint_identity: todoist_conformance
+        credential_identity: todoist_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: task.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `todoist_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `task.delete` on module `todoist`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

@@ -10,6 +10,11 @@
 //! - migrate (DDL): `donat migrate --migrations-dir <dir>`
 //! - validate (metadata vs DB): `donat validate --metadata-dir <dir>`
 //! - inspect (read-only): `donat process inspect --source <s> --instance <id>`
+//! - authorize (deploy-time OAuth2): `donat connector authorize --source <s>
+//!   --instance <i>`, with `donat connector credentials list|revoke` beside it.
+//!   Obtaining a provider token is a command an operator runs, never a route
+//!   the engine serves — see
+//!   `knowledgebase/declarative-saas/decisions/041-*`.
 
 // The binary builds its router from the library's module tree rather than
 // declaring a second copy of it. A second copy compiled the same files again
@@ -144,6 +149,81 @@ enum Command {
     /// Read-only diagnostics for one durable Process instance.
     #[command(subcommand)]
     Process(ProcessCommand),
+    /// Deploy-time connector credential lifecycle (OAuth2).
+    #[command(subcommand)]
+    Connector(ConnectorCommand),
+}
+
+/// The OAuth2 credential lifecycle, and the reason it is a CLI.
+///
+/// A refresh token is the one credential the engine has to write rather than
+/// read, and obtaining the first one needs a human at a browser. Doing that
+/// over HTTP would mean an endpoint that accepts a provider `code` and stores
+/// a credential — a management API, which this engine does not have and will
+/// not grow. So the operator runs it here, with the same database access every
+/// other deploy-time step already requires.
+#[derive(clap::Subcommand, Debug)]
+enum ConnectorCommand {
+    /// Obtain and store the first token for one connector instance.
+    Authorize(ConnectorAuthorizeArgs),
+    /// Read-only credential inventory, and revocation.
+    #[command(subcommand)]
+    Credentials(CredentialsCommand),
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum CredentialsCommand {
+    /// List stored credentials for a source. No secrets; exits non-zero when a
+    /// configured instance has none.
+    List(CredentialsListArgs),
+    /// Revoke at the provider (when it declares an endpoint) and delete.
+    Revoke(CredentialsRevokeArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ConnectorAuthorizeArgs {
+    /// Metadata source holding this connector's credentials.
+    #[arg(long)]
+    source: String,
+    /// The connector instance name (`name:` in metadata).
+    #[arg(long)]
+    instance: String,
+    /// The connector module, checked against the instance's declaration.
+    #[arg(long)]
+    connector: Option<String>,
+    /// The provider's own account identifier, when its token response does not
+    /// carry one.
+    #[arg(long)]
+    subject: Option<String>,
+    /// Capture the redirect with a one-shot listener on `127.0.0.1:<port>`
+    /// instead of pasting it. Never binds a public address.
+    #[arg(long)]
+    listen: Option<u16>,
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct CredentialsListArgs {
+    #[arg(long)]
+    source: String,
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct CredentialsRevokeArgs {
+    #[arg(long)]
+    source: String,
+    #[arg(long)]
+    instance: String,
+    #[arg(long)]
+    connector: Option<String>,
+    /// Which provider account to revoke.
+    #[arg(long)]
+    subject: String,
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
 }
 
 /// The two read-only diagnostics
@@ -574,6 +654,9 @@ async fn main() -> anyhow::Result<()> {
                 findings.len()
             );
         }
+        Some(Command::Connector(command)) => {
+            return run_connector_command(&args, command).await;
+        }
         _ => {}
     }
 
@@ -647,6 +730,10 @@ async fn main() -> anyhow::Result<()> {
             processes: vec![],
             mcp: Default::default(),
             storage: Default::default(),
+            templates: vec![],
+            media: Default::default(),
+            ingest_schemas: vec![],
+            recurrence: Default::default(),
         },
     };
     ensure_default_source(&mut metadata);
@@ -654,7 +741,17 @@ async fn main() -> anyhow::Result<()> {
     // Connector configuration is fully validated before this process opens a
     // listener. The immutable registry retains runtime credentials privately;
     // errors contain static metadata or variable names only, never values.
-    let connectors = Arc::new(connectors::ConnectorRegistry::build(&metadata)?);
+    let connectors = {
+        let mut registry = connectors::ConnectorRegistry::build(&metadata)?;
+        // The OAuth2 half resolves here too: the sealing key, the client
+        // identity behind each declared instance, and the proof that every one
+        // of them already holds a stored credential (spec 011 §7). A deployment
+        // that declares `config.oauth2` and cannot use it must not serve.
+        registry
+            .attach_credentials(&metadata, &database_url)
+            .await?;
+        Arc::new(registry)
+    };
 
     // File attachments resolve their backends and secrets here, before the
     // listener binds: a missing credential must stop the boot, not surface as
@@ -844,6 +941,69 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
     Ok(())
+}
+
+/// Every connector-credential command needs the same two things: the metadata
+/// directory that declares the instance, and the database of the source that
+/// holds its credentials. Both are resolved exactly as `validate` resolves
+/// them, so a deployment names its source once and every command agrees.
+async fn run_connector_command(args: &Args, command: &ConnectorCommand) -> anyhow::Result<()> {
+    use donat_server::credentials::cli::{self, ConnectorTarget};
+
+    fn selection(
+        args: &Args,
+        metadata_dir: Option<&PathBuf>,
+        source: &str,
+    ) -> anyhow::Result<MetadataSourceSelection> {
+        let metadata_dir = metadata_dir
+            .cloned()
+            .or_else(|| args.metadata_dir.clone())
+            .ok_or_else(|| anyhow::anyhow!("connector credential commands need --metadata-dir"))?;
+        resolve_metadata_source(args, metadata_dir, Some(source), &|name| {
+            std::env::var(name)
+        })
+    }
+
+    match command {
+        ConnectorCommand::Authorize(authorize) => {
+            let selected = selection(args, authorize.metadata_dir.as_ref(), &authorize.source)?;
+            cli::authorize(
+                &selected.database_url,
+                &selected.metadata_dir,
+                &ConnectorTarget {
+                    source: selected.source_name,
+                    instance: authorize.instance.clone(),
+                    connector: authorize.connector.clone(),
+                },
+                authorize.subject.as_deref(),
+                authorize.listen,
+            )
+            .await
+        }
+        ConnectorCommand::Credentials(CredentialsCommand::List(list)) => {
+            let selected = selection(args, list.metadata_dir.as_ref(), &list.source)?;
+            cli::list(
+                &selected.database_url,
+                Some(selected.metadata_dir.as_path()),
+                &selected.source_name,
+            )
+            .await
+        }
+        ConnectorCommand::Credentials(CredentialsCommand::Revoke(revoke)) => {
+            let selected = selection(args, revoke.metadata_dir.as_ref(), &revoke.source)?;
+            cli::revoke(
+                &selected.database_url,
+                &selected.metadata_dir,
+                &ConnectorTarget {
+                    source: selected.source_name,
+                    instance: revoke.instance.clone(),
+                    connector: revoke.connector.clone(),
+                },
+                &revoke.subject,
+            )
+            .await
+        }
+    }
 }
 
 fn require_consistent_metadata(problems: &[String]) -> anyhow::Result<()> {

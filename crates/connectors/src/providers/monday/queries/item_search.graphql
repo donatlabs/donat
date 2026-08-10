@@ -1,0 +1,21 @@
+# The filtered form of the same page. monday: "you can't use `query_params` and
+# `cursor` in the same request", so this is a separate operation with no cursor.
+query ItemSearch($board_id: ID!, $limit: Int!, $query_params: ItemsQuery) {
+  boards(ids: [$board_id]) {
+    id
+    items_page(limit: $limit, query_params: $query_params) {
+      cursor
+      items {
+        id
+        name
+        state
+        url
+        column_values {
+          id
+          text
+          value
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,119 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 025 §4).
+#
+# `refused_metadata` enables the folder delete: Box publishes "or has already been deleted"
+# for a file and says nothing of the kind for a folder, so one is `NaturalMethod` and the
+# other is not. `scope_metadata` enables a write a read-only grant cannot authorize, which
+# startup must refuse by naming `config.oauth2.scopes`.
+metadata:
+  version: 3
+  connectors:
+    - name: box_present
+      module: box
+      config:
+        endpoint_identity: box_conformance
+        credential_identity: box_conformance_credential
+        oauth2:
+          authorization_endpoint: https://account.box.com/api/oauth2/authorize
+          token_endpoint: https://api.box.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - root_readwrite
+      operations:
+        - name: file.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: box_missing
+      module: box
+      config:
+        endpoint_identity: box_conformance
+        credential_identity: box_conformance_credential
+        oauth2:
+          authorization_endpoint: https://account.box.com/api/oauth2/authorize
+          token_endpoint: https://api.box.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - root_readwrite
+      operations:
+        - name: file.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+refused_metadata:
+  version: 3
+  connectors:
+    - name: box_refused
+      module: box
+      config:
+        endpoint_identity: box_conformance
+        credential_identity: box_conformance_credential
+        oauth2:
+          authorization_endpoint: https://account.box.com/api/oauth2/authorize
+          token_endpoint: https://api.box.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - root_readwrite
+      operations:
+        - name: folder.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+scope_metadata:
+  version: 3
+  connectors:
+    - name: box_scoped
+      module: box
+      config:
+        endpoint_identity: box_conformance
+        credential_identity: box_conformance_credential
+        oauth2:
+          authorization_endpoint: https://account.box.com/api/oauth2/authorize
+          token_endpoint: https://api.box.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - root_readonly
+      operations:
+        - name: file.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+        - name: file.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `box_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `folder.delete` on module `box`: connector operation is inventory-only and cannot be enabled by a deployment"
+  module_refusal: "connectors.yaml[0].config.oauth2.scopes: connector operation `file.delete` on module `box` is not authorized by any declared scope"
+  output_excludes: "connector-present-secret-sentinel"

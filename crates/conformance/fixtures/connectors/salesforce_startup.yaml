@@ -1,0 +1,127 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 023 §4).
+#
+# `metadata` withholds one instance's OAuth2 client secret while another
+# instance's resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an inventory-only operation — Salesforce documents
+# its upsert as repeat-safe over a `PATCH`, which spec 010 §7 admits for neither
+# mutating class — and startup must name the exact metadata path.
+# `scope_metadata` declares an OAuth2 scope set that does not carry the `api`
+# scope Salesforce publishes for the REST API: startup must name
+# `config.oauth2.scopes`. None of the three may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: salesforce_present
+      module: salesforce
+      config:
+        endpoint_identity: salesforce_conformance
+        credential_identity: salesforce_conformance_credential
+        settings:
+          my_domain: donat-conformance
+        oauth2:
+          authorization_endpoint: https://donat-conformance.my.salesforce.com/services/oauth2/authorize
+          token_endpoint: https://donat-conformance.my.salesforce.com/services/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - api
+            - refresh_token
+      operations:
+        - name: record.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: salesforce_missing
+      module: salesforce
+      config:
+        endpoint_identity: salesforce_conformance
+        credential_identity: salesforce_conformance_credential
+        settings:
+          my_domain: donat-conformance
+        oauth2:
+          authorization_endpoint: https://donat-conformance.my.salesforce.com/services/oauth2/authorize
+          token_endpoint: https://donat-conformance.my.salesforce.com/services/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - api
+            - refresh_token
+      operations:
+        - name: record.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+refused_metadata:
+  version: 3
+  connectors:
+    - name: salesforce_refused
+      module: salesforce
+      config:
+        endpoint_identity: salesforce_conformance
+        credential_identity: salesforce_conformance_credential
+        settings:
+          my_domain: donat-conformance
+        oauth2:
+          authorization_endpoint: https://donat-conformance.my.salesforce.com/services/oauth2/authorize
+          token_endpoint: https://donat-conformance.my.salesforce.com/services/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - api
+            - refresh_token
+      operations:
+        - name: record.upsert
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+scope_metadata:
+  version: 3
+  connectors:
+    - name: salesforce_scoped
+      module: salesforce
+      config:
+        endpoint_identity: salesforce_conformance
+        credential_identity: salesforce_conformance_credential
+        settings:
+          my_domain: donat-conformance
+        oauth2:
+          authorization_endpoint: https://donat-conformance.my.salesforce.com/services/oauth2/authorize
+          token_endpoint: https://donat-conformance.my.salesforce.com/services/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - refresh_token
+      operations:
+        - name: record.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `salesforce_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `record.upsert` on module `salesforce`: connector operation is inventory-only and cannot be enabled by a deployment"
+  module_refusal: "connectors.yaml[0].config.oauth2.scopes: the `salesforce` connector needs the `api` scope"
+  output_excludes: "connector-present-secret-sentinel"

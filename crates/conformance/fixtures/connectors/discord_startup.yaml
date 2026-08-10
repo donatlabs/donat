@@ -1,0 +1,55 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 025 §4).
+#
+# `refused_metadata` enables the message send: Discord publishes `nonce` with
+# `enforce_nonce` — a real deduplication mechanism — and publishes no retention for it, so
+# `ExplicitKey` is refused (ADR 073) and ADR 063's at-most-once class is refused too,
+# because that one is admitted on an *absence* and there is none. Neither instance may
+# disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: discord_present
+      module: discord
+      config:
+        endpoint_identity: discord_conformance
+        credential_identity: discord_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: channel.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: discord_missing
+      module: discord
+      config:
+        endpoint_identity: discord_conformance
+        credential_identity: discord_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: discord_refused
+      module: discord
+      config:
+        endpoint_identity: discord_conformance
+        credential_identity: discord_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: message.send
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `discord_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `message.send` on module `discord`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

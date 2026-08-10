@@ -1013,6 +1013,10 @@ fn default_metadata_with_configuration(
         processes: vec![],
         mcp: Default::default(),
         storage: Default::default(),
+        templates: vec![],
+        media: Default::default(),
+        ingest_schemas: vec![],
+        recurrence: Default::default(),
     }
 }
 

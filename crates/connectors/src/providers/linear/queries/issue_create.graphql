@@ -1,0 +1,14 @@
+# Linear: `issueCreate(input: IssueCreateInput!): IssuePayload!` — "The issue
+# object to create." `IssuePayload.success` is "Whether the operation was
+# successful" and `issue` is "The issue that was created or updated."
+mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
+    issue {
+      id
+      identifier
+      title
+      url
+    }
+  }
+}
