@@ -18,9 +18,11 @@ donat serve                                         # reads both, runs neither
 
 The first line is the engine's own schema — cron state, command claims, Process
 journals — which ships **inside the image** at `/usr/share/donat/migrations`, beside
-the binary that applies it. Nothing to vendor and nothing to mount. Both sets
-share one history table, which is why every migration is timestamped rather
-than numbered.
+the binary that applies it. Nothing to vendor and nothing to mount. It is not
+optional for any deployment: the serving engine checks its helpers at boot
+(`donat.check_violation` among them) and refuses to start without them, however
+little of the format the metadata uses. Both sets share one history table,
+which is why every migration is timestamped rather than numbered.
 
 `validate` checks metadata against the schema **as it actually is**, so running
 it before `migrate` passes for the wrong reason. Both belong in CI and in the

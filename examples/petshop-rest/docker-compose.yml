@@ -27,7 +27,14 @@ services:
   # One-shot: apply versioned V{n}__*.sql migrations, then exit.
   migrate:
     image: ghcr.io/donatlabs/donat:${ENGINE_TAG:-latest}
-    command: ["migrate", "--migrations-dir", "/migrations"]
+    # The engine's own catalog first — the serving engine refuses to boot
+    # without it (`donat.check_violation` is checked at startup) — then this
+    # example's tables. The engine set ships inside the image.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        donat migrate --migrations-dir /usr/share/donat/migrations &&
+        donat migrate --migrations-dir /migrations
     depends_on:
       postgres:
         condition: service_healthy

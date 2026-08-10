@@ -45,15 +45,14 @@ the donat repository's top-level `migrations/`, and `crates/server/src/migrate.r
 says so in as many words: those "must be applied through the explicit
 `donat migrate --migrations-dir ...` path only."
 
-So how many `migrate` runs you need depends on what the application uses:
+Every deployment runs `migrate` **twice**: the engine's own set first, then the
+application's. This is not advice — the serving engine checks at boot that its
+helpers exist (`donat.check_violation` among them) and refuses to start
+otherwise, whatever the metadata uses. The compiled-in bootstrap covers only
+cron state and the event log, and its own source comment says nothing more may
+be added to it.
 
-| The application uses | Runs needed |
-|---|---|
-| Tables, permissions, REST, MCP, files | **one** — your own migrations. The built-in bootstrap covers the rest. |
-| Commands or durable Processes | **two** — the engine's `migrations/` first, then yours. |
-
-`examples/petshop-rest` and `examples/petshop-mcp` are the first case and have a
-single migrate service. `examples/petshop` is the second:
+`examples/petshop` is the shape to copy:
 
 ```yaml
 migrate:
