@@ -1,0 +1,13 @@
+diff --git a/flows/authorized-order-cancellation.yaml b/flows/authorized-order-cancellation.yaml
+index 0c32154..5c0e30b 100644
+--- flows/authorized-order-cancellation.yaml
++++ flows/authorized-order-cancellation.yaml
+@@ -43,7 +43,7 @@ states:
+         schedule_to_start: 5s
+         start_to_close: 5s
+       retry:
+-        retry_on: [transport, timeout, http_429, http_5xx]
++        retry_on: [transport, http_429, http_5xx]
+         max_attempts: 3
+         initial_interval: 100ms
+         max_interval: 1s

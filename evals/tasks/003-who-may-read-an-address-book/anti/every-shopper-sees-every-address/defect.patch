@@ -1,0 +1,13 @@
+--- databases/default/tables/public_customer_address.yaml
++++ databases/default/tables/public_customer_address.yaml
+@@ -9,9 +9,7 @@
+   - role: customer
+     permission:
+       columns: "*"
+-      filter:
+-        customer_id:
+-          _eq: X-Donat-User-Id
++      filter: {}
+   - role: support
+     permission:
+       columns: "*"

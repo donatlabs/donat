@@ -1,0 +1,81 @@
+id: checkout-ambiguous-payment-001
+# dev tasks are what skills and prompts are tuned against; a number
+# reported from them is a number tuned on. Absolute scores come from
+# `split: holdout`, which no tuning loop is allowed to read.
+split: dev
+version: 1
+tags: [processes, connectors, ambiguity, payments]
+difficulty: hard
+canary: DONATBENCH-CANARY-001-CHECKOUT-AMBIGUOUS-PAYMENT
+
+# The store the candidate extends. The fixture is the checked-in Petshop with
+# the checkout payment flow taken out: everything the flow leans on — the
+# commands, the payment connector, the tables, the roles — is already there,
+# so the task is the flow and nothing else.
+fixture:
+  base: examples/petshop/metadata
+  remove:
+    - flows/checkout-payment.yaml
+    - flows.yaml#!include flows/checkout-payment.yaml
+
+writable:
+  - flows/checkout-payment.yaml
+  - flows.yaml
+
+# What the bare model scores here, measured, k=3. A task at the ceiling can
+# guard against regressions and contribute to an absolute score; it cannot
+# show that an edit to a skill helped, because there is no room above it.
+# Run a bare arm on a new task before counting it as tuning capacity.
+bare_baseline: 0.333
+
+budget:
+  wall_clock: 20m
+
+prompt: prompt.md
+
+# Gates classify a failure; they never score. See evals/README.md.
+gates:
+  migrate: pass
+  validate: pass
+  deploy: pass
+
+# The five worlds the scenarios run in. A world is a provider behaviour, not an
+# assertion: what must hold afterwards lives with the scenario.
+# Each name is a world the scenarios define. `verify-oracles` checks that the
+# two lists still agree: a world declared here and missing there is
+# documentation pretending to be a contract.
+worlds:
+  - provider_authorizes
+  - provider_fails_then_authorizes
+  - provider_declines
+  - provider_goes_silent
+  - provider_times_out_after_charging
+  - provider_cannot_prove_absence
+  - provider_challenges_the_card
+
+oracle: oracle/
+
+# Each anti-oracle is a deployable, validate-clean store carrying exactly one
+# business defect. `caught_by` lists the assertions it must trip: an anti-oracle
+# that fails for some other reason has not proven what it was written to prove.
+# Two at minimum, and `verify-oracles` enforces it — a task whose discrimination
+# rests on one scenario stops discriminating the day that scenario drifts, and
+# nothing goes red to say so.
+anti:
+  ambiguity-to-failure:
+    caught_by:
+      - test_a_charge_the_store_never_learned_about
+      - test_an_ambiguous_charge_is_investigated_not_written_off
+    world: provider_times_out_after_charging
+  success-default:
+    caught_by:
+      - test_an_authorized_order_has_money_behind_it
+      - test_a_challenged_card_is_not_money_in_the_till
+    world: provider_challenges_the_card
+  unproven-absence-treated-as-decline:
+    caught_by:
+      - test_an_unproven_absence_is_not_a_decline
+      - test_no_refusal_is_recorded_that_the_provider_never_gave
+    world: provider_cannot_prove_absence
+
+scenarios: scenarios/

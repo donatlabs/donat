@@ -16,9 +16,11 @@
 #   3. It is reviewed when the renderer's dependencies are next bumped. An
 #      entry that has become removable is removed.
 #
-# Every entry below is a transitive dependency of `typst`, the spec 019
+# All but one entry below is a transitive dependency of `typst`, the spec 019
 # document renderer, and of nothing else. None is a direct dependency of this
-# workspace and none can be selected independently of it.
+# workspace and none can be selected independently of it. The exception is the
+# `lru` entry at the end, which arrives under the MySQL client and carries its
+# own argument.
 
 [advisories]
 ignore = [
@@ -64,4 +66,26 @@ ignore = [
     # targets without native atomics, so it is not compiled for any platform
     # this engine ships on. It appears in `cargo tree` only under `--target all`.
     "RUSTSEC-2023-0089", # atomic-polyfill, via heapless -> postcard -> icu_provider
+
+    # --- Unsound ---------------------------------------------------------
+    #
+    # `lru` 0.16.4, reached only as `mysql` 28.0.0 -> lru, which is the MySQL
+    # client's prepared-statement cache. This one is not under `typst`: it is
+    # on a real serving path, so the argument has to be about the code rather
+    # than about the sandbox.
+    #
+    # No upgrade: `lru` 0.18.2 exists, but `mysql` 28.0.0 — the newest
+    # published release, and what all three of our crates depend on — requires
+    # 0.16. There is no resolution of this tree that clears it.
+    #
+    # Reachability: the unsoundness is a use-after-free in `LruCache::pop()`
+    # when a *user-supplied* `Drop`, `Hash` or `Eq` panics part-way through.
+    # We supply none of them. The cache is `mysql`'s own
+    # `LruCache<u32, Entry>` (`conn/stmt_cache.rs`): the key is a `u32`
+    # statement id, whose `Hash`, `Eq` and `Drop` are the primitive ones and
+    # cannot panic or run our code, and the value holds an `Arc<InnerStmt>` and
+    # a string. This workspace never names `lru` directly and never constructs
+    # an `LruCache`, so there is no place for a panicking impl of ours to enter
+    # the unsound window.
+    "RUSTSEC-2026-0253", # lru: panic safety in pop(), via mysql
 ]

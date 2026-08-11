@@ -26,7 +26,9 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-PORT = 8099
+# One stand per port: the eval sweep runs several stores at once and a shared
+# provider would hand one store's scripted answer to another's durable work.
+PORT = int(os.environ.get("PETSHOP_PROVIDERS_PORT", "8099"))
 
 CONTROL_ENABLED = os.environ.get("PETSHOP_PROVIDERS_CONTROL") == "1"
 

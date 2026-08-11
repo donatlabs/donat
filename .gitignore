@@ -18,3 +18,9 @@ tests-system/.stack/
 # System-test stands write their built binaries, pids and logs here.
 tests-system-lending/.stack/
 tests-system-lending/.venv/
+
+# Eval stands: composed metadata, engine logs, agent workspaces and run records.
+evals/.state/
+# Regenerated from mutants.py and the petshop metadata, deterministically:
+# 400 files of generated defect that would review as noise and rot as history.
+evals/mutants/

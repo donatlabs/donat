@@ -1,0 +1,95 @@
+diff --git a/flows/checkout-payment.yaml b/flows/checkout-payment.yaml
+index 8e3389f..0fb5b16 100644
+--- flows/checkout-payment.yaml
++++ flows/checkout-payment.yaml
+@@ -94,9 +94,9 @@ states:
+       next: route_authorization_response
+       on_error:
+         routes:
+-          - { kinds: [authentication, validation], next: reconcile_authorization }
+-          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: reconcile_authorization }
+-        fallback: { next: reconcile_authorization }
++          - { kinds: [authentication, validation], next: authorization_requires_manual_reconciliation }
++          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: authorization_requires_manual_reconciliation }
++        fallback: { next: authorization_requires_manual_reconciliation }
+ 
+   - id: route_authorization_response
+     when:
+@@ -140,77 +140,6 @@ states:
+         payload: { state: request_authorization, field: normalized_payload }
+       next: declined
+ 
+-  # A transport/lease terminal error does not prove that the provider skipped
+-  # the mutation. The read-only lookup uses the original activity key.
+-  - id: reconcile_authorization
+-    request:
+-      connector: mock_payment
+-      operation: lookup_operation
+-      input:
+-        payment_id: { state: checkout, field: payment_id }
+-        resource_kind: { literal: authorization }
+-        resource_id: { state: checkout, field: order_id, as: string }
+-        activity_key: { activity_key: request_authorization }
+-      timeout:
+-        schedule_to_start: 5s
+-        start_to_close: 6s
+-      retry:
+-        retry_on: [transport, timeout, http_429, http_5xx]
+-        max_attempts: 3
+-        initial_interval: 100ms
+-        max_interval: 1s
+-        jitter: deterministic_full
+-      next: route_reconciled_authorization
+-      on_error:
+-        routes:
+-          - { kinds: [authentication, validation], next: authorization_requires_manual_reconciliation }
+-          - { kinds: [permanent, invariant, timeout, retry_exhausted], next: authorization_requires_manual_reconciliation }
+-        fallback: { next: authorization_requires_manual_reconciliation }
+-
+-  - id: route_reconciled_authorization
+-    when:
+-      cases:
+-        - matches:
+-            found: true
+-            outcome: authorized
+-          next: record_reconciled_authorization
+-        - matches:
+-            found: true
+-            outcome: declined
+-          next: record_reconciled_decline
+-        - matches:
+-            found: true
+-            outcome: failed
+-          next: record_reconciled_decline
+-      default: authorization_requires_manual_reconciliation
+-
+-  - id: record_reconciled_authorization
+-    command:
+-      name: authorize_payment
+-      run_as: payment_worker
+-      arguments:
+-        order_id: { state: checkout, field: order_id }
+-        payment_id: { state: checkout, field: payment_id }
+-        provider_authorization_id: { state: reconcile_authorization, field: provider_mutation_id }
+-        provider_event_id: { state: reconcile_authorization, field: provider_event_id }
+-        provider_reference: { state: reconcile_authorization, field: provider_reference }
+-        amount_minor: { state: reconcile_authorization, field: amount_minor }
+-        payload: { state: reconcile_authorization, field: normalized_payload }
+-      next: authorized
+-
+-  - id: record_reconciled_decline
+-    command:
+-      name: finalize_declined_checkout
+-      run_as: payment_worker
+-      arguments:
+-        order_id: { state: checkout, field: order_id }
+-        payment_id: { state: checkout, field: payment_id }
+-        provider_event_id: { state: reconcile_authorization, field: provider_event_id }
+-        outcome: { state: reconcile_authorization, field: outcome }
+-        provider_reference: { state: reconcile_authorization, field: provider_reference }
+-        payload: { state: reconcile_authorization, field: normalized_payload }
+-      next: declined
+-
+   - id: authorized
+     output:
+       values:

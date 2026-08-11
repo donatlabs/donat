@@ -11,6 +11,44 @@ part of a database transaction and must not be able to hold one open.
 
 One file per provider in `connectors/`, listed in `connectors.yaml`.
 
+## First: does this build already have it
+
+Ask the binary before you write anything.
+
+```
+donat help                    # the contents: how many connectors, how many capabilities
+donat help connectors         # every provider this build can call, one line each
+donat help stripe             # one in full — operations, effects, deadlines, credentials
+donat help capabilities       # work done in-process, with no provider and no network
+```
+
+That output is read out of the binary's own declarations, so it describes
+exactly what *this* build can do. It cannot drift from the engine the way a
+document can, and it is the only source that cannot be out of date.
+
+A shipped provider is configured, not written:
+
+```yaml
+connectors:
+  - name: my_stripe
+    module: stripe
+    secrets:
+      secret:
+        from_env: STRIPE_SECRET
+```
+
+You get its operations, their effect classes, their deadlines and its
+credential handling as the engine defines them — which is a great deal of the
+hard thinking in this file already done, and done consistently. Everything
+below about success contracts, effects and bounds still applies to *reading*
+those operations and calling them correctly from a process.
+
+`module: http`, the rest of this skill, is for a provider the build does not
+ship. Write one by hand only after `donat help` has told you there is no
+module for it: a hand-rolled connector for a provider the engine already
+carries is duplicated work that will drift from the engine's own version of the
+same thing.
+
 ## The header
 
 ```yaml

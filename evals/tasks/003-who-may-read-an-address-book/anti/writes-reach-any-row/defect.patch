@@ -1,0 +1,25 @@
+--- databases/default/tables/public_customer_address.yaml
++++ databases/default/tables/public_customer_address.yaml
+@@ -53,12 +53,8 @@
+         - city
+         - postal_code
+         - country_code
+-      filter:
+-        customer_id:
+-          _eq: X-Donat-User-Id
+-      check:
+-        customer_id:
+-          _eq: X-Donat-User-Id
++      filter: {}
++      check: {}
+       validate:
+         - expression: 'size(line1) >= 3'
+           message: line1 must be at least 3 characters
+@@ -70,6 +66,4 @@
+ delete_permissions:
+   - role: customer
+     permission:
+-      filter:
+-        customer_id:
+-          _eq: X-Donat-User-Id
++      filter: {}

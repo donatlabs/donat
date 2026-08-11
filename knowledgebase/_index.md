@@ -24,6 +24,14 @@ The engine as a process: what bounds a request, how it reaches its database,
 how it drains on `SIGTERM`, and what an operator may inspect without a
 permission bypass. 5 decisions. **Status: in progress (August 2026).**
 
+### [[evals/_index|Evals — DonatBench]]
+Measuring whether an agent can build a working donat application: task
+specification, what may be scored versus only gated, and the statistics a
+corpus of tens of tasks can honestly support, and how workflow engines,
+distributed-systems testing and IaC tooling verify the same thing.
+2 research notes.
+**Status: research, August 2026.**
+
 ### [[platform/research-what-a-platform-needs|Platform direction]]
 What separates an engine you deploy from a platform a business is built on,
 written after a week of the engine being used to build one. 1 research note.

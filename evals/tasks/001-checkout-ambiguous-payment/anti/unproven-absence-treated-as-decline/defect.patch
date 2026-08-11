@@ -1,0 +1,14 @@
+diff --git a/flows/checkout-payment.yaml b/flows/checkout-payment.yaml
+index 8e3389f..1b160b4 100644
+--- flows/checkout-payment.yaml
++++ flows/checkout-payment.yaml
+@@ -182,6 +182,9 @@ states:
+             found: true
+             outcome: failed
+           next: record_reconciled_decline
++        - matches:
++            found: false
++          next: record_reconciled_decline
+       default: authorization_requires_manual_reconciliation
+ 
+   - id: record_reconciled_authorization
