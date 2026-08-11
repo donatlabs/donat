@@ -92,13 +92,20 @@ jobs:
         run: cargo test -p donat-conformance --test backend_matrix -- --test-threads=4 --nocapture
         env:
           RUST_BACKTRACE: "1"
+      # Every server test that needs a live MySQL belongs in this list. A test
+      # that talks to MySQL and is *not* named here still runs in the workspace
+      # job, where there is no MySQL — and its guard turns that into a printed
+      # "skipping" line and a pass, so an absent name is an untested test rather
+      # than a failing one. `DONAT_EXTERNAL_DB_TESTS` is what makes the guards
+      # here panic instead of skipping.
       - name: Live MySQL runtime tests
         if: matrix.backend == 'mysql'
         run: |
           cargo test -p donat-server \
             --test mysql_e2e \
             --test mysql_runtime \
-            --test mysql_mutations -- --nocapture
+            --test mysql_mutations \
+            --test multi_source_runtime -- --nocapture
         env:
           DONAT_EXTERNAL_DB_TESTS: "1"
       - name: Live ClickHouse runtime tests
@@ -446,6 +453,15 @@ jobs:
         if: always()
         run: tests-system-lending/stack.sh down
 
+  # Gated on the full fleet on purpose: a release binary is only ever built
+  # from a commit that passed conformance, and `ci_matrix_covers_backend_registry`
+  # asserts that this list still contains the conformance jobs.
+  #
+  # It was briefly ungated to save wall clock, on the reasoning that nothing
+  # consumes these binaries on a pull request. That was wrong twice over. The
+  # invariant is deliberate and tested, not incidental; and the latency it was
+  # trading away is much smaller than one cold-cache run suggested — with a warm
+  # cache these builds take about three and five minutes, not ten and twenty-two.
   artifacts:
     name: Build artifact (${{ matrix.target.name }})
     needs: [lint, test, backend-core-gate, mixed-backend-conformance, petshop-system]

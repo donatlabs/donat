@@ -532,12 +532,11 @@ impl ProcessActivityExecutor for FanoutExecutor {
                 .and_then(Json::as_str)
                 .expect("fan-out input has a string item ID");
             if item_id == "b" {
-                return Err(ConnectorFailure {
-                    class: ConnectorErrorClass::Permanent,
-                    code: "provider_rejected",
-                    safe_message: "provider rejected the item".to_owned(),
-                    retry_after: None,
-                });
+                return Err(ConnectorFailure::new(
+                    ConnectorErrorClass::Permanent,
+                    "provider_rejected",
+                    "provider rejected the item",
+                ));
             }
             Ok(ConnectorSuccess {
                 output: json!({
@@ -1009,6 +1008,221 @@ async fn empty_fanout_collects_empty_output_without_creating_item_work() {
     );
     assert_eq!(row.get::<_, i64>(1), 0);
     assert_eq!(row.get::<_, i64>(2), 0);
+    connection.abort();
+    database.drop().await;
+}
+
+/// The environment variable the at-most-once fan-out fixture resolves its
+/// credential from. Its value is a sentinel: the executor here is a stub.
+const AT_MOST_ONCE_TOKEN: &str = "DONAT_TEST_PROCESS_FANOUT_SLACK_TOKEN";
+
+/// A fan-out whose per-item write publishes no idempotency mechanism, so each
+/// item is one at-most-once send with its own ambiguous destination (ADR 063).
+fn at_most_once_fanout_metadata() -> Metadata {
+    // Safety: the connector registry reads this variable on the same thread
+    // that sets it, before any listener or worker exists.
+    unsafe { std::env::set_var(AT_MOST_ONCE_TOKEN, "xoxb-process-fanout-sentinel") };
+    let mut document = base_metadata();
+    document["connectors"] = json!([{
+        "name": "chat",
+        "module": "slack",
+        "config": {
+            "endpoint_identity": "process-fanout-slack-v1",
+            "credential_identity": "process-fanout-slack-credential",
+            "secret_key": { "value_from_env": AT_MOST_ONCE_TOKEN }
+        },
+        "operations": [{
+            "name": "message.post",
+            "capacity": {
+                "max_in_flight": 4,
+                "rate_limit": { "permits": 10, "per": "1s", "burst": 4 }
+            }
+        }]
+    }]);
+    document["processes"] = json!([{
+        "name": "fanout_test",
+        "kind": "process",
+        "version": 1,
+        "source": "default",
+        "permissions": [{ "role": "customer" }],
+        "input": [
+            { "name": "rows", "type": "[FanoutItem!]!" },
+            { "name": "request_id", "type": "uuid!" }
+        ],
+        "output": [{ "name": "status", "type": "string!" }],
+        "idempotency": {
+            "key": { "input": "request_id" },
+            "scope": []
+        },
+        "start_at": "dispatch",
+        "states": [
+            {
+                "id": "dispatch",
+                "for_each": {
+                    "input": { "input": "rows" },
+                    "item_key": "id",
+                    "max_items": 4,
+                    "max_concurrency": 2,
+                    "completion": "collect",
+                    "preserve_input": true,
+                    "request": {
+                        "connector": "chat",
+                        "operation": "message.post",
+                        "input": {
+                            "channel": { "item": "id" },
+                            "text": { "literal": "one send" }
+                        },
+                        "at_most_once": true,
+                        "on_ambiguous": "unknown",
+                        "timeout": {
+                            "schedule_to_start": "2s",
+                            "start_to_close": "6s"
+                        },
+                        "retry": {
+                            "retry_on": [],
+                            "max_attempts": 1,
+                            "initial_interval": "10ms",
+                            "max_interval": "10ms",
+                            "jitter": "deterministic_full"
+                        },
+                        "on_error": {
+                            "routes": [{ "kinds": ["permanent"], "next": "refused" }],
+                            "fallback": { "next": "refused" }
+                        }
+                    },
+                    "next": "done"
+                }
+            },
+            {
+                "id": "done",
+                "output": { "values": { "status": { "literal": "done" } } }
+            },
+            {
+                "id": "refused",
+                "output": { "values": { "status": { "literal": "refused" } } }
+            },
+            {
+                "id": "unknown",
+                "output": { "values": { "status": { "literal": "unknown" } } }
+            }
+        ]
+    }]);
+    serde_json::from_value(document).expect("at-most-once fan-out metadata deserializes")
+}
+
+/// Item `a` is refused by the provider; item `b`'s answer never comes back.
+struct AtMostOnceFanoutExecutor;
+
+impl ProcessActivityExecutor for AtMostOnceFanoutExecutor {
+    fn execute<'a>(
+        &'a self,
+        _instance: &'a str,
+        _operation: &'a str,
+        input: Json,
+        _idempotency_key: &'a str,
+        _deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<ConnectorSuccess, ConnectorFailure>> {
+        Box::pin(async move {
+            let channel = input
+                .get("channel")
+                .and_then(Json::as_str)
+                .expect("the fan-out item binds a channel");
+            if channel == "a" {
+                return Err(ConnectorFailure::new(
+                    ConnectorErrorClass::Permanent,
+                    "provider_rejected",
+                    "the provider refused this message",
+                ));
+            }
+            Err(ConnectorFailure::new(
+                ConnectorErrorClass::Timeout,
+                "connector_timeout",
+                "the answer to this send never came back",
+            ))
+        })
+    }
+}
+
+/// ADR 063 across a fan-out. One item's send is one logical activity, so one
+/// item can end unknown while another was refused outright — and the aggregate
+/// has one destination. An unknown outcome must not be absorbed by a sibling's
+/// error route: `on_error` routes failures, and no failure route may claim the
+/// absence of knowledge, whichever ordinal it happened to arrive on.
+#[tokio::test]
+async fn an_ambiguous_fanout_item_is_not_absorbed_by_an_earlier_items_error_route() {
+    let database = TestDatabase::create("process_fanout_at_most_once").await;
+    let metadata = at_most_once_fanout_metadata();
+    let (runtime, revision) = runtime(
+        &database,
+        &metadata,
+        Some(Arc::new(AtMostOnceFanoutExecutor)),
+    )
+    .await;
+    seed_start(
+        &database.url,
+        &revision,
+        json!([
+            { "id": "a", "value": 1 },
+            { "id": "b", "value": 2 }
+        ]),
+    )
+    .await;
+    let instance_id = start_instance(&runtime).await;
+    assert!(matches!(
+        runtime
+            .consume_one_transition()
+            .await
+            .expect("fan-out expands"),
+        TransitionConsumption::FanOutExpanded { item_count: 2, .. }
+    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            runtime
+                .consume_one_activity()
+                .await
+                .expect("one fan-out activity executes"),
+            ActivityConsumption::Failed { .. }
+        ));
+        runtime
+            .consume_one_transition()
+            .await
+            .expect("one fan-out completion commits");
+    }
+
+    let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("the collected fan-out is inspectable");
+    let connection = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "
+            SELECT current_state, state_json -> 'dispatch' AS fanout_output
+            FROM donat.process_instances
+            WHERE source_name = 'default' AND id = $1
+            ",
+            &[&instance_id],
+        )
+        .await
+        .expect("the collected fan-out output reads");
+    let output: Json = row.get("fanout_output");
+    assert_eq!(
+        output["failed_items"]
+            .as_array()
+            .map(|items| items.len())
+            .unwrap_or_default(),
+        2,
+        "both items are collected whichever route the aggregate takes"
+    );
+    assert_eq!(output["failed_items"][0]["code"], "provider_rejected");
+    assert_eq!(
+        output["failed_items"][1]["code"], "provider_send_ambiguous",
+        "the second item's send was authorized and its outcome is unknown"
+    );
+    assert_eq!(
+        row.get::<_, String>("current_state"),
+        "unknown",
+        "an unknown outcome takes the ambiguous route even when a sibling failed first"
+    );
     connection.abort();
     database.drop().await;
 }

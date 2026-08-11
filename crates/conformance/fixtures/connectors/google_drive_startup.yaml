@@ -1,0 +1,122 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 014 §3).
+#
+# `metadata` withholds one instance's OAuth2 client secret while another
+# instance's resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an inventory-only operation: startup must name the
+# exact metadata path. `scope_metadata` enables an operation this deployment's
+# declared scopes do not authorize: startup must name `config.oauth2.scopes`,
+# which is `google_drive_scope_shortfall_fails_closed` proven against the real
+# binary. None of the three may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: google_drive_present
+      module: google_drive
+      config:
+        endpoint_identity: google_drive_conformance
+        credential_identity: google_drive_conformance_credential
+        oauth2:
+          authorization_endpoint: https://accounts.google.com/o/oauth2/v2/auth
+          token_endpoint: https://oauth2.googleapis.com/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - https://www.googleapis.com/auth/drive.metadata.readonly
+      operations:
+        - name: file.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: google_drive_missing
+      module: google_drive
+      config:
+        endpoint_identity: google_drive_conformance
+        credential_identity: google_drive_conformance_credential
+        oauth2:
+          authorization_endpoint: https://accounts.google.com/o/oauth2/v2/auth
+          token_endpoint: https://oauth2.googleapis.com/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - https://www.googleapis.com/auth/drive.metadata.readonly
+      operations:
+        - name: file.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+refused_metadata:
+  version: 3
+  connectors:
+    - name: google_drive_refused
+      module: google_drive
+      config:
+        endpoint_identity: google_drive_conformance
+        credential_identity: google_drive_conformance_credential
+        oauth2:
+          authorization_endpoint: https://accounts.google.com/o/oauth2/v2/auth
+          token_endpoint: https://oauth2.googleapis.com/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - https://www.googleapis.com/auth/drive.file
+      operations:
+        - name: file.update_metadata
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+scope_metadata:
+  version: 3
+  connectors:
+    - name: google_drive_scoped
+      module: google_drive
+      config:
+        endpoint_identity: google_drive_conformance
+        credential_identity: google_drive_conformance_credential
+        oauth2:
+          authorization_endpoint: https://accounts.google.com/o/oauth2/v2/auth
+          token_endpoint: https://oauth2.googleapis.com/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - https://www.googleapis.com/auth/drive.metadata.readonly
+      operations:
+        - name: file.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+        - name: file.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `google_drive_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `file.update_metadata` on module `google_drive`: connector operation is inventory-only and cannot be enabled by a deployment"
+  scope_shortfall: "connectors.yaml[0].config.oauth2.scopes: connector operation `file.delete` on module `google_drive` is not authorized by any declared scope"
+  output_excludes: "connector-present-secret-sentinel"

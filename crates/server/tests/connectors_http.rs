@@ -24,7 +24,7 @@ fn postgres_sources() -> serde_json::Value {
 }
 
 #[test]
-fn registry_has_only_the_compiled_http_and_stripe_modules_and_is_immutable_after_build() {
+fn registry_has_only_compiled_modules_and_is_immutable_after_build() {
     let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
         "version": 3,
         "sources": postgres_sources(),
@@ -42,13 +42,124 @@ fn registry_has_only_the_compiled_http_and_stripe_modules_and_is_immutable_after
 
     let registry = ConnectorRegistry::build(&metadata).expect("built-in http instance validates");
 
+    let modules = ConnectorRegistry::built_in_module_names();
     assert_eq!(
-        ConnectorRegistry::built_in_module_names(),
+        &modules[..2],
         ["http", "stripe"],
         "registry exposes the compiled-in table, not a dynamic module loader"
     );
+    assert!(
+        !modules.contains(&"does_not_exist"),
+        "a name the binary was not built with is not in the table: {modules:?}"
+    );
     assert!(registry.http_instance("logistics").is_some());
     assert!(registry.http_instance("unknown").is_none());
+}
+
+/// Every registry lookup goes through the compiled module table.
+///
+/// The registry used to hold a per-module enum, so every lookup had to name
+/// every module and adding a connector meant editing all of them. It now holds
+/// one entry per instance behind a trait the module implements: a module that
+/// has no webhook verifier answers `None` because it does not implement that
+/// method, not because a match arm here remembered to say so.
+#[test]
+fn every_registry_lookup_is_dispatched_through_the_compiled_module_table() {
+    const API_KEY_ENV: &str = "DONAT_CONNECTOR_TABLE_TEST_API_KEY";
+    const WEBHOOK_SECRET_ENV: &str = "DONAT_CONNECTOR_TABLE_TEST_WEBHOOK_SECRET";
+    // SAFETY: these test-only variable names are owned by this test and are
+    // read only while this registry is built.
+    unsafe {
+        std::env::set_var(API_KEY_ENV, "sk_test_module_table");
+        std::env::set_var(WEBHOOK_SECRET_ENV, "whsec_module_table");
+    }
+    let metadata: donat_metadata::Metadata = serde_json::from_value(json!({
+        "version": 3,
+        "sources": postgres_sources(),
+        "connectors": [{
+            "name": "logistics",
+            "module": "http",
+            "config": {
+                "endpoint_identity": "logistics_test",
+                "credential_identity": "logistics_test_credential",
+                "base_url": "https://logistics.example.test"
+            },
+            "operations": [{
+                "name": "create_shipment",
+                "version": "v1",
+                "method": "POST",
+                "path": "/v1/shipments/{input.order_id}",
+                "success_statuses": [200],
+                "idempotency": { "header": "Idempotency-Key" },
+                "capacity": {
+                    "max_in_flight": 1,
+                    "rate_limit": { "permits": 1, "per": "1s", "burst": 1 },
+                    "serialize_by": { "input": "order_id" }
+                }
+            }]
+        }, {
+            "name": "payments",
+            "module": "stripe",
+            "config": {
+                "endpoint_identity": "stripe_test_2026_07",
+                "credential_identity": "stripe_test_credential",
+                "secret_key": { "value_from_env": API_KEY_ENV },
+                "webhook_secret": { "value_from_env": WEBHOOK_SECRET_ENV },
+                "api_version": "2026-07-27"
+            },
+            "operations": [{
+                "name": "checkout.create_session",
+                "capacity": {
+                    "max_in_flight": 1,
+                    "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+                }
+            }]
+        }]
+    }))
+    .expect("two-module metadata deserializes");
+
+    let registry = ConnectorRegistry::build(&metadata).expect("both compiled modules validate");
+
+    assert!(
+        ConnectorRegistry::built_in_module_names().starts_with(&["http", "stripe"]),
+        "the published module names are the table itself"
+    );
+    // Each module answers only for the capabilities it implements.
+    assert!(registry.http_instance("logistics").is_some());
+    assert!(registry.webhook_instance("logistics").is_none());
+    assert!(registry.http_instance("payments").is_none());
+    assert!(registry.webhook_instance("payments").is_some());
+    // ...and each publishes its own operations under its own instance name.
+    assert!(
+        registry
+            .configuration_fingerprint("logistics", "create_shipment")
+            .is_some()
+    );
+    assert!(
+        registry
+            .configuration_fingerprint("logistics", "checkout.create_session")
+            .is_none()
+    );
+    assert_eq!(
+        registry.serialization_key_input("logistics", "create_shipment"),
+        Some("order_id")
+    );
+    assert!(
+        registry
+            .configuration_fingerprint("payments", "checkout.create_session")
+            .is_some()
+    );
+    assert!(
+        registry
+            .configuration_fingerprint("unknown", "any")
+            .is_none()
+    );
+
+    // SAFETY: cleanup restores process state for subsequent tests.
+    unsafe {
+        std::env::remove_var(API_KEY_ENV);
+        std::env::remove_var(WEBHOOK_SECRET_ENV);
+    }
 }
 
 #[test]
@@ -130,10 +241,10 @@ async fn declarative_registry_rejects_undeclared_job_transport_input_before_netw
         .await
         .expect_err("a job may fill only the operation's named input bindings");
 
-    assert_eq!(failure.class, ConnectorErrorClass::Invariant);
-    assert_eq!(failure.code, "connector_invariant");
+    assert_eq!(failure.class(), ConnectorErrorClass::Invariant);
+    assert_eq!(failure.code(), "connector_invariant");
     assert!(
-        !failure.safe_message.contains("attacker.invalid"),
+        !failure.safe_message().contains("attacker.invalid"),
         "rejection must not surface the caller-provided raw URL"
     );
 }
@@ -541,7 +652,7 @@ async fn dns_and_connect_failures_are_transport_errors() {
         .execute(&operation("/dns"), json!({}), context())
         .await
         .expect_err("DNS failure prevents a connection");
-    assert_eq!(dns_failure.class, ConnectorErrorClass::Transport);
+    assert_eq!(dns_failure.class(), ConnectorErrorClass::Transport);
 
     let resolver = Arc::new(SequenceResolver::new([
         Ok(vec![Ipv4Addr::new(8, 8, 8, 8).into()]),
@@ -556,8 +667,8 @@ async fn dns_and_connect_failures_are_transport_errors() {
     .execute(&operation("/connect"), json!({}), context())
     .await
     .expect_err("connect failure is typed");
-    assert_eq!(connect_failure.class, ConnectorErrorClass::Transport);
-    assert!(!connect_failure.safe_message.contains("connection reset"));
+    assert_eq!(connect_failure.class(), ConnectorErrorClass::Transport);
+    assert!(!connect_failure.safe_message().contains("connection reset"));
 }
 
 #[tokio::test]
@@ -581,9 +692,9 @@ async fn the_connected_peer_is_pinned_to_the_connect_time_resolution() {
     .await
     .expect_err("a peer outside the connect-time resolution is rejected");
 
-    assert_eq!(failure.class, ConnectorErrorClass::Invariant);
+    assert_eq!(failure.class(), ConnectorErrorClass::Invariant);
     assert_eq!(
-        failure.safe_message,
+        failure.safe_message(),
         "connector transport connected to an unresolved peer"
     );
 }
@@ -609,8 +720,8 @@ async fn a_declared_template_contract_violation_is_an_invariant_failure() {
         .execute(&operation, json!({}), context())
         .await
         .expect_err("missing declared input violates the module contract");
-    assert_eq!(failure.class, ConnectorErrorClass::Invariant);
-    assert!(!failure.safe_message.contains("input.id"));
+    assert_eq!(failure.class(), ConnectorErrorClass::Invariant);
+    assert!(!failure.safe_message().contains("input.id"));
 }
 
 #[tokio::test]
@@ -630,7 +741,7 @@ async fn a_response_without_an_observed_peer_is_rejected() {
     .await
     .expect_err("public-only responses need an observed peer from the vetted destination set");
 
-    assert_eq!(failure.class, ConnectorErrorClass::Invariant);
+    assert_eq!(failure.class(), ConnectorErrorClass::Invariant);
     assert_eq!(transport.calls.load(Ordering::Relaxed), 1);
 }
 
@@ -653,7 +764,11 @@ async fn an_unvetted_observed_peer_is_rejected() {
         .execute(&operation("/peer"), json!({}), context())
         .await
         .expect_err("the observed peer must be in the vetted set");
-        assert_eq!(failure.class, ConnectorErrorClass::Invariant, "peer {peer}");
+        assert_eq!(
+            failure.class(),
+            ConnectorErrorClass::Invariant,
+            "peer {peer}"
+        );
     }
 }
 
@@ -699,6 +814,6 @@ async fn host_resolution_precedes_request_template_preparation() {
 
     // The operation body names an input the caller never sent: reporting the
     // transport failure instead proves resolution ran first.
-    assert_eq!(failure.class, ConnectorErrorClass::Transport);
+    assert_eq!(failure.class(), ConnectorErrorClass::Transport);
     assert_eq!(transport.calls.load(Ordering::Relaxed), 0);
 }

@@ -87,6 +87,41 @@ validate:
 - `when_present:` refines its column **inside its own entry only**. It does not
   carry to the next entry.
 
+## Phone numbers are a spelling of their own
+
+Whether a number is real is a question about national numbering plans, and no
+expression, regex or `CHECK` answers it. `phone` does, and it also **stores the
+E.164 form**, so one number written five ways is one value in the column:
+
+```yaml
+validate:
+  - phone: { column: contact_phone, region: DE }
+    message: contact_phone must be a valid phone number
+```
+
+`030 1234567`, `030-123 4567`, `(030) 1234567`, `+49 30 1234567` and
+`+49 (0)30 123 4567` are all stored as `+49301234567`. That is what makes a
+unique index on the column mean something.
+
+`region` is the default for a number written **without** an international
+prefix, and it is deploy-time data: it is read from this line and from nowhere
+else. A header, a role, a session variable and a column the caller filled in
+cannot change it — a request that sends `region: "US"` alongside a German
+national number still gets a German number. A number written with `+` names its
+own country and ignores the declared region entirely.
+
+Three things to know:
+
+- it is checked **in Rust, before the statement is built**, so an unusable
+  number never reaches the database and the operation is still one statement;
+- because of that, a `phone` rejection is reported *before* the permission's
+  `check` and before any `expression` entry, whatever the document order. If a
+  row-level rule must mask a value rule, keep the row-level rule in `check`;
+- a null is not a violation. Say `not_null:` first if the number is required.
+
+A region that is not an uppercase two-letter code — including anything that
+looks like it wants to be resolved from the request — refuses the deployment.
+
 Forgetting either is a **deployment** error naming the table, role and entry.
 `donat validate` reports it and the engine refuses to serve, rather than
 failing a request later. If a validator will not compile, the fix is to declare
@@ -97,11 +132,15 @@ is total by construction and needs no ceremony.
 
 ## Four properties that always hold
 
-1. **A validator passes only on TRUE.** An unknown value never satisfies one,
-   so a null is refused even where nothing says so. `not_null` adds that the
-   metadata *says* so — it names the real cause in the message.
-2. **A permission failure is reported before any validator.** A caller who may
-   not write the row never learns which value would have been rejected.
+1. **An `expression` passes only on TRUE.** An unknown value never satisfies
+   one, so a null is refused even where nothing says so. `not_null` adds that
+   the metadata *says* so — it names the real cause in the message. (`phone` is
+   the exception: it judges a value, and a null is not a value. Declare
+   `not_null` when the number is required.)
+2. **A permission failure is reported before any `expression` or `not_null`
+   entry.** A caller who may not write the row never learns which value would
+   have been rejected. `phone` is decided earlier, in the engine, so it is the
+   one entry that can answer before the permission does.
 3. **An upsert is held to both lists** — the insert list and the update list.
 4. **A role that inherits a permission inherits its validators with it.**
 

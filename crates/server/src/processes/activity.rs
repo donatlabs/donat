@@ -28,6 +28,21 @@ use super::{
     ProcessRuntime,
 };
 
+/// The scope an at-most-once send authorization is keyed under.
+///
+/// It is not a provider key — an at-most-once operation binds none, which is
+/// what makes it at-most-once. It is the engine's own name for "the one send
+/// this logical activity is allowed", and it is deliberately different from any
+/// provider idempotency scope so the two can never collide in one table.
+const AT_MOST_ONCE_SEND_SCOPE: &str = "donat.at_most_once.send";
+
+/// The code an ambiguous at-most-once outcome carries.
+///
+/// It is routed by the transition consumer to the activity's declared
+/// `on_ambiguous` state, and never through `on_error`: this is not a failure
+/// class, it is the absence of any knowledge about the outcome (ADR 063).
+pub(super) const PROVIDER_SEND_AMBIGUOUS: &str = "provider_send_ambiguous";
+
 /// The narrow side-effect boundary available to the Process activity worker.
 ///
 /// Implementations receive only a deployment-selected connector operation,
@@ -194,7 +209,9 @@ impl ProcessRuntime {
                         "connector_invariant",
                         "connector returned a mismatched request fingerprint",
                     );
-                    return self.complete_activity_failure(&claimed, failure).await;
+                    return self
+                        .complete_answered_activity_failure(&claimed, failure)
+                        .await;
                 }
                 let valid_output = typed_value(&success.output)
                     .ok()
@@ -206,7 +223,9 @@ impl ProcessRuntime {
                         "connector_output_contract_violation",
                         "connector output violated its declared operation contract",
                     );
-                    return self.complete_activity_failure(&claimed, failure).await;
+                    return self
+                        .complete_answered_activity_failure(&claimed, failure)
+                        .await;
                 }
                 if self
                     .complete_activity_success(&claimed, &success.output)
@@ -792,7 +811,11 @@ impl ProcessRuntime {
 
         let spec = dependency.spec.clone();
         let maximum_send_horizon_ms = match &spec.effect {
-            OperationEffect::ReadOnly => None,
+            // Neither class has a provider retention window to stay inside: one
+            // performs no mutation, and the other's provider remembers nothing
+            // about the send at all, which is the whole reason it may be made
+            // only once (ADR 063).
+            OperationEffect::ReadOnly | OperationEffect::AtMostOnce => None,
             OperationEffect::ProviderIdempotent { side_effect_steps } => {
                 if side_effect_steps.len() != 1 {
                     bail!(
@@ -848,6 +871,75 @@ impl ProcessRuntime {
             .context("starting Process provider-step transaction")?;
         let (idempotency_key, provider_refusal) = match &claimed.spec.effect {
             OperationEffect::ReadOnly => (claimed.logical_activity_id.clone(), None),
+            // ADR 063. The send authorization *is* the durable record, and it
+            // is claimed exactly once: the row is committed before any byte
+            // leaves, so a later attempt — always a lease takeover, since an
+            // at-most-once activity compiles with no retryable class and one
+            // attempt — finds it there and refuses to send. What that later
+            // worker knows is only that a send was authorized; whether it was
+            // made, and what the provider did with it, is unknown, which is
+            // exactly what the ambiguous route exists to receive.
+            OperationEffect::AtMostOnce => {
+                let step =
+                    claimed.spec.steps.first().ok_or_else(|| {
+                        anyhow!("at-most-once Process activity has no compiled step")
+                    })?;
+                let key = provider_step_key(
+                    &claimed.logical_activity_id,
+                    AT_MOST_ONCE_SEND_SCOPE,
+                    step.step.as_str(),
+                );
+                let authorized = transaction
+                    .execute(
+                        "
+                        INSERT INTO donat.process_activity_provider_steps (
+                            source_name,
+                            activity_job_id,
+                            logical_activity_id,
+                            compiled_step_id,
+                            idempotency_key,
+                            first_provider_attempt_at,
+                            maximum_send_deadline_at,
+                            usable_window_expires_at,
+                            created_at
+                        )
+                        SELECT
+                            $1,
+                            $2,
+                            $3,
+                            $4,
+                            $5,
+                            statement_timestamp(),
+                            $6,
+                            $6,
+                            statement_timestamp()
+                        ON CONFLICT (
+                            source_name,
+                            logical_activity_id,
+                            compiled_step_id
+                        )
+                        DO NOTHING
+                        ",
+                        &[
+                            &self.source_name,
+                            &claimed.activity_job_id,
+                            &claimed.logical_activity_id,
+                            &step.step.as_str(),
+                            &key,
+                            &claimed.completion_deadline,
+                        ],
+                    )
+                    .await
+                    .context("claiming the one at-most-once Process provider send")?;
+                let refusal = (authorized == 0).then(|| {
+                    ConnectorFailure::new(
+                        ConnectorErrorClass::Permanent,
+                        PROVIDER_SEND_AMBIGUOUS,
+                        "an at-most-once provider send was already authorized and its outcome is unknown",
+                    )
+                });
+                (claimed.logical_activity_id.clone(), refusal)
+            }
             OperationEffect::ProviderIdempotent { side_effect_steps } => {
                 let step = side_effect_steps.first().ok_or_else(|| {
                     anyhow!("provider-idempotent Process activity has no compiled step")
@@ -1113,21 +1205,35 @@ impl ProcessRuntime {
         Ok(true)
     }
 
+    /// The executor was entered and answered with a failure.
     async fn complete_activity_failure(
         &self,
         claimed: &ClaimedActivity,
         failure: ConnectorFailure,
     ) -> anyhow::Result<ActivityConsumption> {
-        self.complete_activity_failure_with_retry(claimed, failure, true)
+        self.complete_activity_failure_with_retry(claimed, failure, SendOutcome::Attempted)
             .await
     }
 
+    /// The provider answered successfully and the engine refused the answer, so
+    /// the send certainly happened whatever the recorded class says.
+    async fn complete_answered_activity_failure(
+        &self,
+        claimed: &ClaimedActivity,
+        failure: ConnectorFailure,
+    ) -> anyhow::Result<ActivityConsumption> {
+        self.complete_activity_failure_with_retry(claimed, failure, SendOutcome::Answered)
+            .await
+    }
+
+    /// The activity refused before the executor was entered, so no byte of this
+    /// attempt can have reached the provider.
     async fn complete_terminal_activity_failure(
         &self,
         claimed: &ClaimedActivity,
         failure: ConnectorFailure,
     ) -> anyhow::Result<ActivityConsumption> {
-        self.complete_activity_failure_with_retry(claimed, failure, false)
+        self.complete_activity_failure_with_retry(claimed, failure, SendOutcome::NotAttempted)
             .await
     }
 
@@ -1135,7 +1241,7 @@ impl ProcessRuntime {
         &self,
         claimed: &ClaimedActivity,
         failure: ConnectorFailure,
-        retry_allowed: bool,
+        send: SendOutcome,
     ) -> anyhow::Result<ActivityConsumption> {
         let mut client = self
             .pool
@@ -1153,8 +1259,8 @@ impl ProcessRuntime {
                 claimed,
                 "activity_stale_completion",
                 json!({
-                    "class": connector_error_class_name(failure.class),
-                    "code": failure.code,
+                    "class": connector_error_class_name(failure.class()),
+                    "code": failure.code(),
                 }),
             )
             .await?;
@@ -1169,11 +1275,42 @@ impl ProcessRuntime {
                 lease_generation: claimed.lease_generation,
             });
         }
-        let retryable =
-            retry_allowed && activity_failure_is_retryable(&claimed.state, failure.class);
+        // ADR 063. The one send authorization commits *before* the request
+        // leaves, so from the moment it is there the engine cannot say what the
+        // provider did — and that is true whether the worker was lost (which
+        // `resolve_late_running_activity` already handles) or survived to be
+        // told the request timed out. Writing the connector's class verbatim
+        // here would route a delivered mail through `on_error` as a failure and
+        // leave the `on_ambiguous` destination the compiler *forces* an
+        // operator to declare unreachable in the single-worker case.
+        let mut failure = failure;
+        let mut ambiguous_cause = None;
+        if claimed.state.at_most_once
+            && send_outcome_is_unknown(send, failure.class())
+            && at_most_once_send_was_authorized(
+                &transaction,
+                &self.source_name,
+                &claimed.logical_activity_id,
+            )
+            .await?
+        {
+            // ADR 031: an outcome the engine reclassified still names what
+            // stopped the send, because that is the only thing an operator
+            // reconciling the instance has to go on.
+            ambiguous_cause = Some(json!({
+                "class": connector_error_class_name(failure.class()),
+                "code": failure.code(),
+            }));
+            failure = ConnectorFailure::new(
+                ConnectorErrorClass::Permanent,
+                PROVIDER_SEND_AMBIGUOUS,
+                "an at-most-once provider send was authorized and its outcome is unknown",
+            );
+        }
+        let retryable = matches!(send, SendOutcome::Attempted | SendOutcome::Answered)
+            && activity_failure_is_retryable(&claimed.state, failure.class());
         let attempt = u32::try_from(claimed.attempt)
             .context("Process activity attempt cannot be negative")?;
-        let mut failure = failure;
         if retryable && attempt < claimed.state.retry.max_attempts {
             let retry_upper_ms = retry_delay_upper_ms(&claimed.state, claimed.attempt)?;
             let jitter_ms = deterministic_full_jitter_ms(
@@ -1182,7 +1319,7 @@ impl ProcessRuntime {
                 retry_upper_ms,
             );
             let retry_after_ms = failure
-                .retry_after
+                .retry_after()
                 .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0);
             if retry_after_ms <= retry_upper_ms {
@@ -1203,8 +1340,8 @@ impl ProcessRuntime {
                     claimed,
                     "activity_retry_scheduled",
                     json!({
-                        "class": connector_error_class_name(failure.class),
-                        "code": failure.code,
+                        "class": connector_error_class_name(failure.class()),
+                        "code": failure.code(),
                         "delay_ms": delay_ms,
                     }),
                 )
@@ -1223,15 +1360,19 @@ impl ProcessRuntime {
                         .ok_or_else(|| anyhow!("Process activity next attempt overflow"))?,
                 });
             }
-            failure = ConnectorFailure {
-                class: ConnectorErrorClass::Timeout,
-                code: "retry_after_exceeds_retry_bound",
-                safe_message: "provider Retry-After exceeds the declared retry delay bound"
-                    .to_owned(),
-                retry_after: failure.retry_after,
-            };
+            failure = ConnectorFailure::new(
+                ConnectorErrorClass::Timeout,
+                "retry_after_exceeds_retry_bound",
+                "provider Retry-After exceeds the declared retry delay bound",
+            )
+            .with_retry_after(failure.retry_after());
         }
         let mut error = connector_failure_json(&failure);
+        if let Some(cause) = ambiguous_cause
+            && let Some(object) = error.as_object_mut()
+        {
+            object.insert("caused_by".to_owned(), cause);
+        }
         let retry_exhausted = retryable && attempt >= claimed.state.retry.max_attempts;
         let event_kind = if retry_exhausted {
             error = json!({
@@ -1240,8 +1381,8 @@ impl ProcessRuntime {
                 "safe_message": "the activity retry budget was exhausted",
                 "retry_after_ms": null,
                 "last_failure": {
-                    "class": connector_error_class_name(failure.class),
-                    "code": failure.code,
+                    "class": connector_error_class_name(failure.class()),
+                    "code": failure.code(),
                 }
             });
             "retry_exhausted"
@@ -1304,7 +1445,7 @@ impl ProcessRuntime {
                 activity_job_id: claimed.activity_job_id,
                 attempt: claimed.attempt,
                 lease_generation: claimed.lease_generation,
-                last_class: failure.class,
+                last_class: failure.class(),
             })
         } else {
             Ok(ActivityConsumption::Failed {
@@ -1312,7 +1453,7 @@ impl ProcessRuntime {
                 activity_job_id: claimed.activity_job_id,
                 attempt: claimed.attempt,
                 lease_generation: claimed.lease_generation,
-                class: failure.class,
+                class: failure.class(),
             })
         }
     }
@@ -1324,6 +1465,85 @@ enum ProviderAuthorization {
         deadline_ms: u64,
     },
     Refused(ConnectorFailure),
+}
+
+/// What the worker knows about its one send when it records a failure.
+///
+/// It is the half of the at-most-once question the authorization row cannot
+/// answer: the row says a send was *authorized*, this says how far the worker
+/// got afterwards.
+#[derive(Debug, Clone, Copy)]
+enum SendOutcome {
+    /// The executor was never entered — the activity refused first — so no byte
+    /// of this attempt reached the provider and the recorded class is exact.
+    NotAttempted,
+    /// The executor was entered and answered with a failure.
+    Attempted,
+    /// The provider answered successfully and the engine refused the answer.
+    Answered,
+}
+
+/// ADR 063. Whether a recorded at-most-once failure describes an outcome the
+/// engine knows, or the absence of one.
+///
+/// The four classes an ambiguous `Attempted` send can carry are exactly the four
+/// `retry_on` is forbidden to name, for the same reason: they are "precisely the
+/// ones where a request may already have reached the provider". A timeout is the
+/// ambiguous case by definition, a transport error cannot distinguish a
+/// connection that never opened from a response that never came back, a `5xx` on
+/// a non-idempotent write may sit on top of a completed one, and a `429` from an
+/// edge that had already forwarded the request is indistinguishable from one
+/// that had not.
+///
+/// The other four are deliberately *not* ambiguous. `authentication`,
+/// `validation`, and `permanent` are the provider's own answer — it received the
+/// request, refused it, and said so — and telling a Process "unknown" for a
+/// refusal it declared a route for would make the class useless. `invariant` is
+/// the connector or the engine disagreeing with a contract, and it straddles
+/// request construction (nothing sent) and response decoding; only the engine's
+/// own post-success refusals, which arrive as `Answered`, are known to have been
+/// sent.
+fn send_outcome_is_unknown(send: SendOutcome, class: ConnectorErrorClass) -> bool {
+    match send {
+        SendOutcome::NotAttempted => false,
+        SendOutcome::Attempted => matches!(
+            class,
+            ConnectorErrorClass::Transport
+                | ConnectorErrorClass::Timeout
+                | ConnectorErrorClass::Http429
+                | ConnectorErrorClass::Http5xx
+        ),
+        // The provider answered `2xx` and the engine could not use the answer.
+        // The send is not unknown so much as known to have happened with an
+        // unusable result, and of the two destinations a Process declares, the
+        // one that must not re-send is the right one.
+        SendOutcome::Answered => true,
+    }
+}
+
+/// Whether this logical activity's one send authorization is already committed.
+///
+/// Read exactly as [`resolve_late_running_activity`] reads it, and from the same
+/// table: one row keyed by the logical activity is the whole durable record that
+/// a send was allowed to leave.
+async fn at_most_once_send_was_authorized(
+    transaction: &Transaction<'_>,
+    source_name: &str,
+    logical_activity_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(transaction
+        .query_opt(
+            "
+            SELECT 1
+            FROM donat.process_activity_provider_steps
+            WHERE source_name = $1
+              AND logical_activity_id = $2
+            ",
+            &[&source_name, &logical_activity_id],
+        )
+        .await
+        .context("reading the at-most-once send authorization of a failed Process activity")?
+        .is_some())
 }
 
 fn capacity_policy_fingerprint(
@@ -1486,12 +1706,26 @@ async fn resolve_late_running_activity(
     state: &CompiledProcessRequestState,
     db_now: DateTime<Utc>,
 ) -> anyhow::Result<ActivityConsumption> {
-    let failure = ConnectorFailure::new(
-        ConnectorErrorClass::Timeout,
-        "start_to_close_timeout",
-        "the activity exceeded start_to_close and its takeover grace",
-    );
-    let retryable = activity_failure_is_retryable(state, failure.class);
+    // An at-most-once activity that already claimed its one send is ambiguous
+    // rather than timed out, and it stays ambiguous whichever code path notices
+    // that its worker is gone. A timeout route would tell the Process something
+    // this engine does not know: that nothing reached the provider.
+    let authorized_send = state.at_most_once
+        && at_most_once_send_was_authorized(transaction, source_name, logical_activity_id).await?;
+    let failure = if authorized_send {
+        ConnectorFailure::new(
+            ConnectorErrorClass::Permanent,
+            PROVIDER_SEND_AMBIGUOUS,
+            "an at-most-once provider send was already authorized and its outcome is unknown",
+        )
+    } else {
+        ConnectorFailure::new(
+            ConnectorErrorClass::Timeout,
+            "start_to_close_timeout",
+            "the activity exceeded start_to_close and its takeover grace",
+        )
+    };
+    let retryable = activity_failure_is_retryable(state, failure.class());
     let attempt_ordinal =
         u32::try_from(attempt).context("Process activity attempt cannot be negative")?;
     let failure_json = connector_failure_json(&failure);
@@ -1985,10 +2219,10 @@ async fn append_unclaimed_activity_log(
 
 fn connector_failure_json(failure: &ConnectorFailure) -> Json {
     json!({
-        "class": connector_error_class_name(failure.class),
-        "code": failure.code,
-        "safe_message": failure.safe_message,
-        "retry_after_ms": failure.retry_after.map(|delay| delay.as_millis() as u64),
+        "class": connector_error_class_name(failure.class()),
+        "code": failure.code(),
+        "safe_message": failure.safe_message(),
+        "retry_after_ms": failure.retry_after().map(|delay| delay.as_millis() as u64),
     })
 }
 

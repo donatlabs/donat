@@ -1,0 +1,13 @@
+# The updates already on one item, read through the item itself.
+query UpdateList($ids: [ID!], $limit: Int!) {
+  items(ids: $ids) {
+    id
+    updates(limit: $limit) {
+      id
+      body
+      text_body
+      created_at
+      creator_id
+    }
+  }
+}

@@ -11119,6 +11119,18 @@ semantic_projection {
                     "OperationEffectMaterialV1::ReadOnly",
                     ReadOnly as "read_only",
                 );
+                (
+                    "OperationEffect::AtMostOnce",
+                    "OperationEffect::AtMostOnce",
+                    Model,
+                    "OperationEffectMaterialV1{kind=at_most_once}.kind",
+                    "normalized",
+                    "scalar",
+                    "required",
+                    "at_most_once",
+                    "OperationEffectMaterialV1::AtMostOnce",
+                    AtMostOnce as "at_most_once",
+                );
             }
             composite_unit_variants {}
             tuple_variants {}
@@ -15820,6 +15832,7 @@ fn operation_bounds_from_material(
 fn effect_from_material(value: OperationEffectMaterialV1) -> Result<OperationEffect, CatalogError> {
     Ok(match value {
         OperationEffectMaterialV1::ReadOnly(()) => OperationEffect::ReadOnly,
+        OperationEffectMaterialV1::AtMostOnce(()) => OperationEffect::AtMostOnce,
         OperationEffectMaterialV1::ProviderIdempotent { side_effect_steps } => {
             OperationEffect::ProviderIdempotent {
                 side_effect_steps: side_effect_steps

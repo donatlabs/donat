@@ -1,0 +1,94 @@
+{
+  "//": [
+    "Published API schemas, per connector module. ADR 037 admits a provider's",
+    "own published schema as ground truth beside its prose documentation, and",
+    "this is the register of the ones that exist.",
+    "",
+    "A module absent from this file is not a pass and not a failure: it is a",
+    "connector no schema can check, and check_provider_schemas.py reports it as",
+    "uncovered so the gap stays visible. Adding a URL here is how a provider",
+    "moves out of that column.",
+    "",
+    "Every URL is the provider's own publication. Nothing here is derived from",
+    "a third-party integration project."
+  ],
+
+  "openai": {
+    "url": "https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml",
+    "note": "OpenAI's published OpenAPI document."
+  },
+  "github": {
+    "url": "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json",
+    "note": "GitHub's own rest-api-description repository."
+  },
+  "asana": {
+    "url": "https://raw.githubusercontent.com/Asana/openapi/master/defs/asana_oas.yaml",
+    "note": "Asana's published OAS."
+  },
+  "box": {
+    "url": "https://raw.githubusercontent.com/box/box-openapi/main/openapi.json",
+    "note": "Box's published OpenAPI."
+  },
+  "sentry": {
+    "url": "https://raw.githubusercontent.com/getsentry/sentry-api-schema/main/openapi-derefed.json",
+    "note": "Sentry's published, dereferenced schema."
+  },
+  "discord": {
+    "url": "https://raw.githubusercontent.com/discord/discord-api-spec/main/specs/openapi.json",
+    "note": "Discord's published API spec."
+  },
+  "cloudflare": {
+    "url": "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json",
+    "note": "Cloudflare's published api-schemas."
+  },
+  "pagerduty": {
+    "url": "https://raw.githubusercontent.com/PagerDuty/api-schema/main/reference/REST/openapiv3.json",
+    "note": "PagerDuty's published REST schema."
+  },
+  "twilio": {
+    "url": "https://raw.githubusercontent.com/twilio/twilio-oai/main/spec/json/twilio_api_v2010.json",
+    "note": "Twilio's published OAI for the 2010-04-01 API."
+  },
+  "slack": {
+    "url": "https://raw.githubusercontent.com/slackapi/slack-api-specs/master/web-api/slack_web_openapi_v2.json",
+    "note": "Slack's published web-api spec."
+  },
+  "xero": {
+    "url": "https://raw.githubusercontent.com/XeroAPI/Xero-OpenAPI/master/xero_accounting.yaml",
+    "note": "Xero's published Accounting API spec; this connector's other surfaces are not in it."
+  },
+  "mailchimp": {
+    "url": "https://api.mailchimp.com/schema/3.0/Swagger.json?expand",
+    "note": "Mailchimp's published Swagger, served from its own API host."
+  },
+  "google_calendar": {
+    "url": "https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest",
+    "note": "Google publishes a Discovery document rather than OpenAPI; same two facts."
+  },
+  "google_drive": {
+    "url": "https://www.googleapis.com/discovery/v1/apis/drive/v3/rest",
+    "note": "Google Discovery."
+  },
+  "google_gmail": {
+    "url": "https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest",
+    "note": "Google Discovery."
+  },
+  "google_sheets": {
+    "url": "https://www.googleapis.com/discovery/v1/apis/sheets/v4/rest",
+    "note": "Google Discovery."
+  },
+  "paypal": {
+    "url": [
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/checkout_orders_v2.json",
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/billing_subscriptions_v1.json",
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/reporting_transactions_v1.json",
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/payments_payment_v2.json",
+      "https://raw.githubusercontent.com/paypal/paypal-rest-api-specifications/main/openapi/invoicing_v2.json"
+    ],
+    "note": "PayPal publishes one document per API, so this connector's surface spans five of them."
+  },
+  "intercom": {
+    "url": "https://raw.githubusercontent.com/intercom/Intercom-OpenAPI/main/descriptions/2.11/api.intercom.io.yaml",
+    "note": "Intercom's published OpenAPI, version 2.11."
+  }
+}

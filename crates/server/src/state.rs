@@ -2,6 +2,7 @@
 //! snapshot (metadata + per-source catalogs) that metadata operations
 //! mutate at runtime.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ pub struct ConnectorConfigError {
 }
 
 impl ConnectorConfigError {
-    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             message: message.into(),
@@ -82,6 +83,21 @@ pub fn validate_connector_metadata(metadata: &Metadata) -> Vec<ConnectorConfigEr
 
     for (index, connector) in metadata.connectors.iter().enumerate() {
         let path = format!("connectors.yaml[{index}]");
+        // A `local.*` instance is a capability compiled into this binary, not a
+        // provider. It has no module in the connector table, no origin, and no
+        // credential, and `donat_metadata::validate_local_capabilities` refuses
+        // the very `endpoint_identity`/`credential_identity` this function
+        // requires. Validating it here would refuse every deployment that uses
+        // one, twice over; its own validator owns it.
+        if donat_metadata::is_local(&connector.module) {
+            if !instance_names.insert(connector.name.as_str()) {
+                errors.push(ConnectorConfigError::new(
+                    format!("{path}.name"),
+                    format!("duplicate connector instance name `{}`", connector.name),
+                ));
+            }
+            continue;
+        }
         if !instance_names.insert(connector.name.as_str()) {
             errors.push(ConnectorConfigError::new(
                 format!("{path}.name"),
@@ -95,7 +111,12 @@ pub fn validate_connector_metadata(metadata: &Metadata) -> Vec<ConnectorConfigEr
             ));
         }
 
-        if !matches!(connector.module.as_str(), "http" | "stripe") {
+        // The compiled module table is the only list of module names, and now
+        // the only source of per-module rules: a module carries its own
+        // validation with it, so adding a connector never means remembering to
+        // widen a `match` in this file.
+        let module = crate::connectors::compiled_module(&connector.module);
+        if module.is_none() {
             errors.push(ConnectorConfigError::new(
                 format!("{path}.module"),
                 format!("unknown connector module `{}`", connector.module),
@@ -103,7 +124,28 @@ pub fn validate_connector_metadata(metadata: &Metadata) -> Vec<ConnectorConfigEr
         }
 
         validate_connector_config(connector, &path, &mut errors);
-        validate_connector_operations(connector, &path, &mut errors);
+        match module {
+            Some(module) => {
+                crate::connectors::validate_module_metadata(module, connector, &path, &mut errors);
+                // The declaration this instance's operations are admitted
+                // against. A module whose declaration is completed by
+                // configuration — Twilio's, from its Account SID — has none
+                // when that configuration is missing or malformed, and its own
+                // validator above has already named the key that earned it.
+                if let Some(declaration) = module.declaration().resolve(connector) {
+                    crate::connectors::validate_enabled_operations(
+                        &declaration,
+                        connector,
+                        &path,
+                        &mut errors,
+                    );
+                }
+            }
+            // An unknown module has already been reported; its operations are
+            // still checked against the rules every operation obeys, so one
+            // typo in `module` does not hide a second defect below it.
+            None => validate_connector_operation_defaults(connector, &path, &mut errors),
+        }
     }
 
     errors
@@ -152,44 +194,6 @@ fn validate_connector_config(
         ));
     }
 
-    match connector.module.as_str() {
-        "http" => {
-            if config.base_url.is_none() {
-                errors.push(ConnectorConfigError::new(
-                    format!("{path}.config.base_url"),
-                    "base_url is required for the http connector",
-                ));
-            }
-            if let Err(error) = crate::connectors::http::validate_http_config_metadata(config) {
-                errors.push(ConnectorConfigError::new(
-                    format!("{path}.config.base_url"),
-                    error.to_string(),
-                ));
-            }
-        }
-        "stripe" => {
-            if config.secret_key.is_none() {
-                errors.push(ConnectorConfigError::new(
-                    format!("{path}.config.secret_key"),
-                    "secret_key is required for the stripe connector",
-                ));
-            }
-            if config.webhook_secret.is_none() {
-                errors.push(ConnectorConfigError::new(
-                    format!("{path}.config.webhook_secret"),
-                    "webhook_secret is required for the stripe connector",
-                ));
-            }
-            if config.api_version.as_deref().is_none_or(str::is_empty) {
-                errors.push(ConnectorConfigError::new(
-                    format!("{path}.config.api_version"),
-                    "api_version is required for the stripe connector",
-                ));
-            }
-        }
-        _ => {}
-    }
-
     for (field, variable) in connector_environment_variables(config) {
         if !valid_environment_variable_name(variable) {
             errors.push(ConnectorConfigError::new(
@@ -200,37 +204,16 @@ fn validate_connector_config(
     }
 }
 
-fn validate_connector_operations(
+/// The rules every connector operation obeys, whatever module compiles it.
+///
+/// A module's own validator may call this; the `http` and `stripe` modules
+/// check the same ground in their own compilers, so today only an unknown
+/// module reaches it.
+pub(crate) fn validate_connector_operation_defaults(
     connector: &ConnectorInstance,
     path: &str,
     errors: &mut Vec<ConnectorConfigError>,
 ) {
-    if connector.module == "http" {
-        if let Err(error) = crate::connectors::http::validate_http_instance_metadata(
-            &connector.config,
-            &connector.operations,
-        ) {
-            errors.push(ConnectorConfigError::new(
-                format!("{path}.operations"),
-                error.to_string(),
-            ));
-        }
-        return;
-    }
-
-    if connector.module == "stripe" {
-        if let Err(error) = crate::connectors::stripe::validate_stripe_instance_metadata(
-            &connector.config,
-            &connector.operations,
-        ) {
-            errors.push(ConnectorConfigError::new(
-                format!("{path}.operations"),
-                error.to_string(),
-            ));
-        }
-        return;
-    }
-
     for (index, operation) in connector.operations.iter().enumerate() {
         let operation_path = format!("{path}.operations[{index}]");
         if operation.name.is_empty() {
@@ -277,33 +260,63 @@ fn validate_connector_operations(
     }
 }
 
-fn connector_environment_variables(config: &ConnectorConfig) -> impl Iterator<Item = (&str, &str)> {
+fn connector_environment_variables(
+    config: &ConnectorConfig,
+) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
     let base_url = match config.base_url.as_ref() {
         Some(ConnectorBaseUrl::FromEnv(reference)) => {
-            Some(("base_url", reference.value_from_env.as_str()))
+            Some((Cow::Borrowed("base_url"), reference.value_from_env.as_str()))
         }
         _ => None,
     };
     base_url
         .into_iter()
-        .chain(
-            config
-                .headers
-                .iter()
-                .map(|header| ("headers.value_from_env", header.value_from_env.as_str())),
-        )
-        .chain(
-            config
-                .secret_key
-                .iter()
-                .map(|reference| ("secret_key", reference.value_from_env.as_str())),
-        )
-        .chain(
-            config
-                .webhook_secret
-                .iter()
-                .map(|reference| ("webhook_secret", reference.value_from_env.as_str())),
-        )
+        .chain(config.headers.iter().map(|header| {
+            (
+                Cow::Borrowed("headers.value_from_env"),
+                header.value_from_env.as_str(),
+            )
+        }))
+        .chain(config.secret_key.iter().map(|reference| {
+            (
+                Cow::Borrowed("secret_key"),
+                reference.value_from_env.as_str(),
+            )
+        }))
+        .chain(config.webhook_secret.iter().map(|reference| {
+            (
+                Cow::Borrowed("webhook_secret"),
+                reference.value_from_env.as_str(),
+            )
+        }))
+        // The named secrets a hand-written connector's credential contract
+        // declares beyond `secret_key` — AWS's access key, secret access key,
+        // and optional session token. They are ordinary `SecretRef`s and are
+        // checked here so a missing one stops startup naming only the variable,
+        // exactly as `secret_key` does.
+        .chain(config.secrets.iter().map(|(name, reference)| {
+            (
+                Cow::Owned(format!("secrets.{name}")),
+                reference.value_from_env.as_str(),
+            )
+        }))
+        // The OAuth2 client identity. The tokens themselves are not here —
+        // they are sealed in `donat.connector_credential` — but the client
+        // credentials that refresh them are ordinary `SecretRef`s and must be
+        // present before the process starts serving, exactly like every other
+        // connector secret.
+        .chain(config.oauth2.iter().flat_map(|oauth2| {
+            std::iter::once((
+                Cow::Borrowed("oauth2.client_id"),
+                oauth2.client_id.value_from_env.as_str(),
+            ))
+            .chain(oauth2.client_secret.iter().map(|reference| {
+                (
+                    Cow::Borrowed("oauth2.client_secret"),
+                    reference.value_from_env.as_str(),
+                )
+            }))
+        }))
 }
 
 fn valid_environment_variable_name(variable: &str) -> bool {
@@ -1065,7 +1078,13 @@ fn normalize_metadata_sources(metadata: &mut Metadata) {
     metadata.sources = normalized;
 }
 
-fn resolve_source_url(source: &Source, default_url: &str) -> String {
+/// The database URL one metadata source resolves to.
+///
+/// The connector credential store is source-local — a credential lives in the
+/// same database as the Process that uses it — so the connector registry
+/// resolves its pool through exactly this function rather than a second rule
+/// that could disagree with the one serving uses.
+pub(crate) fn resolve_source_url(source: &Source, default_url: &str) -> String {
     if let Some(connection_info) = &source.configuration.connection_info {
         return match &connection_info.database_url {
             DatabaseUrl::Url(url) => url.clone(),

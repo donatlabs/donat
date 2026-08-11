@@ -1,0 +1,64 @@
+# Donat-owned connector startup fixture (spec 010 §12: every connector adds a
+# native conformance fixture proving startup validation and redaction).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an operation this deployment may not reach — WooCommerce publishes nothing about what a `PUT` does beyond "This API lets you make changes to an order", so `order.update` is inventory-only. The `store_origin` is the store's whole origin and the `consumer_key` is the HTTP Basic username.
+# Neither may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: woocommerce_present
+      module: woocommerce
+      config:
+        endpoint_identity: woocommerce_conformance
+        credential_identity: woocommerce_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          store_origin: https://donat-conformance.example.test
+          consumer_key: ck_donat_conformance
+      operations:
+        - name: order.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: woocommerce_missing
+      module: woocommerce
+      config:
+        endpoint_identity: woocommerce_conformance
+        credential_identity: woocommerce_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          store_origin: https://donat-conformance.example.test
+          consumer_key: ck_donat_conformance
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: woocommerce_refused
+      module: woocommerce
+      config:
+        endpoint_identity: woocommerce_conformance
+        credential_identity: woocommerce_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          store_origin: https://donat-conformance.example.test
+          consumer_key: ck_donat_conformance
+      operations:
+        - name: order.update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `woocommerce_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `order.update` on module `woocommerce`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

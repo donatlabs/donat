@@ -357,6 +357,17 @@ impl OperationSpec {
         }
         match &self.effect {
             OperationEffect::ReadOnly => {}
+            // One send is one step: an operation the runtime may attempt only
+            // once cannot be a multi-step walk, because a worker lost between
+            // two of its steps leaves an outcome no route could describe.
+            OperationEffect::AtMostOnce => {
+                if self.steps.len() != 1 {
+                    return Err(CatalogError::new(
+                        "catalog_operation_effect_incomplete",
+                        "an at-most-once operation is exactly one step",
+                    ));
+                }
+            }
             OperationEffect::ProviderIdempotent { side_effect_steps } => {
                 if side_effect_steps.len() != self.steps.len() {
                     return Err(CatalogError::new(
@@ -413,6 +424,15 @@ pub enum OperationEffect {
     ProviderIdempotent {
         side_effect_steps: Vec<ProviderIdempotentStep>,
     },
+    /// A provider mutation with no idempotency mechanism at all (ADR 063).
+    ///
+    /// It carries no evidence here on purpose. The evidence — the search that
+    /// found no key, and what a second send produces — belongs to the connector
+    /// module that was admitted on it; what the runtime needs from the catalog
+    /// is the one fact it acts on: this operation may be sent once, so the
+    /// activity referencing it must have declared `at_most_once` and a
+    /// destination for an outcome that cannot be known.
+    AtMostOnce,
 }
 
 pub struct ProviderIdempotentStep {
@@ -874,7 +894,10 @@ pub fn check_fact_requirements(
             }
         }
         match operation.effect {
-            OperationEffect::ReadOnly => {}
+            // Neither class owns a fact use site: one has no idempotency
+            // material at all, and the other's absence is recorded in the
+            // connector module rather than in a fact.
+            OperationEffect::ReadOnly | OperationEffect::AtMostOnce => {}
             OperationEffect::ProviderIdempotent { side_effect_steps } => {
                 for side_effect in side_effect_steps {
                     let step = side_effect.step.as_str();
@@ -1537,6 +1560,11 @@ fn validate_manifest_effects(manifest: &ConnectorManifest) -> Result<(), Catalog
     for operation in &manifest.operations {
         match &operation.effect {
             OperationEffect::ReadOnly => {}
+            OperationEffect::AtMostOnce => {
+                if operation.steps.len() != 1 {
+                    return effect_incomplete("an at-most-once operation is exactly one step");
+                }
+            }
             OperationEffect::ProviderIdempotent { side_effect_steps } => {
                 if side_effect_steps.len() != operation.steps.len() {
                     return effect_incomplete("every side-effecting step needs exact evidence");

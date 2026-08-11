@@ -1,0 +1,14 @@
+# Linear: `teams(filter: TeamFilter, first: Int, after: String): TeamConnection!`.
+query TeamList($first: Int!, $after: String) {
+  teams(first: $first, after: $after) {
+    nodes {
+      id
+      key
+      name
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}

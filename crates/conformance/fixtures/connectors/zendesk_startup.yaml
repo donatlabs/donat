@@ -1,0 +1,64 @@
+# Donat-owned connector startup fixture (spec 010 §12: every connector adds a
+# native conformance fixture proving startup validation and redaction).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an operation this deployment may not reach — Zendesk documents `create_or_update` as repeat-safe over a `POST`, which spec 010 §7 admits for neither mutating class, so it is inventory-only. The `subdomain` fills the templated host and the `email` is half the HTTP Basic username.
+# Neither may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: zendesk_present
+      module: zendesk
+      config:
+        endpoint_identity: zendesk_conformance
+        credential_identity: zendesk_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          subdomain: donat-conformance
+          email: integrations@example.test
+      operations:
+        - name: ticket.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: zendesk_missing
+      module: zendesk
+      config:
+        endpoint_identity: zendesk_conformance
+        credential_identity: zendesk_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          subdomain: donat-conformance
+          email: integrations@example.test
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: zendesk_refused
+      module: zendesk
+      config:
+        endpoint_identity: zendesk_conformance
+        credential_identity: zendesk_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          subdomain: donat-conformance
+          email: integrations@example.test
+      operations:
+        - name: user.create_or_update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `zendesk_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `user.create_or_update` on module `zendesk`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

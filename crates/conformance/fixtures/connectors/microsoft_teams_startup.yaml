@@ -1,0 +1,110 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 015 §3).
+#
+# `metadata` withholds one instance's OAuth2 client secret while another
+# instance's resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an inventory-only operation: startup must name the
+# exact metadata path. `scope_metadata` enables an operation this deployment's
+# declared permissions do not authorize: startup must name
+# `config.oauth2.scopes`, which is `microsoft_teams_permission_shortfall_fails_closed`
+# proven against the real binary. None of the three may disclose a resolved
+# value.
+#
+# Every instance declares `offline_access` alongside its Graph permissions,
+# because Microsoft publishes that as the precondition for receiving a refresh
+# token at all, and this connector family cannot serve without one.
+metadata:
+  version: 3
+  connectors:
+    - name: microsoft_teams_present
+      module: microsoft_teams
+      config:
+        endpoint_identity: microsoft_teams_conformance
+        credential_identity: microsoft_teams_conformance_credential
+        oauth2:
+          authorization_endpoint: https://login.microsoftonline.com/common/oauth2/v2.0/authorize
+          token_endpoint: https://login.microsoftonline.com/common/oauth2/v2.0/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - offline_access
+            - Channel.ReadBasic.All
+      operations:
+        - name: channel.get
+          capacity: &capacity
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: microsoft_teams_missing
+      module: microsoft_teams
+      config:
+        endpoint_identity: microsoft_teams_conformance
+        credential_identity: microsoft_teams_conformance_credential
+        oauth2:
+          authorization_endpoint: https://login.microsoftonline.com/common/oauth2/v2.0/authorize
+          token_endpoint: https://login.microsoftonline.com/common/oauth2/v2.0/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - offline_access
+            - Channel.ReadBasic.All
+      operations:
+        - name: channel.get
+          capacity: *capacity
+refused_metadata:
+  version: 3
+  connectors:
+    - name: microsoft_teams_refused
+      module: microsoft_teams
+      config:
+        endpoint_identity: microsoft_teams_conformance
+        credential_identity: microsoft_teams_conformance_credential
+        oauth2:
+          authorization_endpoint: https://login.microsoftonline.com/common/oauth2/v2.0/authorize
+          token_endpoint: https://login.microsoftonline.com/common/oauth2/v2.0/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - offline_access
+      operations:
+        - name: channel.archive
+          capacity: *capacity
+scope_metadata:
+  version: 3
+  connectors:
+    - name: microsoft_teams_scoped
+      module: microsoft_teams
+      config:
+        endpoint_identity: microsoft_teams_conformance
+        credential_identity: microsoft_teams_conformance_credential
+        oauth2:
+          authorization_endpoint: https://login.microsoftonline.com/common/oauth2/v2.0/authorize
+          token_endpoint: https://login.microsoftonline.com/common/oauth2/v2.0/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - offline_access
+            - Channel.ReadBasic.All
+      operations:
+        - name: channel.get
+          capacity: *capacity
+        - name: chat_message.list
+          capacity: *capacity
+expect:
+  missing_variable: "connector instance `microsoft_teams_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `channel.archive` on module `microsoft_teams`: connector operation is not compiled into this binary"
+  scope_shortfall: "connectors.yaml[0].config.oauth2.scopes: connector operation `chat_message.list` on module `microsoft_teams` is not authorized by any declared scope"
+  output_excludes: "connector-present-secret-sentinel"

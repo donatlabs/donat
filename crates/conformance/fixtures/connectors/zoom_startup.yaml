@@ -1,0 +1,119 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 025 §4).
+#
+# `refused_metadata` enables an operation this binary was not built with: Zoom's `PATCH`
+# meeting update is a partial update over a method spec 010 §7 admits for neither mutating
+# class, so it is not declared at all. `scope_metadata` enables the delete under a read-only
+# grant, which startup must refuse by naming `config.oauth2.scopes`.
+metadata:
+  version: 3
+  connectors:
+    - name: zoom_present
+      module: zoom
+      config:
+        endpoint_identity: zoom_conformance
+        credential_identity: zoom_conformance_credential
+        oauth2:
+          authorization_endpoint: https://zoom.us/oauth/authorize
+          token_endpoint: https://zoom.us/oauth/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - meeting:write
+      operations:
+        - name: meeting.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: zoom_missing
+      module: zoom
+      config:
+        endpoint_identity: zoom_conformance
+        credential_identity: zoom_conformance_credential
+        oauth2:
+          authorization_endpoint: https://zoom.us/oauth/authorize
+          token_endpoint: https://zoom.us/oauth/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - meeting:write
+      operations:
+        - name: meeting.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+refused_metadata:
+  version: 3
+  connectors:
+    - name: zoom_refused
+      module: zoom
+      config:
+        endpoint_identity: zoom_conformance
+        credential_identity: zoom_conformance_credential
+        oauth2:
+          authorization_endpoint: https://zoom.us/oauth/authorize
+          token_endpoint: https://zoom.us/oauth/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - meeting:write
+      operations:
+        - name: meeting.update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+scope_metadata:
+  version: 3
+  connectors:
+    - name: zoom_scoped
+      module: zoom
+      config:
+        endpoint_identity: zoom_conformance
+        credential_identity: zoom_conformance_credential
+        oauth2:
+          authorization_endpoint: https://zoom.us/oauth/authorize
+          token_endpoint: https://zoom.us/oauth/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - meeting:read
+      operations:
+        - name: meeting.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+        - name: meeting.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `zoom_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `meeting.update` on module `zoom`: connector operation is not compiled into this binary"
+  module_refusal: "connectors.yaml[0].config.oauth2.scopes: connector operation `meeting.delete` on module `zoom` is not authorized by any declared scope"
+  output_excludes: "connector-present-secret-sentinel"

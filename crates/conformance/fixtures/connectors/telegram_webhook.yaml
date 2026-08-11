@@ -1,0 +1,50 @@
+# Donat-owned Batch B inbound fixture (spec 013 §4, proof 4 `telegram_route_matrix`
+# and proof 6 `telegram_verified_event_is_not_persisted`).
+#
+# One deployed instance of the `telegram` connector, and the exact answers its
+# ingress route owes: `404` for an unknown instance, `413` over the body limit,
+# `400` for a body whose verification fails, and `503` for a delivery that
+# verified — because the Process-owned inbound transaction has not landed yet,
+# so an authentic event has nowhere to go and nothing is written down.
+metadata:
+  version: 3
+  sources: []
+  connectors:
+    - name: telegram_inbound
+      module: telegram
+      config:
+        endpoint_identity: telegram_conformance
+        credential_identity: telegram_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_BATCH_B_API_KEY
+        webhook_secret:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_BATCH_B_WEBHOOK_SECRET
+      operations:
+        - name: chat.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+request:
+  instance: telegram_inbound
+  unknown_instance: telegram_absent
+  path: /v1/connectors/telegram_inbound/webhooks
+  unknown_path: /v1/connectors/telegram_absent/webhooks
+  body: '{"update_id":10000,"message":{"message_id":1,"date":1,"chat":{"id":1}}}'
+expect:
+  # An instance the deployment never declared is indistinguishable from any
+  # other absent route, and the answer arrives before the body is read.
+  unknown_instance_status: 404
+  # The raw-body ceiling is applied before the MAC is computed over the body.
+  oversized_status: 413
+  # A body that fails verification. Its content is never parsed, and no
+  # provider text reaches the response.
+  invalid_status: 400
+  # A delivery that verified. Spec 013 §0: still `503`.
+  verified_status: 503
+  body: ""
+  # Proof 6: nothing about a verified delivery is written down.
+  persisted_deliveries: 0
+  persisted_events: 0

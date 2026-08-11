@@ -1,0 +1,61 @@
+# Donat-owned connector startup fixture (spec 010 §12: every connector adds a
+# native conformance fixture proving startup validation and redaction).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an operation this deployment may not reach: startup
+# must name the exact metadata path. Neither may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: typeform_present
+      module: typeform
+      config:
+        endpoint_identity: typeform_conformance
+        credential_identity: typeform_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        webhook_secret:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_WEBHOOK_SECRET
+      operations:
+        - name: form.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: typeform_missing
+      module: typeform
+      config:
+        endpoint_identity: typeform_conformance
+        credential_identity: typeform_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        webhook_secret:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_WEBHOOK_SECRET
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: typeform_refused
+      module: typeform
+      config:
+        endpoint_identity: typeform_conformance
+        credential_identity: typeform_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        webhook_secret:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_WEBHOOK_SECRET
+      operations:
+        - name: response.create
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `typeform_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `response.create` on module `typeform`: connector operation is not compiled into this binary"
+  output_excludes: "connector-present-secret-sentinel"

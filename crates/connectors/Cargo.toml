@@ -1,0 +1,66 @@
+[package]
+name = "donat-connectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Connector SDK: fixed-origin transport and the shared runtime every connector uses"
+publish = false
+
+[features]
+# `sdk::testing` is the local provider stub every connector test runs against.
+# It is compiled for this crate's own unit tests automatically; an integration
+# test in `tests/` asks for it with `--features testing`.  It is never part of
+# a production build, so the stub's HTTP server stays out of the binary.
+testing = ["dep:axum"]
+
+[dependencies]
+donat-value-contract = { path = "../value-contract" }
+base64 = { workspace = true }
+futures-util = { workspace = true }
+# Webhook verification: HMAC-SHA256 over exact raw bytes, and the
+# constant-time digest comparison that follows it.
+hmac = "0.12"
+percent-encoding = "2"
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true, optional = true }
+# The four document backends of spec 019. See the workspace manifest for why
+# each is pinned exactly and why `mrml` arrives with its loaders switched off.
+typst = { workspace = true }
+typst-layout = { workspace = true }
+typst-pdf = { workspace = true }
+mrml = { workspace = true }
+rust_xlsxwriter = { workspace = true }
+icalendar = { workspace = true }
+# The two ingest backends of spec 020, plus the archive guard that runs before
+# either of them. See the workspace manifest for why `calamine` is pinned and
+# why its date and picture features are off.
+calamine = { workspace = true }
+csv = { workspace = true }
+zip = { workspace = true }
+# The media derivatives of spec 022. See the workspace manifest for why each is
+# pinned exactly, why both code crates arrive with their own renderers switched
+# off, and why `image`'s feature list is the decoder's format allowlist.
+qrcode = { workspace = true }
+barcoders = { workspace = true }
+image = { workspace = true }
+# Recurrence (spec 021 §3). `rrule` parses and expands RFC 5545 rules; the two
+# things beside it are what turns a rule into instants. `chrono` is the naive
+# wall-clock arithmetic an expansion is driven over, and `chrono-tz` is the
+# IANA database the wall clock is resolved through — the same database, pinned
+# to the same release, that decides when a zoned cron trigger fires
+# (`knowledgebase/declarative-saas/decisions/039-*`).
+rrule = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+zip = { workspace = true }
+# Spec 022's image fixtures are authored in the test that uses them — a real
+# PNG, a real JPEG, a real animated GIF — so the encoder is a dev-dependency
+# too. The adversarial fixtures (the pixel bomb, the Exif GPS block) are
+# assembled byte by byte and need nothing.
+image = { workspace = true }

@@ -10,6 +10,9 @@ tests/donat/tests-py/
 *.log
 .claude/agent-memory
 .worktrees/
+# Working specifications stay local: they are drafting material, not a
+# published contract. Accepted decisions live in knowledgebase/.
+specs/
 tests-system/.stack/
 
 # System-test stands write their built binaries, pids and logs here.

@@ -1,0 +1,85 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 025 §4).
+#
+# The second half of one provider: Dropbox serves content from another origin, and a
+# connector has one compiled origin, so this is its own module and its own instance
+# (spec 025 §2). `refused_metadata` enables the metadata read, which lives on the *other*
+# connector — a name this module was not built with is refused by its metadata path.
+metadata:
+  version: 3
+  connectors:
+    - name: dropbox_content_present
+      module: dropbox_content
+      config:
+        endpoint_identity: dropbox_content_conformance
+        credential_identity: dropbox_content_conformance_credential
+        oauth2:
+          authorization_endpoint: https://www.dropbox.com/oauth2/authorize
+          token_endpoint: https://api.dropboxapi.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - files.content.read
+      operations:
+        - name: file.download
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: dropbox_content_missing
+      module: dropbox_content
+      config:
+        endpoint_identity: dropbox_content_conformance
+        credential_identity: dropbox_content_conformance_credential
+        oauth2:
+          authorization_endpoint: https://www.dropbox.com/oauth2/authorize
+          token_endpoint: https://api.dropboxapi.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - files.content.read
+      operations:
+        - name: file.download
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+refused_metadata:
+  version: 3
+  connectors:
+    - name: dropbox_content_refused
+      module: dropbox_content
+      config:
+        endpoint_identity: dropbox_content_conformance
+        credential_identity: dropbox_content_conformance_credential
+        oauth2:
+          authorization_endpoint: https://www.dropbox.com/oauth2/authorize
+          token_endpoint: https://api.dropboxapi.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - files.content.read
+      operations:
+        - name: file.get_metadata
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `dropbox_content_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `file.get_metadata` on module `dropbox_content`: connector operation is not compiled into this binary"
+  output_excludes: "connector-present-secret-sentinel"

@@ -1,0 +1,97 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 028 §3).
+#
+# Harvest sends two credential-adjacent values on every request and only one of
+# them is a secret: the Personal Access Token is `config.secret_key`, and the
+# account id it travels beside is ordinary `config.settings` material — Harvest
+# prints it beside the token it issues, and it selects an account rather than
+# authorizing one. The `User-Agent` is the same kind of value for the same
+# reason Basecamp's is: Harvest answers a request without one with a `400`, and
+# demands that it name the application and a way to reach its author.
+#
+# `metadata` withholds one instance's token while another instance's resolves:
+# startup must name only the unavailable variable, and must not disclose the one
+# it could read. `refused_metadata` enables the partial update Harvest publishes
+# as a `PATCH` and says nothing about repeating — a method the effect gate does
+# not admit for `NaturalMethod`, and an operation with no recorded consequence
+# for a second send, so it is not at-most-once either. `account_metadata` names
+# an account id Harvest's own grammar does not admit, which is a startup refusal
+# rather than a header this connector would have sent.
+metadata:
+  version: 3
+  connectors:
+    - name: harvest_present
+      module: harvest
+      config:
+        endpoint_identity: harvest_conformance
+        credential_identity: harvest_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          account_id: "1234567"
+          user_agent: Donat (integrations@example.test)
+      operations:
+        - name: time_entry.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: harvest_missing
+      module: harvest
+      config:
+        endpoint_identity: harvest_conformance
+        credential_identity: harvest_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          account_id: "1234567"
+          user_agent: Donat (integrations@example.test)
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: harvest_refused
+      module: harvest
+      config:
+        endpoint_identity: harvest_conformance
+        credential_identity: harvest_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          account_id: "1234567"
+          user_agent: Donat (integrations@example.test)
+      operations:
+        - name: time_entry.update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+account_metadata:
+  version: 3
+  connectors:
+    - name: harvest_account
+      module: harvest
+      config:
+        endpoint_identity: harvest_conformance
+        credential_identity: harvest_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          account_id: 1234567/../7654321
+          user_agent: Donat (integrations@example.test)
+      operations:
+        - name: time_entry.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `harvest_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `time_entry.update` on module `harvest`: connector operation is inventory-only and cannot be enabled by a deployment"
+  module_refusal: "connectors.yaml[0].config.settings.account_id: the `harvest` connector refuses this value"
+  output_excludes: "connector-present-secret-sentinel"

@@ -1,0 +1,56 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 027 §3).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an operation this deployment may not reach:
+# Cloudflare publishes `zone.update` as "Edits a zone. Only one zone property
+# can be changed at a time." — a partial update, unlike the DNS record `PUT`
+# it publishes as "Overwrite".
+metadata:
+  version: 3
+  connectors:
+    - name: cloudflare_present
+      module: cloudflare
+      config:
+        endpoint_identity: cloudflare_conformance
+        credential_identity: cloudflare_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: zone.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: cloudflare_missing
+      module: cloudflare
+      config:
+        endpoint_identity: cloudflare_conformance
+        credential_identity: cloudflare_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: cloudflare_refused
+      module: cloudflare
+      config:
+        endpoint_identity: cloudflare_conformance
+        credential_identity: cloudflare_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: zone.update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `cloudflare_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `zone.update` on module `cloudflare`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

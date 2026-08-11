@@ -61,7 +61,7 @@ notice:
 entrypoints:
   - package.json
 dependencies:
-  - dependency: n8n-workflow
+  - dependency: vendor-workflow-sdk
     disposition:
       kind: type_only_replaced
       value:

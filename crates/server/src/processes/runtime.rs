@@ -221,7 +221,36 @@ pub async fn spawn(
         let source_runtime = engine.runtimes.get(source_name).with_context(|| {
             format!("runtime for deployed Process source `{source_name}` is missing")
         })?;
-        runtimes.push(build_process_runtime(
+        // Local capabilities are compiled into this binary and are dispatched
+        // beside the connector registry, not through it. The store they write
+        // artifacts to is source-local, like everything else a Process owns.
+        let SourceRuntime::Postgres { pool, .. } = source_runtime else {
+            bail!("Process source `{source_name}` must use Postgres");
+        };
+        let artifacts = Arc::new(crate::local::StorageArtifactStore::new(
+            state.storage.clone(),
+            state.http.clone(),
+            pool.clone(),
+        ));
+        let local = Arc::new(
+            crate::local::LocalCapabilityRegistry::build(
+                &engine.metadata,
+                artifacts.clone(),
+                shutdown.clone(),
+            )
+            .map(|registry| registry.with_sources(artifacts))
+            .map_err(|errors| {
+                anyhow::anyhow!(
+                    "local capability instances are invalid: {}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })?,
+        );
+        runtimes.push(build_process_runtime_with_activity_executor(
             source_name,
             source_runtime,
             Arc::new(deployed_catalog.clone()),
@@ -229,6 +258,10 @@ pub async fn spawn(
             engine.command_catalog.clone(),
             engine.finalized_command_catalog.clone(),
             state.connectors.clone(),
+            Arc::new(crate::local::RoutedActivityExecutor::new(
+                local,
+                state.connectors.clone(),
+            )),
         )?);
     }
 

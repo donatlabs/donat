@@ -239,11 +239,30 @@ fn verified_event(
     payment_status: &str,
 ) -> donat_connector_abi::VerifiedInboundEvent {
     let body = webhook_body(provider_event_id, order_id, payment_status);
-    connectors
+    // Stripe is the one module whose inbound transaction has landed, so its
+    // verification produces a correlated event rather than the `Unacknowledged`
+    // answer spec 013's connectors give
+    // ([[053-a-verified-delivery-with-nowhere-to-go]]).
+    match connectors
         .webhook_instance(CONNECTOR_INSTANCE)
         .expect("compiled webhook instance exists")
         .verify(&signed_headers(&body), &body)
         .expect("signed fixture verifies")
+    {
+        donat_server::connectors::VerifiedDelivery::Correlated(event) => *event,
+        donat_server::connectors::VerifiedDelivery::Unacknowledged => {
+            panic!("the Stripe module publishes a correlated inbound trigger")
+        }
+    }
+}
+
+/// The catalog trigger snapshot of a module that publishes one.
+fn trigger_spec<'a>(
+    webhook: &'a donat_server::connectors::WebhookInstance<'a>,
+) -> &'a donat_connector_catalog::TriggerSpec {
+    webhook
+        .trigger()
+        .expect("the Stripe module publishes a catalog trigger snapshot")
 }
 
 #[tokio::test]
@@ -267,8 +286,9 @@ async fn accepted_and_duplicate_webhooks_share_one_dedupe_row_and_link_one_event
 
     let event = verified_event(&connectors, "evt_accepted_42", ORDER_ID, "paid");
     let (left, right) = tokio::join!(
-        runtime.persist_verified_inbound(CONNECTOR_INSTANCE, webhook.trigger(), event.clone(),),
-        runtime.persist_verified_inbound(CONNECTOR_INSTANCE, webhook.trigger(), event),
+        runtime
+            .persist_verified_inbound(CONNECTOR_INSTANCE, trigger_spec(&webhook), event.clone(),),
+        runtime.persist_verified_inbound(CONNECTOR_INSTANCE, trigger_spec(&webhook), event),
     );
     let left = left.expect("first concurrent verified delivery commits");
     let right = right.expect("second concurrent verified delivery commits");
@@ -373,7 +393,7 @@ async fn verified_webhook_outcomes_are_closed_and_never_buffered() {
         runtime
             .persist_verified_inbound(
                 CONNECTOR_INSTANCE,
-                webhook.trigger(),
+                trigger_spec(&webhook),
                 verified_event(&connectors, "evt_guard_false", ORDER_ID, "unpaid"),
             )
             .await
@@ -393,7 +413,7 @@ async fn verified_webhook_outcomes_are_closed_and_never_buffered() {
         runtime
             .persist_verified_inbound(
                 CONNECTOR_INSTANCE,
-                webhook.trigger(),
+                trigger_spec(&webhook),
                 verified_event(
                     &connectors,
                     "evt_unmatched",
@@ -438,7 +458,7 @@ async fn verified_webhook_outcomes_are_closed_and_never_buffered() {
         runtime
             .persist_verified_inbound(
                 CONNECTOR_INSTANCE,
-                webhook.trigger(),
+                trigger_spec(&webhook),
                 verified_event(&connectors, "evt_ambiguous", ambiguous_order, "paid",),
             )
             .await
@@ -471,7 +491,7 @@ async fn verified_webhook_outcomes_are_closed_and_never_buffered() {
         runtime
             .persist_verified_inbound(
                 CONNECTOR_INSTANCE,
-                webhook.trigger(),
+                trigger_spec(&webhook),
                 verified_event(&connectors, "evt_early", early_order, "paid"),
             )
             .await
@@ -616,7 +636,7 @@ async fn corrupted_webhook_wait_marker_fails_closed_without_an_acknowledgeable_a
     let error = runtime
         .persist_verified_inbound(
             CONNECTOR_INSTANCE,
-            webhook.trigger(),
+            trigger_spec(&webhook),
             verified_event(&connectors, "evt_corrupt_marker", ORDER_ID, "paid"),
         )
         .await

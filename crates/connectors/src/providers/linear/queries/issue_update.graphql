@@ -1,0 +1,15 @@
+# Linear: `issueUpdate(id: String!, input: IssueUpdateInput!): IssuePayload!` —
+# "A partial issue object to update the issue with", which is why this operation
+# is inventory-only: a partial update is not a write to a fixed resource
+# identity, and the mutation is not a `PUT` in any case.
+mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) {
+    success
+    issue {
+      id
+      identifier
+      title
+      url
+    }
+  }
+}

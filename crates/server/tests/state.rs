@@ -382,6 +382,47 @@ fn connector_startup_accepts_non_secret_identities_and_named_capacity() {
     validate_connector_startup(&metadata).expect("static connector needs no environment value");
 }
 
+/// A deployment that renders a document, reads a spreadsheet, or draws a code
+/// declares a `local.*` instance in the same `connectors.yaml` a provider uses.
+/// Connector validation must step over it: it has no module in the compiled
+/// connector table, and `donat_metadata::validate_local_capabilities` refuses
+/// the very `endpoint_identity`/`credential_identity` this validator requires,
+/// so validating it here refused every such deployment twice over. Nothing
+/// caught it because every local-capability test built its registry from a
+/// `Metadata` value directly, never through the startup path a listener opens
+/// behind.
+#[test]
+fn connector_startup_accepts_a_local_capability_instance_and_still_refuses_an_unknown_module() {
+    let local = metadata(json!([{
+        "name": "documents",
+        "module": "local.document",
+        "operations": [{ "name": "pdf.render" }]
+    }]));
+    assert!(
+        validate_connector_metadata(&local).is_empty(),
+        "a local capability instance is validated by its own validator, not this one: {:?}",
+        validate_connector_metadata(&local)
+    );
+    validate_connector_startup(&local).expect("a local capability needs no environment value");
+
+    // The skip is keyed on the reserved namespace, not on "the table does not
+    // know it" — an ordinary typo must still be refused by name.
+    let unknown = metadata(json!([{
+        "name": "documents",
+        "module": "locally.document",
+        "operations": [{ "name": "pdf.render" }]
+    }]));
+    let rendered = validate_connector_metadata(&unknown)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("unknown connector module `locally.document`"),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn connector_startup_rejects_missing_env_without_revealing_a_value() {
     let metadata = metadata(json!([{

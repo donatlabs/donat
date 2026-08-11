@@ -1,0 +1,69 @@
+# Donat-owned connector startup fixture (spec 010 §12: every connector adds a
+# native conformance fixture proving startup validation and redaction).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an operation this deployment may not reach — the
+# string `idempot` does not occur once in Atlassian's published Jira platform
+# description, so `issue.create` is inventory-only — and startup must name the
+# exact metadata path. Neither may disclose a resolved value.
+#
+# Jira is the batch's per-deployment declaration: the `site` fills its templated
+# host and the `email` is its HTTP Basic username, so both are settings.
+metadata:
+  version: 3
+  connectors:
+    - name: jira_present
+      module: jira
+      config:
+        endpoint_identity: jira_conformance
+        credential_identity: jira_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          site: donat-conformance
+          email: integrations@example.test
+      operations:
+        - name: issue.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: jira_missing
+      module: jira
+      config:
+        endpoint_identity: jira_conformance
+        credential_identity: jira_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          site: donat-conformance
+          email: integrations@example.test
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: jira_refused
+      module: jira
+      config:
+        endpoint_identity: jira_conformance
+        credential_identity: jira_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          site: donat-conformance
+          email: integrations@example.test
+      operations:
+        - name: issue.update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `jira_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `issue.update` on module `jira`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

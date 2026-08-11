@@ -307,6 +307,181 @@ fn command_dependencies() -> Dependencies {
     dependencies
 }
 
+/// The environment variable one hand-written connector fixture resolves its
+/// credential from. Its value is a sentinel: nothing here sends a request.
+const AIRTABLE_TOKEN: &str = "DONAT_TEST_PROCESS_COMPILER_AIRTABLE_TOKEN";
+
+/// One deployment of a hand-written connector, and a Process that references
+/// `operation` on it.
+fn hand_written_connector_metadata(operation: &str) -> Metadata {
+    // Safety: the connector registry reads this variable on the same thread
+    // that sets it, before any listener or worker exists.
+    unsafe { std::env::set_var(AIRTABLE_TOKEN, "pat_process_compiler_sentinel") };
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": { "database_url": "postgres://unused" }
+            }
+        }],
+        "connectors": [{
+            "name": "records",
+            "module": "airtable",
+            "config": {
+                "endpoint_identity": "airtable_process_test",
+                "credential_identity": "airtable_process_credential",
+                "secret_key": { "value_from_env": AIRTABLE_TOKEN },
+                "settings": { "base_id": "appProcessCompiler1" }
+            },
+            "operations": [{
+                "name": operation,
+                "capacity": {
+                    "max_in_flight": 1,
+                    "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+                }
+            }]
+        }],
+        "processes": [{
+            "name": "catalogue_sync",
+            "kind": "process",
+            "version": 1,
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "input": [
+                { "name": "table", "type": "string!" },
+                { "name": "request_id", "type": "uuid!" }
+            ],
+            "output": [{ "name": "status", "type": "string!" }],
+            "idempotency": {
+                "key": { "input": "request_id" },
+                "scope": [{ "input": "table" }]
+            },
+            "start_at": "read",
+            "states": [
+                {
+                    "id": "read",
+                    "request": {
+                        "connector": "records",
+                        "operation": operation,
+                        "input": { "table": { "input": "table" } },
+                        "timeout": {
+                            "schedule_to_start": "1s",
+                            "start_to_close": "6s"
+                        },
+                        "retry": {
+                            "retry_on": ["transport", "timeout"],
+                            "max_attempts": 2,
+                            "initial_interval": "100ms",
+                            "max_interval": "1s",
+                            "jitter": "deterministic_full"
+                        },
+                        "next": "done"
+                    }
+                },
+                {
+                    "id": "done",
+                    "output": { "values": { "status": { "literal": "read" } } }
+                }
+            ]
+        }]
+    }))
+    .expect("hand-written connector process metadata deserializes")
+}
+
+fn hand_written_dependencies(metadata: &Metadata) -> Dependencies {
+    Dependencies {
+        types: BTreeMap::new(),
+        commands: BTreeMap::new(),
+        rules: BTreeMap::new(),
+        decisions: BTreeMap::new(),
+        connectors: ConnectorRegistry::build(metadata)
+            .expect("the hand-written connector instance compiles"),
+    }
+}
+
+/// A Process may reference a hand-written connector operation, and what it
+/// binds is the declaration's own contract: the table is an input, the
+/// configured base is not, and the declared response is the state's output
+/// (`knowledgebase/declarative-saas/decisions/029-*`).
+#[test]
+fn a_process_compiles_against_a_hand_written_connector_operation() {
+    let metadata = hand_written_connector_metadata("record.list");
+    let dependencies = hand_written_dependencies(&metadata);
+    let catalog = compile_process_catalog(&metadata, &dependencies)
+        .expect("a Process may reference a published connector operation");
+
+    let process = catalog
+        .source("default")
+        .expect("the compiled source")
+        .process("catalogue_sync")
+        .expect("the compiled process");
+    let state = process
+        .states
+        .get("read")
+        .expect("the request state compiled");
+    assert_eq!(
+        state.output.roots.keys().collect::<Vec<_>>(),
+        ["offset", "records"],
+        "the state reads exactly the operation's declared response"
+    );
+    assert!(
+        !state.output.roots["offset"].required,
+        "a declared optional response field stays optional through compilation"
+    );
+
+    let pinned = process
+        .dependencies
+        .connector_operations
+        .values()
+        .find(|dependency| dependency.spec.operation.as_str() == "record.list")
+        .expect("the compiled revision pins the connector operation");
+    assert_eq!(pinned.instance, "records");
+    assert_eq!(
+        pinned.spec.input.roots.keys().collect::<Vec<_>>(),
+        ["table"],
+        "the configured base is deploy-time material, not a Process binding"
+    );
+}
+
+/// Spec 010 §7 at the level that matters to a product: an operation a
+/// deployment cannot enable is an operation a Process cannot reference, and the
+/// refusal names the exact metadata path.
+#[test]
+fn a_process_cannot_reference_an_inventory_only_connector_operation() {
+    // The deployment cannot even enable it, so the Process is compiled against
+    // a registry that carries the module and not that operation.
+    let enabled = hand_written_connector_metadata("record.update_patch");
+    assert!(
+        donat_server::state::validate_connector_metadata(&enabled)
+            .iter()
+            .any(|error| error
+                .to_string()
+                .contains("inventory-only and cannot be enabled by a deployment")),
+        "an inventory-only operation is refused at deploy time"
+    );
+
+    let mut metadata = hand_written_connector_metadata("record.list");
+    let dependencies = hand_written_dependencies(&metadata);
+    // ...and referencing it from a Process is refused too, rather than
+    // resolving to the read the deployment did enable.
+    match &mut metadata.processes[0].states[0].operation {
+        ProcessStateOperation::Request { request } => {
+            "record.update_patch".clone_into(&mut request.operation);
+        }
+        _ => panic!("the fixture starts with a request state"),
+    }
+
+    let error = compile_process_catalog(&metadata, &dependencies)
+        .expect_err("an inventory-only operation is not referenceable");
+    assert_eq!(error.path, "processes[0].states[0].request.operation");
+    assert_eq!(
+        error.message,
+        "connector operation `default.records.record.update_patch` is not executable"
+    );
+}
+
 #[test]
 fn process_compiler_pins_exact_horizon_and_dependency_revision() {
     // 2 * (2s + 5s takeover) + (100ms retry upper bound + 1s schedule) = 15.1s.
@@ -1132,6 +1307,63 @@ fn process_revision_is_stable_closed_and_pins_the_catalog_arc() {
     );
 }
 
+/// The persisted definition is read back, and it must recompile to the same
+/// revision.
+///
+/// `reconcile` stores `serde_json::to_value(&process.definition)` as the
+/// canonical definition of a revision, and boot decodes that value back into a
+/// [`Metadata`] process to recompile any revision that still has in-flight
+/// instances. Everything the loader derives onto a process — the document
+/// template pin of ADR 050 among it — therefore has to survive a
+/// serialize/deserialize round trip: a field that only serializes fails the
+/// decode outright, and a field that silently drops changes the definition
+/// fingerprint, which is the same revision claiming to be a different one.
+#[test]
+fn a_persisted_definition_reads_back_and_recompiles_to_the_same_revision() {
+    let mut metadata = base_metadata();
+    // What the metadata loader stamps onto a `local.document` activity. The
+    // value is derived, so no deployment writes it; the round trip below is
+    // the one a running deployment makes on every boot.
+    request_state_mut(&mut metadata).template_pin = Some("invoice@0f0f".to_owned());
+    let dependencies = base_dependencies(16_100);
+    let compiled = compile_process_catalog(&metadata, &dependencies)
+        .expect("a process carrying a derived pin compiles");
+    let deployed = compiled
+        .source("default")
+        .unwrap()
+        .process("checkout")
+        .unwrap();
+
+    let canonical_definition =
+        serde_json::to_value(&deployed.definition).expect("a compiled definition serializes");
+    let read_back: donat_metadata::Process = serde_json::from_value(canonical_definition.clone())
+        .expect("a persisted definition decodes at boot");
+    assert_eq!(
+        serde_json::to_value(&read_back).expect("the decoded definition serializes"),
+        canonical_definition,
+        "boot must read back exactly what reconcile persisted"
+    );
+
+    let mut retained = metadata.clone();
+    retained.processes.clear();
+    retained.processes.push(read_back);
+    let recompiled = compile_process_catalog(&retained, &dependencies)
+        .expect("the persisted definition recompiles");
+    let recompiled = recompiled
+        .source("default")
+        .unwrap()
+        .process("checkout")
+        .unwrap();
+    assert_eq!(
+        deployed.definition_fingerprint, recompiled.definition_fingerprint,
+        "a revision recompiled from its persisted definition is the same definition"
+    );
+    assert_eq!(
+        deployed.revision_fingerprint, recompiled.revision_fingerprint,
+        "a revision recompiled from its persisted definition is the same revision"
+    );
+}
+
 #[test]
 fn custom_owner_types_and_lifecycle_publish_exact_effect_policy() {
     let mut metadata = base_metadata();
@@ -1718,4 +1950,350 @@ fn command_result_types(name: &str) -> BTreeMap<String, String> {
         .iter()
         .map(|(name, type_)| ((*name).to_owned(), (*type_).to_owned()))
         .collect()
+}
+
+/// The environment variables the at-most-once fixture resolves its credential
+/// and webhook secret from. Both values are sentinels: nothing here sends a
+/// request.
+const TELEGRAM_TOKEN: &str = "DONAT_TEST_PROCESS_COMPILER_TELEGRAM_TOKEN";
+const TELEGRAM_WEBHOOK_SECRET: &str = "DONAT_TEST_PROCESS_COMPILER_TELEGRAM_WEBHOOK";
+
+/// One deployment of a connector whose write publishes no idempotency
+/// mechanism, and a Process that references it (ADR 063).
+///
+/// `mutate` edits the request state before it is deserialized, which is how
+/// each refusal below states exactly one thing wrong with the declaration.
+fn at_most_once_metadata(mutate: impl FnOnce(&mut serde_json::Value)) -> Metadata {
+    at_most_once_metadata_with(mutate, |_| {})
+}
+
+/// [`at_most_once_metadata`] with a second hook for the states array, so a
+/// refusal that removes an edge can also remove the state that edge reached and
+/// keep the rest of the graph honest.
+fn at_most_once_metadata_with(
+    mutate: impl FnOnce(&mut serde_json::Value),
+    mutate_states: impl FnOnce(&mut serde_json::Value),
+) -> Metadata {
+    // Safety: the connector registry reads these variables on the same thread
+    // that sets them, before any listener or worker exists.
+    unsafe {
+        std::env::set_var(TELEGRAM_TOKEN, "8100000:process-compiler-sentinel");
+        std::env::set_var(TELEGRAM_WEBHOOK_SECRET, "whsec_process_compiler_sentinel");
+    }
+    let mut request = json!({
+        "connector": "chat",
+        "operation": "message.send",
+        "input": {
+            "chat_id": { "input": "chat_id" },
+            "text": { "input": "text" }
+        },
+        "at_most_once": true,
+        "on_ambiguous": "reconcile",
+        "timeout": { "schedule_to_start": "1s", "start_to_close": "6s" },
+        "retry": {
+            "retry_on": [],
+            "max_attempts": 1,
+            "initial_interval": "100ms",
+            "max_interval": "1s",
+            "jitter": "deterministic_full"
+        },
+        "next": "done",
+        "on_error": {
+            "routes": [{ "kinds": ["validation"], "next": "refused" }],
+            "fallback": { "next": "refused" }
+        }
+    });
+    mutate(&mut request);
+    let mut states = json!([
+        { "id": "send", "request": request },
+        {
+            "id": "done",
+            "output": { "values": { "status": { "literal": "sent" } } }
+        },
+        {
+            "id": "reconcile",
+            "output": { "values": { "status": { "literal": "unknown" } } }
+        },
+        {
+            "id": "refused",
+            "output": { "values": { "status": { "literal": "refused" } } }
+        }
+    ]);
+    mutate_states(&mut states);
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": { "database_url": "postgres://unused" }
+            }
+        }],
+        "connectors": [{
+            "name": "chat",
+            "module": "telegram",
+            "config": {
+                "endpoint_identity": "telegram_process_test",
+                "credential_identity": "telegram_process_credential",
+                "secret_key": { "value_from_env": TELEGRAM_TOKEN },
+                "webhook_secret": { "value_from_env": TELEGRAM_WEBHOOK_SECRET }
+            },
+            "operations": [{
+                "name": "message.send",
+                "capacity": {
+                    "max_in_flight": 1,
+                    "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+                }
+            }, {
+                "name": "chat.get",
+                "capacity": {
+                    "max_in_flight": 1,
+                    "rate_limit": { "permits": 1, "per": "1s", "burst": 1 }
+                }
+            }]
+        }],
+        "processes": [{
+            "name": "notify",
+            "kind": "process",
+            "version": 1,
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "input": [
+                { "name": "chat_id", "type": "bigint!" },
+                { "name": "text", "type": "string!" },
+                { "name": "request_id", "type": "uuid!" }
+            ],
+            "output": [{ "name": "status", "type": "string!" }],
+            "idempotency": {
+                "key": { "input": "request_id" },
+                "scope": [{ "input": "text" }]
+            },
+            "start_at": "send",
+            "states": states
+        }]
+    }))
+    .expect("at-most-once process metadata deserializes")
+}
+
+fn at_most_once_dependencies(metadata: &Metadata) -> Dependencies {
+    Dependencies {
+        types: BTreeMap::new(),
+        commands: BTreeMap::new(),
+        rules: BTreeMap::new(),
+        decisions: BTreeMap::new(),
+        connectors: ConnectorRegistry::build(metadata)
+            .expect("the at-most-once connector instance compiles"),
+    }
+}
+
+fn at_most_once_error(mutate: impl FnOnce(&mut serde_json::Value)) -> donat_schema::PlanError {
+    let metadata = at_most_once_metadata(mutate);
+    let dependencies = at_most_once_dependencies(&metadata);
+    compile_process_catalog(&metadata, &dependencies)
+        .expect_err("the declaration is refused at compilation")
+}
+
+/// ADR 063, the admission: a provider write with no idempotency mechanism is
+/// executable when — and only when — the activity that references it says so,
+/// and says where an outcome nobody can know goes.
+#[test]
+fn a_process_may_reference_an_at_most_once_operation_that_declares_the_opt_in() {
+    let metadata = at_most_once_metadata(|_| {});
+    let dependencies = at_most_once_dependencies(&metadata);
+    let catalog = compile_process_catalog(&metadata, &dependencies)
+        .expect("a declared at-most-once activity compiles");
+
+    let state = catalog
+        .source("default")
+        .expect("the compiled source")
+        .process("notify")
+        .expect("the compiled process")
+        .states
+        .get("send")
+        .expect("the request state compiled");
+    let donat_server::processes::CompiledProcessStateOperation::Request(request) = &state.operation
+    else {
+        panic!("the fixture starts with a request state")
+    };
+    assert!(request.at_most_once);
+    assert_eq!(request.on_ambiguous.as_deref(), Some("reconcile"));
+    assert!(
+        !request.provider_idempotent,
+        "there is no provider key to bind: that is the whole reason the class exists"
+    );
+    assert!(
+        state.maximum_send_horizons_ms.is_empty(),
+        "no provider retention window means no compiled send horizon"
+    );
+}
+
+/// The gate itself: the same operation, referenced without the opt-in, is
+/// refused with the metadata path of the declaration that is missing.
+#[test]
+fn an_at_most_once_operation_is_refused_without_the_opt_in() {
+    let error = at_most_once_error(|request| {
+        request["at_most_once"] = json!(false);
+        request.as_object_mut().unwrap().remove("on_ambiguous");
+        request["on_error"]["fallback"]["next"] = json!("reconcile");
+        request["retry"]["retry_on"] = json!(["transport"]);
+    });
+    assert_eq!(error.path, "processes[0].states[0].request.at_most_once");
+    assert!(
+        error.message.contains("publishes no idempotency mechanism")
+            && error.message.contains("at_most_once: true"),
+        "{}",
+        error.message
+    );
+}
+
+/// ADR 034 in the other direction: the opt-in on an operation whose provider
+/// absorbs a duplicate is a declaration the runtime would ignore.
+#[test]
+fn the_at_most_once_opt_in_is_refused_on_an_operation_that_does_not_need_it() {
+    let error = at_most_once_error(|request| {
+        request["operation"] = json!("chat.get");
+        request["input"] = json!({ "chat_id": { "input": "chat_id" } });
+        request["retry"]["retry_on"] = json!(["transport"]);
+    });
+    assert_eq!(error.path, "processes[0].states[0].request.at_most_once");
+    assert!(
+        error.message.contains("would change nothing"),
+        "{}",
+        error.message
+    );
+}
+
+/// The route is not optional, and `on_error` cannot stand in for it: a failure
+/// is a known outcome and an ambiguous send is the absence of one.
+#[test]
+fn an_at_most_once_activity_is_refused_without_an_ambiguous_route() {
+    // The fallback keeps `reconcile` reachable, so the refusal under test is
+    // the missing route and not an unreachable state.
+    let error = at_most_once_error(|request| {
+        request.as_object_mut().unwrap().remove("on_ambiguous");
+        request["on_error"]["fallback"]["next"] = json!("reconcile");
+    });
+    assert_eq!(error.path, "processes[0].states[0].request.on_ambiguous");
+    assert!(
+        error.message.contains("`on_error` routes failures"),
+        "{}",
+        error.message
+    );
+}
+
+/// And the route without the opt-in is refused too, for the same reason the
+/// opt-in without the class is: nothing would ever route there.
+#[test]
+fn an_ambiguous_route_is_refused_without_the_at_most_once_opt_in() {
+    let error = at_most_once_error(|request| {
+        request["at_most_once"] = json!(false);
+        request["operation"] = json!("chat.get");
+        request["input"] = json!({ "chat_id": { "input": "chat_id" } });
+        request["retry"]["retry_on"] = json!(["transport"]);
+    });
+    assert_eq!(error.path, "processes[0].states[0].request.on_ambiguous");
+    assert!(
+        error
+            .message
+            .contains("reachable only for an at-most-once activity"),
+        "{}",
+        error.message
+    );
+}
+
+/// The sharpest interaction (ADR 063 §retry): a retryable class on an
+/// at-most-once activity is a *second provider attempt*, which is exactly what
+/// the class refuses. `retry_on` must be empty and the attempt budget must be
+/// one, or the declaration promises something the runtime will not do.
+#[test]
+fn an_at_most_once_activity_may_not_declare_a_retryable_failure_class() {
+    for kind in ["transport", "timeout", "http_429", "http_5xx"] {
+        let error = at_most_once_error(|request| {
+            request["retry"]["retry_on"] = json!([kind]);
+        });
+        assert_eq!(
+            error.path, "processes[0].states[0].request.retry.retry_on",
+            "{kind}"
+        );
+        assert!(
+            error.message.contains("second provider attempt"),
+            "{kind}: {}",
+            error.message
+        );
+    }
+
+    let error = at_most_once_error(|request| {
+        request["retry"]["max_attempts"] = json!(2);
+    });
+    assert_eq!(
+        error.path,
+        "processes[0].states[0].request.retry.max_attempts"
+    );
+    assert!(
+        error.message.contains("exactly one attempt"),
+        "{}",
+        error.message
+    );
+}
+
+/// An at-most-once operation binds no provider key, so a stable activity key
+/// declared on one names a binding that does not exist.
+#[test]
+fn an_at_most_once_activity_declares_no_idempotency_key() {
+    let error = at_most_once_error(|request| {
+        request["idempotency_key"] = json!({ "stable": { "run": "id", "state": "send" } });
+    });
+    assert_eq!(error.path, "processes[0].states[0].request.idempotency_key");
+    assert!(
+        error.message.contains("binds no provider key"),
+        "{}",
+        error.message
+    );
+}
+
+/// The ambiguous route is a real transition: it must name a state, and the
+/// graph is validated with it in place.
+#[test]
+fn an_ambiguous_route_must_name_a_declared_state() {
+    let error = at_most_once_error(|request| {
+        request["on_ambiguous"] = json!("nowhere");
+    });
+    assert!(
+        error.message.contains("nowhere"),
+        "{} at {}",
+        error.message,
+        error.path
+    );
+}
+
+/// ADR 034 in the direction the compiler was missing. An at-most-once activity
+/// with only `on_ambiguous` compiles today and then stalls: the transition
+/// consumer needs a compiled error route to place a failure, refuses when there
+/// is none, and the instance sits `running` forever. This class is where the
+/// omission is certain rather than merely possible — `retry_on` is empty and
+/// `max_attempts` is one, so the *first* ordinary failure is terminal.
+#[test]
+fn an_at_most_once_activity_must_declare_where_a_failure_goes() {
+    let metadata = at_most_once_metadata_with(
+        |request| {
+            request.as_object_mut().unwrap().remove("on_error");
+        },
+        |states| {
+            // `refused` was reachable only through the route just removed.
+            states
+                .as_array_mut()
+                .unwrap()
+                .retain(|state| state["id"] != json!("refused"));
+        },
+    );
+    let dependencies = at_most_once_dependencies(&metadata);
+    let error = compile_process_catalog(&metadata, &dependencies)
+        .expect_err("a request activity with nowhere to put a failure is refused");
+    assert_eq!(error.path, "processes[0].states[0].request.on_error");
+    assert!(
+        error.message.contains("on_error"),
+        "{} at {}",
+        error.message,
+        error.path
+    );
 }

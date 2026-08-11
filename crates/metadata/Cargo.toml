@@ -10,3 +10,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+phonenumber = { workspace = true }
+chrono-tz = { workspace = true }
+# A document template is pinned into the process definition revision by the
+# hash of its bytes (spec 019 §2), and that hash is taken where the bytes are
+# read.
+sha2 = { workspace = true }

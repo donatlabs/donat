@@ -1,0 +1,89 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 026 §4).
+#
+# `metadata` withholds one instance's OAuth2 client secret while another
+# instance's resolves: startup must name only the unavailable variable.
+# `refused_metadata` declares a send horizon one millisecond past the window
+# Xero's own documented six-minute key retention leaves once the clock safety
+# margin is taken off — the point at which "Repeating the same key after expiry
+# … will instead be processed as a new key", which for `payment.create` is a
+# second payment. Startup must refuse it by its metadata path, and neither
+# document may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: xero_present
+      module: xero
+      config:
+        endpoint_identity: xero_conformance
+        credential_identity: xero_conformance_credential
+        settings:
+          tenant_id: 00000000-0000-0000-0000-000000000042
+        oauth2:
+          authorization_endpoint: https://login.xero.com/identity/connect/authorize
+          token_endpoint: https://identity.xero.com/connect/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - accounting.transactions
+      operations:
+        - name: invoice.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: xero_missing
+      module: xero
+      config:
+        endpoint_identity: xero_conformance
+        credential_identity: xero_conformance_credential
+        settings:
+          tenant_id: 00000000-0000-0000-0000-000000000043
+        oauth2:
+          authorization_endpoint: https://login.xero.com/identity/connect/authorize
+          token_endpoint: https://identity.xero.com/connect/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - accounting.transactions
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: xero_refused
+      module: xero
+      config:
+        endpoint_identity: xero_conformance
+        credential_identity: xero_conformance_credential
+        settings:
+          tenant_id: 00000000-0000-0000-0000-000000000042
+          send_horizon_ms: "300001"
+        oauth2:
+          authorization_endpoint: https://login.xero.com/identity/connect/authorize
+          token_endpoint: https://identity.xero.com/connect/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - accounting.transactions
+      operations:
+        - name: payment.create
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `xero_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].config.settings.send_horizon_ms: the `xero` connector refuses this value: the send horizon must fit inside the documented six-minute key retention less the clock safety margin"
+  output_excludes: "connector-present-secret-sentinel"

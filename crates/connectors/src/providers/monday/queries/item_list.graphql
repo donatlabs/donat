@@ -1,0 +1,22 @@
+# One page of a board's items. monday: "The `items_page` object represents a
+# page of items", and the continuation is its own `cursor` field.
+query ItemList($board_id: ID!, $limit: Int!, $cursor: String) {
+  boards(ids: [$board_id]) {
+    id
+    items_page(limit: $limit, cursor: $cursor) {
+      cursor
+      items {
+        id
+        name
+        state
+        url
+        updated_at
+        column_values {
+          id
+          text
+          value
+        }
+      }
+    }
+  }
+}

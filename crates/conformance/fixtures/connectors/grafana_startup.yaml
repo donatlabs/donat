@@ -1,0 +1,62 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 027 §3).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable. The
+# `instance_origin` is the deployment's own Grafana instance.
+# `refused_metadata` enables an operation this deployment may not reach:
+# Grafana publishes `alert_rule.update` as "Update an existing alert rule."
+# and publishes no statement about repeating one, so it is inventory-only.
+metadata:
+  version: 3
+  connectors:
+    - name: grafana_present
+      module: grafana
+      config:
+        endpoint_identity: grafana_conformance
+        credential_identity: grafana_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          instance_origin: https://grafana.donat-conformance.example.test
+      operations:
+        - name: alert_rule.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: grafana_missing
+      module: grafana
+      config:
+        endpoint_identity: grafana_conformance
+        credential_identity: grafana_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          instance_origin: https://grafana.donat-conformance.example.test
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: grafana_refused
+      module: grafana
+      config:
+        endpoint_identity: grafana_conformance
+        credential_identity: grafana_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          instance_origin: https://grafana.donat-conformance.example.test
+      operations:
+        - name: alert_rule.update
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `grafana_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `alert_rule.update` on module `grafana`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

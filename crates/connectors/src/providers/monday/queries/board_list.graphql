@@ -1,0 +1,14 @@
+# monday: "limit — The number of boards to return. The default is 25", "page —
+# The page number to return. Starts at 1."
+query BoardList($limit: Int!, $page: Int!) {
+  boards(limit: $limit, page: $page) {
+    id
+    name
+    state
+    board_kind
+    workspace {
+      id
+      name
+    }
+  }
+}

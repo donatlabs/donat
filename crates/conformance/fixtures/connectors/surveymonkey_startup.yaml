@@ -1,0 +1,59 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 028 §4).
+#
+# `metadata` withholds one instance's access token while another instance's
+# resolves: startup must name only the unavailable variable. SurveyMonkey's
+# origin is a compiled constant and its access token is the whole credential,
+# so neither instance configures a setting at all — the EU and Canadian
+# datacentres are a second connector rather than a second mode of this one.
+# `refused_metadata` enables the one `DELETE` this connector declares:
+# SurveyMonkey publishes no repeat statement for it and no consequence of a
+# second send either, so it is inventory-only and startup must name its exact
+# metadata path.
+metadata:
+  version: 3
+  connectors:
+    - name: surveymonkey_present
+      module: surveymonkey
+      config:
+        endpoint_identity: surveymonkey_conformance
+        credential_identity: surveymonkey_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: survey.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: surveymonkey_missing
+      module: surveymonkey
+      config:
+        endpoint_identity: surveymonkey_conformance
+        credential_identity: surveymonkey_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: surveymonkey_refused
+      module: surveymonkey
+      config:
+        endpoint_identity: surveymonkey_conformance
+        credential_identity: surveymonkey_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: response.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `surveymonkey_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `response.delete` on module `surveymonkey`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

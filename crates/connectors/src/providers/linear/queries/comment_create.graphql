@@ -1,0 +1,13 @@
+# Linear: `commentCreate(input: CommentCreateInput!): CommentPayload!` — "The
+# comment object to create."
+mutation CommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) {
+    success
+    comment {
+      id
+      body
+      url
+      createdAt
+    }
+  }
+}

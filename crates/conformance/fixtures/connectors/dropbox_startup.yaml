@@ -1,0 +1,89 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 025 §4).
+#
+# `metadata` withholds one instance's OAuth2 client secret while another's resolves.
+# `refused_metadata` enables the delete: Dropbox serves every endpoint over `POST`, its own
+# RPC style, so no write of its can reach `NaturalMethod` — and its published error union
+# makes a repeat a refusal rather than a second effect, which wants a class that keeps the
+# retry rather than ADR 063's. Neither may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: dropbox_present
+      module: dropbox
+      config:
+        endpoint_identity: dropbox_conformance
+        credential_identity: dropbox_conformance_credential
+        oauth2:
+          authorization_endpoint: https://www.dropbox.com/oauth2/authorize
+          token_endpoint: https://api.dropboxapi.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - files.metadata.read
+            - files.content.read
+      operations:
+        - name: file.get_metadata
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: dropbox_missing
+      module: dropbox
+      config:
+        endpoint_identity: dropbox_conformance
+        credential_identity: dropbox_conformance_credential
+        oauth2:
+          authorization_endpoint: https://www.dropbox.com/oauth2/authorize
+          token_endpoint: https://api.dropboxapi.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+          scopes:
+            - files.metadata.read
+            - files.content.read
+      operations:
+        - name: file.get_metadata
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+refused_metadata:
+  version: 3
+  connectors:
+    - name: dropbox_refused
+      module: dropbox
+      config:
+        endpoint_identity: dropbox_conformance
+        credential_identity: dropbox_conformance_credential
+        oauth2:
+          authorization_endpoint: https://www.dropbox.com/oauth2/authorize
+          token_endpoint: https://api.dropboxapi.com/oauth2/token
+          redirect_uri: http://127.0.0.1:8765/callback
+          client_id:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          client_secret:
+            value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+          scopes:
+            - files.metadata.read
+            - files.content.read
+      operations:
+        - name: file.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `dropbox_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `file.delete` on module `dropbox`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

@@ -1,0 +1,61 @@
+# Donat-owned connector startup fixture (spec 010 §12: every connector adds a
+# native conformance fixture proving startup validation and redaction).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable.
+# `refused_metadata` enables an operation this deployment may not reach: startup
+# must name the exact metadata path. Neither may disclose a resolved value.
+metadata:
+  version: 3
+  connectors:
+    - name: twilio_present
+      module: twilio
+      config:
+        endpoint_identity: twilio_conformance
+        credential_identity: twilio_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          account_sid: AC00000000000000000000000000000042
+      operations:
+        - name: message.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: twilio_missing
+      module: twilio
+      config:
+        endpoint_identity: twilio_conformance
+        credential_identity: twilio_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          account_sid: AC00000000000000000000000000000042
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: twilio_refused
+      module: twilio
+      config:
+        endpoint_identity: twilio_conformance
+        credential_identity: twilio_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          account_sid: AC00000000000000000000000000000042
+      operations:
+        - name: message.send_batch
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `twilio_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `message.send_batch` on module `twilio`: connector operation is not compiled into this binary"
+  output_excludes: "connector-present-secret-sentinel"

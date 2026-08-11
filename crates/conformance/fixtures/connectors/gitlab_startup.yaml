@@ -1,0 +1,63 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 027 §3).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable. The
+# `instance_origin` is the deployment's own GitLab instance, named as a whole
+# origin, and it is checked before a listener opens.
+# `refused_metadata` enables a name this binary was never built with: every
+# operation GitLab declares here is executable, so the refusal this connector
+# owes is the undeclared one.
+metadata:
+  version: 3
+  connectors:
+    - name: gitlab_present
+      module: gitlab
+      config:
+        endpoint_identity: gitlab_conformance
+        credential_identity: gitlab_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          instance_origin: https://gitlab.donat-conformance.example.test
+      operations:
+        - name: project.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: gitlab_missing
+      module: gitlab
+      config:
+        endpoint_identity: gitlab_conformance
+        credential_identity: gitlab_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+        settings:
+          instance_origin: https://gitlab.donat-conformance.example.test
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: gitlab_refused
+      module: gitlab
+      config:
+        endpoint_identity: gitlab_conformance
+        credential_identity: gitlab_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+        settings:
+          instance_origin: https://gitlab.donat-conformance.example.test
+      operations:
+        - name: issue.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `gitlab_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `issue.delete` on module `gitlab`: connector operation is not compiled into this binary"
+  output_excludes: "connector-present-secret-sentinel"

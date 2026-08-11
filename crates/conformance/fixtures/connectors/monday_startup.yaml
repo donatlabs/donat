@@ -1,0 +1,55 @@
+# Donat-owned connector startup fixture (spec 010 §12).
+#
+# `refused_metadata` enables the operation whose class this batch's sharpest
+# finding produced: monday publishes an `Idempotency-Key` with a 30-minute cache
+# *and* an unquantified escape clause, so no mutation of it is provider
+# idempotent, and `item.delete` — a GraphQL mutation over a POST, with no
+# published second send — is inventory-only.
+metadata:
+  version: 3
+  connectors:
+    - name: monday_present
+      module: monday
+      config:
+        endpoint_identity: monday_conformance
+        credential_identity: monday_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: item.get
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: monday_missing
+      module: monday
+      config:
+        endpoint_identity: monday_conformance
+        credential_identity: monday_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: monday_refused
+      module: monday
+      config:
+        endpoint_identity: monday_conformance
+        credential_identity: monday_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: item.delete
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `monday_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `item.delete` on module `monday`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

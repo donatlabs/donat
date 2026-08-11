@@ -1,0 +1,58 @@
+# Donat-owned connector startup fixture (spec 010 §12, spec 027 §3).
+#
+# `metadata` withholds one required environment value while another instance's
+# secret resolves: startup must name only the unavailable variable. The
+# credential is a bearer token because this connector declares UptimeRobot's
+# v3 surface, whose own OpenAPI publishes one HTTP bearer scheme; the v2 form
+# that put the key in the request body is not declared anywhere.
+# `refused_metadata` enables the write UptimeRobot documents as repeat-safe
+# over a `POST`, which wants a class that keeps the retry and therefore stays
+# inventory-only.
+metadata:
+  version: 3
+  connectors:
+    - name: uptimerobot_present
+      module: uptimerobot
+      config:
+        endpoint_identity: uptimerobot_conformance
+        credential_identity: uptimerobot_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: monitor.list
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+    - name: uptimerobot_missing
+      module: uptimerobot
+      config:
+        endpoint_identity: uptimerobot_conformance
+        credential_identity: uptimerobot_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY
+      operations: []
+refused_metadata:
+  version: 3
+  connectors:
+    - name: uptimerobot_refused
+      module: uptimerobot
+      config:
+        endpoint_identity: uptimerobot_conformance
+        credential_identity: uptimerobot_conformance_credential
+        secret_key:
+          value_from_env: DONAT_CONNECTOR_CONFORMANCE_PRESENT_SECRET
+      operations:
+        - name: monitor.pause
+          capacity:
+            max_in_flight: 1
+            rate_limit:
+              permits: 1
+              per: 1s
+              burst: 1
+expect:
+  missing_variable: "connector instance `uptimerobot_missing` requires environment variable `DONAT_CONNECTOR_CONFORMANCE_MISSING_API_KEY`"
+  refused_operation: "connectors.yaml[0].operations[0].name: connector operation `monitor.pause` on module `uptimerobot`: connector operation is inventory-only and cannot be enabled by a deployment"
+  output_excludes: "connector-present-secret-sentinel"

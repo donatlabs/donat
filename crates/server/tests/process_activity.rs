@@ -831,12 +831,11 @@ impl ProcessActivityExecutor for RetryThenSuccessExecutor {
                 .push(idempotency_key.to_owned());
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call == 0 {
-                Err(ConnectorFailure {
-                    class: ConnectorErrorClass::Http5xx,
-                    code: "provider_unavailable",
-                    safe_message: "the provider is temporarily unavailable".to_owned(),
-                    retry_after: None,
-                })
+                Err(ConnectorFailure::new(
+                    ConnectorErrorClass::Http5xx,
+                    "provider_unavailable",
+                    "the provider is temporarily unavailable",
+                ))
             } else {
                 Ok(ConnectorSuccess {
                     output: json!({ "status": "authorized" }),
@@ -1094,12 +1093,11 @@ impl ProcessActivityExecutor for AuthenticationFailureExecutor {
     ) -> BoxFuture<'a, Result<ConnectorSuccess, ConnectorFailure>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(ConnectorFailure {
-                class: ConnectorErrorClass::Authentication,
-                code: "provider_authentication",
-                safe_message: "the provider rejected its configured credential".to_owned(),
-                retry_after: None,
-            })
+            Err(ConnectorFailure::new(
+                ConnectorErrorClass::Authentication,
+                "provider_authentication",
+                "the provider rejected its configured credential",
+            ))
         })
     }
 }
@@ -1278,12 +1276,11 @@ impl ProcessActivityExecutor for AlwaysUnavailableExecutor {
                 .lock()
                 .await
                 .push(idempotency_key.to_owned());
-            Err(ConnectorFailure {
-                class: ConnectorErrorClass::Http5xx,
-                code: "provider_unavailable",
-                safe_message: "the provider is temporarily unavailable".to_owned(),
-                retry_after: None,
-            })
+            Err(ConnectorFailure::new(
+                ConnectorErrorClass::Http5xx,
+                "provider_unavailable",
+                "the provider is temporarily unavailable",
+            ))
         })
     }
 }
@@ -2028,12 +2025,12 @@ impl ProcessActivityExecutor for ExcessiveRetryAfterExecutor {
     ) -> BoxFuture<'a, Result<ConnectorSuccess, ConnectorFailure>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(ConnectorFailure {
-                class: ConnectorErrorClass::Http429,
-                code: "rate_limited",
-                safe_message: "the provider requested an excessive delay".to_owned(),
-                retry_after: Some(std::time::Duration::from_millis(101)),
-            })
+            Err(ConnectorFailure::new(
+                ConnectorErrorClass::Http429,
+                "rate_limited",
+                "the provider requested an excessive delay",
+            )
+            .with_retry_after(Some(std::time::Duration::from_millis(101))))
         })
     }
 }
@@ -2171,12 +2168,11 @@ impl ProcessActivityExecutor for SeedProviderDeadlineExecutor {
         Box::pin(async move {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call == 0 {
-                Err(ConnectorFailure {
-                    class: ConnectorErrorClass::Http5xx,
-                    code: "provider_unavailable",
-                    safe_message: "the provider is temporarily unavailable".to_owned(),
-                    retry_after: None,
-                })
+                Err(ConnectorFailure::new(
+                    ConnectorErrorClass::Http5xx,
+                    "provider_unavailable",
+                    "the provider is temporarily unavailable",
+                ))
             } else {
                 Ok(ConnectorSuccess {
                     output: json!({ "status": "must-not-run" }),
@@ -2948,5 +2944,786 @@ async fn malformed_connector_success_becomes_a_durable_invariant_failure() {
             ..
         } if routed == instance_id && to_state == "provider_failed"
     ));
+    database.drop().await;
+}
+
+/// The environment variable the at-most-once fixture resolves its credential
+/// from. Its value is a sentinel: the activity executor here is a stub.
+const AT_MOST_ONCE_TOKEN: &str = "DONAT_TEST_PROCESS_ACTIVITY_SLACK_TOKEN";
+
+/// A deployment whose one write publishes no idempotency mechanism, and the
+/// Process that accepted it (ADR 063).
+fn at_most_once_metadata() -> Metadata {
+    // Safety: the connector registry reads this variable on the same thread
+    // that sets it, before any listener or worker exists.
+    unsafe { std::env::set_var(AT_MOST_ONCE_TOKEN, "xoxb-process-activity-sentinel") };
+    serde_json::from_value(json!({
+        "version": 3,
+        "sources": [{
+            "name": "default",
+            "kind": "postgres",
+            "configuration": {
+                "connection_info": { "database_url": "postgres://unused" }
+            }
+        }],
+        "connectors": [{
+            "name": "chat",
+            "module": "slack",
+            "config": {
+                "endpoint_identity": "process-activity-slack-v1",
+                "credential_identity": "process-activity-slack-credential",
+                "secret_key": { "value_from_env": AT_MOST_ONCE_TOKEN }
+            },
+            "operations": [{
+                "name": "message.post",
+                "capacity": {
+                    "max_in_flight": 4,
+                    "rate_limit": { "permits": 10, "per": "1s", "burst": 4 }
+                }
+            }]
+        }],
+        "processes": [{
+            "name": "checkout",
+            "kind": "process",
+            "version": 1,
+            "source": "default",
+            "permissions": [{ "role": "customer" }],
+            "input": [
+                { "name": "channel", "type": "string!" },
+                { "name": "text", "type": "string!" },
+                { "name": "request_id", "type": "uuid!" }
+            ],
+            "output": [{ "name": "status", "type": "string!" }],
+            "idempotency": {
+                "key": { "input": "request_id" },
+                "scope": [{ "input": "channel" }]
+            },
+            "start_at": "post",
+            "states": [
+                {
+                    "id": "post",
+                    "request": {
+                        "connector": "chat",
+                        "operation": "message.post",
+                        "input": {
+                            "channel": { "input": "channel" },
+                            "text": { "input": "text" }
+                        },
+                        "at_most_once": true,
+                        "on_ambiguous": "unknown",
+                        "timeout": {
+                            "schedule_to_start": "1s",
+                            "start_to_close": "6s"
+                        },
+                        "retry": {
+                            "retry_on": [],
+                            "max_attempts": 1,
+                            "initial_interval": "100ms",
+                            "max_interval": "1s",
+                            "jitter": "deterministic_full"
+                        },
+                        "next": "done",
+                        "on_error": {
+                            "routes": [{
+                                "kinds": ["validation"],
+                                "next": "refused"
+                            }],
+                            "fallback": { "next": "refused" }
+                        }
+                    }
+                },
+                {
+                    "id": "done",
+                    "output": { "values": { "status": { "literal": "posted" } } }
+                },
+                {
+                    "id": "unknown",
+                    "output": { "values": { "status": { "literal": "unknown" } } }
+                },
+                {
+                    "id": "refused",
+                    "fail": {
+                        "code": "provider_refused",
+                        "message": "the provider refused the message"
+                    }
+                }
+            ]
+        }]
+    }))
+    .expect("at-most-once Process activity metadata deserializes")
+}
+
+async fn seed_at_most_once_start(database_url: &str, revision: &str) -> Uuid {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .expect("Process activity database is available");
+    let connection = tokio::spawn(connection);
+    let request_id = client
+        .query_one(
+            "
+            INSERT INTO donat.process_start_requests (
+                source_name, process_name, revision, input_json,
+                command_invocation_id, effect_position, idempotency_key, status
+            )
+            VALUES ('default', 'checkout', $1, $2, gen_random_uuid(), 0, $3, 'pending')
+            RETURNING id
+            ",
+            &[
+                &revision,
+                &json!({ "channel": "C0000001", "text": "one send", "request_id": REQUEST_ID }),
+                &REQUEST_ID,
+            ],
+        )
+        .await
+        .expect("Process activity start request inserts")
+        .get(0);
+    connection.abort();
+    request_id
+}
+
+/// An executor that never answers, so the worker holding the one send
+/// authorization is exactly a worker that vanished mid-request.
+struct StalledExecutor {
+    calls: AtomicUsize,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl StalledExecutor {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl ProcessActivityExecutor for StalledExecutor {
+    fn execute<'a>(
+        &'a self,
+        _instance: &'a str,
+        _operation: &'a str,
+        _input: Json,
+        _idempotency_key: &'a str,
+        _deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<ConnectorSuccess, ConnectorFailure>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.started.notify_one();
+            self.release.notified().await;
+            Err(ConnectorFailure::new(
+                ConnectorErrorClass::Transport,
+                "transport",
+                "the first worker never learned the outcome",
+            ))
+        })
+    }
+}
+
+/// ADR 063 at runtime. The send authorization is committed before the request
+/// leaves and is claimed exactly once, so the worker that takes the lease over
+/// cannot send again — and does not pretend the send failed. It reports an
+/// outcome nobody knows, and the Process takes the route it declared for one.
+#[tokio::test]
+async fn an_at_most_once_send_is_claimed_once_and_a_takeover_routes_the_unknown_outcome() {
+    let database = TestDatabase::create("process_activity_at_most_once").await;
+    let metadata = at_most_once_metadata();
+    let executor = Arc::new(StalledExecutor::new());
+    let (runtime, revision) = runtime(&database, &metadata, Some(executor.clone())).await;
+    seed_at_most_once_start(&database.url, &revision).await;
+    let instance_id = match runtime
+        .consume_one_start()
+        .await
+        .expect("Process start consumes")
+    {
+        StartConsumption::Started { instance_id, .. } => instance_id,
+        other => panic!("expected a new Process instance, got {other:?}"),
+    };
+    let activity_job_id = match runtime
+        .consume_one_transition()
+        .await
+        .expect("request activity schedules")
+    {
+        TransitionConsumption::ActivityScheduled {
+            activity_job_id, ..
+        } => activity_job_id,
+        other => panic!("expected an activity schedule, got {other:?}"),
+    };
+
+    let runtime = Arc::new(runtime);
+    let first_worker = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.consume_one_activity().await }
+    });
+    executor.started.notified().await;
+
+    let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("the at-most-once clock is mutable by the test");
+    let connection = tokio::spawn(connection);
+    // The send authorization is durable before the request leaves, which is the
+    // whole of the promise: whatever happens to this worker, the row is there.
+    assert_eq!(
+        client
+            .query_one(
+                "
+                SELECT count(*)
+                FROM donat.process_activity_provider_steps
+                WHERE source_name = 'default' AND activity_job_id = $1
+                ",
+                &[&activity_job_id],
+            )
+            .await
+            .expect("the authorization is readable")
+            .get::<_, i64>(0),
+        1,
+        "the one send is claimed in the database before any byte leaves"
+    );
+    client
+        .execute(
+            "
+            UPDATE donat.process_activity_jobs
+            SET lease_expires_at = statement_timestamp() - interval '1 millisecond',
+                available_at = statement_timestamp()
+            WHERE source_name = 'default' AND id = $1
+            ",
+            &[&activity_job_id],
+        )
+        .await
+        .expect("test expires the first worker lease inside the takeover grace");
+    client
+        .execute(
+            "
+            UPDATE donat.process_capacity_reservations
+            SET expires_at = statement_timestamp() - interval '1 millisecond'
+            WHERE source_name = 'default'
+              AND activity_job_id = $1
+              AND released_at IS NULL
+            ",
+            &[&activity_job_id],
+        )
+        .await
+        .expect("test expires the first worker capacity reservation");
+
+    let taken_over = runtime
+        .consume_one_activity()
+        .await
+        .expect("the lease is taken over");
+    let ActivityConsumption::Failed {
+        instance_id: failed_instance,
+        activity_job_id: failed_job,
+        ..
+    } = taken_over
+    else {
+        panic!("expected a terminal outcome, got {taken_over:?}")
+    };
+    assert_eq!(failed_instance, instance_id);
+    assert_eq!(failed_job, activity_job_id);
+    assert_eq!(
+        executor.calls.load(Ordering::Relaxed),
+        1,
+        "the second worker never reached the provider"
+    );
+
+    assert!(matches!(
+        runtime
+            .consume_one_transition()
+            .await
+            .expect("the unknown outcome routes"),
+        TransitionConsumption::Advanced { .. }
+    ));
+    let row = client
+        .query_one(
+            "
+            SELECT
+                instance.current_state,
+                job.last_error_json->>'code',
+                (SELECT count(*)
+                 FROM donat.process_transition_logs log
+                 WHERE log.source_name = 'default'
+                   AND log.activity_job_id = job.id
+                   AND log.outcome = 'activity_ambiguous_routed'
+                   AND log.to_state = 'unknown'),
+                (SELECT count(*)
+                 FROM donat.process_transition_logs log
+                 WHERE log.source_name = 'default'
+                   AND log.activity_job_id = job.id
+                   AND log.outcome = 'activity_error_routed'),
+                (SELECT count(*)
+                 FROM donat.process_activity_provider_steps step
+                 WHERE step.source_name = 'default'
+                   AND step.activity_job_id = job.id)
+            FROM donat.process_activity_jobs job
+            JOIN donat.process_instances instance
+              ON instance.source_name = job.source_name
+             AND instance.id = job.instance_id
+            WHERE job.source_name = 'default' AND job.id = $1
+            ",
+            &[&activity_job_id],
+        )
+        .await
+        .expect("the ambiguous outcome is inspectable");
+    assert_eq!(
+        row.get::<_, String>(0),
+        "unknown",
+        "the instance took its declared ambiguous route"
+    );
+    assert_eq!(
+        row.get::<_, Option<String>>(1).as_deref(),
+        Some("provider_send_ambiguous")
+    );
+    assert_eq!(
+        row.get::<_, i64>(2),
+        1,
+        "the journal says it was not an error"
+    );
+    assert_eq!(
+        row.get::<_, i64>(3),
+        0,
+        "no `on_error` route or fallback ever claims an unknown outcome"
+    );
+    assert_eq!(
+        row.get::<_, i64>(4),
+        1,
+        "the one authorization is never rotated or duplicated"
+    );
+    connection.abort();
+
+    executor.release.notify_one();
+    first_worker.abort();
+    database.drop().await;
+}
+
+/// The other way a worker can be lost: nobody takes the lease over inside the
+/// grace at all. The activity is late rather than failed, and the engine still
+/// has no idea whether the send happened — so the outcome is the same unknown,
+/// not the `timeout` an activity with no authorized send would report.
+#[tokio::test]
+async fn a_late_at_most_once_activity_with_an_authorized_send_is_unknown_not_timed_out() {
+    let database = TestDatabase::create("process_activity_at_most_once_late").await;
+    let metadata = at_most_once_metadata();
+    let executor = Arc::new(StalledExecutor::new());
+    let (runtime, revision) = runtime(&database, &metadata, Some(executor.clone())).await;
+    seed_at_most_once_start(&database.url, &revision).await;
+    match runtime
+        .consume_one_start()
+        .await
+        .expect("Process start consumes")
+    {
+        StartConsumption::Started { .. } => {}
+        other => panic!("expected a new Process instance, got {other:?}"),
+    }
+    let activity_job_id = match runtime
+        .consume_one_transition()
+        .await
+        .expect("request activity schedules")
+    {
+        TransitionConsumption::ActivityScheduled {
+            activity_job_id, ..
+        } => activity_job_id,
+        other => panic!("expected an activity schedule, got {other:?}"),
+    };
+
+    let runtime = Arc::new(runtime);
+    let first_worker = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.consume_one_activity().await }
+    });
+    executor.started.notified().await;
+
+    let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("the at-most-once clock is mutable by the test");
+    let connection = tokio::spawn(connection);
+    client
+        .execute(
+            "
+            UPDATE donat.process_activity_jobs
+            SET lease_expires_at = statement_timestamp() - interval '1 millisecond',
+                start_to_close_deadline =
+                    statement_timestamp() - interval '6 seconds',
+                available_at = statement_timestamp()
+            WHERE source_name = 'default' AND id = $1
+            ",
+            &[&activity_job_id],
+        )
+        .await
+        .expect("test pushes the activity past start_to_close and its takeover grace");
+
+    let resolved = runtime
+        .consume_one_activity()
+        .await
+        .expect("the late activity resolves");
+    assert!(
+        matches!(resolved, ActivityConsumption::Failed { .. }),
+        "expected a terminal outcome, got {resolved:?}"
+    );
+    assert!(matches!(
+        runtime
+            .consume_one_transition()
+            .await
+            .expect("the unknown outcome routes"),
+        TransitionConsumption::Advanced { .. }
+    ));
+    let row = client
+        .query_one(
+            "
+            SELECT
+                instance.current_state,
+                job.last_error_json->>'code'
+            FROM donat.process_activity_jobs job
+            JOIN donat.process_instances instance
+              ON instance.source_name = job.source_name
+             AND instance.id = job.instance_id
+            WHERE job.source_name = 'default' AND job.id = $1
+            ",
+            &[&activity_job_id],
+        )
+        .await
+        .expect("the late outcome is inspectable");
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(
+        row.get::<_, Option<String>>(1).as_deref(),
+        Some("provider_send_ambiguous"),
+        "a lost worker that had authorized its send is never reported as a timeout"
+    );
+    connection.abort();
+
+    executor.release.notify_one();
+    first_worker.abort();
+    database.drop().await;
+}
+
+/// An executor that answers one fixed failure, so a test can say exactly what
+/// the provider seam reported and nothing else.
+struct FixedFailureExecutor {
+    calls: AtomicUsize,
+    class: ConnectorErrorClass,
+    code: &'static str,
+}
+
+impl FixedFailureExecutor {
+    fn new(class: ConnectorErrorClass, code: &'static str) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            class,
+            code,
+        }
+    }
+}
+
+impl ProcessActivityExecutor for FixedFailureExecutor {
+    fn execute<'a>(
+        &'a self,
+        _instance: &'a str,
+        _operation: &'a str,
+        _input: Json,
+        _idempotency_key: &'a str,
+        _deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<ConnectorSuccess, ConnectorFailure>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(ConnectorFailure::new(
+                self.class,
+                self.code,
+                "the fixed provider outcome for this test",
+            ))
+        })
+    }
+}
+
+/// Run the at-most-once fixture to its terminal outcome under one worker that
+/// survives its own request, and report the recorded error, the state the
+/// instance took, and how the journal named the routing.
+async fn at_most_once_single_worker_outcome(
+    label: &str,
+    class: ConnectorErrorClass,
+    code: &'static str,
+) -> (Json, String, i64, i64) {
+    let database = TestDatabase::create(label).await;
+    let metadata = at_most_once_metadata();
+    let executor = Arc::new(FixedFailureExecutor::new(class, code));
+    let (runtime, revision) = runtime(&database, &metadata, Some(executor.clone())).await;
+    seed_at_most_once_start(&database.url, &revision).await;
+    match runtime
+        .consume_one_start()
+        .await
+        .expect("Process start consumes")
+    {
+        StartConsumption::Started { .. } => {}
+        other => panic!("expected a new Process instance, got {other:?}"),
+    }
+    let activity_job_id = match runtime
+        .consume_one_transition()
+        .await
+        .expect("request activity schedules")
+    {
+        TransitionConsumption::ActivityScheduled {
+            activity_job_id, ..
+        } => activity_job_id,
+        other => panic!("expected an activity schedule, got {other:?}"),
+    };
+    let consumed = runtime
+        .consume_one_activity()
+        .await
+        .expect("the one worker completes the activity");
+    assert!(
+        matches!(consumed, ActivityConsumption::Failed { .. }),
+        "an at-most-once activity retries nothing, so it is terminal: {consumed:?}"
+    );
+    assert_eq!(
+        executor.calls.load(Ordering::Relaxed),
+        1,
+        "the one send is made exactly once"
+    );
+    assert!(matches!(
+        runtime
+            .consume_one_transition()
+            .await
+            .expect("the terminal outcome routes"),
+        TransitionConsumption::Advanced { .. }
+    ));
+
+    let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("the at-most-once outcome is readable");
+    let connection = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "
+            SELECT
+                job.last_error_json,
+                instance.current_state,
+                (SELECT count(*)
+                 FROM donat.process_transition_logs log
+                 WHERE log.source_name = 'default'
+                   AND log.activity_job_id = job.id
+                   AND log.outcome = 'activity_ambiguous_routed'),
+                (SELECT count(*)
+                 FROM donat.process_transition_logs log
+                 WHERE log.source_name = 'default'
+                   AND log.activity_job_id = job.id
+                   AND log.outcome = 'activity_error_routed')
+            FROM donat.process_activity_jobs job
+            JOIN donat.process_instances instance
+              ON instance.source_name = job.source_name
+             AND instance.id = job.instance_id
+            WHERE job.source_name = 'default' AND job.id = $1
+            ",
+            &[&activity_job_id],
+        )
+        .await
+        .expect("the outcome is inspectable");
+    let outcome = (
+        row.get::<_, Option<Json>>(0)
+            .expect("a terminal activity has a safe error"),
+        row.get::<_, String>(1),
+        row.get::<_, i64>(2),
+        row.get::<_, i64>(3),
+    );
+    connection.abort();
+    database.drop().await;
+    outcome
+}
+
+/// ADR 063, the case a surviving worker produces. The send authorization is
+/// committed before the request leaves, so a transport-shaped failure that comes
+/// back to the *original* worker is exactly as unknown as one a takeover finds:
+/// the engine cannot tell a request that never left from one whose answer was
+/// lost. Reporting `timeout` here would tell the Process the mail was not sent,
+/// and the `on_ambiguous` route the compiler forces an operator to declare would
+/// be unreachable in the only case that usually happens.
+#[tokio::test]
+async fn a_lost_answer_is_unknown_even_when_the_at_most_once_worker_survives() {
+    for (label, class, code) in [
+        (
+            "process_activity_amo_timeout",
+            ConnectorErrorClass::Timeout,
+            "connector_timeout",
+        ),
+        (
+            "process_activity_amo_transport",
+            ConnectorErrorClass::Transport,
+            "connector_transport",
+        ),
+        (
+            "process_activity_amo_5xx",
+            ConnectorErrorClass::Http5xx,
+            "provider_unavailable",
+        ),
+        (
+            "process_activity_amo_429",
+            ConnectorErrorClass::Http429,
+            "provider_throttled",
+        ),
+    ] {
+        let (error, state, ambiguous_routed, error_routed) =
+            at_most_once_single_worker_outcome(label, class, code).await;
+        assert_eq!(
+            error.get("code").and_then(Json::as_str),
+            Some("provider_send_ambiguous"),
+            "{code} left the outcome unknown, so it is not reported as a failure"
+        );
+        // ADR 031: the cause a durable outcome was reclassified from is still
+        // the thing an operator has to read.
+        assert_eq!(
+            error
+                .get("caused_by")
+                .and_then(|cause| cause.get("code"))
+                .and_then(Json::as_str),
+            Some(code),
+            "the unknown outcome still names what stopped the send"
+        );
+        assert_eq!(state, "unknown", "{code} took the declared ambiguous route");
+        assert_eq!(ambiguous_routed, 1);
+        assert_eq!(
+            error_routed, 0,
+            "no `on_error` route or fallback ever claims an unknown outcome"
+        );
+    }
+}
+
+/// The other half of the same rule, and the reason it is not "every failure is
+/// unknown": a provider that answered and refused told the engine what happened,
+/// and a Process that declared a route for that class must still get it.
+#[tokio::test]
+async fn an_at_most_once_failure_the_provider_answered_keeps_its_class() {
+    for (label, class, code) in [
+        (
+            "process_activity_amo_validation",
+            ConnectorErrorClass::Validation,
+            "provider_rejected",
+        ),
+        (
+            "process_activity_amo_auth",
+            ConnectorErrorClass::Authentication,
+            "provider_unauthorized",
+        ),
+        (
+            "process_activity_amo_permanent",
+            ConnectorErrorClass::Permanent,
+            "provider_refused",
+        ),
+    ] {
+        let (error, state, ambiguous_routed, error_routed) =
+            at_most_once_single_worker_outcome(label, class, code).await;
+        assert_eq!(
+            error.get("code").and_then(Json::as_str),
+            Some(code),
+            "{code} is the provider's own answer and keeps it"
+        );
+        assert_eq!(state, "refused", "{code} took its declared error route");
+        assert_eq!(ambiguous_routed, 0);
+        assert_eq!(error_routed, 1);
+    }
+}
+
+/// An executor whose provider answered, and whose answer the engine refuses.
+struct AnsweredButUnusableExecutor {
+    calls: AtomicUsize,
+}
+
+impl ProcessActivityExecutor for AnsweredButUnusableExecutor {
+    fn execute<'a>(
+        &'a self,
+        _instance: &'a str,
+        _operation: &'a str,
+        _input: Json,
+        _idempotency_key: &'a str,
+        _deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<ConnectorSuccess, ConnectorFailure>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ConnectorSuccess {
+                output: json!({}),
+                request_fingerprint: "not-the-fingerprint-this-activity-sent".to_owned(),
+            })
+        })
+    }
+}
+
+/// The third position an at-most-once send can end in: the provider answered,
+/// and the engine refused the answer. The mail went out, so the one thing the
+/// Process must not be told is that it did not — an `invariant` on `on_error` is
+/// where a compensating re-send lives.
+#[tokio::test]
+async fn an_at_most_once_send_the_engine_could_not_read_is_not_reported_as_unsent() {
+    let database = TestDatabase::create("process_activity_amo_answered").await;
+    let metadata = at_most_once_metadata();
+    let executor = Arc::new(AnsweredButUnusableExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let (runtime, revision) = runtime(&database, &metadata, Some(executor.clone())).await;
+    seed_at_most_once_start(&database.url, &revision).await;
+    match runtime
+        .consume_one_start()
+        .await
+        .expect("Process start consumes")
+    {
+        StartConsumption::Started { .. } => {}
+        other => panic!("expected a new Process instance, got {other:?}"),
+    }
+    let activity_job_id = match runtime
+        .consume_one_transition()
+        .await
+        .expect("request activity schedules")
+    {
+        TransitionConsumption::ActivityScheduled {
+            activity_job_id, ..
+        } => activity_job_id,
+        other => panic!("expected an activity schedule, got {other:?}"),
+    };
+    let consumed = runtime
+        .consume_one_activity()
+        .await
+        .expect("the unusable answer is journaled");
+    assert!(
+        matches!(consumed, ActivityConsumption::Failed { .. }),
+        "expected a terminal outcome, got {consumed:?}"
+    );
+    assert!(matches!(
+        runtime
+            .consume_one_transition()
+            .await
+            .expect("the outcome routes"),
+        TransitionConsumption::Advanced { .. }
+    ));
+
+    let (client, connection) = tokio_postgres::connect(&database.url, NoTls)
+        .await
+        .expect("the outcome is readable");
+    let connection = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "
+            SELECT job.last_error_json, instance.current_state
+            FROM donat.process_activity_jobs job
+            JOIN donat.process_instances instance
+              ON instance.source_name = job.source_name
+             AND instance.id = job.instance_id
+            WHERE job.source_name = 'default' AND job.id = $1
+            ",
+            &[&activity_job_id],
+        )
+        .await
+        .expect("the outcome is inspectable");
+    let error: Json = row
+        .get::<_, Option<Json>>(0)
+        .expect("a terminal activity has a safe error");
+    assert_eq!(
+        error.get("code").and_then(Json::as_str),
+        Some("provider_send_ambiguous")
+    );
+    assert_eq!(
+        error
+            .get("caused_by")
+            .and_then(|cause| cause.get("code"))
+            .and_then(Json::as_str),
+        Some("connector_invariant"),
+        "the connector defect that produced the unknown outcome is still named"
+    );
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    connection.abort();
     database.drop().await;
 }
