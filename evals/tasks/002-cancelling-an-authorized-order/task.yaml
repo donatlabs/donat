@@ -1,0 +1,66 @@
+id: cancelling-an-authorized-order-002
+# dev tasks are what skills and prompts are tuned against; a number
+# reported from them is a number tuned on. Absolute scores come from
+# `split: holdout`, which no tuning loop is allowed to read.
+split: dev
+version: 1
+tags: [processes, connectors, retries, reconciliation, payments]
+difficulty: hard
+canary: DONATBENCH-CANARY-002-CANCELLING-AN-AUTHORIZED-ORDER
+
+# Why this flow and not another: the mutant sweep put fourteen defects into
+# this file and the store's own black-box suite noticed one of them. Every
+# survivor was about the same thing — what happens when the provider stumbles
+# or goes quiet — which is exactly what this task asks a candidate to get right.
+# See knowledgebase/evals/findings-mutant-sweep.md.
+fixture:
+  base: examples/petshop/metadata
+  remove:
+    - flows/authorized-order-cancellation.yaml
+    - flows.yaml#!include flows/authorized-order-cancellation.yaml
+
+writable:
+  - flows/authorized-order-cancellation.yaml
+  - flows.yaml
+
+# What the bare model scores here, measured, k=3. A task at the ceiling can
+# guard against regressions and contribute to an absolute score; it cannot
+# show that an edit to a skill helped, because there is no room above it.
+# Run a bare arm on a new task before counting it as tuning capacity.
+bare_baseline: 1.0
+
+budget:
+  wall_clock: 20m
+
+prompt: prompt.md
+
+gates:
+  migrate: pass
+  validate: pass
+  deploy: pass
+
+worlds:
+  - provider_voids
+  - provider_stumbles_then_voids
+  - provider_times_out_then_voids
+  - provider_refuses_the_void
+
+oracle: oracle/
+
+# Both anti-oracles are mutants that survived the store's whole suite: they
+# deploy, they validate clean, and Petshop's own tests call them correct.
+# `caught_by` lists two independent readings each — the shopper's order and
+# support's books — so neither task rests on a single assertion.
+anti:
+  single-attempt:
+    caught_by:
+      - test_a_stumbling_provider_still_gives_the_money_back
+      - test_a_stumble_does_not_leave_the_money_held
+    world: provider_stumbles_then_voids
+  no-retry-on-timeout:
+    caught_by:
+      - test_a_timed_out_void_is_not_a_lost_void
+      - test_a_timed_out_void_does_not_leave_the_money_held
+    world: provider_times_out_then_voids
+
+scenarios: scenarios/

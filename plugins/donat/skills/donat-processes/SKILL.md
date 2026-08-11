@@ -230,6 +230,74 @@ after what was violated, and keep it stable.
 across retries and worker takeover, so a provider that honours an idempotency
 header sees one operation no matter how many attempts happen.
 
+### A state's output is readable only where it always happened
+
+`{ state: s, field: f }` is legal at a state only if **every** path that
+reaches it went through `s`. Not "some path" — every one. The compiler works it
+out from the transition graph and refuses otherwise:
+
+```
+processes[2].states[13].command.arguments.payload:
+  state output `reconcile_void.normalized_payload`
+  is not available on every transition path
+```
+
+This is the rule that branching flows hit, and it is not pedantry: a state
+reached both directly and via a reconciliation detour has no value from the
+detour on the direct path, so the reference would read something that never
+ran. The compiler is telling you the merge point does not know which way it got
+there.
+
+Three ways out, in order of how often they are the right one:
+
+- **Move the read earlier**, into a state that only the detour reaches, and
+  pass the result forward as that state's own output.
+- **Split the merge point.** Two paths that carry different facts usually want
+  two states, not one state that shrugs. This is the answer more often than it
+  looks, and it usually makes the flow easier to read.
+- **Carry the value deliberately** — have both paths produce the same field, so
+  it is available whichever way the run arrived.
+
+What not to do is route the second path away from the merge just to satisfy the
+compiler. That turns a diagnostic about missing data into a flow that silently
+skips work.
+
+### Nullability travels with the value
+
+Every reference carries the nullability of where it came from, and the compiler
+checks it. A nullable source flowing into a field the target declares as
+required is a `validate` failure, not a warning:
+
+```
+processes[0].states[3].request.input.request_id:
+  nullable String is not assignable to String
+```
+
+Three ordinary things are nullable and routinely surprise: a process `input`
+declared without `!`, a column that is nullable in the table behind a command's
+result, and a connector response field the provider does not always send.
+
+Two narrowings, and they are not interchangeable:
+
+```yaml
+# an assertion: "this is never null here, and I mean it"
+payment_id: { state: open_order, field: payment_id, require_non_null: true }
+
+# a refinement: reinterpret the scalar (String -> Uuid, and so on)
+run_key: { activity_key: authorize, as: uuid }
+```
+
+`require_non_null` is checked again **at run time**. It does not coerce and it
+does not default — if the value really is null the run fails there, which is the
+correct behaviour and the reason to place it only where an earlier state
+genuinely guarantees the value. Reaching for it to silence the compiler moves a
+build error to a production one.
+
+If the value is *legitimately* sometimes absent, do not assert it. Branch on it
+with a `when` state, or route the empty case to its own terminal. An optional
+value forced into a required field is a design that has not decided what
+"absent" means.
+
 ## Ambiguity is a branch, not an error
 
 A timeout does not mean "it did not happen". When a mutation may have taken

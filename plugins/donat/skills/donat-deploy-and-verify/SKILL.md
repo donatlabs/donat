@@ -16,6 +16,18 @@ donat validate --metadata-dir metadata              # metadata against the real 
 donat serve                                         # reads both, runs neither
 ```
 
+One more, and it needs none of the above — no database, no metadata, no
+network:
+
+```sh
+donat help                    # what this build can call: connectors, capabilities
+donat help <name>             # one of them in full
+```
+
+It reads the binary's own declarations, so it answers "does this engine already
+have that provider" for the engine you are actually deploying, rather than for
+the one the documentation was written against.
+
 The first line is the engine's own schema — cron state, command claims, Process
 journals — which ships **inside the image** at `/usr/share/donat/migrations`, beside
 the binary that applies it. Nothing to vendor and nothing to mount. It is not

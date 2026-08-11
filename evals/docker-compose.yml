@@ -1,0 +1,46 @@
+# The external services an eval stand needs. Deliberately its own stack rather
+# than a share of the Petshop system-test one: an eval scripts providers into
+# states no store should ever see (a charge that goes silent, an absence nobody
+# can prove), and a scripted answer claimed by somebody else's durable work is
+# indistinguishable from the candidate misbehaving.
+#
+# Ports are offset from both the conformance stack and the Petshop stands, so
+# all three can be up at once.
+
+name: donat-evals
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: donat_evals
+    ports:
+      - "15435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d donat_evals"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mock-providers:
+    image: python:3.12-slim
+    command: ["python", "/srv/providers.py"]
+    environment:
+      # The scripted-response control plane is the whole point here: without it
+      # an eval can only test the happy path. Never enable this outside testing.
+      PETSHOP_PROVIDERS_CONTROL: "1"
+    volumes:
+      - ../examples/petshop/mock-providers:/srv:ro
+    ports:
+      - "8097:8099"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/')"
+      interval: 2s
+      timeout: 3s
+      retries: 30

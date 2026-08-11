@@ -1,0 +1,75 @@
+table:
+  name: customer_address
+  schema: public
+object_relationships:
+  - name: customer
+    using:
+      foreign_key_constraint_on: customer_id
+select_permissions:
+  - role: customer
+    permission:
+      columns: "*"
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: customer
+    permission:
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+      set:
+        customer_id: X-Donat-User-Id
+      columns:
+        - label
+        - line1
+        - line2
+        - city
+        - postal_code
+        - country_code
+      # country_code has a database CHECK for its two-letter shape, because a
+      # malformed country code is wrong for every writer. Length bounds are
+      # not: they exist so a carrier label prints, and the carrier contract is
+      # the customer's, not the schema's.
+      validate:
+        - expression: 'size(line1) >= 3'
+          message: line1 must be at least 3 characters
+        - expression: 'size(postal_code) <= 16'
+          message: postal_code is limited to 16 characters
+        - expression: 'size(line2) >= 2'
+          when_present: line2
+          message: line2 must be at least 2 characters when present
+update_permissions:
+  - role: customer
+    permission:
+      columns:
+        - label
+        - line1
+        - line2
+        - city
+        - postal_code
+        - country_code
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id
+      check:
+        customer_id:
+          _eq: X-Donat-User-Id
+      validate:
+        - expression: 'size(line1) >= 3'
+          message: line1 must be at least 3 characters
+        - expression: 'size(postal_code) <= 16'
+          message: postal_code is limited to 16 characters
+        - expression: 'size(line2) >= 2'
+          when_present: line2
+          message: line2 must be at least 2 characters when present
+delete_permissions:
+  - role: customer
+    permission:
+      filter:
+        customer_id:
+          _eq: X-Donat-User-Id

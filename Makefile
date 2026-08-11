@@ -1,7 +1,9 @@
 .PHONY: build test conformance db-up db-down db-logs conformance-backend \
 	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex \
 	petshop-up petshop-down petshop-system-tests wasm-core go-test \
-	lending-up lending-down lending-system-tests
+	lending-up lending-down lending-system-tests \
+	evals-verify-oracles evals-run evals-agent evals-mutants evals-control \
+	evals-sweep evals-down evals-arm evals-compare
 
 build:
 	cargo build
@@ -158,6 +160,66 @@ petshop-system-tests:
 	@test -d tests-system/.venv || python3 -m venv tests-system/.venv
 	@tests-system/.venv/bin/pip install -q -r tests-system/requirements.txt
 	@cd tests-system && eval "$$(./stack.sh env)" && .venv/bin/python -m pytest
+
+# Evals: can an agent build this application? Local only, and deliberately not
+# in CI — a pipeline must never call a model. See evals/README.md.
+#
+# `evals-verify-oracles` is the one target here with no agent in it at all: it
+# asks whether the tasks can tell a correct store from a plausible wrong one,
+# which is the question that decides whether any later score means anything.
+evals-verify-oracles:
+	python3 evals/run.py verify-oracles $(TASK)
+
+evals-run:
+	@test -n "$(TASK)" || (echo 'usage: make evals-run TASK=<task> CANDIDATE=<oracle|anti/<name>|path>'; exit 2)
+	python3 evals/run.py run $(TASK) $(or $(CANDIDATE),oracle)
+
+# The mutant corpus: the checked-in Petshop with one business defect seeded at
+# a time, judged by the store's own black-box suite. No agent, no prompts, no
+# money — it measures what we would *notice*, which is what decides whether any
+# later agent score is worth reading. Survivors are holes in the suite.
+evals-mutants:
+	python3 evals/mutants.py generate --limit $(or $(COUNT),200)
+
+# The pristine store through the identical path. Anything red here is the
+# stack, not a defect — and a sweep refuses to run until this is green, because
+# a test that fails on a correct store kills every mutant it touches and reads
+# exactly like detection.
+evals-control:
+	python3 evals/sweep.py --control
+
+evals-sweep:
+	python3 evals/sweep.py --workers $(or $(WORKERS),6) $(if $(LIMIT),--limit $(LIMIT)) $(if $(ONLY),--only $(ONLY))
+
+# The only target that calls a model, and the only one that costs money. The
+# agent is a process contract — prompt in, working tree out — so EVAL_AGENT_CMD
+# swaps Claude Code for Codex or anything else without touching a task.
+evals-agent:
+	@test -n "$(TASK)" || (echo 'usage: make evals-agent TASK=<task> [ATTEMPTS=3] [SKILLS=plugin] [LABEL=name]'; exit 2)
+	python3 evals/agent.py $(TASK) --attempts $(or $(ATTEMPTS),1) \
+		$(if $(SKILLS),--skills $(SKILLS)) $(if $(LABEL),--label $(LABEL))
+
+# Tuning a skill is a paired question — "is this edit better?" — and paired
+# questions are answerable on a corpus this small, where absolute ones are not.
+# Both arms run the same tasks with the same attempt count; `compare` reads
+# them scenario by scenario, so an edit that moves an attempt from six of ten
+# to nine of ten is visible, which it is not in a task-level rate at k=3.
+#
+#   make evals-arm TASK=001-… LABEL=bare
+#   … edit plugins/donat/skills/…
+#   make evals-arm TASK=001-… LABEL=v3 SKILLS=plugin
+#   make evals-compare BEFORE=bare AFTER=v3
+evals-arm:
+	@test -n "$(TASK)" -a -n "$(LABEL)" || (echo 'usage: make evals-arm TASK=<task> LABEL=<arm> [SKILLS=plugin] [ATTEMPTS=3]'; exit 2)
+	python3 evals/agent.py $(TASK) --attempts $(or $(ATTEMPTS),3) --label $(LABEL) \
+		$(if $(SKILLS),--skills $(SKILLS))
+
+evals-compare:
+	@test -n "$(BEFORE)" -a -n "$(AFTER)" || (echo 'usage: make evals-compare BEFORE=<arm> AFTER=<arm>'; exit 2)
+	python3 evals/compare.py $(BEFORE) $(AFTER)
+
+evals-down:
+	docker compose -f evals/docker-compose.yml down --volumes --remove-orphans
 
 claude:
 	claude --dangerously-skip-permissions --teammate-mode tmux

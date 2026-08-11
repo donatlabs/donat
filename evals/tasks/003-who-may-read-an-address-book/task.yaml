@@ -1,0 +1,74 @@
+id: who-may-read-an-address-book-003
+# The first holdout task. Held-out tasks are the only place an *absolute*
+# number can come from: dev tasks are what skills and prompts are tuned
+# against, so a score read from them is a score tuned on. Nothing in a tuning
+# loop may read this one — `agent.py` refuses it without `--holdout`.
+split: holdout
+version: 1
+tags: [permissions, row-filters, roles, tracking, data-isolation]
+difficulty: medium
+canary: DONATBENCH-CANARY-003-WHO-MAY-READ-AN-ADDRESS-BOOK
+
+# Why this table and not another. Two reasons, and the first is measured.
+#
+# The mutant sweep put three `open-row-filter` defects into this file — the
+# select, update and delete filters each removed in turn, so one shopper reads
+# and edits another's addresses — and Petshop's own suite noticed none of them.
+# Across the corpus that operator survived 14 times in 22. This is the largest
+# unmeasured class in the store and the only one that is a data-isolation
+# failure rather than a business-logic one.
+#
+# The second reason is the corpus's own shape. Tasks 001 and 002 are both about
+# ambiguous answers from a payment provider — one cluster, measured twice. This
+# task has no process, no connector and no ambiguity in it at all; it is
+# declaration only. A corpus that varies in kind is the point of a corpus.
+fixture:
+  base: examples/petshop/metadata
+  remove:
+    - databases/default/tables/public_customer_address.yaml
+    - databases/default/tables/tables.yaml#!include public_customer_address.yaml
+
+writable:
+  - databases/default/tables/public_customer_address.yaml
+  - databases/default/tables/tables.yaml
+
+# What the bare model scores here, measured, k=3. A task at the ceiling can
+# guard against regressions and contribute to an absolute score; it cannot
+# show that an edit to a skill helped, because there is no room above it.
+# Run a bare arm on a new task before counting it as tuning capacity.
+bare_baseline: 1.0
+
+budget:
+  wall_clock: 20m
+
+prompt: prompt.md
+
+gates:
+  migrate: pass
+  validate: pass
+  deploy: pass
+
+# There is no provider in this task, so the "worlds" are the people asking.
+worlds:
+  - a_shopper_with_two_addresses
+  - two_shoppers_with_addresses_each
+
+oracle: oracle/
+
+# Both anti-oracles are the shape the sweep found surviving: a permission that
+# reads plausibly, validates clean, deploys, serves the owner correctly, and
+# hands one customer another customer's rows. Each is caught by two independent
+# readings — what the intruder can see, and what the owner's own list becomes.
+anti:
+  every-shopper-sees-every-address:
+    caught_by:
+      - test_an_address_book_holds_only_its_owners_addresses
+      - test_one_shopper_cannot_read_anothers_address
+    world: two_shoppers_with_addresses_each
+  writes-reach-any-row:
+    caught_by:
+      - test_one_shopper_cannot_change_anothers_address
+      - test_one_shopper_cannot_remove_anothers_address
+    world: two_shoppers_with_addresses_each
+
+scenarios: scenarios/
