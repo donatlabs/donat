@@ -2087,6 +2087,23 @@ pub struct ActionDefinition {
     /// refuses one whose function nobody registered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler: Option<String>,
+    /// Rewrite the outgoing HTTP request before it is sent.
+    ///
+    /// Absent means the Donat shape: one `POST` carrying
+    /// `{action, input, session_variables}`, which is what a handler written
+    /// for this engine expects. Present, the action can speak whatever an API
+    /// that already exists expects — its own method, path, query and body —
+    /// each written as a template over the invocation. See [`RequestTransform`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_transform: Option<RequestTransform>,
+    /// Rewrite the handler's answer before it is shaped to `output_type`.
+    ///
+    /// The same machinery pointed the other way: `$body` is what the handler
+    /// replied, and the template says what the action returns. It is how an
+    /// API whose fields are not the ones a schema promises can still satisfy
+    /// that schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_transform: Option<ResponseTransform>,
     #[serde(default)]
     pub forward_client_headers: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2116,6 +2133,103 @@ pub struct ArgumentDefinition {
     pub type_: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// Rewriting an action's HTTP request — Donat v2's `request_transform`.
+///
+/// Every field is a [Kriti](donat_kriti) template evaluated against the
+/// invocation, with these bindings:
+///
+/// | Binding | What it holds |
+/// |---|---|
+/// | `$body` | `{action, input, session_variables}`, the request as it would have been sent |
+/// | `$base_url` | the action's own `handler` |
+/// | `$query_params` | the query string as an object |
+/// | `$session_variables` | the caller's session variables |
+///
+/// A field that is absent is left as it was, which is what makes a transform
+/// additive: `{"method": "GET", "url": "{{$base_url}}/users"}` changes those
+/// two things and nothing else.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RequestTransform {
+    /// `1` (the default) or `2`. The version decides only how `body` is
+    /// written: a bare template in v1, an action object in v2.
+    #[serde(default = "default_transform_version")]
+    pub version: u8,
+    /// `Kriti`, which is the only one there has ever been. Kept because it is
+    /// part of the exported metadata and dropping it would change the document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_engine: Option<String>,
+    /// Replace the HTTP method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Replace the URL. Renders to a string rather than to JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_params: Option<QueryParamsTransform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<HeadersTransform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodyTransform>,
+}
+
+fn default_transform_version() -> u8 {
+    1
+}
+
+/// Rewriting the handler's answer — Donat v2's `response_transform`.
+///
+/// Only a body: there is no method or URL to change on the way back.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResponseTransform {
+    #[serde(default = "default_transform_version")]
+    pub version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodyTransform>,
+}
+
+/// Either a table of parameters, or one template producing the whole set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum QueryParamsTransform {
+    /// `{"limit": "{{$body.input.limit}}"}`. A `null` value sends the
+    /// parameter with no value at all, as `?flag`.
+    Table(std::collections::BTreeMap<String, Option<String>>),
+    /// A single template evaluating to an object of parameters.
+    Template(String),
+}
+
+/// Headers to add or replace, and headers to drop.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct HeadersTransform {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub add_headers: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_headers: Vec<String>,
+}
+
+/// What happens to the body.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum BodyTransform {
+    /// Version 1: a bare template, meaning "send this instead".
+    Template(String),
+    /// Version 2: an action, so that "send nothing" can be said at all.
+    Action(BodyAction),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BodyAction {
+    /// `remove`, `transform` or `x_www_form_urlencoded`.
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// For `x_www_form_urlencoded`: one template per form field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_template: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

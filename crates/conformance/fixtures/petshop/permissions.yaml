@@ -150,9 +150,13 @@
           code: validation-failed
         message: "field 'update_refund' not found in type: 'mutation_root'"
 
-- description: A trusted request without an explicit role is denied.
+- description: >-
+    A request that names no role is refused before any permission is read.
+    There is no admin role and no header this engine believes on its own: a
+    role comes from a verified JWT or from the authentication hook, and this
+    suite's hook refuses a request that named none.
   url: /v1/graphql
-  status: 200
+  status: 401
   query:
     query: |
       query { product { slug } }
@@ -161,7 +165,7 @@
       - extensions:
           path: $
           code: access-denied
-        message: "x-donat-role header is required (this engine has no admin role)"
+        message: "Authentication hook unauthorized this request"
 
 - description: MCP cannot bypass anonymous catalog-only permissions to read customers.
   url: /mcp

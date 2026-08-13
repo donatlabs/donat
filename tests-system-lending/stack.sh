@@ -38,7 +38,9 @@ GO_PORT="${LENDING_GO_PORT:-8091}"
 DRIVER_PORT="${LENDING_DRIVER_PORT:-8092}"
 ENGINE_DB="${LENDING_ENGINE_DB:-lending_engine}"
 GO_DB="${LENDING_GO_DB:-lending_go}"
-ADMIN_SECRET="${LENDING_ADMIN_SECRET:-lending-secret}"
+# The stand signs its own tokens with this key: a role reaches the engine from
+# a verified JWT or an authentication hook, and never from a header.
+LENDING_JWT_KEY="${LENDING_JWT_KEY:-lending-dev-jwt-key-change-me-32bytes+}"
 # The metadata declares an attachment, so both stands need the same storage
 # secrets. The Go host defaults them in main.go; the engine reads them from the
 # environment, so the same values are exported for it here — a stand signing
@@ -153,7 +155,7 @@ cmd_up() {
   echo "==> serving the engine on $ENGINE_PORT"
   DONAT_PORT="$ENGINE_PORT" \
   DONAT_GRAPHQL_DATABASE_URL="$engine_url" \
-  DONAT_GRAPHQL_ADMIN_SECRET="$ADMIN_SECRET" \
+  DONAT_GRAPHQL_JWT_SECRET="{\"type\":\"HS256\",\"key\":\"$LENDING_JWT_KEY\"}" \
   RUST_LOG="${RUST_LOG:-donat=info}" \
     nohup "$repo/target/debug/donat" --metadata-dir "$engine_metadata" \
       >"$engine_log" 2>&1 &
@@ -166,7 +168,7 @@ cmd_up() {
   echo "==> driving the Go stand's Processes with an engine on $DRIVER_PORT"
   DONAT_PORT="$DRIVER_PORT" \
   DONAT_GRAPHQL_DATABASE_URL="$go_url" \
-  DONAT_GRAPHQL_ADMIN_SECRET="$ADMIN_SECRET" \
+  DONAT_GRAPHQL_JWT_SECRET="{\"type\":\"HS256\",\"key\":\"$LENDING_JWT_KEY\"}" \
   RUST_LOG="${RUST_LOG:-donat=info}" \
     nohup "$repo/target/debug/donat" --metadata-dir "$engine_metadata" \
       >"$driver_log" 2>&1 &
@@ -197,7 +199,7 @@ cmd_down() {
 cmd_env() {
   echo "export LENDING_ENGINE_URL=http://127.0.0.1:$ENGINE_PORT"
   echo "export LENDING_GO_URL=http://127.0.0.1:$GO_PORT"
-  echo "export LENDING_ADMIN_SECRET=$ADMIN_SECRET"
+  echo "export LENDING_JWT_KEY=$LENDING_JWT_KEY"
 }
 
 cmd_logs() {

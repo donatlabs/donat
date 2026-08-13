@@ -2,5 +2,7 @@
 # already-running stands; nothing imports the engine.
 pytest>=8.3,<9
 requests>=2.32,<3
+# The stand mints its own HS256 tokens; the engine honours no role header.
+PyJWT>=2.9,<3
 # stack.sh strips embedded-only actions from the engine stand's metadata copy.
 PyYAML>=6,<7

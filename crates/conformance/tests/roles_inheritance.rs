@@ -7,15 +7,13 @@
 //!
 //! test_roles_inheritance.py carries module-level
 //! `pytestmark = [admin_secret, hge_env(ENABLE_REMOTE_SCHEMA_PERMISSIONS=true)]`,
-//! so every class from that module would get `.admin_secret()` + that env var.
+//! so every class from that module would get an admin secret + that env var.
 //!
 //! NOTE: the admin_secret mark is purely environmental for these classes —
-//! tests-py sends the secret alongside explicit X-Donat-Role headers,
-//! which yields the same trusted-role session a secretless engine
-//! produces, and no fixture asserts on the secret itself. The suites below
-//! therefore run without it; the hge_env marks are still replicated via
-//! `.env()`. (Suite::start() authenticates its bootstrap calls when
-//! `.admin_secret()` is set, so using it here would also work.)
+//! tests-py sends the secret alongside explicit X-Donat-Role headers, and no
+//! fixture asserts on the secret itself. This engine has no secret at all:
+//! the suite's own authentication hook turns those role headers into
+//! sessions. The hge_env marks are still replicated via `.env()`.
 
 use donat_conformance::{Running, Suite, Transport};
 

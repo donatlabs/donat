@@ -23,7 +23,7 @@ export DONAT_MOCK_CARRIER_BASE_URL=http://127.0.0.1:8099 DONAT_MOCK_CARRIER_TOKE
 
 log="$(mktemp)"
 DONAT_PORT="$port" DONAT_METADATA_DIR="$metadata" \
-DONAT_GRAPHQL_ADMIN_SECRET=measure DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous \
+DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous \
   "$repo/target/release/donat" --metadata-dir "$metadata" >"$log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT

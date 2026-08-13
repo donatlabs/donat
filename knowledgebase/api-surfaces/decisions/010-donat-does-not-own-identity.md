@@ -70,7 +70,9 @@ donat to act as an OpenID Connect relying party — a login route that redirects
 to the configured provider and a callback that sets the session cookie the
 engine already reads (`TokenLocation::Cookie`) — stores no users, holds no
 passwords and issues no tokens, so it stays on the allowed side of this
-decision. It is not part of this change, but nothing here forbids it.
+decision. It is not part of this change, but nothing here forbids it. *It was
+built later: see
+[[decisions/013-a-role-is-established-by-a-verified-token-or-a-hook-and-by-nothing-else]].*
 
 ## Alternatives
 
@@ -110,13 +112,12 @@ What we pay for it:
   answered by a local mock), and it must come up offline and in CI. A SaaS IdP
   would need a tenant, credentials in the repository and network access.
 - **The admin secret outranks JWT.** In `resolve_session` a valid
-  `X-Donat-Admin-Secret` short-circuits the JWT path entirely
-  (`gql.rs:315-319`) and builds the session from headers. It is not a
-  permission bypass — a trusted request must still name an explicit role
-  (`gql.rs:274-283`) — but it is an authentication bypass. The `auth` profile
-  must therefore unset `DONAT_GRAPHQL_ADMIN_SECRET` in the same change that
-  introduces the JWT configuration, or the demonstrated login would be
-  decorative.
+  `X-Donat-Admin-Secret` short-circuited the JWT path entirely and built the
+  session from headers — an authentication bypass, though not a permission
+  one. *Superseded by
+  [[decisions/013-a-role-is-established-by-a-verified-token-or-a-hook-and-by-nothing-else]]:
+  the secret and the header path were removed outright, so this hazard no
+  longer exists and the example's login is not decorative.*
 
 If donat ever ships a deployment shape where no second process can exist, this
 decision is worth revisiting. The embedded-SDK direction is not that case: it

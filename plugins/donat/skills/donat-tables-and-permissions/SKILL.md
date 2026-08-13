@@ -93,7 +93,7 @@ filter:
 ```
 
 `X-Donat-User-Id` is the caller's identity, established by the JWT or asserted
-by a trusted request. There is no other way to reach the caller from a
+by the authentication hook. There is no other way to reach the caller from a
 permission, and no way for a client to influence it.
 
 Predicates traverse relationships to any depth: `cart: { customer_id: ... }`,

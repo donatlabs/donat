@@ -4782,8 +4782,8 @@ mod tests {
             engine: tokio::sync::RwLock::new(Arc::new(engine)),
             connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: url,
-            admin_secret: None,
             unauthorized_role: None,
+            oidc: None,
             stringify_numerics: false,
             infer_function_permissions: true,
             jwt: None,
@@ -7826,15 +7826,17 @@ mod tests {
         let err = mcp_session_variable_headers(&headers).unwrap_err();
         assert_eq!(err, "duplicate MCP session variable header");
 
+        // Case-insensitive duplicates are duplicates whichever session
+        // namespace they are spelled in.
         let mut headers = HeaderMap::new();
-        headers.append("X-Donat-Admin-Secret", "secret-1".parse().unwrap());
-        headers.append("x-donat-admin-secret", "secret-2".parse().unwrap());
+        headers.append("X-Donat-User-Id", "1".parse().unwrap());
+        headers.append("x-donat-user-id", "2".parse().unwrap());
         let err = mcp_session_variable_headers(&headers).unwrap_err();
         assert_eq!(err, "duplicate MCP session variable header");
 
         let mut headers = HeaderMap::new();
-        headers.append("X-Hasura-Admin-Secret", "secret-1".parse().unwrap());
-        headers.append("x-hasura-admin-secret", "secret-2".parse().unwrap());
+        headers.append("X-Hasura-User-Id", "1".parse().unwrap());
+        headers.append("x-hasura-user-id", "2".parse().unwrap());
         let err = mcp_session_variable_headers(&headers).unwrap_err();
         assert_eq!(err, "duplicate MCP session variable header");
     }

@@ -1,20 +1,19 @@
 #!/bin/sh
-# Give the optional IdP (see auth.env) its own database and role inside the
-# Postgres this example already runs, so no second database server is needed.
-# Identity data never shares a database with the data plane: password hashes
-# must not sit in the database donat serves.
+# Give the IdP its own database and role inside the Postgres this example
+# already runs, so no second database server is needed. Identity data never
+# shares a database with the data plane: password hashes must not sit in the
+# database donat serves.
 #
-# Gated on RAUTHY_DB_PASSWORD, which only auth.env sets. A plain
-# `docker compose up` therefore creates nothing — an example used as a starting
-# point is not left holding a login nobody asked for.
+# Still gated on RAUTHY_DB_PASSWORD so a deployment that replaces this IdP with
+# its own can unset the variable and be left with no unused role.
 #
 # The postgres image runs this while initializing an empty data directory, so
-# enabling the profile on an example that has already been started means
-# recreating the volume: `docker compose down -v`.
+# an example that was started before the IdP existed needs its volume
+# recreated: `docker compose down -v`.
 set -e
 
 if [ -z "$RAUTHY_DB_PASSWORD" ]; then
-    echo "identity profile disabled (RAUTHY_DB_PASSWORD unset): no rauthy database created"
+    echo "RAUTHY_DB_PASSWORD unset: no rauthy database created"
     exit 0
 fi
 

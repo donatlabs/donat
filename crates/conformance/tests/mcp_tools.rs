@@ -2781,7 +2781,6 @@ fn mcp_rejects_oversized_response_result_before_accepting() {
 fn mcp_tools_call_honors_authorization_bearer_jwt() {
     let secret = mcp_jwt_secret_json();
     let s = Suite::new("mcp_jwt_authorization")
-        .admin_secret("mcp-jwt-admin-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret)
         .start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
@@ -2853,7 +2852,6 @@ fn mcp_tools_call_honors_authorization_bearer_jwt() {
 fn mcp_tools_call_rejects_invalid_bearer_jwt_without_token_reflection() {
     let secret = mcp_jwt_secret_json();
     let s = Suite::new("mcp_jwt_invalid_token")
-        .admin_secret("mcp-jwt-admin-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret)
         .start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
@@ -2896,7 +2894,6 @@ fn mcp_tools_call_rejects_invalid_bearer_jwt_without_token_reflection() {
 fn mcp_rejects_malformed_authorization_header_before_jwt_resolution() {
     let secret = mcp_jwt_secret_json();
     let s = Suite::new("mcp_malformed_authorization")
-        .admin_secret("mcp-jwt-admin-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret)
         .start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
@@ -2947,7 +2944,6 @@ fn mcp_rejects_malformed_authorization_header_before_jwt_resolution() {
 fn mcp_rejects_duplicate_jwt_custom_header_before_jwt_resolution() {
     let secret = mcp_custom_header_jwt_secret_json("X-JWT");
     let s = Suite::new("mcp_duplicate_jwt_custom_header")
-        .admin_secret("mcp-jwt-admin-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret)
         .start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
@@ -3028,7 +3024,6 @@ fn mcp_rejects_duplicate_jwt_custom_header_before_jwt_resolution() {
 fn mcp_rejects_conflicting_jwt_custom_header_name_before_jwt_resolution() {
     let secret = mcp_custom_header_jwt_secret_json("X-Donat-Role");
     let s = Suite::new("mcp_conflicting_jwt_custom_header")
-        .admin_secret("mcp-jwt-admin-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret)
         .start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
@@ -3076,7 +3071,6 @@ fn mcp_rejects_conflicting_jwt_custom_header_name_before_jwt_resolution() {
 fn mcp_rejects_duplicate_authorization_header_before_jwt_resolution() {
     let secret = mcp_jwt_secret_json();
     let s = Suite::new("mcp_duplicate_authorization")
-        .admin_secret("mcp-jwt-admin-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret)
         .start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
@@ -3171,7 +3165,6 @@ fn mcp_rejects_proxy_authorization_header_before_dispatch() {
 fn mcp_rejects_duplicate_cookie_header_before_jwt_resolution() {
     let secret = mcp_cookie_jwt_secret_json("donat_user");
     let s = Suite::new("mcp_duplicate_cookie")
-        .admin_secret("mcp-jwt-admin-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret)
         .start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));
@@ -3254,7 +3247,6 @@ fn mcp_rejects_duplicate_cookie_header_before_jwt_resolution() {
 fn mcp_rejects_oversized_credential_headers_before_jwt_resolution() {
     let secret = mcp_jwt_secret_json();
     let s = Suite::new("mcp_oversized_credential_headers")
-        .admin_secret("mcp-jwt-admin-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret)
         .start();
     s.setup_v1q(&format!("{MCP}/setup.yaml"));

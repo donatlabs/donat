@@ -29,6 +29,8 @@ fn sync_suite(name: &str) -> Running {
         "create_user",
         "create_users",
         "mirror",
+        "mirror_transformed",
+        "mirror_transformed_output",
         "null_response",
         "omitted_response_field",
         "scalar_response",
@@ -119,6 +121,10 @@ fn sync_actions() {
         // Successful response shaping.
         "mirror_action_success.yaml",
         "mirror_action_unexpected_field.yaml",
+        // Request and response transforms — the declaration that lets an
+        // action stand in front of an API written for someone else.
+        "mirror_action_request_transformed.yaml",
+        "mirror_action_response_transformed.yaml",
         "null_response.yaml",
         "omitted_field_response_for_nullable_field.yaml",
         "get_scalar_action_output_type_success.yaml",

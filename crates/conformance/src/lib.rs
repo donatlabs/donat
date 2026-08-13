@@ -22,7 +22,9 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value as Json, json};
 
 mod action_webhook;
+pub mod auth_hook;
 pub mod cron_webhook;
+pub mod idp_stub;
 pub mod object_store;
 pub mod provider_stub;
 mod remote_graphql;
@@ -1033,7 +1035,9 @@ pub struct Suite {
     env: Vec<(String, String)>,
     request_headers: Vec<(String, String)>,
     args: Vec<String>,
-    admin_secret: Option<String>,
+    /// False when the suite deliberately configures no way to authenticate a
+    /// request; see `no_authentication`.
+    authenticate: bool,
     webhook: Option<action_webhook::EngineHandle>,
     cron: Option<cron_webhook::CronWebhook>,
     event: Option<cron_webhook::CronWebhook>,
@@ -1049,7 +1053,7 @@ impl Suite {
             env: vec![],
             request_headers: vec![],
             args: vec![],
-            admin_secret: None,
+            authenticate: true,
             webhook: None,
             cron: None,
             event: None,
@@ -1127,13 +1131,13 @@ impl Suite {
         self
     }
 
-    /// Classes marked `@pytest.mark.admin_secret`: the engine gets
-    /// DONAT_GRAPHQL_ADMIN_SECRET and every request carries the secret
-    /// header (mirroring tests-py `add_auth`).
-    pub fn admin_secret(mut self, secret: &str) -> Self {
-        self.admin_secret = Some(secret.to_string());
-        self.env
-            .push(("DONAT_GRAPHQL_ADMIN_SECRET".to_string(), secret.to_string()));
+    /// Configure NO authentication mechanism: no JWT, and not even the
+    /// harness's own hook. Every request is then whatever
+    /// `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` names, whatever headers it carries —
+    /// which is what a public deployment looks like, and what the
+    /// unauthorized-role suites exist to prove.
+    pub fn no_authentication(mut self) -> Self {
+        self.authenticate = false;
         self
     }
 
@@ -1160,7 +1164,7 @@ impl Suite {
     /// Create the suite database + postgis, but DO NOT spawn the engine yet.
     /// The engine starts lazily on the first request, once all setup ops
     /// have been accumulated into the in-memory metadata.
-    pub fn start(self) -> Running {
+    pub fn start(mut self) -> Running {
         let backend = self
             .backend
             .map(Ok)
@@ -1203,6 +1207,30 @@ impl Suite {
             );
         }
 
+        // A role reaches the engine through a verified JWT or an
+        // authentication hook, and through nothing else — no header and no
+        // shared secret can name one. Suites that configure a JWT bring their
+        // own mechanism; every other suite gets the harness's hook, which
+        // turns the role headers its fixtures carry into a session (see
+        // `auth_hook`). Without this, every fixture in the crate would run as
+        // whatever `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` happens to be.
+        if self.authenticate
+            && !self
+                .env
+                .iter()
+                .any(|(key, _)| key == "DONAT_GRAPHQL_JWT_SECRET")
+        {
+            let hook = auth_hook::spawn();
+            self.env.push((
+                "DONAT_GRAPHQL_AUTH_HOOK".to_string(),
+                hook.url().to_string(),
+            ));
+            self.env.push((
+                "DONAT_GRAPHQL_AUTH_HOOK_MODE".to_string(),
+                "POST".to_string(),
+            ));
+        }
+
         let metadata = self
             .initial_metadata
             .unwrap_or_else(|| default_metadata_for(backend, &db_url));
@@ -1213,7 +1241,6 @@ impl Suite {
             env: self.env,
             request_headers: self.request_headers,
             args: self.args,
-            admin_secret: self.admin_secret,
             webhook: self.webhook,
             cron: self.cron,
             event: self.event,
@@ -1263,7 +1290,6 @@ pub struct Running {
     env: Vec<(String, String)>,
     request_headers: Vec<(String, String)>,
     args: Vec<String>,
-    admin_secret: Option<String>,
     webhook: Option<action_webhook::EngineHandle>,
     cron: Option<cron_webhook::CronWebhook>,
     event: Option<cron_webhook::CronWebhook>,
@@ -2550,7 +2576,7 @@ impl Running {
                 .iter()
                 .find(|(name, _)| is_role_header(name))
                 .map(|(_, value)| value.clone());
-            handle.set(&proc.base_url, self.admin_secret.clone(), role);
+            handle.set(&proc.base_url, role);
         }
         *self.engine.borrow_mut() = Some(proc);
     }
@@ -2825,12 +2851,12 @@ impl Running {
         (code, body)
     }
 
-    fn auth_headers(&self, mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
-        headers = merge_request_headers(&self.request_headers, headers);
-        if let Some(secret) = &self.admin_secret {
-            headers.push(("X-Donat-Admin-Secret".to_string(), secret.clone()));
-        }
-        headers
+    /// A fixture's request headers, plus whatever the suite adds to every
+    /// request. Nothing authenticates a request here: the role headers the
+    /// fixtures carry become a session only because the suite's
+    /// authentication hook says so (see `auth_hook`).
+    fn auth_headers(&self, headers: Vec<(String, String)>) -> Vec<(String, String)> {
+        merge_request_headers(&self.request_headers, headers)
     }
 
     /// Apply a setup fixture: parse the document and accumulate its ops into
@@ -2905,7 +2931,14 @@ impl Running {
     }
 
     fn conf_headers(conf: &Json) -> Vec<(String, String)> {
+        // One upstream fixture spells the key `header:` (singular) — see
+        // `queries/graphql_mutation/insert/permissions/
+        // article_on_conflict_constraint_on_user_role_error.yaml`. Reading
+        // only `headers:` silently dropped its role, so the case ran with no
+        // session at all rather than as `user`. Accepting both spellings
+        // keeps the fixture unedited and makes it test what it says.
         conf.get("headers")
+            .or_else(|| conf.get("header"))
             .and_then(|h| h.as_object())
             .map(|h| {
                 h.iter()
@@ -3679,6 +3712,7 @@ mod tests {
             "jwt_claims_map",
             "mcp_tools",
             "migrate",
+            "oidc_login",
             "petshop",
             "petshop_process",
             "process_activity",

@@ -165,16 +165,21 @@ the two to read as a model.
 
 ## Sessions and roles
 
-This engine has **no admin role**. Every request runs as one explicit role,
-resolved from `X-Donat-*` headers, and a request with no `X-Donat-Role` is
-denied before it reaches the database. There is no permission-bypass path and
-no admin-over-HTTP surface.
+This engine has **no admin role**. Every request runs as one explicit role, and
+a request with no role is denied before it reaches the database. There is no
+permission-bypass path and no admin-over-HTTP surface.
 
-`X-Donat-Admin-Secret` is API-level auth, never a role: the SDK excludes it
-from the session variables and does not check it. Deciding who may reach the
-handler at all — a secret, a JWT, a mesh identity — belongs to your own
-middleware, in front of `eng.Handler()`. What the engine guarantees is that
-whatever gets through still runs as exactly one declared role.
+Where that role comes from differs by deployment shape, and the difference
+matters. The **standalone** engine accepts a role from a verified JWT or an
+authentication hook and from nothing else — no header and no shared secret can
+name one. An **embedded** host is itself the authentication layer: your
+middleware in front of `eng.Handler()` decides who the caller is — a JWT, a
+mesh identity, a session your application already keeps — and then states that
+decision in `X-Donat-Role`. The SDK trusts it because your own code put it
+there.
+
+What the engine guarantees either way is that whatever gets through runs as
+exactly one declared role, with that role's permissions.
 
 ## File attachments
 

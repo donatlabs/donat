@@ -1,0 +1,65 @@
+# The admin panel's own login screen in front of this example's provider.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.panel-login.yml up -d
+#   cd ../../apps/admin
+#   DONAT_UPSTREAM=http://host.docker.internal:8090 \
+#   DONAT_STANDS='[{"id":"petshop","label":"Petshop","graphqlUrl":"/v1/graphql",
+#     "role":"support","users":{"table":"customer","nameField":"name",
+#     "emailField":"email","identityField":"customer_id",
+#     "mapping":{"selectFields":["id","customer_id","name","email","avatar"]}}}]' \
+#     docker compose up -d --build          # the panel on :5180
+#
+# The stand is what makes the panel's Users screen mean something here: this
+# shop has no `users` table and no `admin` role — its people are `customer` and
+# the role it declares for an operator is `support` (metadata/databases/…/
+# public_customer.yaml). Sign in as sam@example.com / petshop-demo-password,
+# who holds it. The panel's default names a `users` table, and a deployment
+# that has none answers exactly that: field 'users' not found.
+#
+# Then http://localhost:5180 — "Sign in" lands on `/idp/authorize`, which is
+# this repository's own screen speaking the provider's unchanged protocol
+# (apps/admin/README.md, knowledgebase/platform/decisions/002-*).
+#
+# Everything here says one thing: **the provider is reached on the panel's
+# origin**. Its session cookie and its `Origin` check both require that, and it
+# is the reverse-proxy deployment the provider documents. The forwarding is the
+# engine's own (`DONAT_OIDC.login_api` → `/auth/v1/…`), so nothing but this file
+# changes.
+#
+# The engine moves to :8090 because :8080 is the address the default
+# configuration hands to browsers, and leaving both would make it ambiguous
+# which one a login belongs to.
+services:
+  rauthy:
+    environment:
+      # The address a browser uses — the panel's, now that it fronts the login.
+      PUB_URL: localhost:5180
+      RP_ORIGIN: http://localhost:5180
+
+  engine:
+    ports: !override
+      - "8090:8080"
+    environment:
+      # `iss` follows the provider's public URL, so the engine's verification
+      # has to follow it too.
+      DONAT_GRAPHQL_JWT_SECRET: >-
+        {"jwk_url":"http://rauthy:8080/auth/v1/oidc/certs",
+        "issuer":"http://localhost:5180/auth/v1/",
+        "audience":"petshop",
+        "claims_map":{"x-donat-allowed-roles":{"path":"$$.roles"},
+        "x-donat-default-role":{"path":"$$.roles[0]"},
+        "x-donat-user-id":{"path":"$$.custom.customer_id","default":""}}}
+      # `authorization_endpoint` is our screen; `login_api` is what lets that
+      # screen talk to the provider at all, by serving its login API on this
+      # engine's origin. `redirect_uri` comes back through the panel, and
+      # bootstrap/clients.json registers it.
+      DONAT_OIDC: >-
+        {"authorization_endpoint":"http://localhost:5180/idp/authorize",
+        "token_endpoint":"http://rauthy:8080/auth/v1/oidc/token",
+        "login_api":"http://rauthy:8080",
+        "client_id":"petshop",
+        "redirect_uri":"http://localhost:5180/auth/callback",
+        "scopes":["openid","donat"],
+        "cookie":"donat_session",
+        "cookie_secure":false,
+        "session_token":"access_token"}

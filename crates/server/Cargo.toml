@@ -30,6 +30,7 @@ graphql-parser = { workspace = true }
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }
 jsonwebtoken = { workspace = true }
+donat-kriti = { path = "../kriti" }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 serde_yaml = { workspace = true }

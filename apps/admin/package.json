@@ -1,0 +1,44 @@
+{
+  "name": "@donat/admin",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "preview": "vite preview",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.3.0",
+    "@refinest/context": "0.2.0",
+    "@refinest/core": "0.2.0",
+    "@refinest/field-types": "0.2.0",
+    "@refinest/i18n-core": "0.2.0",
+    "@refinest/react": "0.2.0",
+    "@refinest/ui-shadcn": "0.2.0",
+    "@tanstack/react-query": "5.100.7",
+    "lucide-react": "^1.28.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-router": "^8.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^26.1.2",
+    "@types/react": "~19.2.17",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "jsdom": "^30.0.1",
+    "playwright": "^1.62.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~6.0.3",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
+  }
+}

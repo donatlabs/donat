@@ -23,5 +23,14 @@ COPY --from=build /src/target/release/donat /usr/local/bin/donat
 # disagree with its engine is a copy that eventually does.
 COPY migrations/ /usr/share/donat/migrations/
 
+# Not root.
+#
+# The engine reads its metadata, talks to a database and answers on 8080 —
+# nothing it does needs the machine. Running as root anyway means a bug here is
+# a bug with every capability the container has, and 8080 is unprivileged, so
+# there is nothing to give up.
+RUN useradd --system --uid 10001 --create-home --home-dir /var/lib/donat donat
+USER 10001:10001
+
 EXPOSE 8080
 ENTRYPOINT ["donat"]

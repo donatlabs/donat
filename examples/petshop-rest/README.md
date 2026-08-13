@@ -38,9 +38,14 @@ body**). A successful call returns the GraphQL `data` object directly.
 | `customer`  | logged-in shopper | Available pets + own profile/orders.           |
 | `staff`     | store employee  | Every pet (incl. pending/sold); full inventory.  |
 
-`anonymous` is the `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`: a request with no role
-falls back to it. The secret `petshop-secret` marks a request *trusted* so it
-may assert a role via `X-Donat-Role` (a demo stand-in for edge auth / JWTs).
+`anonymous` is the `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`: a request carrying no
+token falls back to it. Any other role comes from a **verified token** — this
+engine has no admin role and no header that names one. Mint one for this stand
+with the shared development key:
+
+```bash
+STAFF=$(../mint-token.sh staff)
+```
 
 ## Try it
 
@@ -59,7 +64,7 @@ curl -s localhost:8080/api/rest/pet/4
 # {"pet_by_pk":null}
 
 curl -s localhost:8080/api/rest/pet/4 \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff'
+  -H "authorization: Bearer $STAFF"
 # {"pet_by_pk":{"id":4,"name":"Shadow","status":"pending",...,"category":{"name":"Cats"}}}
 ```
 
@@ -69,7 +74,7 @@ Add a pet (staff only — the same call as `anonymous` returns a
 ```bash
 curl -s localhost:8080/api/rest/pet \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
+  -H "authorization: Bearer $STAFF" \
   -d '{"name":"Coco","category_id":3,"price":45,"status":"available","description":"Talkative parrot"}'
 # {"insert_pet":{"affected_rows":1,"returning":[{"id":7,"name":"Coco",...}]}}
 ```

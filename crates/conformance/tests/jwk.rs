@@ -27,7 +27,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use donat_conformance::{Suite, fixture_root};
 use serde_json::{Value as Json, json};
 
-const ADMIN_SECRET: &str = "jwk-test-secret";
 const KID: &str = "test-key-1";
 
 // ------------------------------------------------------------- JWKS stub
@@ -256,7 +255,6 @@ fn run_scenario(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let s = Suite::new(suite)
-            .admin_secret(ADMIN_SECRET)
             .env(
                 "DONAT_GRAPHQL_JWT_SECRET",
                 &format!(r#"{{"jwk_url": "{}{}"}}"#, stub.url, jwk_path),

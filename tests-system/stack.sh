@@ -29,7 +29,6 @@ PETSHOP_PORT="${PETSHOP_PORT:-8080}"
 PETSHOP_PG_URL="${PETSHOP_PG_URL:-postgresql://postgres:postgres@127.0.0.1:15434/petshop_system}"
 PETSHOP_PROVIDERS_URL="${PETSHOP_PROVIDERS_URL:-http://127.0.0.1:8099}"
 PETSHOP_JWT_KEY="${PETSHOP_JWT_KEY:-petshop-dev-jwt-key-change-me-32bytes+}"
-PETSHOP_ADMIN_SECRET="${PETSHOP_ADMIN_SECRET:-petshop-secret}"
 PETSHOP_BASE_URL="${PETSHOP_BASE_URL:-http://127.0.0.1:${PETSHOP_PORT}}"
 FAST_PORT="${PETSHOP_FAST_PORT:-8081}"
 FAST_PG_URL="${PETSHOP_FAST_PG_URL:-postgresql://postgres:postgres@127.0.0.1:15434/petshop_fast}"
@@ -147,7 +146,6 @@ cmd_up() {
   # token always names the one role its request runs as.
   DONAT_PORT="$PETSHOP_PORT" \
   DONAT_METADATA_DIR="$STAND_METADATA" \
-  DONAT_GRAPHQL_ADMIN_SECRET="$PETSHOP_ADMIN_SECRET" \
   DONAT_GRAPHQL_UNAUTHORIZED_ROLE="anonymous" \
   DONAT_GRAPHQL_JWT_SECRET="{\"type\":\"HS256\",\"key\":\"$PETSHOP_JWT_KEY\"}" \
   RUST_LOG="${RUST_LOG:-donat=info}" \
@@ -257,7 +255,6 @@ cmd_up_fast() {
 
   DONAT_PORT="$FAST_PORT" \
   DONAT_METADATA_DIR="$FAST_METADATA" \
-  DONAT_GRAPHQL_ADMIN_SECRET="$PETSHOP_ADMIN_SECRET" \
   DONAT_GRAPHQL_UNAUTHORIZED_ROLE="anonymous" \
   DONAT_GRAPHQL_JWT_SECRET="{\"type\":\"HS256\",\"key\":\"$PETSHOP_JWT_KEY\"}" \
   RUST_LOG="${RUST_LOG:-donat=info}" \

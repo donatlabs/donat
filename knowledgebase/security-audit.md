@@ -20,8 +20,11 @@ items are downgraded accordingly.
   runs, on `/v1/graphql` and the ws path.
 - **`resolve_url_template` panic (#3): FIXED.** Rewritten to be panic-free
   (anchors `}}` after `{{`) and to substitute all occurrences.
-- **Non-constant-time secret compare (#4): FIXED.** `gql::ct_eq` is used for
-  the `X-Donat-Admin-Secret` check in `resolve_session`.
+- **Non-constant-time secret compare (#4): FIXED, then MOOT (2026-08-11).**
+  `gql::ct_eq` was used for the `X-Donat-Admin-Secret` check; the secret and
+  the comparison were both removed with
+  [[api-surfaces/decisions/013-a-role-is-established-by-a-verified-token-or-a-hook-and-by-nothing-else]].
+  There is no shared secret left to compare.
 - **Metadata `!include` cycle → overflow: FIXED.** The loader tracks the
   include chain and returns `LoadError::IncludeCycle`.
 - **Aggregate-function injection in `order_by` (SEC-01): FIXED (2026-06-13).**
@@ -91,7 +94,18 @@ process**, so a single malformed/buggy-client query kills the service for
 everyone. Fix: reject queries past a max depth (e.g. 30–50) before/while
 parsing, and a max-aliases/complexity cap.
 
-### 1b. Admin role widened fail-open to the WHOLE data plane — UPDATE (2026-06-13)
+### 1b. Admin role widened fail-open to the WHOLE data plane — RESOLVED (2026-08-11)
+
+> The posture below no longer exists. The admin role and `run_sql` were
+> removed, and with
+> [[api-surfaces/decisions/013-a-role-is-established-by-a-verified-token-or-a-hook-and-by-nothing-else]]
+> so was the secret: a role is established by a verified JWT or an
+> authentication hook, no header names one, a request nothing authenticated is
+> the unauthorized role or refused, and a deployment configuring none of the
+> three refuses to boot. The unconfigured deployment is now the most
+> restrictive rather than the least. The record below is kept as history.
+
+#### Original finding (2026-06-13)
 After the Donat admin role landed, "no admin secret configured" now means
 **every no-role request is admin** on `/v1/graphql` too, not just the
 metadata API. Verified live: new binary, no secret, `{ __typename }` with no

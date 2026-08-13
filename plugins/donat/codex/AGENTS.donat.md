@@ -44,8 +44,9 @@ writers, the other is bypassed by any other role.
   your partner can no longer read it. Tier 2 needs the engine embedded in a Go
   program; on the standalone server it collapses into tier 3, so establish the
   host before promising it.
-- `X-Donat-Admin-Secret` is transport authentication — it only permits a
-  request to *assert* a role. It is never a permission.
+- A role comes from a verified JWT or an authentication hook, and from
+  nothing else. No header names one: `X-Donat-Role` only picks between roles a
+  token already granted, and there is no shared secret in this engine.
 - Secrets in metadata are always `value_from_env:`, never literals.
 - **Talk in the partner's language; write the repository in English.** Comments,
   metadata descriptions, scripts, docs and commit messages are English whatever

@@ -138,13 +138,38 @@ explicit role and a matching permission.
 ## Get started
 
 ```sh
+make env                          # fresh secrets, once, on this machine
+docker compose up -d --build      # http://localhost:5180
+```
+
+That is the default deployment, built from this tree: Postgres, an identity
+provider, object storage, the engine, and the admin panel. Sign in as
+`operator@example.com` with the password `make env` printed (it is in `.env`).
+
+It has **no application in it** — no tables, no metadata beyond a source and a
+store — because an application is what you add on top. What it has is
+everything you would otherwise assemble first: a way to sign in, a way to say
+who may do what, and somewhere for files to go. The panel's Identity section
+manages the provider's own accounts, roles, groups, scopes, applications,
+attributes, blocked addresses and sessions — none of which is metadata you
+write; see
+[apps/admin](apps/admin) and
+[ADR platform/003](knowledgebase/platform/decisions/003-the-identity-adapter-ships-in-the-binary-and-grants-nothing.md).
+
+Add tables to `deploy/metadata/databases/default/tables/` with per-role
+permissions beside them, and the panel renders them as resources.
+
+### An application to look at
+
+```sh
 docker build -t ghcr.io/donatlabs/donat:latest .
 cd examples/petshop
 docker compose up
 ```
 
-That brings up Postgres, applies the schema, deploys the Process revisions,
-answers the five declared providers with a local fixture, and serves:
+The Petshop brings up Postgres, applies the schema, deploys the Process
+revisions, answers the five declared providers with a local fixture, and
+serves:
 
 - **GraphQL** — <http://localhost:8080/v1/graphql>
 - **REST** — <http://localhost:8080/api/rest/>

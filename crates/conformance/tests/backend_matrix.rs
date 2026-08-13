@@ -1070,14 +1070,19 @@ fn transport_and_role_contract() {
         TRANSPORT_ROLE_CASES,
         |case| match case {
             "missing-role" => {
+                // A request that names no role names nothing this engine can
+                // act on: there is no admin role to fall back to, and a header
+                // is not authentication. The suite's authentication hook
+                // refuses it, and with no unauthorized role configured the
+                // refusal is the answer.
                 let (status, no_role) =
                     suite.post("/v1/graphql", &json!({ "query": "{ pet { id } }" }), &[]);
-                assert_eq!(status, 200);
+                assert_eq!(status, 401);
                 assert_eq!(
                     no_role,
                     json!({ "errors": [{
                         "extensions": { "path": "$", "code": "access-denied" },
-                        "message": "x-donat-role header is required (this engine has no admin role)"
+                        "message": "Authentication hook unauthorized this request"
                     }]})
                 );
             }

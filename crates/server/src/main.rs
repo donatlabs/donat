@@ -125,10 +125,6 @@ struct Args {
     #[arg(long, env = "DONAT_PORT", default_value_t = 8080)]
     port: u16,
 
-    /// If set, metadata endpoints require X-Donat-Admin-Secret.
-    #[arg(long, env = "DONAT_GRAPHQL_ADMIN_SECRET")]
-    admin_secret: Option<String>,
-
     /// Comma-separated list of API surfaces to expose: `graphql`, `rest`,
     /// `mcp` (case-insensitive). Absent => all three. Unknown tokens are
     /// ignored with a warning.
@@ -339,8 +335,6 @@ struct ServeArgs {
     enable_telemetry: Option<String>,
     #[arg(long, default_value_t = false)]
     stringify_numeric_types: bool,
-    #[arg(long)]
-    admin_secret: Option<String>,
     /// CLI override of `--enabled-apis` (wins over the global flag / env).
     #[arg(long)]
     enabled_apis: Option<String>,
@@ -696,11 +690,8 @@ async fn main() -> anyhow::Result<()> {
     let database_url = resolve_global_database_url(&args, &|name| std::env::var(name))?
         .ok_or_else(|| anyhow::anyhow!("--database-url or --metadata-database-url is required"))?;
     let port = serve.and_then(|s| s.server_port).unwrap_or(args.port);
-    let admin_secret = serve
-        .and_then(|s| s.admin_secret.clone())
-        .or(args.admin_secret);
-    // CLI override (serve) wins over the global flag / env, mirroring
-    // admin_secret. `None` (truly unset) => default all surfaces on.
+    // CLI override (serve) wins over the global flag / env. `None` (truly
+    // unset) => default all surfaces on.
     let enabled_apis = parse_enabled_apis(
         serve
             .and_then(|s| s.enabled_apis.clone())
@@ -718,14 +709,27 @@ async fn main() -> anyhow::Result<()> {
         (url, mode)
     });
     // A JWT configuration the engine cannot parse stops the boot. Dropping it
-    // would disable token verification without saying so, and a deployment
-    // with no admin secret would then honor whatever role a caller asks for.
+    // would disable token verification without saying so, and every request
+    // would silently become the unauthorized role.
     let jwt = std::env::var("DONAT_GRAPHQL_JWT_SECRET")
         .ok()
         .map(|raw| jwt::JwtConfig::from_env_value(&raw))
         .transpose()
         .map_err(|e| anyhow::anyhow!("DONAT_GRAPHQL_JWT_SECRET is unusable: {e}"))?;
-    warn_when_unauthenticated(admin_secret.is_some(), jwt.is_some(), auth_hook.is_some());
+    // The login routes exist only where a provider is named. Like the JWT
+    // configuration, an unusable value stops the boot rather than quietly
+    // leaving the deployment without a way in.
+    let oidc = std::env::var("DONAT_OIDC")
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| donat_server::oidc::OidcConfig::from_env_value(&raw))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("DONAT_OIDC is unusable: {e}"))?;
+    require_a_way_to_answer(
+        jwt.is_some(),
+        auth_hook.is_some(),
+        unauthorized_role.is_some(),
+    )?;
     let infer_function_permissions = std::env::var("DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS")
         .map(|v| !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
@@ -741,6 +745,24 @@ async fn main() -> anyhow::Result<()> {
                      this server has no such registry — give each one a `handler`, or serve \
                      the metadata from an embedded host",
                     in_process
+                );
+            }
+            let bad_templates: Vec<String> = md
+                .actions
+                .iter()
+                .flat_map(|action| {
+                    donat_server::transform::unparsable_templates(
+                        action.definition.request_transform.as_ref(),
+                        action.definition.response_transform.as_ref(),
+                    )
+                    .into_iter()
+                    .map(move |problem| format!("{}: {problem}", action.name))
+                })
+                .collect();
+            if !bad_templates.is_empty() {
+                anyhow::bail!(
+                    "these action transforms do not parse: {}",
+                    bad_templates.join("; ")
                 );
             }
             tracing::info!(dir = %dir.display(), "metadata loaded");
@@ -769,6 +791,21 @@ async fn main() -> anyhow::Result<()> {
             recurrence: Default::default(),
         },
     };
+
+    // The identity provider's own accounts, when a deployment configured a key
+    // for them. The declaration ships in the binary; what a deployment says is
+    // where the provider is, how to reach it and which role may — see
+    // `donat_server::idp_admin`. A deployment that declares these fields
+    // itself keeps its own.
+    if let Some(admin) = oidc.as_ref().and_then(|config| config.admin.as_ref()) {
+        donat_server::idp_admin::extend(&mut metadata, admin)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        tracing::info!(
+            target: "donat::auth",
+            role = %admin.role,
+            "serving the identity provider's accounts"
+        );
+    }
     ensure_default_source(&mut metadata);
 
     // Connector configuration is fully validated before this process opens a
@@ -798,8 +835,8 @@ async fn main() -> anyhow::Result<()> {
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap_checked(metadata)?)),
         connectors,
         default_url: database_url,
-        admin_secret,
         unauthorized_role,
+        oidc,
         stringify_numerics,
         infer_function_permissions,
         jwt,
@@ -892,6 +929,33 @@ async fn main() -> anyhow::Result<()> {
         // durable database work, so it carries the deadline the data surfaces
         // carry rather than being the one unbounded way in.
         .merge(bounded_router(connector_webhook::router()));
+    // Login is not a data API: it is mounted whenever a provider is
+    // configured, including on a deployment that serves no GraphQL at all,
+    // because a browser has to be able to obtain a session before any surface
+    // will answer it.
+    // Reporting a caller back to itself needs no provider, and a browser needs
+    // it whether or not this engine serves the login.
+    app = app.route("/auth/session", bounded(get(donat_server::oidc::session)));
+    if state.oidc.is_some() {
+        app = app
+            .route("/auth/login", bounded(get(donat_server::oidc::login)))
+            .route("/auth/callback", bounded(get(donat_server::oidc::callback)))
+            .route("/auth/logout", bounded(get(donat_server::oidc::logout)));
+        // The provider's own login API, on this origin, when a deployment asks
+        // for it. It is what lets a first-party page render the login screen
+        // while the provider keeps the protocol; it establishes no role and
+        // reaches no data. See `donat_server::idp_proxy`.
+        if state
+            .oidc
+            .as_ref()
+            .is_some_and(|config| config.login_api.is_some())
+        {
+            app = app.route(
+                &format!("{}/{{*path}}", donat_server::idp_proxy::PREFIX),
+                bounded(axum::routing::any(donat_server::idp_proxy::forward)),
+            );
+        }
+    }
     // Data APIs are mounted only when enabled (deploy-time flag); a disabled
     // surface's routes are simply absent => plain 404.
     // Every request-response surface carries a deadline; the websocket
@@ -953,12 +1017,19 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(%addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown({
-            let stopping = shutdown.stopping.clone();
-            async move { stopping.cancelled().await }
-        })
-        .await?;
+    // `with_connect_info` because one handler needs the caller's address: the
+    // identity-provider proxy has to tell the provider who is knocking, or its
+    // rate limiting and its blacklist are about this engine instead of about
+    // anybody (see `donat_server::idp_proxy`).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown({
+        let stopping = shutdown.stopping.clone();
+        async move { stopping.cancelled().await }
+    })
+    .await?;
 
     // The listener is closed and every request that was in flight has been
     // answered. The background workers were told at the same moment; give them
@@ -1197,26 +1268,38 @@ fn panic_response(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::respo
         .into_response()
 }
 
-/// The warning a deployment with no request authentication deserves, if any.
+/// Why a deployment that can answer nobody must not boot, if it is one.
 ///
-/// With no admin secret, no JWT configuration and no auth hook every request is
-/// trusted: the caller names its own role in `X-Donat-Role` and gets exactly
-/// that role's permissions. That is the documented compatible behaviour and it
-/// stays the default — the fixture mode and the conformance harness rely on it
-/// — but it is a deploy-time decision nobody should make by accident, so the
-/// boot says so out loud.
-fn unauthenticated_warning(admin_secret: bool, jwt: bool, auth_hook: bool) -> Option<&'static str> {
-    (!admin_secret && !jwt && !auth_hook).then_some(
-        "no request authentication is configured: no admin secret, no \
-         DONAT_GRAPHQL_JWT_SECRET and no DONAT_GRAPHQL_AUTH_HOOK. Every caller \
-         chooses its own role with the x-donat-role header and receives that \
-         role's permissions. Serve this only on a trusted network.",
+/// A role reaches this engine from a verified JWT or from an authentication
+/// hook. Nothing else names one: no header, no shared secret. A deployment
+/// with neither can still serve a public surface — every request becomes
+/// `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` — but a deployment with neither AND no
+/// unauthorized role has no session to run any request under, so every
+/// request it will ever receive is already decided. Saying that at boot beats
+/// discovering it one denied request at a time.
+fn missing_authentication(
+    jwt: bool,
+    auth_hook: bool,
+    unauthorized_role: bool,
+) -> Option<&'static str> {
+    (!jwt && !auth_hook && !unauthorized_role).then_some(
+        "no session can be resolved: set DONAT_GRAPHQL_JWT_SECRET to verify \
+         tokens, DONAT_GRAPHQL_AUTH_HOOK to resolve them elsewhere, or \
+         DONAT_GRAPHQL_UNAUTHORIZED_ROLE to serve every request as one \
+         explicit role. This engine has no admin role and honors no role \
+         header on its own, so without one of the three every request is \
+         denied.",
     )
 }
 
-fn warn_when_unauthenticated(admin_secret: bool, jwt: bool, auth_hook: bool) {
-    if let Some(message) = unauthenticated_warning(admin_secret, jwt, auth_hook) {
-        tracing::warn!(target: "donat::auth", "{message}");
+fn require_a_way_to_answer(
+    jwt: bool,
+    auth_hook: bool,
+    unauthorized_role: bool,
+) -> anyhow::Result<()> {
+    match missing_authentication(jwt, auth_hook, unauthorized_role) {
+        Some(message) => Err(anyhow::anyhow!(message)),
+        None => Ok(()),
     }
 }
 
@@ -1300,8 +1383,8 @@ mod tests {
 
     use super::{
         Args, DeploymentSelection, EnabledApis, MetadataSourceSelection, MigrateArgs, ValidateArgs,
-        parse_enabled_apis, resolve_migrate_selection, resolve_validate_selection,
-        unauthenticated_warning,
+        missing_authentication, parse_enabled_apis, require_a_way_to_answer,
+        resolve_migrate_selection, resolve_validate_selection,
     };
 
     static NEXT_METADATA_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1476,23 +1559,27 @@ mod tests {
         assert!(!body.to_string().contains("handler exploded"));
     }
 
-    /// Only a deployment where nothing authenticates the caller is warned
-    /// about; any one of the three mechanisms is enough to silence it.
+    /// A deployment that can resolve no session at all must not boot, and any
+    /// one of the three ways to resolve one is enough to let it.
     #[test]
-    fn only_a_wholly_unauthenticated_deployment_is_warned() {
-        let warning = unauthenticated_warning(false, false, false)
-            .expect("a deployment with no authentication is warned");
-        assert!(warning.contains("x-donat-role"));
-        for (admin_secret, jwt, auth_hook) in [
+    fn a_deployment_that_can_answer_nobody_refuses_to_boot() {
+        let message =
+            missing_authentication(false, false, false).expect("nothing can resolve a session");
+        assert!(message.contains("DONAT_GRAPHQL_JWT_SECRET"));
+        assert!(message.contains("DONAT_GRAPHQL_AUTH_HOOK"));
+        assert!(message.contains("DONAT_GRAPHQL_UNAUTHORIZED_ROLE"));
+        assert!(require_a_way_to_answer(false, false, false).is_err());
+        for (jwt, auth_hook, unauthorized_role) in [
             (true, false, false),
             (false, true, false),
             (false, false, true),
             (true, true, true),
         ] {
             assert!(
-                unauthenticated_warning(admin_secret, jwt, auth_hook).is_none(),
-                "admin_secret={admin_secret} jwt={jwt} auth_hook={auth_hook} must not warn"
+                missing_authentication(jwt, auth_hook, unauthorized_role).is_none(),
+                "jwt={jwt} auth_hook={auth_hook} unauthorized_role={unauthorized_role} must boot"
             );
+            assert!(require_a_way_to_answer(jwt, auth_hook, unauthorized_role).is_ok());
         }
     }
 
@@ -1537,7 +1624,6 @@ mod tests {
             database_url: database_url.map(str::to_owned),
             metadata_database_url: metadata_database_url.map(str::to_owned),
             port: 8080,
-            admin_secret: None,
             enabled_apis: None,
             command: None,
         }

@@ -117,8 +117,9 @@ a named role with an explicit list of what it may read and write, and a
 sentence about why it needs each item. Convert the request; never grant it, and
 never route around it with a shared secret or a service account.
 
-`X-Donat-Admin-Secret` is not an exception — it only lets a request *assert* a
-role. Anyone who calls it a permission has misread it.
+There is no exception and no back door: a role comes from a verified token or
+an authentication hook. This engine has no shared secret, and a header cannot
+add a role a token did not grant.
 
 ## Red flags
 

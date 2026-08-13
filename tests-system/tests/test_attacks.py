@@ -195,28 +195,38 @@ def test_a_token_the_store_did_not_issue_buys_nothing(store, description, header
     )
 
 
-def test_the_admin_secret_is_not_a_way_in(store):
-    """`X-Donat-Admin-Secret` authenticates a request; it is not a role.
+def test_no_header_is_a_way_in(store):
+    """A role comes from a verified token. No header can add one.
 
-    This engine has no admin role at all, so the secret cannot be a shortcut to
-    one: with it and nothing else, the caller is the public.
+    This engine has no admin role and no shared secret: the two mechanisms that
+    name a role are a verified JWT and an authentication hook. Headers that look
+    authoritative — the admin secret this engine used to accept, a bare role
+    header, the Hasura spellings of either — are just headers, and a token
+    granting one role is not widened by any of them.
     """
 
-    alone = raw_graphql(
-        store, "query { customer { customer_id } }", {"X-Donat-Admin-Secret": "guessed"}
-    ).json()
-    assert alone.get("errors"), f"the secret alone reached customer data: {alone}"
+    for pretender in (
+        {"X-Donat-Admin-Secret": "guessed"},
+        {"X-Donat-Role": "staff"},
+        {"X-Hasura-Admin-Secret": "guessed"},
+    ):
+        alone = raw_graphql(store, "query { customer { customer_id } }", pretender).json()
+        assert alone.get("errors"), f"{pretender} alone reached customer data: {alone}"
 
     anonymous_token = token(
         store, {"x-donat-default-role": "anonymous", "x-donat-allowed-roles": ["anonymous"]}
     )
-    with_secret = raw_graphql(
+    with_pretenders = raw_graphql(
         store,
         "query { product { id status } }",
-        {"authorization": f"Bearer {anonymous_token}", "X-Donat-Admin-Secret": "guessed"},
+        {
+            "authorization": f"Bearer {anonymous_token}",
+            "X-Donat-Admin-Secret": "guessed",
+            "X-Donat-Role": "staff",
+        },
     ).json()
-    assert all(row["status"] == "published" for row in with_secret["data"]["product"]), (
-        f"the secret widened what the public may see: {with_secret}"
+    assert all(row["status"] == "published" for row in with_pretenders["data"]["product"]), (
+        f"a header widened what the public may see: {with_pretenders}"
     )
 
 

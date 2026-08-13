@@ -18,7 +18,6 @@ fn petshop_suite(name: &str) -> donat_conformance::Running {
     let running = Suite::new(name)
         .initial_metadata(metadata)
         .with_migrations()
-        .admin_secret("petshop-secret")
         .env("PETSHOP_PAYMENT_BASE_URL", "http://127.0.0.1:9")
         .env("PETSHOP_PAYMENT_API_TOKEN", "petshop-test-payment")
         .env("DONAT_MOCK_CARRIER_BASE_URL", "http://127.0.0.1:9")
@@ -53,7 +52,6 @@ fn petshop_domain_suite(name: &str) -> donat_conformance::Running {
     metadata.processes.clear();
     let running = Suite::new(name)
         .initial_metadata(metadata)
-        .admin_secret("petshop-secret")
         // The tracked domain keeps its file column: an attachment is table
         // metadata, not one of the runtime sections this suite strips.
         .env("PETSHOP_FILE_SIGNING_SECRET", "petshop-test-file-signing")

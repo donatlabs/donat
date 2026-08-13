@@ -1,0 +1,801 @@
+# The identity provider's own accounts, as fields this engine serves.
+#
+# This file ships **inside the binary** (`include_str!` in `idp_admin.rs`) and
+# is not something a deployment writes. Three things are filled in from
+# `DONAT_OIDC` before it is used: the handler URL, the `Authorization` header
+# carrying the provider's admin key, and the one role allowed to call any of
+# it. Everything else is fixed, because it describes an API this engine did not
+# design and cannot change.
+#
+# Why in code rather than in metadata: the same reason connectors are. An
+# adapter for one named provider is a fact about that provider, and asking
+# every deployment to copy the same forty lines of YAML — correctly — is how
+# they end up differing. A provider that is not this one is still an ordinary
+# `actions.yaml`; nothing here closes that door.
+#
+# It grants nothing on its own. The role below is named by configuration, the
+# permission is the same per-role permission every other field has, and a
+# deployment that configures no admin key has no such fields at all.
+
+custom_types:
+  objects:
+    # What `GET /users` returns per account. Deliberately the provider's own
+    # field names — renaming them here would hide which API this is.
+    # What `GET /users` returns per account — plus, nullable, the fields only
+    # the detail carries. The panel selects one set of fields for both the list
+    # and the card, so the two types have to admit the same selection; the list
+    # answers `null` for what it does not send, and the card answers for real.
+    - name: IdpUser
+      fields:
+        - name: id
+          type: ID!
+        - name: email
+          type: String!
+        - name: given_name
+          type: String
+        - name: family_name
+          type: String
+        - name: created_at
+          type: bigint
+        - name: last_login
+          type: bigint
+        - name: language
+          type: String
+        - name: roles
+          type: '[String!]'
+        - name: enabled
+          type: Boolean
+        - name: email_verified
+          type: Boolean
+        - name: account_type
+          type: String
+
+    # What `GET /users/{id}` adds: the fields an operator acts on.
+    - name: IdpUserDetail
+      fields:
+        - name: id
+          type: ID!
+        - name: email
+          type: String!
+        - name: given_name
+          type: String
+        - name: family_name
+          type: String
+        - name: language
+          type: String
+        - name: roles
+          type: '[String!]'
+        - name: enabled
+          type: Boolean
+        - name: email_verified
+          type: Boolean
+        - name: created_at
+          type: bigint
+        - name: account_type
+          type: String
+
+    - name: IdpRole
+      fields:
+        - name: id
+          type: ID!
+        - name: name
+          type: String!
+
+    - name: IdpGroup
+      fields:
+        - name: id
+          type: ID!
+        - name: name
+          type: String!
+
+    - name: IdpScope
+      fields:
+        - name: id
+          type: ID!
+        - name: name
+          type: String!
+
+    - name: IdpUserAttribute
+      fields:
+        - name: name
+          type: ID!
+        - name: desc
+          type: String
+        - name: user_editable
+          type: Boolean
+
+    - name: IdpBlockedIp
+      fields:
+        - name: ip
+          type: ID!
+        # Unix seconds. The provider speaks in numbers here, and translating
+        # would mean this engine deciding what "expired" means on its behalf.
+        - name: exp
+          type: bigint
+
+    - name: IdpSession
+      fields:
+        - name: id
+          type: ID!
+        - name: user_id
+          type: String
+        - name: is_mfa
+          type: Boolean
+        - name: state
+          type: String
+        - name: exp
+          type: bigint
+        - name: last_seen
+          type: bigint
+        - name: remote_ip
+          type: String
+
+    # A client is an application allowed to sign people in. Only the fields an
+    # operator reads or turns on and off — a client's secret is not among them
+    # and is never returned here.
+    - name: IdpClient
+      fields:
+        - name: id
+          type: ID!
+        - name: name
+          type: String
+        - name: enabled
+          type: Boolean
+        - name: confidential
+          type: Boolean
+        - name: redirect_uris
+          type: '[String!]'
+        - name: allowed_origins
+          type: '[String!]'
+        - name: flows_enabled
+          type: '[String!]'
+        - name: scopes
+          type: '[String!]'
+        - name: default_scopes
+          type: '[String!]'
+        - name: force_mfa
+          type: Boolean
+        - name: client_uri
+          type: String
+
+  input_objects:
+    - name: IdpUserInput
+      fields:
+        - name: email
+          type: String!
+        - name: given_name
+          type: String!
+        - name: family_name
+          type: String
+        - name: roles
+          type: '[String!]!'
+        - name: enabled
+          type: Boolean!
+        - name: email_verified
+          type: Boolean!
+
+    - name: IdpUserCreateInput
+      fields:
+        - name: email
+          type: String!
+        - name: given_name
+          type: String!
+        - name: family_name
+          type: String
+        # Absent means none. A required list here would not make a form send
+        # one — it would make this template fail on a key nobody typed.
+        - name: roles
+          type: '[String!]'
+
+    # Roles, groups and scopes are each one name, which is the whole record.
+    - name: IdpNameInput
+      fields:
+        - name: name
+          type: String!
+
+    - name: IdpUserAttributeInput
+      fields:
+        - name: name
+          type: String!
+        - name: desc
+          type: String
+
+    - name: IdpBlockedIpInput
+      fields:
+        - name: ip
+          type: String!
+        - name: exp
+          type: bigint!
+
+    - name: IdpClientInput
+      fields:
+        - name: name
+          type: String
+        - name: enabled
+          type: Boolean!
+        - name: confidential
+          type: Boolean!
+        - name: redirect_uris
+          type: '[String!]!'
+        - name: allowed_origins
+          type: '[String!]'
+        - name: flows_enabled
+          type: '[String!]!'
+        - name: scopes
+          type: '[String!]!'
+        - name: default_scopes
+          type: '[String!]!'
+        - name: force_mfa
+          type: Boolean!
+        - name: client_uri
+          type: String
+
+actions:
+  - name: idp_users
+    comment: Every account the identity provider holds.
+    definition:
+      kind: synchronous
+      type: query
+      output_type: '[IdpUser!]!'
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/users'
+        # An action's default body is this engine's own invocation envelope,
+        # which an API that never asked for it would refuse.
+        body:
+          action: remove
+
+  - name: idp_user
+    comment: One account, with the fields an operator acts on.
+    definition:
+      kind: synchronous
+      type: query
+      arguments:
+        - name: id
+          type: ID!
+      output_type: IdpUserDetail
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/users/{{$body.input.id}}'
+        body:
+          action: remove
+
+  - name: idp_user_update
+    comment: >-
+      Change an account. The provider replaces the whole record on PUT, so the
+      template sends every field it manages — a partial body would blank the
+      rest.
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+        - name: input
+          type: IdpUserInput!
+      output_type: IdpUserDetail
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: PUT
+        url: '{{$base_url}}/users/{{$body.input.id}}'
+        body:
+          action: transform
+          template: |
+            {
+              "email": {{ $body.input.input.email }},
+              "given_name": {{ $body.input.input.given_name }},
+              "family_name": {{ $body.input.input?.family_name }},
+              "roles": {{ $body.input.input?.roles ?? [] }},
+              "groups": [],
+              "enabled": {{ $body.input.input.enabled }},
+              "email_verified": {{ $body.input.input.email_verified }},
+              "password": {{ $body.input.input?.password }}
+            }
+
+  - name: idp_user_create
+    comment: >-
+      Invite an account. The provider creates it in its "new" state and mails
+      the person a link to set a password — so a deployment with no mail
+      configured gets an account nobody can use yet, which is the provider's
+      design rather than a gap here.
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: input
+          type: IdpUserCreateInput!
+      output_type: IdpUserDetail
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: POST
+        url: '{{$base_url}}/users'
+        body:
+          action: transform
+          template: |
+            {
+              "email": {{ $body.input.input.email }},
+              "given_name": {{ $body.input.input.given_name }},
+              "family_name": {{ $body.input.input?.family_name }},
+              "roles": {{ $body.input.input?.roles ?? [] }},
+              "groups": [],
+              "language": "en"
+            }
+
+  - name: idp_user_delete
+    comment: Remove an account. The person can no longer sign in anywhere.
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+      output_type: json
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: DELETE
+        url: '{{$base_url}}/users/{{$body.input.id}}'
+        body:
+          action: remove
+
+  # Roles, groups and scopes are each a single name. The provider returns the
+  # record it made, so each of these answers with it.
+  - name: idp_roles
+    comment: Every role the provider can put in a token.
+    definition:
+      kind: synchronous
+      type: query
+      output_type: '[IdpRole!]!'
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/roles'
+        body:
+          action: remove
+
+  - name: idp_role_create
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: input
+          type: IdpNameInput!
+      output_type: IdpRole
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: POST
+        url: '{{$base_url}}/roles'
+        body:
+          action: transform
+          template: '{ "role": {{ $body.input.input?.name }} }'
+
+  - name: idp_role_update
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+        - name: input
+          type: IdpNameInput!
+      output_type: IdpRole
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: PUT
+        url: '{{$base_url}}/roles/{{$body.input.id}}'
+        body:
+          action: transform
+          template: '{ "role": {{ $body.input.input?.name }} }'
+
+  - name: idp_role_delete
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+      output_type: json
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: DELETE
+        url: '{{$base_url}}/roles/{{$body.input.id}}'
+        body:
+          action: remove
+
+  - name: idp_groups
+    comment: Every group, which is how a provider carries membership.
+    definition:
+      kind: synchronous
+      type: query
+      output_type: '[IdpGroup!]!'
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/groups'
+        body:
+          action: remove
+
+  - name: idp_group_create
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: input
+          type: IdpNameInput!
+      output_type: IdpGroup
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: POST
+        url: '{{$base_url}}/groups'
+        body:
+          action: transform
+          template: '{ "group": {{ $body.input.input?.name }} }'
+
+  - name: idp_group_update
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+        - name: input
+          type: IdpNameInput!
+      output_type: IdpGroup
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: PUT
+        url: '{{$base_url}}/groups/{{$body.input.id}}'
+        body:
+          action: transform
+          template: '{ "group": {{ $body.input.input?.name }} }'
+
+  - name: idp_group_delete
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+      output_type: json
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: DELETE
+        url: '{{$base_url}}/groups/{{$body.input.id}}'
+        body:
+          action: remove
+
+  - name: idp_scopes
+    comment: Every scope an application may ask for.
+    definition:
+      kind: synchronous
+      type: query
+      output_type: '[IdpScope!]!'
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/scopes'
+        body:
+          action: remove
+
+  - name: idp_scope_create
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: input
+          type: IdpNameInput!
+      output_type: IdpScope
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: POST
+        url: '{{$base_url}}/scopes'
+        body:
+          action: transform
+          template: '{ "scope": {{ $body.input.input?.name }} }'
+
+  - name: idp_scope_update
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+        - name: input
+          type: IdpNameInput!
+      output_type: IdpScope
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: PUT
+        url: '{{$base_url}}/scopes/{{$body.input.id}}'
+        body:
+          action: transform
+          template: '{ "scope": {{ $body.input.input?.name }} }'
+
+  - name: idp_scope_delete
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+      output_type: json
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: DELETE
+        url: '{{$base_url}}/scopes/{{$body.input.id}}'
+        body:
+          action: remove
+
+  # Applications allowed to sign people in. A client's secret is neither read
+  # nor written here: rotating one is a deliberate act at the provider, not a
+  # field on a form.
+  - name: idp_clients
+    comment: Every application that may sign people in.
+    definition:
+      kind: synchronous
+      type: query
+      output_type: '[IdpClient!]!'
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/clients'
+        body:
+          action: remove
+
+  - name: idp_client
+    definition:
+      kind: synchronous
+      type: query
+      arguments:
+        - name: id
+          type: ID!
+      output_type: IdpClient
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/clients/{{$body.input.id}}'
+        body:
+          action: remove
+
+  - name: idp_client_update
+    comment: >-
+      Change an application. The provider replaces the whole record, so every
+      field it manages is sent — and `id` is sent with them, because it is part
+      of that record rather than only part of the path.
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+        - name: input
+          type: IdpClientInput!
+      output_type: IdpClient
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: PUT
+        url: '{{$base_url}}/clients/{{$body.input.id}}'
+        body:
+          action: transform
+          template: |
+            {
+              "id": {{ $body.input.id }},
+              "name": {{ $body.input.input?.name }},
+              "enabled": {{ $body.input.input.enabled }},
+              "confidential": {{ $body.input.input.confidential }},
+              "redirect_uris": {{ $body.input.input.redirect_uris }},
+              "allowed_origins": {{ $body.input.input?.allowed_origins ?? [] }},
+              "flows_enabled": {{ $body.input.input.flows_enabled }},
+              "access_token_alg": "RS256",
+              "id_token_alg": "RS256",
+              "auth_code_lifetime": 60,
+              "access_token_lifetime": 3600,
+              "scopes": {{ $body.input.input.scopes }},
+              "default_scopes": {{ $body.input.input.default_scopes }},
+              "challenges": ["S256"],
+              "force_mfa": {{ $body.input.input.force_mfa }},
+              "client_uri": {{ $body.input.input?.client_uri }}
+            }
+
+  # Custom claims. A deployment's own facts about a person — a department, a
+  # tenant — which the provider can then put in a token and a permission can
+  # then be written against.
+  #
+  # The provider answers with `{"values": [...]}` rather than a list, so a
+  # response transform unwraps it. That is what response transforms are for:
+  # an output type promises a shape, and the API that already existed does not
+  # have to have agreed with it.
+  - name: idp_user_attributes
+    comment: The custom claims this provider can carry about a person.
+    definition:
+      kind: synchronous
+      type: query
+      output_type: '[IdpUserAttribute!]!'
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/users/attr'
+        body:
+          action: remove
+      response_transform:
+        version: 2
+        template_engine: Kriti
+        body:
+          action: transform
+          template: '{{ $body.values }}'
+
+  - name: idp_user_attribute_create
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: input
+          type: IdpUserAttributeInput!
+      output_type: IdpUserAttribute
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: POST
+        url: '{{$base_url}}/users/attr'
+        body:
+          action: transform
+          template: |
+            {
+              "name": {{ $body.input.input?.name }},
+              "desc": {{ $body.input.input?.desc ?? "" }}
+            }
+
+  - name: idp_user_attribute_update
+    comment: >-
+      The name is the key here, not a generated id — so renaming an attribute
+      is deleting one and making another, and this only changes the wording.
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+        - name: input
+          type: IdpUserAttributeInput!
+      output_type: IdpUserAttribute
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: PUT
+        url: '{{$base_url}}/users/attr/{{$body.input.id}}'
+        body:
+          action: transform
+          template: |
+            {
+              "name": {{ $body.input.id }},
+              "desc": {{ $body.input.input?.desc ?? "" }}
+            }
+
+  - name: idp_user_attribute_delete
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+      output_type: json
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: DELETE
+        url: '{{$base_url}}/users/attr/{{$body.input.id}}'
+        body:
+          action: remove
+
+  # Addresses the provider refuses to answer. Operational rather than
+  # decorative: this is the screen someone opens during an incident.
+  - name: idp_blocked_ips
+    comment: The addresses the provider is currently refusing.
+    definition:
+      kind: synchronous
+      type: query
+      output_type: '[IdpBlockedIp!]!'
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/blacklist'
+        body:
+          action: remove
+      response_transform:
+        version: 2
+        template_engine: Kriti
+        body:
+          action: transform
+          template: '{{ $body.ips }}'
+
+  - name: idp_blocked_ip_create
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: input
+          type: IdpBlockedIpInput!
+      output_type: json
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: POST
+        url: '{{$base_url}}/blacklist'
+        body:
+          action: transform
+          template: |
+            {
+              "ip": {{ $body.input.input.ip }},
+              "exp": {{ $body.input.input.exp }}
+            }
+
+  - name: idp_blocked_ip_delete
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+      output_type: json
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: DELETE
+        url: '{{$base_url}}/blacklist/{{$body.input.id}}'
+        body:
+          action: remove
+
+  # Who is signed in right now. Read and end — there is nothing to edit about
+  # a session, and ending one is the only thing an operator ever wants.
+  - name: idp_sessions
+    comment: Every session the provider is currently honouring.
+    definition:
+      kind: synchronous
+      type: query
+      output_type: '[IdpSession!]!'
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: GET
+        url: '{{$base_url}}/sessions'
+        body:
+          action: remove
+
+  - name: idp_session_delete
+    definition:
+      kind: synchronous
+      type: mutation
+      arguments:
+        - name: id
+          type: ID!
+      output_type: json
+      request_transform:
+        version: 2
+        template_engine: Kriti
+        method: DELETE
+        url: '{{$base_url}}/sessions/{{$body.input.id}}'
+        body:
+          action: remove

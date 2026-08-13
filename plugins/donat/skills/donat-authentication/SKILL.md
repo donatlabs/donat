@@ -13,18 +13,24 @@ authentication.
 This is good news and it is the first thing to say out loud, because people
 assume the opposite and design around a login the engine will never provide.
 
-## The three ways identity arrives
+## The two ways identity arrives
 
 | How | When | What it means |
 |---|---|---|
-| **A JWT** in `Authorization: Bearer …` | production | role and session variables come from the token's claims |
-| **`X-Donat-Role` + session headers**, behind `X-Donat-Admin-Secret` | a demo, a test, an edge-auth proxy you trust | the request is *trusted to assert* a role. Not a permission. |
-| **Neither** | anonymous traffic | falls back to `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`, or is rejected with `x-donat-role header is required` |
+| **A verified JWT** — `Authorization: Bearer …`, or the session cookie the engine's own login writes | almost always | role and session variables come from the token's claims |
+| **An authentication hook** — `DONAT_GRAPHQL_AUTH_HOOK` | you already have a service that knows who a caller is | the engine forwards the request's headers to it and takes the session variables it answers with |
+| **Neither** | anonymous traffic | falls back to `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`, or the request is refused |
 
-**The admin secret outranks the token.** A request presenting it may still
-assert any role by header, whatever the token says. Set it for a local stand;
-remove it from anything real. Leaving it configured beside a working JWT setup
-is the single most likely way to undo the whole permission model.
+**No header names a role.** `X-Donat-Role` only *picks* between roles the token
+already granted; it can never add one, and neither can any secret — there is no
+shared secret in this engine at all. A deployment that configures none of the
+three refuses to boot, because it could answer nobody.
+
+**The engine can run the login itself.** Set `DONAT_OIDC` and it serves
+`/auth/login` (redirect to your provider, authorization code + PKCE) and
+`/auth/callback` (the token into an `HttpOnly` cookie it then verifies like any
+other). It still stores no users and issues no tokens — which is what a browser
+needs and a bearer header cannot give it. This is how `apps/admin` signs in.
 
 ## Which provider
 
@@ -158,16 +164,20 @@ Recommend one, name the cost of the alternative, move on.
    the row filters compare against.
 5. Namespaced claims reached with bracket paths where the provider requires
    them.
-6. `DONAT_GRAPHQL_ADMIN_SECRET` removed from anything beyond a local stand.
-7. `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` set deliberately, or absent deliberately.
+6. `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` set deliberately, or absent deliberately.
+7. For a browser: `DONAT_OIDC`'s `redirect_uri` registered with the provider,
+   its `cookie` equal to the JWT config's cookie name, `cookie_secure` on
+   anywhere but a plain-HTTP stand, and `session_token` naming the token your
+   provider actually puts the roles in (`access_token` or `id_token`).
 8. Verified with a real token: the right rows for one user, **nothing** for
    another user's rows, and a denial when asking for a role the token does not
    carry.
 
 ## Files to read
 
-- [`examples/petshop/auth.env`](https://github.com/donatlabs/donat/blob/main/examples/petshop/auth.env)
-  — the full JWT config with the mapping explained line by line, including the
+- [`examples/petshop/docker-compose.yml`](https://github.com/donatlabs/donat/blob/main/examples/petshop/docker-compose.yml)
+  — the full JWT and OIDC configuration with the mapping explained line by
+  line, including the
   default-role warning
 - [`examples/petshop/README.md`](https://github.com/donatlabs/donat/blob/main/examples/petshop/README.md)
   — "Logging in for real": bring up the identity profile, get a token, and see

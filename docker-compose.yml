@@ -1,0 +1,294 @@
+# donat, running.
+#
+#   make env                          # fresh secrets, once, on this machine
+#   docker compose up -d --build      # then open http://localhost:5180
+#
+# Sign in as operator@example.com with the password in that `.env`.
+#
+# Every credential lives in that `.env` and none of it lives here — or in
+# `.env.example`, which ships the names with no values. A file in the
+# repository holding a working secret is a secret everyone who clones it
+# shares, which is a default password by another name.
+#
+# This is the default deployment: a database, an identity provider, object
+# storage, the engine, and the admin panel. It has no application in it — no
+# tables, no metadata beyond a source and a store — because an application is
+# what you add on top. What it does have is everything you would otherwise
+# have to assemble before adding one: a way to sign in, a way to say who may
+# do what, and somewhere for files to go.
+#
+# Signing in is the part worth reading about before changing anything. The
+# engine issues no tokens and honours no role header: a role reaches it from a
+# verified JWT or an authentication hook and from nowhere else. The provider
+# below mints those tokens, the engine verifies them, and the panel is an
+# ordinary client holding none of it — see
+# knowledgebase/api-surfaces/decisions/013-*.
+#
+# Everything a browser touches is on the panel's origin (`:5180`), which is
+# split three ways: the app itself, `/v1/` and `/auth/` to the engine, and —
+# through the engine — `/auth/v1/` to the identity provider. That is not
+# tidiness: the provider's session cookie is `__Host-`-prefixed and it compares
+# the `Origin` header against its own public URL, so a login page anywhere else
+# is refused.
+#
+# The engine is built from this working tree, not pulled: this repository is
+# the engine, and a stack that ran a published image would be demonstrating
+# somebody else's build. The first `up` compiles it in release, which takes a
+# few minutes; after that the layer is cached.
+#
+# `deploy/metadata` and `deploy/bootstrap` are what this stack mounts; both are
+# small enough to read in a sitting.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${DONAT_DB_PASSWORD:?see .env.example}
+      POSTGRES_DB: donat
+    healthcheck:
+      # Over TCP and against the real database, not the socket: while the
+      # official image is initialising it runs a temporary server on the socket
+      # alone, with no password set yet — a socket check passes there and the
+      # next container's connection is then refused.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d donat -h 127.0.0.1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres:/var/lib/postgresql/data
+
+  # Object storage. The engine has no local-disk backend: a browser uploads
+  # straight to this store with a presigned URL and downloads come from it too,
+  # so no file byte ever passes through the engine.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${DONAT_S3_KEY:?see .env.example}
+      MINIO_ROOT_PASSWORD: ${DONAT_S3_SECRET:?see .env.example}
+    ports:
+      # Published because a browser has to reach it: an upload goes straight
+      # there, and a public attachment's URL points at it.
+      - "${DONAT_S3_PORT:-9000}:9000"
+    volumes:
+      - files:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: make the bucket. Public read, because a public attachment's URL
+  # carries no signature — which is what makes it cacheable forever.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set donat http://minio:9000 ${DONAT_S3_KEY:?see .env.example} ${DONAT_S3_SECRET:?see .env.example} &&
+      mc mb --ignore-existing donat/donat-media &&
+      mc anonymous set download donat/donat-media
+      "
+    restart: "no"
+
+  # The identity provider.
+  #
+  # Not optional: this engine has no admin role and no shared secret, so
+  # somebody has to say who a caller is. It keeps its accounts in its own
+  # embedded storage — identity never shares a database with the data plane.
+  #
+  # Swap it for your own by pointing DONAT_GRAPHQL_JWT_SECRET's
+  # `jwk_url`/`issuer`/`audience` and DONAT_OIDC's endpoints at it. The engine
+  # has no opinion about which provider it is; `admin_key` below is the one
+  # part that is Rauthy-shaped, and without it the panel simply has no identity
+  # screens.
+  #
+  # ./deploy/bootstrap is applied only while initialising an empty database.
+  # Editing it later does nothing until the volume is recreated.
+  rauthy:
+    image: ghcr.io/sebadob/rauthy:0.36.1
+    environment:
+      # Plain HTTP on localhost; a real deployment terminates TLS in front.
+      LISTEN_SCHEME: http
+      COOKIE_MODE: danger-insecure
+      HQL_INSECURE_COOKIE: "true"
+      HQL_NODE_ID: "1"
+      HQL_SECRET_RAFT: ${DONAT_IDP_RAFT_SECRET:?see .env.example}
+      HQL_SECRET_API: ${DONAT_IDP_API_SECRET:?see .env.example}
+      # The address a BROWSER reaches it on — the panel's, because the panel
+      # fronts it. This is the setting everything else here follows.
+      PUB_URL: localhost:${DONAT_ADMIN_PORT:-5180}
+      RP_ID: localhost
+      RP_ORIGIN: http://localhost:${DONAT_ADMIN_PORT:-5180}
+      RP_NAME: donat
+      # Whose address to count a login against. The engine sets this header
+      # from what it actually saw and refuses to forward one a caller sent, so
+      # the provider's rate limiting and its blacklist are about the person in
+      # front of the browser rather than about the engine — see
+      # crates/server/src/idp_proxy.rs.
+      #
+      # TRUSTED_PROXIES is not optional with it: the provider blocks any
+      # request carrying that header from an address it was not told to trust,
+      # which is the whole reason the header is worth anything. This range is
+      # the compose network — nothing outside it can reach the provider at all,
+      # because it publishes no port.
+      PEER_IP_HEADER_NAME: X-Donat-Peer-Ip
+      TRUSTED_PROXIES: ${DONAT_NETWORK_CIDR:-172.16.0.0/12}
+      # What the provider encrypts its own stored secrets with.
+      ENC_KEYS: donat/${DONAT_IDP_ENC_KEY:?see .env.example}
+      ENC_KEY_ACTIVE: donat
+      BOOTSTRAP_DIR: /bootstrap
+      BOOTSTRAP_ADMIN_EMAIL: admin@example.com
+      BOOTSTRAP_ADMIN_PASSWORD_PLAIN: ${DONAT_ADMIN_PASSWORD:?see .env.example}
+      # The API key the engine administers this provider with — the one
+      # credential it holds for the provider, and the whole reason the panel
+      # has an Identity section at all.
+      #
+      # It is base64 of a JSON declaration naming what the key may touch, and
+      # it names only what `crates/server/src/idp_admin.yaml` actually calls:
+      # a key that could also read secrets or manage PAM would be a key that
+      # could do things nothing in this repository asks for. Decoded:
+      #
+      #   {"name":"donat","exp":2147483647,"access":[
+      #     {"group":"Users",          "access_rights":["read","create","update","delete"]},
+      #     {"group":"UserAttributes", "access_rights":["read","create","update","delete"]},
+      #     {"group":"Roles",          "access_rights":["read","create","update","delete"]},
+      #     {"group":"Groups",         "access_rights":["read","create","update","delete"]},
+      #     {"group":"Scopes",         "access_rights":["read","create","update","delete"]},
+      #     {"group":"Clients",        "access_rights":["read","create","update","delete"]},
+      #     {"group":"Blacklist",      "access_rights":["read","create","update","delete"]},
+      #     {"group":"Sessions",       "access_rights":["read","delete"]}]}
+      #
+      # The secret half is a credential and lives in `.env`.
+      BOOTSTRAP_API_KEY: eyJuYW1lIjogImRvbmF0IiwgImV4cCI6IDIxNDc0ODM2NDcsICJhY2Nlc3MiOiBbeyJncm91cCI6ICJVc2VycyIsICJhY2Nlc3NfcmlnaHRzIjogWyJyZWFkIiwgImNyZWF0ZSIsICJ1cGRhdGUiLCAiZGVsZXRlIl19LCB7Imdyb3VwIjogIlVzZXJBdHRyaWJ1dGVzIiwgImFjY2Vzc19yaWdodHMiOiBbInJlYWQiLCAiY3JlYXRlIiwgInVwZGF0ZSIsICJkZWxldGUiXX0sIHsiZ3JvdXAiOiAiUm9sZXMiLCAiYWNjZXNzX3JpZ2h0cyI6IFsicmVhZCIsICJjcmVhdGUiLCAidXBkYXRlIiwgImRlbGV0ZSJdfSwgeyJncm91cCI6ICJHcm91cHMiLCAiYWNjZXNzX3JpZ2h0cyI6IFsicmVhZCIsICJjcmVhdGUiLCAidXBkYXRlIiwgImRlbGV0ZSJdfSwgeyJncm91cCI6ICJTY29wZXMiLCAiYWNjZXNzX3JpZ2h0cyI6IFsicmVhZCIsICJjcmVhdGUiLCAidXBkYXRlIiwgImRlbGV0ZSJdfSwgeyJncm91cCI6ICJDbGllbnRzIiwgImFjY2Vzc19yaWdodHMiOiBbInJlYWQiLCAiY3JlYXRlIiwgInVwZGF0ZSIsICJkZWxldGUiXX0sIHsiZ3JvdXAiOiAiQmxhY2tsaXN0IiwgImFjY2Vzc19yaWdodHMiOiBbInJlYWQiLCAiY3JlYXRlIiwgInVwZGF0ZSIsICJkZWxldGUiXX0sIHsiZ3JvdXAiOiAiU2Vzc2lvbnMiLCAiYWNjZXNzX3JpZ2h0cyI6IFsicmVhZCIsICJkZWxldGUiXX1dfQ==
+      BOOTSTRAP_API_KEY_SECRET: ${DONAT_IDP_ADMIN_SECRET:?see .env.example}
+    volumes:
+      - ./deploy/bootstrap:/bootstrap:ro
+      - rauthy:/app/data
+
+  # Gives the operator the password from `.env`.
+  #
+  # The provider's bootstrap files are committed, so `deploy/bootstrap/users.json`
+  # says who the operator is and nothing about how they prove it — a password in
+  # a file everyone clones is a shared password. This puts it in afterwards,
+  # through the provider's own admin API with the engine's own key, and does it
+  # on every `up` so that editing `.env` does what it looks like it does.
+  operator:
+    image: python:3.13-alpine
+    depends_on:
+      rauthy:
+        condition: service_started
+    environment:
+      IDP_API: http://rauthy:8080/auth/v1
+      IDP_ADMIN_KEY: API-Key donat$$${DONAT_IDP_ADMIN_SECRET:?see .env.example}
+      OPERATOR_PASSWORD: ${DONAT_ADMIN_PASSWORD:?see .env.example}
+    volumes:
+      - ./deploy/set-operator-password.py:/set-operator-password.py:ro
+    command: ["python3", "/set-operator-password.py"]
+    restart: "no"
+
+  # Applies the engine's own schema — cron state, the event log, durable
+  # process journals. Runs once and exits; the serving engine runs no DDL.
+  migrate:
+    image: donat:local
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DONAT_DATABASE_URL: postgresql://postgres:${DONAT_DB_PASSWORD:?see .env.example}@postgres:5432/donat
+    command: ["migrate", "--migrations-dir", "/usr/share/donat/migrations"]
+    restart: "no"
+
+  engine:
+    # The same image the migration ran, built once from this tree.
+    image: donat:local
+    build:
+      context: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      operator:
+        condition: service_completed_successfully
+    environment:
+      DONAT_METADATA_DIR: /metadata
+      DONAT_PORT: "8080"
+      DONAT_DATABASE_URL: postgresql://postgres:${DONAT_DB_PASSWORD:?see .env.example}@postgres:5432/donat
+      DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:${DONAT_DB_PASSWORD:?see .env.example}@postgres:5432/donat
+      # A role comes from a verified token and from nothing else. No
+      # unauthorized role is set, so a request with no session is refused
+      # outright — this deployment has nothing public to show.
+      DONAT_GRAPHQL_JWT_SECRET: >-
+        {"jwk_url":"http://rauthy:8080/auth/v1/oidc/certs",
+        "issuer":"http://localhost:${DONAT_ADMIN_PORT:-5180}/auth/v1/",
+        "audience":"donat-admin",
+        "header":{"type":"Cookie","name":"donat_session"},
+        "claims_map":{"x-donat-allowed-roles":{"path":"$$.roles"},
+        "x-donat-default-role":{"path":"$$.roles[0]"},
+        "x-donat-user-id":{"path":"$$.sub","default":""}}}
+      # The engine is the relying party: /auth/login starts the flow and
+      # /auth/callback exchanges the code for the session cookie.
+      #
+      #   authorization_endpoint  the panel's own sign-in screen, which speaks
+      #                           the provider's protocol unchanged
+      #   login_api               lets it: the engine serves the provider's
+      #                           login API at /auth/v1/… on this origin
+      #   token_endpoint          reached by the engine over this network
+      #   admin_key / admin_role  make the engine serve the provider's own
+      #                           accounts, roles, groups, scopes, clients,
+      #                           attributes, blocked addresses and sessions as
+      #                           GraphQL fields, visible to that one role.
+      #                           That is the panel's whole Identity section,
+      #                           and there is no metadata for it: the
+      #                           declaration ships in the binary
+      #                           (crates/server/src/idp_admin.yaml).
+      DONAT_OIDC: >-
+        {"authorization_endpoint":"http://localhost:${DONAT_ADMIN_PORT:-5180}/idp/authorize",
+        "token_endpoint":"http://rauthy:8080/auth/v1/oidc/token",
+        "login_api":"http://rauthy:8080",
+        "client_id":"donat-admin",
+        "redirect_uri":"http://localhost:${DONAT_ADMIN_PORT:-5180}/auth/callback",
+        "scopes":["openid","profile","email"],
+        "cookie":"donat_session",
+        "cookie_secure":false,
+        "session_token":"access_token",
+        "admin_key":"API-Key donat$$${DONAT_IDP_ADMIN_SECRET:?see .env.example}",
+        "admin_role":"support"}
+      # The store in deploy/metadata/storage.yaml, and the secret its signed
+      # URLs are minted with.
+      DONAT_S3_KEY: ${DONAT_S3_KEY:?see .env.example}
+      DONAT_S3_SECRET: ${DONAT_S3_SECRET:?see .env.example}
+      DONAT_FILE_SIGNING_SECRET: ${DONAT_FILE_SIGNING_SECRET:?see .env.example}
+    volumes:
+      - ./deploy/metadata:/metadata:ro
+
+  admin:
+    build:
+      context: ./apps/admin
+      args:
+        VITE_DONAT_GRAPHQL_URL: /v1/graphql
+        VITE_DONAT_ROLE: support
+        # No stand is declared: one deployment, one role, and the Identity
+        # screens the panel already knows the shape of.
+        #
+        # Offering "create an account" is a second decision: the provider
+        # decides whether anyone may (`OPEN_USER_REG`, off by default) and
+        # announces it nowhere, so this only says whether to show the form.
+        VITE_DONAT_IDP_REGISTRATION: ${DONAT_IDP_REGISTRATION:-false}
+    depends_on:
+      engine:
+        condition: service_started
+    environment:
+      DONAT_UPSTREAM: http://engine:8080
+      NGINX_ENVSUBST_FILTER: DONAT_
+    ports:
+      - "${DONAT_ADMIN_PORT:-5180}:80"
+
+volumes:
+  postgres:
+  files:
+  rauthy:

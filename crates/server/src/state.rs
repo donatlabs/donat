@@ -388,10 +388,13 @@ pub struct AppState {
     /// The fallback/default database (also the metadata database in
     /// --hge-bin mode).
     pub default_url: String,
-    pub admin_secret: Option<String>,
-    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: fallback role only for untrusted
-    /// requests whose supplied identity cannot be accepted.
+    /// DONAT_GRAPHQL_UNAUTHORIZED_ROLE: the role a request runs as when
+    /// nothing authenticated it — no token, or a hook that refused it.
     pub unauthorized_role: Option<String>,
+    /// DONAT_OIDC: the provider `/auth/login` sends a browser to. Absent means
+    /// those routes are not mounted at all — a deployment whose clients bring
+    /// their own tokens needs no login route here.
+    pub oidc: Option<crate::oidc::OidcConfig>,
     /// --stringify-numeric-types
     pub stringify_numerics: bool,
     /// DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS (default true).
@@ -2024,8 +2027,8 @@ mod snapshot_tests {
             engine: RwLock::new(Arc::new(engine)),
             connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: "sqlite::memory:".to_string(),
-            admin_secret: None,
             unauthorized_role: None,
+            oidc: None,
             stringify_numerics: false,
             infer_function_permissions: true,
             jwt: None,

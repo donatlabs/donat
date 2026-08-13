@@ -26,7 +26,7 @@ export DONAT_MOCK_CARRIER_BASE_URL=http://127.0.0.1:8099 DONAT_MOCK_CARRIER_TOKE
 log="$(mktemp)"
 start=$(date +%s.%N)
 DONAT_PORT="$port" DONAT_METADATA_DIR="$metadata" \
-DONAT_GRAPHQL_ADMIN_SECRET=measure DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous \
+DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous \
 DONAT_GRAPHQL_JWT_SECRET="{\"type\":\"HS256\",\"key\":\"${PETSHOP_JWT_KEY:-petshop-dev-jwt-key-change-me-32bytes+}\"}" \
   "$binary" --metadata-dir "$metadata" >"$log" 2>&1 &
 pid=$!

@@ -26,7 +26,6 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 const DIR: &str = "queries/subscriptions/basic";
-const SECRET: &str = "conformance-subs-secret";
 
 // --------------------------------------------------------------- ws client
 
@@ -172,8 +171,7 @@ fn negative_ws(s: &Running, conf: &Json, via_subscription: bool) -> WsClient {
         ));
     }
 
-    let mut headers = conf["headers"].clone();
-    headers["X-Donat-Admin-Secret"] = json!(SECRET);
+    let headers = conf["headers"].clone();
     let mut ws = WsClient::connect(s);
     ws.init(&headers);
 
@@ -235,7 +233,7 @@ fn stop_subscription(ws: &mut WsClient) {
 
 #[test]
 fn subscription_basic() {
-    let s = Suite::new("subs_basic").admin_secret(SECRET).start();
+    let s = Suite::new("subs_basic").start();
 
     // tests-py HGECtx applies queries/clear_db.yaml before every class:
     // the hge_tests schema the fixtures create tables in.
@@ -244,20 +242,22 @@ fn subscription_basic() {
         &json!({"type": "run_sql", "args": {
             "sql": "drop schema if exists hge_tests cascade; create schema hge_tests;"
         }}),
-        &[("X-Donat-Admin-Secret".to_string(), SECRET.to_string())],
+        &[],
     );
     assert!(code < 300, "clear_db failed ({code}): {resp}");
 
     s.setup_v1q(&format!("{DIR}/setup.yaml"));
 
-    // ws_conn_init class fixture: connection inited with the admin secret.
-    let mut ws = WsClient::connect(&s);
-    ws.init(&json!({"X-Donat-Admin-Secret": SECRET}));
-
     // negative_test.yaml is a single-step list file.
     let conf = load_fixture(&fixture_root().join(format!("{DIR}/negative_test.yaml")))
         .expect("loading negative_test.yaml")[0]
         .clone();
+
+    // ws_conn_init class fixture. tests-py inited this connection with the
+    // admin secret; a connection now names its role like every other request,
+    // and the suite's authentication hook turns it into a session.
+    let mut ws = WsClient::connect(&s);
+    ws.init(&conf["headers"]);
 
     // test_negative[http]
     s.check_query_f(&format!("{DIR}/negative_test.yaml"), Transport::Http);
@@ -332,7 +332,6 @@ fn jwt_expiry_suite(name: &str, stem: &str, key_type: &str, algorithm: Algorithm
     let secret_json = json!({"type": key_type, "key": public}).to_string();
 
     let s = Suite::new(name)
-        .admin_secret(SECRET)
         .env("DONAT_GRAPHQL_JWT_SECRET", &secret_json)
         .start();
 

@@ -15,6 +15,10 @@ tests/donat/tests-py/
 specs/
 tests-system/.stack/
 
+# The admin panel is the repository's only JavaScript.
+node_modules/
+apps/admin/dist/
+
 # System-test stands write their built binaries, pids and logs here.
 tests-system-lending/.stack/
 tests-system-lending/.venv/

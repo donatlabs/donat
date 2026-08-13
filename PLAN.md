@@ -53,12 +53,14 @@ GraphQL / REST / MCP
 These hold everywhere. A diff that breaks one is wrong even when its tests
 pass.
 
-**No admin role.** There is no permission-bypass role and no
-admin-over-HTTP surface: the runtime admin/`run_sql` API was deleted and the
-admin data role removed. Every access resolves through an explicit per-role
-permission, including the ones a Process makes on a caller's behalf. A trusted
-request without `X-Donat-Role` is denied; `X-Donat-Admin-Secret` is API-level
-auth only. The read-only `donat process inspect` / `verify-history` commands
+**No admin role, and no admin secret.** There is no permission-bypass role and
+no admin-over-HTTP surface: the runtime admin/`run_sql` API was deleted, the
+admin data role removed, and `DONAT_GRAPHQL_ADMIN_SECRET` with it. Every access
+resolves through an explicit per-role permission, including the ones a Process
+makes on a caller's behalf. A role is established by a verified JWT or an
+authentication hook and by nothing else — no header names one — and the engine
+can serve that login itself without owning any identity
+([[api-surfaces/decisions/013-a-role-is-established-by-a-verified-token-or-a-hook-and-by-nothing-else]]). The read-only `donat process inspect` / `verify-history` commands
 are the only operator entry points, and they are permitted by name in
 [[declarative-saas/decisions/002-durable-process-operational-contracts]].
 

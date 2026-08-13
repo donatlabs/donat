@@ -45,7 +45,8 @@
             "Plain": "petshop-demo-password"
         },
         "roles": [
-            "staff"
+            "staff",
+            "support"
         ],
         "enabled": true,
         "email_verified": true

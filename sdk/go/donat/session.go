@@ -19,17 +19,19 @@ func (e *sessionError) Error() string {
 	return fmt.Sprintf("session error [%s] %s: %s", e.code, e.path, e.message)
 }
 
-// sessionFromHeaders mirrors crates/server/src/gql.rs:session_from_headers
-// (trusted branch, no admin role). It:
+// sessionFromHeaders resolves the session for an embedded host. It:
 //
-//  1. Collects every X-Donat-* header (except X-Donat-Admin-Secret) into a
-//     map with LOWERCASED keys and the original value.
+//  1. Collects every X-Donat-* header into a map with LOWERCASED keys and the
+//     original value.
 //  2. Requires x-donat-role to be non-empty; absent or empty → access-denied.
 //  3. Validates x-donat-use-backend-only-permissions when present; an
 //     unrecognised value → bad-request (matching gql.rs exactly).
 //
-// JWT / admin-secret auth is the responsibility of the host application's HTTP
-// middleware. The SDK operates only in the "trusted" branch (role is explicit).
+// The standalone engine takes its session from a verified JWT or an
+// authentication hook and honours no header on its own. An embedded host is
+// the authentication layer — it owns the middleware in front of this handler,
+// so by the time a request arrives here, whoever it is has already been
+// established and the role header is that decision, not a claim.
 //
 // Returned error is always *sessionError; check with errors.As.
 func sessionFromHeaders(h http.Header) (map[string]string, error) {
@@ -37,9 +39,6 @@ func sessionFromHeaders(h http.Header) (map[string]string, error) {
 	for rawKey, vals := range h {
 		key := strings.ToLower(rawKey)
 		if !strings.HasPrefix(key, "x-donat-") {
-			continue
-		}
-		if key == "x-donat-admin-secret" {
 			continue
 		}
 		if len(vals) == 0 {

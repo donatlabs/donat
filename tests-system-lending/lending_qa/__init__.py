@@ -14,7 +14,10 @@ import datetime as dt
 import os
 import time
 import uuid
+
 from typing import Any
+
+import jwt
 
 import requests
 
@@ -93,16 +96,31 @@ class Library:
     ) -> dict[str, Any]:
         """Run one operation as `role`, raising GraphQLError on a rejection."""
         headers = {"Content-Type": "application/json"}
+        identity = member_id if member_id is not None else self.member_id
+        # The Go host resolves these headers itself; the standalone engine
+        # honours no header at all, so the same request also carries a token
+        # that grants exactly this role (and nothing else).
         if role:
             headers["X-Donat-Role"] = role
-        identity = member_id if member_id is not None else self.member_id
         if role == MEMBER and identity:
             headers["X-Donat-User-Id"] = identity
-        secret = os.environ.get("LENDING_ADMIN_SECRET")
-        if secret:
-            # The standalone engine only honours X-Donat-* headers on a trusted
-            # request. The Go host resolves them directly and ignores this.
-            headers["X-Donat-Admin-Secret"] = secret
+        key = os.environ.get("LENDING_JWT_KEY")
+        if key and role:
+            claims: dict[str, Any] = {
+                "x-donat-default-role": role,
+                "x-donat-allowed-roles": [role],
+            }
+            if role == MEMBER and identity:
+                claims["x-donat-user-id"] = identity
+            headers["Authorization"] = "Bearer " + jwt.encode(
+                {
+                    "sub": identity or role,
+                    "https://donat.io/jwt/claims": claims,
+                    "exp": int(time.time()) + 300,
+                },
+                key,
+                algorithm="HS256",
+            )
 
         payload: dict[str, Any] = {"query": query}
         if variables:
