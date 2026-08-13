@@ -399,6 +399,12 @@ jobs:
   lending-system:
     name: Lending system tests (engine vs Go host)
     runs-on: ubuntu-latest
+    env:
+      # Both stands sign with it and the suite mints its tokens with it, so it
+      # is set once here: a role reaches the engine from a verified JWT and
+      # from nothing else, and two copies of this value would drift into a
+      # suite that sends no token and a stand that is right to refuse it.
+      LENDING_JWT_KEY: lending-ci-jwt-key-change-me-32bytes+
     services:
       postgres:
         image: postgres:16
@@ -442,7 +448,6 @@ jobs:
         env:
           LENDING_ENGINE_URL: http://127.0.0.1:8090
           LENDING_GO_URL: http://127.0.0.1:8091
-          LENDING_ADMIN_SECRET: lending-secret
         run: .venv/bin/python -m pytest -q
       - name: Stand logs
         if: failure()

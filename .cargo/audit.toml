@@ -48,6 +48,17 @@ ignore = [
     "RUSTSEC-2026-0194", # quick-xml: quadratic time on duplicate attributes
     "RUSTSEC-2026-0195", # quick-xml: unbounded namespace allocation
 
+    # lru's `pop()` is not panic-safe: a `Drop` that unwinds mid-removal can
+    # leave the map pointing at freed memory. It is reachable only through the
+    # MySQL driver's own prepared-statement cache, whose keys and values are
+    # `String`s and `Arc`s — none of which panics while being dropped, so the
+    # sequence the advisory describes has no way to start here.
+    #
+    # Fixed in lru >= 0.18.2, which this workspace cannot take: it arrives
+    # under `mysql`, and 28.0.0 — the newest published — requires `^0.16.3`.
+    # Revisit when that crate moves.
+    "RUSTSEC-2026-0253", # lru: panic safety in `pop()`, via mysql
+
     # --- Unmaintained ----------------------------------------------------
     #
     # None of these is a vulnerability. Each is a crate its own author has
