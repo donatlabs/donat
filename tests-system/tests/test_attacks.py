@@ -216,18 +216,33 @@ def test_no_header_is_a_way_in(store):
     anonymous_token = token(
         store, {"x-donat-default-role": "anonymous", "x-donat-allowed-roles": ["anonymous"]}
     )
-    with_pretenders = raw_graphql(
+
+    # A header that looks like a credential is not one: it is ignored, and the
+    # request runs as the token says it does.
+    with_secrets = raw_graphql(
         store,
         "query { product { id status } }",
         {
             "authorization": f"Bearer {anonymous_token}",
             "X-Donat-Admin-Secret": "guessed",
-            "X-Donat-Role": "staff",
+            "X-Hasura-Admin-Secret": "guessed",
         },
     ).json()
-    assert all(row["status"] == "published" for row in with_pretenders["data"]["product"]), (
-        f"a header widened what the public may see: {with_pretenders}"
+    assert all(row["status"] == "published" for row in with_secrets["data"]["product"]), (
+        f"a header widened what the public may see: {with_secrets}"
     )
+
+    # `X-Donat-Role` is the one header the engine reads, and it only *picks*
+    # among the roles a token already granted. Naming one it did not is
+    # refused outright rather than ignored — stricter than being ignored, and
+    # the difference an operator sees is an error instead of silence.
+    as_staff = raw_graphql(
+        store,
+        "query { product { id status } }",
+        {"authorization": f"Bearer {anonymous_token}", "X-Donat-Role": "staff"},
+    ).json()
+    assert as_staff.get("errors"), f"a header granted a role the token did not: {as_staff}"
+    assert "allowed roles" in as_staff["errors"][0]["message"].lower(), as_staff
 
 
 # -- widening a mutation -----------------------------------------------------
