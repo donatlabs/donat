@@ -29,6 +29,7 @@ jobs:
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -83,6 +84,7 @@ jobs:
     name: Publish the tags
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
@@ -157,6 +159,7 @@ jobs:
     name: Smoke the published image
     needs: manifest
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # No packages permission on purpose: the pull must succeed with no
     # credentials at all, or the package visibility has regressed.
     permissions:

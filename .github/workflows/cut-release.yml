@@ -30,6 +30,7 @@ jobs:
   tag:
     name: Validate and tag
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: The token must exist before anything happens
         env:
