@@ -20,7 +20,6 @@ import { signWithPasskey } from '../idp/webauthn';
 import {
   loginRequest,
   parseAuthorizeParams,
-  providerPageUrl,
   type AuthorizeParams,
 } from '../idp/authorize-params';
 import { IDP_BASE, IDP_REGISTRATION } from '../env';
@@ -62,8 +61,6 @@ export interface IdpAuthorizeFormProps {
   params: AuthorizeParams;
   client: IdpClient;
   solver: PowSolver;
-  /** The provider's own login page, for whatever this one hands over. */
-  providerUrl: string;
   /**
    * Offer to create an account. Whether anyone may is the provider's decision
    * and it announces it nowhere, so this is configuration — see `env.ts`.
@@ -75,7 +72,6 @@ export function IdpAuthorizeForm({
   params,
   client,
   solver,
-  providerUrl,
   registration = false,
 }: IdpAuthorizeFormProps): ReactElement {
   const [starting, setStarting] = useState(true);
@@ -385,13 +381,17 @@ export function IdpAuthorizeForm({
         </CardHeader>
         <CardContent>
           <p className="text-muted-foreground text-sm">
-            Your identity provider handles this screen itself. Continuing takes you there with the
-            same sign-in request.
+            {handoff === 'mfa'
+              ? 'Add a passkey to your account, then sign in again.'
+              : 'Your account has something to settle before this sign-in can finish.'}
           </p>
         </CardContent>
         <CardFooter>
+          {/* A whole page load rather than a route change: this is the one
+              place where the panel has a provider session and no engine one,
+              and the account screen lives outside the guarded shell. */}
           <Button className="w-full" data-testid="idp-handoff-continue" asChild>
-            <a href={providerUrl}>Continue</a>
+            <a href="/account">Go to your account</a>
           </Button>
         </CardFooter>
       </Card>
@@ -597,7 +597,6 @@ export default function IdpAuthorizePage(): ReactElement {
           params={params}
           client={client}
           solver={solver}
-          providerUrl={providerPageUrl(IDP_BASE, location.search)}
           registration={IDP_REGISTRATION}
         />
       ) : (

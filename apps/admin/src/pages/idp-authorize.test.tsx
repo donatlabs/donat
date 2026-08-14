@@ -97,7 +97,6 @@ function renderForm(
       params={params}
       client={provider.client}
       solver={provider.solver}
-      providerUrl="/auth/v1/oidc/authorize?client_id=panel"
       registration={options.registration}
     />,
   );
@@ -261,9 +260,9 @@ describe('IdpAuthorizeForm', () => {
     submit();
 
     await waitFor(() => expect(screen.getByTestId('idp-handoff')).toBeTruthy());
-    expect(screen.getByTestId('idp-handoff-continue').getAttribute('href')).toBe(
-      '/auth/v1/oidc/authorize?client_id=panel',
-    );
+    // Our own account screen, not the provider's page: enrolling a key is
+    // what this needs, and that screen is ours now.
+    expect(screen.getByTestId('idp-handoff-continue').getAttribute('href')).toBe('/account');
     // Nothing was signed in, so nothing was navigated.
     expect(replace).not.toHaveBeenCalled();
   });
@@ -293,7 +292,6 @@ describe('IdpAuthorizeForm', () => {
         params={params}
         client={client}
         solver={new PowSolver(() => client.challenge(), (c) => Promise.resolve(c))}
-        providerUrl="/auth/v1/oidc/authorize"
       />,
     );
 

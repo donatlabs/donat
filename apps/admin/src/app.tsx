@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, Outlet, Route, Routes } from 'react-router';
 import { generateRouteDescriptors, useApp, type RouteDescriptor } from '@refinest/react';
 import { Providers } from './components/providers';
 import AppShell from './layout/app-shell';
+import { AccountScreen } from './pages/account';
 import IdpAuthorizePage from './pages/idp-authorize';
 import LoginPage from './pages/login';
 import { ResourceCreateBody } from './pages/resources/create';
@@ -72,6 +73,15 @@ export function AppRoutes(): ReactElement {
         shell, like `/login`: nobody is signed in yet.
       */}
       <Route path="/idp/authorize" element={<IdpAuthorizePage />} />
+      {/*
+        The account, replacing the provider's own page. Outside the guarded
+        shell on purpose: the provider sends people here mid-login — when an
+        application wants a second factor, or the account has to be updated
+        before it may sign in — and at that moment there is a provider session
+        but no engine one. The screen needs only the first, and answers "that
+        session is no longer signed in" when there is not even that.
+      */}
+      <Route path="/account" element={<AccountScreen />} />
       <Route element={<AdminFrame />}>
         <Route
           index

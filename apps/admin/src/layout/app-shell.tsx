@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { useLocation, useNavigate } from 'react-router';
+import { Link, useLocation, useNavigate } from 'react-router';
 import { useDataRuntime } from '@refinest/react';
 import {
   AppHeader,
@@ -7,6 +7,7 @@ import {
   AppSidebar,
   Badge,
   Button,
+  DropdownMenuItem,
   NavMain,
   NavUser,
   SidebarMenu,
@@ -210,6 +211,13 @@ export default function AppShell({ children }: { children: ReactNode }): React.R
               name={stand.role}
               email="engine session"
               avatarFallback={stand.role.slice(0, 2).toUpperCase()}
+              menu={
+                /* The account screen replaces the provider's own page, so the
+                   way to it belongs where somebody looks for themselves. */
+                <DropdownMenuItem asChild data-testid="nav-account">
+                  <Link to="/account">Your account</Link>
+                </DropdownMenuItem>
+              }
               onLogout={() => auth.signOut()}
             />
           }
