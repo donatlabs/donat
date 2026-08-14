@@ -138,13 +138,21 @@ explicit role and a matching permission.
 ## Get started
 
 ```sh
-make env                          # fresh secrets, once, on this machine
-docker compose up -d --build      # http://localhost:5180
+make up                           # http://localhost:5180
 ```
 
+One command, and nothing to fill in. It prints the password to sign in as
+`operator@example.com` with.
+
 That is the default deployment, built from this tree: Postgres, an identity
-provider, object storage, the engine, and the admin panel. Sign in as
-`operator@example.com` with the password `make env` printed (it is in `.env`).
+provider, object storage, and the engine — which serves the admin panel
+itself, so there is one container answering on one origin rather than a
+reverse proxy in front of two.
+
+Every other credential it uses is generated on this machine the first time,
+into `.env`. None of them is a value anybody chooses: they are secrets two
+programs use to recognise each other, and the only reason to see one is to
+rotate it.
 
 It has **no application in it** — no tables, no metadata beyond a source and a
 store — because an application is what you add on top. What it has is
