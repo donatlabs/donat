@@ -221,28 +221,6 @@ custom_types:
         - name: redirect_uris
           type: '[String!]!'
 
-    # What a client is worth on the day it is registered. The provider fills
-    # the rest in with its own defaults, and the edit screen has them all.
-    - name: IdpClientCreateInput
-      fields:
-        - name: id
-          type: ID!
-        - name: name
-          type: String
-        - name: confidential
-          type: Boolean!
-        - name: redirect_uris
-          type: '[String!]!'
-
-    - name: IdpClientSecret
-      fields:
-        - name: id
-          type: ID!
-        - name: confidential
-          type: Boolean
-        - name: secret
-          type: String
-
     - name: IdpClientInput
       fields:
         - name: name
@@ -705,72 +683,6 @@ actions:
               "force_mfa": {{ $body.input.input.force_mfa }},
               "client_uri": {{ $body.input.input?.client_uri }}
             }
-
-  - name: idp_client_create
-    comment: >-
-      Register an application. The id is the caller's to choose, because it is
-      what that application will present as its `client_id` — the provider does
-      not mint one. Only the fields needed to exist are sent; everything else
-      is edited afterwards, which is also how the provider's own screen does
-      it.
-    definition:
-      kind: synchronous
-      type: mutation
-      arguments:
-        - name: input
-          type: IdpClientCreateInput!
-      output_type: IdpClient
-      request_transform:
-        version: 2
-        template_engine: Kriti
-        method: POST
-        url: '{{$base_url}}/clients'
-        body:
-          action: transform
-          template: |
-            {
-              "id": {{ $body.input.input.id }},
-              "name": {{ $body.input.input?.name }},
-              "confidential": {{ $body.input.input.confidential }},
-              "redirect_uris": {{ $body.input.input.redirect_uris }}
-            }
-
-  - name: idp_client_delete
-    definition:
-      kind: synchronous
-      type: mutation
-      arguments:
-        - name: id
-          type: ID!
-      output_type: json
-      request_transform:
-        version: 2
-        template_engine: Kriti
-        method: DELETE
-        url: '{{$base_url}}/clients/{{$body.input.id}}'
-        body:
-          action: remove
-
-  - name: idp_client_secret
-    comment: >-
-      A confidential client's secret, which it cannot be deployed without.
-      Reading it is an ordinary per-role permission like every other field
-      here, and a deployment that does not want it read declares the role
-      without this one.
-    definition:
-      kind: synchronous
-      type: query
-      arguments:
-        - name: id
-          type: ID!
-      output_type: IdpClientSecret
-      request_transform:
-        version: 2
-        template_engine: Kriti
-        method: GET
-        url: '{{$base_url}}/clients/{{$body.input.id}}/secret'
-        body:
-          action: remove
 
   # Custom claims. A deployment's own facts about a person — a department, a
   # tenant — which the provider can then put in a token and a permission can
