@@ -75,7 +75,16 @@ wrong produces an engine error, never wider access.
 
 A stand that declares no `users` block is a **platform** stand, and gets eight
 screens instead of one, under one `Identity` section: Users, Roles, Groups,
-Attributes, Scopes, Applications, Blocked addresses and Sessions. Each renders
+Attributes, Scopes, Applications, Blocked addresses and Sessions.
+
+**Applications** is where another product is registered against this
+deployment's identity: an id it will present as its `client_id`, whether it can
+keep a secret, and the addresses it may be sent back to. Everything else about
+a client — scopes, flows, allowed origins, whether it forces a second factor —
+is edited afterwards, because that is what the provider accepts on a
+registration. A confidential client's secret is not shown here and never
+travels through these fields: the provider mints it and serves it to whoever
+holds its API key, which is the engine. Each renders
 fields the engine serves when a deployment configures `DONAT_OIDC.admin_key`
 and `admin_role` — `idp_users`, `idp_roles`, `idp_clients` and the rest, and
 everything its API key can reach is there. Nothing is configured here for that: the panel

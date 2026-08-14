@@ -171,6 +171,8 @@ mod tests {
                 "idp_scope_delete",
                 "idp_clients",
                 "idp_client",
+                "idp_client_create",
+                "idp_client_delete",
                 "idp_client_update",
                 // What a deployment can say about a person beyond a name, who
                 // is refused at the door, and who is signed in right now.

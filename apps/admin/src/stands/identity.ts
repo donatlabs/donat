@@ -113,9 +113,15 @@ function clientsResource(): StandResource {
       fields: {
         list: 'idp_clients',
         one: 'idp_client',
+        create: 'idp_client_create',
         update: 'idp_client_update',
+        delete: 'idp_client_delete',
         args: { id: 'id', input: 'input' },
         inputType: 'IdpClientInput!',
+        // Registering one and changing one take different shapes: the
+        // provider assigns no id, so a registration carries the caller's, and
+        // the rest of the record gets its defaults and is edited afterwards.
+        createInputType: 'IdpClientCreateInput!',
       },
       selectFields: [
         'id',
@@ -156,20 +162,27 @@ function clientsResource(): StandResource {
       displayField: 'name',
       fields: (f) => {
         const fields: Record<string, unknown> = {
-          id: f.string({ system: true, label: 'Client ID' }),
+          // Not `system`: a registration chooses it, and it is what the
+          // application will present as its `client_id`. It cannot be changed
+          // afterwards, which the write rule below states.
+          id: f.string({ label: 'Client ID', required: true, write: 'create' }),
           name: f.string({ label: 'Name' }),
-          enabled: f.boolean({ label: 'Enabled' }),
+          // `write: 'update'` on everything the provider does not accept when
+          // registering one. Not a preference: these are absent from
+          // `IdpClientCreateInput`, and a form offering them would be a form
+          // whose answers the engine rejects.
+          enabled: f.boolean({ label: 'Enabled', write: 'update' }),
           confidential: f.boolean({ label: 'Confidential' }),
-          force_mfa: f.boolean({ label: 'Require a second factor' }),
-          client_uri: f.url({ label: 'Application URL' }),
+          force_mfa: f.boolean({ label: 'Require a second factor', write: 'update' }),
+          client_uri: f.url({ label: 'Application URL', write: 'update' }),
           // Lists of strings the provider replaces wholesale. `json` rather
           // than a relation: they are addresses and flow names, not rows in
           // anything this panel can offer to pick from.
           redirect_uris: f.json({ label: 'Redirect URIs' }),
-          allowed_origins: f.json({ label: 'Allowed origins' }),
-          flows_enabled: f.json({ label: 'Flows' }),
-          scopes: f.json({ label: 'Scopes' }),
-          default_scopes: f.json({ label: 'Default scopes' }),
+          allowed_origins: f.json({ label: 'Allowed origins', write: 'update' }),
+          flows_enabled: f.json({ label: 'Flows', write: 'update' }),
+          scopes: f.json({ label: 'Scopes', write: 'update' }),
+          default_scopes: f.json({ label: 'Default scopes', write: 'update' }),
         };
         return fields as never;
       },
