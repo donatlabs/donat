@@ -82,8 +82,19 @@ services:
       timeout: 3s
       retries: 30
 
-  # One-shot: make the bucket. Public read, because a public attachment's URL
-  # carries no signature — which is what makes it cacheable forever.
+  # One-shot: make the bucket, and nothing else.
+  #
+  # It deliberately does *not* make the bucket anonymously readable. That was
+  # here for public attachments — a column declared `public: true` gets an
+  # unsigned URL, which is what makes it cacheable forever — and this
+  # deployment has no tables, so it has no such column and never had one.
+  #
+  # What it did have was a bucket policy cancelling the expiry of every
+  # presigned download in it. `storage.yaml` asks for `download_ttl_seconds:
+  # 300`; an object that also answers unsigned answers forever, so the five
+  # minutes bought nothing. Public reads are worth turning on when something
+  # is actually public, per bucket, deliberately — not in the example everyone
+  # copies.
   minio-init:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
     depends_on:
@@ -92,8 +103,7 @@ services:
     entrypoint: >
       /bin/sh -c "
       mc alias set donat http://minio:9000 ${DONAT_S3_KEY:?see .env.example} ${DONAT_S3_SECRET:?see .env.example} &&
-      mc mb --ignore-existing donat/donat-media &&
-      mc anonymous set download donat/donat-media
+      mc mb --ignore-existing donat/donat-media
       "
     restart: "no"
 
@@ -144,6 +154,11 @@ services:
       ENC_KEYS: donat/${DONAT_IDP_ENC_KEY:?see .env.example}
       ENC_KEY_ACTIVE: donat
       BOOTSTRAP_DIR: /bootstrap
+      # The provider's own administrator, which is not the operator: this
+      # account carries the provider's roles (`admin`, `rauthy_admin`), and
+      # the first of them is what `x-donat-default-role` would read. The
+      # operator is created below with exactly the role this deployment
+      # declares.
       BOOTSTRAP_ADMIN_EMAIL: admin@example.com
       BOOTSTRAP_ADMIN_PASSWORD_PLAIN: ${DONAT_ADMIN_PASSWORD:?see .env.example}
       # The API key the engine administers this provider with — the one
@@ -172,13 +187,16 @@ services:
       - ./deploy/bootstrap:/bootstrap:ro
       - rauthy:/app/data
 
-  # Gives the operator the password from `.env`.
+  # One-shot: create the operator this deployment signs in as.
   #
-  # The provider's bootstrap files are committed, so `deploy/bootstrap/users.json`
-  # says who the operator is and nothing about how they prove it — a password in
-  # a file everyone clones is a shared password. This puts it in afterwards,
-  # through the provider's own admin API with the engine's own key, and does it
-  # on every `up` so that editing `.env` does what it looks like it does.
+  # Not `deploy/bootstrap/users.json`, which is where this lived and could not
+  # stay: that file requires a `password` field, so declaring the operator
+  # there meant either committing a working password or a stack that panics on
+  # first start. It panicked — and only on a *first* start, which is why it
+  # went unnoticed: bootstrap files apply solely to an empty database.
+  #
+  # Idempotent, and it runs on every `up`, so editing `.env` does what it looks
+  # like it does.
   operator:
     image: python:3.13-alpine
     depends_on:
@@ -189,8 +207,8 @@ services:
       IDP_ADMIN_KEY: API-Key donat$$${DONAT_IDP_ADMIN_SECRET:?see .env.example}
       OPERATOR_PASSWORD: ${DONAT_ADMIN_PASSWORD:?see .env.example}
     volumes:
-      - ./deploy/set-operator-password.py:/set-operator-password.py:ro
-    command: ["python3", "/set-operator-password.py"]
+      - ./deploy/provision-operator.py:/provision-operator.py:ro
+    command: ["python3", "/provision-operator.py"]
     restart: "no"
 
   # Applies the engine's own schema — cron state, the event log, durable

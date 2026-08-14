@@ -21,9 +21,15 @@ backends:
       value_from_env: DONAT_S3_KEY
     secret_access_key:
       value_from_env: DONAT_S3_SECRET
-    # Where a public attachment's stable URL is rooted — a CDN in production,
-    # MinIO's own anonymous origin here.
-    public_base_url: http://127.0.0.1:9000/donat-media
+    # Where a public attachment's stable URL would be rooted — a CDN, or a
+    # bucket you have deliberately opened. Unset, because this bucket is not
+    # open and a column declaring `public: true` should fail at load time
+    # rather than hand out a URL that answers 403.
+    #
+    # Turning it on is two deliberate steps, in this order: open the bucket to
+    # anonymous downloads, then name where those downloads are served from.
+    # Both, or neither.
+    #public_base_url: https://media.example.com/donat-media
 
 signing:
   # The store presigns upload and download URLs, and the call reporting an
