@@ -52,7 +52,7 @@ look like a broken library either.
 |---|---|
 | `LENDING_ENGINE_URL` | the standalone engine stand; unset skips that half |
 | `LENDING_GO_URL` | the Go host stand; unset skips that half |
-| `LENDING_ADMIN_SECRET` | sent as `X-Donat-Admin-Secret`; the engine only honours `X-Donat-*` headers on a trusted request, and the Go host ignores it |
+| `LENDING_JWT_KEY` | signs the HS256 token every request carries. The engine honours no role header on its own — a role comes from a verified token — while the Go host resolves the headers itself and ignores the token |
 | `LENDING_PG_BASE` | the database server, default `…@127.0.0.1:15433` |
 | `LENDING_ENGINE_PORT`, `LENDING_GO_PORT`, `LENDING_DRIVER_PORT` | listen ports, default 8090, 8091 and 8092 |
 

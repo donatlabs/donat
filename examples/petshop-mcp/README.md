@@ -26,11 +26,11 @@ or column permission.
 
 ## Auth
 
-The MCP request carries the same headers as the rest of the engine. In this
-demo, the trusted secret `petshop-secret` plus an `X-Donat-Role` header pick
-the role; in production you would send a JWT (`Authorization: Bearer <jwt>`)
-and the role comes from its claims. Curated `tools/list` and `tools/call` both
-need a role because the published catalogue is role-scoped.
+The MCP request carries the same auth as the rest of the engine: a verified
+token (`Authorization: Bearer <jwt>`), with the role read from its claims. An
+`X-Donat-Role` header only *picks* between several roles one token carries.
+Curated `tools/list` and `tools/call` both need a role, because the published
+catalogue is role-scoped.
 
 ## Connect an MCP client
 
@@ -44,8 +44,7 @@ role headers. For example, a project `.mcp.json`:
       "type": "http",
       "url": "http://localhost:8080/mcp",
       "headers": {
-        "X-Donat-Admin-Secret": "petshop-secret",
-        "X-Donat-Role": "staff"
+        "Authorization": "Bearer <token from ../mint-token.sh staff>"
       }
     }
   }
@@ -61,8 +60,7 @@ For a stdio-only client, bridge with `mcp-remote`:
       "command": "npx",
       "args": [
         "mcp-remote", "http://localhost:8080/mcp",
-        "--header", "X-Donat-Admin-Secret:petshop-secret",
-        "--header", "X-Donat-Role:staff"
+        "--header", "Authorization:Bearer <token from ../mint-token.sh staff>"
       ]
     }
   }
@@ -71,11 +69,19 @@ For a stdio-only client, bridge with `mcp-remote`:
 
 ## Try it with curl
 
+A role comes from a verified token; this engine has no admin role and no
+header that names one. Mint one for this stand with the shared development
+key:
+
+```bash
+STAFF=$(../mint-token.sh staff)
+```
+
 List the tools for a role:
 
 ```bash
 curl -s localhost:8080/mcp -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
+  -H "authorization: Bearer $STAFF" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
@@ -84,7 +90,7 @@ Call the curated inventory lookup tool:
 ```bash
 curl -s localhost:8080/mcp \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
+  -H "authorization: Bearer $STAFF" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
         "name":"inventory.lookup",
         "arguments":{"columns":["id","name","status"],"order_by":{"id":"asc"}}}}'
@@ -96,7 +102,7 @@ to the saved GraphQL operation:
 ```bash
 curl -s localhost:8080/mcp \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
+  -H "authorization: Bearer $STAFF" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
         "name":"catalogue.search", "arguments":{"limit":10}}}'
 ```
@@ -106,7 +112,7 @@ Create an inventory item as staff:
 ```bash
 curl -s localhost:8080/mcp \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
+  -H "authorization: Bearer $STAFF" \
   -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
         "name":"inventory.create",
         "arguments":{"objects":[{"name":"Milo","category_id":2,"price":80,"status":"available"}],

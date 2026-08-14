@@ -1,0 +1,48 @@
+# A GraphQL subscription upgrades the connection; anything else must not.
+# `map` is an http-level directive and this file is included inside `http`.
+map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ''      close;
+}
+
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+
+  # The engine, served under the SAME origin as the panel. That is not a
+  # convenience: it is what makes the panel need no CORS from the engine
+  # (which delegates CORS to its fronting layer by design), and it is what
+  # will let the `session` auth mode work at all — a session cookie the
+  # engine sets is only sent back to the engine's own origin.
+  location /v1/ {
+    proxy_pass ${DONAT_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # Subscriptions ride the same path over a WebSocket upgrade.
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+  }
+
+  # The engine's own OpenID Connect relying party: /auth/login starts a login,
+  # /auth/callback exchanges the code and sets the session cookie, and
+  # /auth/session reports who the caller is.
+  #
+  # /auth/v1/ goes the same way, to the identity provider behind the engine
+  # (DONAT_OIDC.login_api). That is what lets /idp/authorize render the login
+  # screen here while the provider keeps the protocol: the provider's session
+  # cookie and its Origin check both require the browser to reach it on this
+  # origin.
+  location /auth/ {
+    proxy_pass ${DONAT_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  # A single-page app: every other path is the app's own route.
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+}

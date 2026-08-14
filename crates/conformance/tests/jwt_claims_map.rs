@@ -23,7 +23,6 @@ use donat_conformance::{
 };
 use serde_json::{Value as Json, json};
 
-const ADMIN_SECRET: &str = "claims-map-test-secret";
 const KID: &str = "test-key-1";
 
 // ------------------------------------------------------------- JWKS stub
@@ -191,7 +190,6 @@ const QUERY: &str = "query { orders { id customer_id order_status } }";
 fn claims_map_projects_token_identity_onto_row_filters() {
     let jwks = start_jwks_stub();
     let s = Suite::new("jwt_claims_map")
-        .admin_secret(ADMIN_SECRET)
         .env(
             "DONAT_GRAPHQL_JWT_SECRET",
             &json!({

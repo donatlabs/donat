@@ -1,0 +1,49 @@
+# Where uploaded files go.
+#
+# Nothing in this deployment uploads anything yet — it has no tables. The store
+# is here because the first table with a file column should not also need new
+# infrastructure: declare the column, and this is already resolved, signed and
+# swept.
+#
+# Which column holds a file is declared on the table itself, not here.
+backends:
+  - name: media
+    kind: s3
+    bucket: donat-media
+    region: us-east-1
+    # MinIO beside the engine. Point this at a real bucket and nothing else in
+    # this file changes.
+    endpoint: http://minio:9000
+    # MinIO reached by hostname needs path-style addressing; a real S3 bucket
+    # does not.
+    path_style: true
+    access_key_id:
+      value_from_env: DONAT_S3_KEY
+    secret_access_key:
+      value_from_env: DONAT_S3_SECRET
+    # Where a public attachment's stable URL is rooted — a CDN in production,
+    # MinIO's own anonymous origin here.
+    public_base_url: http://127.0.0.1:9000/donat-media
+
+signing:
+  # The store presigns upload and download URLs, and the call reporting an
+  # upload finished carries no other proof. Never a literal in metadata.
+  secret:
+    value_from_env: DONAT_FILE_SIGNING_SECRET
+  upload_ttl_seconds: 900
+  download_ttl_seconds: 300
+
+gc:
+  every_days: 1
+  pending_ttl_days: 1
+  orphan_grace_days: 1
+
+limits:
+  pending_uploads_per_session: 10
+  uploads_per_minute_per_session: 30
+
+# An upload is bound to the session that asked for it. Here that is whoever the
+# token says it is — the same session variable every permission is written
+# against.
+identity:
+  session_variable: x-donat-user-id

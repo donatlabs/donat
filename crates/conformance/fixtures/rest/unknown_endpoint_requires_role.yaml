@@ -1,13 +1,14 @@
 # The regression this pins: session resolution must precede routing for a
-# request that matches no endpoint. Were 404 returned first, a role-less
-# request could enumerate which routes exist; the role error must win.
-description: A role-less request to an unknown path gets the role error, not 404.
+# request that matches no endpoint. Were 404 returned first, an
+# unauthenticated request could enumerate which routes exist; the
+# authentication failure must win.
+description: An unauthenticated request to an unknown path is refused, not 404'd.
 url: /api/rest/does/not/exist
 method: GET
-status: 200
+status: 401
 response:
   errors:
     - extensions:
         path: "$"
         code: access-denied
-      message: x-donat-role header is required (this engine has no admin role)
+      message: Authentication hook unauthorized this request

@@ -1136,6 +1136,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "donat-kriti"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "donat-metadata"
 version = "0.1.0"
 dependencies = [
@@ -1217,6 +1224,7 @@ dependencies = [
  "donat-connector-catalog",
  "donat-connectors",
  "donat-ir",
+ "donat-kriti",
  "donat-metadata",
  "donat-processes",
  "donat-rules",

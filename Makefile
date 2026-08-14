@@ -159,8 +159,31 @@ petshop-system-tests:
 	@tests-system/.venv/bin/pip install -q -r tests-system/requirements.txt
 	@cd tests-system && eval "$$(./stack.sh env)" && .venv/bin/python -m pytest
 
+# The admin panel (apps/admin) is its own npm project, not part of the Cargo
+# workspace — `make test` does not reach it, so these targets are how it is
+# run and checked. Point VITE_DONAT_GRAPHQL_URL at an engine first (see
+# apps/admin/.env.example).
+admin:
+	cd apps/admin && npm install && npm run dev
+
+admin-test:
+	cd apps/admin && npm install && npm run typecheck && npm test
+
 claude:
 	claude --dangerously-skip-permissions --teammate-mode tmux
 
 codex:
 	codex --sandbox danger-full-access
+
+# Fill .env with fresh secrets.
+#
+# .env.example ships every name and no value: a committed file with working
+# secrets in it is a shared secret. This makes the values, once, on the machine
+# that will use them. It refuses to overwrite an existing .env — those secrets
+# are already in a database somewhere.
+.PHONY: env
+env:
+	@test ! -f .env || { echo ".env exists; delete it first if you mean to replace it"; exit 1; }
+	@python3 scripts/generate-env.py > .env
+	@echo "wrote .env — sign in as operator@example.com with:"
+	@grep DONAT_ADMIN_PASSWORD .env

@@ -37,14 +37,18 @@ separate branches and merge independently).
 - [[decisions/009-defer-mcp-action-output-relationships]] — why action tools
   reject output relationships until MCP has a role-scoped target selection
 - [[decisions/010-donat-does-not-own-identity]] — why the engine ships no
-  authentication of its own and the petshop example gets an optional Rauthy
-  profile instead, and why an external IdP is not an admin-role bypass
+  authentication of its own and the petshop example runs Rauthy instead, and
+  why an external IdP is not an admin-role bypass
 - [[decisions/011-share-rendered-schema-documents-across-slots]] — why a
   compiled snapshot shares, serializes and indexes what it keeps, halving the
   engine's resident memory without changing a served response
 - [[decisions/012-a-wide-selection-is-an-ordinary-query]] — why an object of
   more than fifty fields is built from an ordered row set instead of one
   `json_build_object`, and why field order ruled `jsonb` out
+- [[decisions/013-a-role-is-established-by-a-verified-token-or-a-hook-and-by-nothing-else]]
+  — why the admin secret was deleted, why a deployment that can answer nobody
+  refuses to boot, and why the engine now serves the OIDC login itself while
+  still owning no identity
 
 ## Cross-cutting
 

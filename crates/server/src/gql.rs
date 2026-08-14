@@ -207,25 +207,8 @@ pub fn query_too_deep(query: &str) -> bool {
     max > MAX_QUERY_DEPTH
 }
 
-/// Constant-time byte-slice equality for the admin-secret check (avoids a
-/// timing side-channel on the secret value; length is not secret).
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 fn is_session_header(name: &str) -> bool {
     name.starts_with("x-donat-") || name.starts_with("x-hasura-")
-}
-
-fn is_reserved_session_secret(name: &str) -> bool {
-    name == "x-donat-admin-secret" || name == "x-hasura-admin-secret"
 }
 
 /// A planning-level GraphQL error (shared with remote validation).
@@ -236,135 +219,152 @@ pub struct GqlError {
     pub message: String,
 }
 
-/// Build the request session from X-Donat-* headers. There is no admin
-/// role: the role header is mandatory and grants nothing by itself.
-/// `trusted` is false when an admin secret is configured but absent from
-/// the request: X-Donat-* headers are then ignored entirely and the
-/// session falls back to the unauthorized role.
-pub fn session_from_headers(
-    headers: &HeaderMap,
-    unauthorized_role: Option<&str>,
-    trusted: bool,
-) -> Result<Session, Json> {
-    if !trusted {
-        return match unauthorized_role {
-            Some(role) => Ok(Session {
-                role: role.to_string(),
-                vars: std::collections::HashMap::new(),
-                backend_request: false,
-            }),
-            None => Err(json!({
-                "errors": [{
-                    "extensions": { "path": "$", "code": "access-denied" },
-                    "message": "x-donat-admin-secret required, but not found",
-                }]
-            })),
-        };
-    }
-    let mut donat_role = None;
-    let mut hasura_role = None;
-    let mut vars = std::collections::HashMap::new();
-    for (name, value) in headers {
-        let name = name.as_str().to_ascii_lowercase();
-        if !is_session_header(&name) || is_reserved_session_secret(&name) {
-            continue;
-        }
-        let Ok(value) = value.to_str() else { continue };
-        if name == "x-donat-role" {
-            donat_role = Some(value.to_string());
-        } else if name == "x-hasura-role" {
-            hasura_role = Some(value.to_string());
-        }
-        vars.insert(name, value.to_string());
-    }
-    let backend_request = match vars.get("x-donat-use-backend-only-permissions") {
-        None => false,
-        Some(raw) => match raw.to_ascii_lowercase().as_str() {
-            "true" | "t" | "yes" | "y" => true,
-            "false" | "f" | "no" | "n" => false,
-            _ => {
-                return Err(json!({
-                    "errors": [{
-                        "extensions": { "path": "$", "code": "bad-request" },
-                        "message": "x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive",
-                    }]
-                }));
-            }
-        },
+/// Whether the request asked for backend-only permissions.
+///
+/// A client hint, not a grant: it can only narrow what the resolved role may
+/// do. Parsed once for every request, whichever mechanism resolves the
+/// session, because the error text for a malformed value is part of the API
+/// contract.
+pub fn backend_only_requested(headers: &HeaderMap) -> Result<bool, Json> {
+    let Some(raw) = headers
+        .get("x-donat-use-backend-only-permissions")
+        .or_else(|| headers.get("x-hasura-use-backend-only-permissions"))
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(false);
     };
-    // No admin role: a trusted request must name an explicit role (an
-    // unauthorized-role fallback applies only to the untrusted branch above).
-    match donat_role.or(hasura_role) {
-        Some(role) => {
-            vars.insert("x-donat-role".to_string(), role.clone());
-            vars.insert("x-hasura-role".to_string(), role.clone());
-            Ok(Session {
-                role,
-                vars,
-                backend_request,
-            })
-        }
-        None => Err(json!({
+    match raw.to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" => Ok(true),
+        "false" | "f" | "no" | "n" => Ok(false),
+        _ => Err(json!({
             "errors": [{
-                "extensions": { "path": "$", "code": "access-denied" },
-                "message": "x-donat-role header is required (this engine has no admin role)",
+                "extensions": { "path": "$", "code": "bad-request" },
+                "message": "x-donat-use-backend-only-permissions:  Not a valid boolean text. True values are [\"true\",\"t\",\"yes\",\"y\"] and  False values are [\"false\",\"f\",\"no\",\"n\"]. All values are case insensitive",
             }]
         })),
     }
 }
 
-/// Full session resolution: admin secret wins (X-Donat-* honored), then
-/// JWT bearer tokens when configured, then the unauthorized role.
+/// Find the token a request carries.
+///
+/// The configured location is tried first. When the deployment also runs the
+/// engine's own login, the session cookie that login writes is tried after it:
+/// a deployment with both a browser panel and API clients has tokens arriving
+/// two ways, and its `claims_map` is the same either way. This adds no trust —
+/// the cookie is only consulted when this engine set it, and the token in it
+/// is verified exactly like one from a header.
+fn token_from_request(
+    headers: &HeaderMap,
+    location: &crate::jwt::TokenLocation,
+    oidc: Option<&crate::oidc::OidcConfig>,
+) -> Option<String> {
+    let cookie_named = |name: &str| {
+        headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|cookies| crate::oidc::cookie_value(cookies, name))
+    };
+    let configured = match location {
+        crate::jwt::TokenLocation::Authorization => headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_string),
+        crate::jwt::TokenLocation::Cookie(name) => cookie_named(name),
+        crate::jwt::TokenLocation::CustomHeader(name) => headers
+            .get(name.to_ascii_lowercase().as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+    };
+    configured.or_else(|| oidc.and_then(|oidc| cookie_named(&oidc.cookie)))
+}
+
+/// The session a request gets when nothing authenticated it.
+///
+/// There is no admin role and no trusted header: a role reaches this engine
+/// from a verified JWT or from an authentication hook, so a request that
+/// carried neither is not "trusted with what it claims" — it is anonymous.
+/// It runs as `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` when a deployment names one,
+/// and is denied when it does not. Whatever `x-donat-*` headers it carried
+/// are dropped, because nothing vouched for them.
+pub fn unauthenticated_session(unauthorized_role: Option<&str>) -> Result<Session, Json> {
+    match unauthorized_role {
+        Some(role) => Ok(Session {
+            role: role.to_string(),
+            vars: std::collections::HashMap::new(),
+            backend_request: false,
+        }),
+        None => Err(json!({
+            "errors": [{
+                "extensions": { "path": "$", "code": "access-denied" },
+                "message": "no authentication was supplied and this deployment sets no unauthorized role",
+            }]
+        })),
+    }
+}
+
+/// How a request's session was established.
+///
+/// The distinction a browser needs and cannot otherwise get: a deployment that
+/// sets `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` answers an unauthenticated request
+/// *successfully*, as that role. To the caller that is indistinguishable from
+/// "your role may see nothing" — so a panel would sit on an empty screen
+/// instead of sending the operator to log in. This says which happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// A verified token, or an authentication hook that recognised the caller.
+    Authenticated,
+    /// Nothing authenticated the request; it runs as the unauthorized role.
+    Unauthenticated,
+}
+
+/// Full session resolution: an authentication hook if one is configured,
+/// else a verified JWT, else the unauthorized role.
+///
+/// The two mechanisms are the only ways a role is named. There is no header
+/// and no shared secret that can name one — a deployment that wants a request
+/// to choose its own role gives it a token that grants those roles.
 pub async fn resolve_session(
     state: &crate::state::AppState,
     headers: &HeaderMap,
 ) -> Result<Session, (axum::http::StatusCode, Json)> {
-    let secret_ok = match &state.admin_secret {
-        None => true,
-        Some(expected) => headers
-            .get("x-donat-admin-secret")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|provided| ct_eq(provided.as_bytes(), expected.as_bytes())),
-    };
+    resolve_session_with_origin(state, headers)
+        .await
+        .map(|(session, _)| session)
+}
+
+/// [`resolve_session`], plus how the session was established.
+pub async fn resolve_session_with_origin(
+    state: &crate::state::AppState,
+    headers: &HeaderMap,
+) -> Result<(Session, SessionOrigin), (axum::http::StatusCode, Json)> {
+    let backend_request =
+        backend_only_requested(headers).map_err(|e| (axum::http::StatusCode::OK, e))?;
     if let Some((url, mode)) = &state.auth_hook {
-        if state.admin_secret.is_some() && secret_ok {
-            return session_from_headers(headers, state.unauthorized_role.as_deref(), true)
-                .map_err(|e| (axum::http::StatusCode::OK, e));
-        }
-        return webhook_session(state, url, mode, headers).await;
+        return webhook_session(state, url, mode, headers)
+            .await
+            .map(|(session, origin)| {
+                (
+                    Session {
+                        backend_request,
+                        ..session
+                    },
+                    origin,
+                )
+            });
     }
     if let Some(jwt) = &state.jwt {
-        if state.admin_secret.is_some() && secret_ok {
-            return session_from_headers(headers, state.unauthorized_role.as_deref(), true)
-                .map_err(|e| (axum::http::StatusCode::OK, e));
-        }
-        let token: Option<String> = match &jwt.header {
-            crate::jwt::TokenLocation::Authorization => headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .map(str::to_string),
-            crate::jwt::TokenLocation::Cookie(name) => headers
-                .get("cookie")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|cookies| {
-                    cookies.split(';').find_map(|c| {
-                        let c = c.trim();
-                        c.strip_prefix(&format!("{name}=")).map(str::to_string)
-                    })
-                }),
-            crate::jwt::TokenLocation::CustomHeader(name) => headers
-                .get(name.to_ascii_lowercase().as_str())
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string),
-        };
+        let token = token_from_request(headers, &jwt.header, state.oidc.as_ref());
         let Some(token) = token else {
             if let Some(role) = &state.unauthorized_role {
-                return Ok(Session {
-                    role: role.clone(),
-                    vars: std::collections::HashMap::new(),
-                    backend_request: false,
-                });
+                return Ok((
+                    Session {
+                        role: role.clone(),
+                        vars: std::collections::HashMap::new(),
+                        backend_request: false,
+                    },
+                    SessionOrigin::Unauthenticated,
+                ));
             }
             return Err((
                 axum::http::StatusCode::OK,
@@ -380,17 +380,15 @@ pub async fn resolve_session(
             .get("x-donat-role")
             .or_else(|| headers.get("x-hasura-role"))
             .and_then(|v| v.to_str().ok());
-        let backend = headers
-            .get("x-donat-use-backend-only-permissions")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "t" | "yes" | "y"))
-            .unwrap_or(false);
-        return match jwt.session(&token, requested, backend) {
-            Ok(sess) => Ok(Session {
-                role: sess.role,
-                vars: sess.vars,
-                backend_request: backend,
-            }),
+        return match jwt.session(&token, requested, backend_request) {
+            Ok(sess) => Ok((
+                Session {
+                    role: sess.role,
+                    vars: sess.vars,
+                    backend_request,
+                },
+                SessionOrigin::Authenticated,
+            )),
             // JWT failures are HTTP 200 on /v1/graphql; the legacy
             // endpoint upgrades them to 400 itself.
             Err(e) => Err((
@@ -404,8 +402,43 @@ pub async fn resolve_session(
             )),
         };
     }
-    session_from_headers(headers, state.unauthorized_role.as_deref(), secret_ok)
+    unauthenticated_session(state.unauthorized_role.as_deref())
+        .map(|session| (session, SessionOrigin::Unauthenticated))
         .map_err(|e| (axum::http::StatusCode::OK, e))
+}
+
+/// Project an authentication hook's response into a role and its session
+/// variables, or `None` when the response named no role.
+///
+/// The hook's answer is now one of only two things that can name a role (a
+/// verified JWT is the other), so what it says goes: its `x-donat-*` /
+/// `x-hasura-*` keys become the session variables permissions are evaluated
+/// against, and anything else in the response is ignored. Both namespaces are
+/// accepted and the Donat one wins, matching how a token's claims are read.
+fn session_from_hook_response(
+    response: &Json,
+) -> Option<(String, std::collections::HashMap<String, String>)> {
+    let mut vars = std::collections::HashMap::new();
+    if let Some(map) = response.as_object() {
+        for (k, v) in map {
+            let key = k.to_ascii_lowercase();
+            if !is_session_header(&key) {
+                continue;
+            }
+            let value = match v {
+                Json::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            vars.insert(key, value);
+        }
+    }
+    let role = vars
+        .get("x-donat-role")
+        .or_else(|| vars.get("x-hasura-role"))
+        .cloned()?;
+    vars.insert("x-donat-role".to_string(), role.clone());
+    vars.insert("x-hasura-role".to_string(), role.clone());
+    Some((role, vars))
 }
 
 /// Webhook authentication: forward the client headers, expect a JSON
@@ -415,7 +448,7 @@ async fn webhook_session(
     url: &str,
     mode: &str,
     headers: &HeaderMap,
-) -> Result<Session, (axum::http::StatusCode, Json)> {
+) -> Result<(Session, SessionOrigin), (axum::http::StatusCode, Json)> {
     let header_map: serde_json::Map<String, Json> = headers
         .iter()
         .filter_map(|(k, v)| {
@@ -459,11 +492,14 @@ async fn webhook_session(
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         if let Some(role) = &state.unauthorized_role {
-            return Ok(Session {
-                role: role.clone(),
-                vars: std::collections::HashMap::new(),
-                backend_request: false,
-            });
+            return Ok((
+                Session {
+                    role: role.clone(),
+                    vars: std::collections::HashMap::new(),
+                    backend_request: false,
+                },
+                SessionOrigin::Unauthenticated,
+            ));
         }
         return Err((
             axum::http::StatusCode::UNAUTHORIZED,
@@ -493,25 +529,7 @@ async fn webhook_session(
                 ));
             }
         };
-    let mut vars = std::collections::HashMap::new();
-    if let Some(map) = vars_raw.as_object() {
-        for (k, v) in map {
-            let key = k.to_ascii_lowercase();
-            if !is_session_header(&key) || is_reserved_session_secret(&key) {
-                continue;
-            }
-            let value = match v {
-                Json::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            vars.insert(key, value);
-        }
-    }
-    let Some(role) = vars
-        .get("x-donat-role")
-        .or_else(|| vars.get("x-hasura-role"))
-        .cloned()
-    else {
+    let Some((role, vars)) = session_from_hook_response(&vars_raw) else {
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({
@@ -522,13 +540,14 @@ async fn webhook_session(
             }),
         ));
     };
-    vars.insert("x-donat-role".to_string(), role.clone());
-    vars.insert("x-hasura-role".to_string(), role.clone());
-    Ok(Session {
-        role,
-        vars,
-        backend_request: false,
-    })
+    Ok((
+        Session {
+            role,
+            vars,
+            backend_request: false,
+        },
+        SessionOrigin::Authenticated,
+    ))
 }
 
 pub async fn execute(
@@ -2021,14 +2040,6 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq() {
-        assert!(ct_eq(b"secret", b"secret"));
-        assert!(!ct_eq(b"secret", b"secrey"));
-        assert!(!ct_eq(b"secret", b"secre"));
-        assert!(ct_eq(b"", b""));
-    }
-
-    #[test]
     fn command_roots_fail_closed_before_non_postgres_execution() {
         let roots = vec![donat_ir::MutationRoot::Command {
             alias: "submitted".to_string(),
@@ -2077,108 +2088,142 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_request_falls_back_to_unauthorized_role() {
-        let h = headers(&[("x-donat-role", "editor"), ("x-donat-user-id", "1")]);
-        let s = session_from_headers(&h, Some("anonymous"), false).unwrap();
-        assert_eq!(s.role, "anonymous");
-        assert!(s.vars.is_empty(), "untrusted headers must be ignored");
+    fn a_token_is_found_where_it_was_configured_and_in_the_login_cookie() {
+        use crate::jwt::TokenLocation;
+        let oidc = crate::oidc::OidcConfig::from_env_value(
+            r#"{"authorization_endpoint":"https://i/a","token_endpoint":"https://i/t","client_id":"c","redirect_uri":"https://a/auth/callback","cookie":"donat_session"}"#,
+        )
+        .expect("a valid configuration");
+
+        // The configured location wins.
+        let bearer = headers(&[("authorization", "Bearer FROM_HEADER")]);
+        assert_eq!(
+            token_from_request(&bearer, &TokenLocation::Authorization, Some(&oidc)).as_deref(),
+            Some("FROM_HEADER")
+        );
+
+        // A deployment that also runs the login accepts the cookie that login
+        // wrote, so a browser and an API client can share one configuration.
+        let cookie = headers(&[("cookie", "other=1; donat_session=FROM_COOKIE")]);
+        assert_eq!(
+            token_from_request(&cookie, &TokenLocation::Authorization, Some(&oidc)).as_deref(),
+            Some("FROM_COOKIE")
+        );
+        // Without the login configured, that cookie is just a cookie.
+        assert_eq!(
+            token_from_request(&cookie, &TokenLocation::Authorization, None),
+            None
+        );
+        // And the header still wins when both are present.
+        let both = headers(&[
+            ("authorization", "Bearer FROM_HEADER"),
+            ("cookie", "donat_session=FROM_COOKIE"),
+        ]);
+        assert_eq!(
+            token_from_request(&both, &TokenLocation::Authorization, Some(&oidc)).as_deref(),
+            Some("FROM_HEADER")
+        );
     }
 
     #[test]
-    fn untrusted_request_without_unauthorized_role_is_denied() {
-        let e = session_from_headers(&HeaderMap::new(), None, false).unwrap_err();
+    fn an_unauthenticated_request_becomes_the_unauthorized_role() {
+        let s = unauthenticated_session(Some("anonymous")).unwrap();
+        assert_eq!(s.role, "anonymous");
+        assert!(
+            s.vars.is_empty(),
+            "nothing vouched for this request's headers"
+        );
+        assert!(!s.backend_request);
+    }
+
+    #[test]
+    fn an_unauthenticated_request_without_an_unauthorized_role_is_denied() {
+        let e = unauthenticated_session(None).unwrap_err();
         assert_eq!(
             e.pointer("/errors/0/extensions/code"),
             Some(&json!("access-denied"))
         );
         assert_eq!(
             e.pointer("/errors/0/message"),
-            Some(&json!("x-donat-admin-secret required, but not found"))
-        );
-    }
-
-    #[test]
-    fn trusted_request_collects_x_donat_vars() {
-        let h = headers(&[
-            ("x-donat-role", "editor"),
-            ("X-Donat-User-Id", "7"),
-            ("x-donat-admin-secret", "shh"),
-            ("content-type", "application/json"),
-        ]);
-        let s = session_from_headers(&h, None, true).unwrap();
-        assert_eq!(s.role, "editor");
-        assert_eq!(s.vars.get("x-donat-user-id").map(String::as_str), Some("7"));
-        assert!(!s.vars.contains_key("x-donat-admin-secret"));
-        assert!(!s.vars.contains_key("content-type"));
-        assert!(!s.backend_request);
-    }
-
-    #[test]
-    fn trusted_request_collects_x_hasura_vars() {
-        let h = headers(&[
-            ("X-Hasura-Role", "editor"),
-            ("X-Hasura-User-Id", "7"),
-            ("X-Hasura-Admin-Secret", "ignored"),
-        ]);
-        let s = session_from_headers(&h, None, true).unwrap();
-        assert_eq!(s.role, "editor");
-        assert_eq!(
-            s.vars.get("x-hasura-user-id").map(String::as_str),
-            Some("7")
-        );
-        assert_eq!(
-            s.vars.get("x-hasura-role").map(String::as_str),
-            Some("editor")
-        );
-        assert_eq!(
-            s.vars.get("x-donat-role").map(String::as_str),
-            Some("editor")
-        );
-        assert!(!s.vars.contains_key("x-donat-admin-secret"));
-        assert!(!s.vars.contains_key("x-hasura-admin-secret"));
-    }
-
-    #[test]
-    fn x_donat_role_wins_over_x_hasura_role() {
-        let h = headers(&[
-            ("X-Hasura-Role", "hasura_user"),
-            ("X-Donat-Role", "donat_user"),
-        ]);
-        let s = session_from_headers(&h, None, true).unwrap();
-        assert_eq!(s.role, "donat_user");
-        assert_eq!(
-            s.vars.get("x-hasura-role").map(String::as_str),
-            Some("donat_user")
-        );
-    }
-
-    #[test]
-    fn trusted_request_requires_a_role() {
-        // No admin role: a trusted request with no X-Donat-Role is denied.
-        let e =
-            session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true).unwrap_err();
-        assert_eq!(
-            e.pointer("/errors/0/message"),
             Some(&json!(
-                "x-donat-role header is required (this engine has no admin role)"
+                "no authentication was supplied and this deployment sets no unauthorized role"
             ))
         );
     }
 
     #[test]
+    fn a_hook_response_becomes_the_session_variables() {
+        let (role, vars) = session_from_hook_response(&json!({
+            "X-Donat-Role": "editor",
+            "x-donat-user-id": "7",
+            "content-type": "application/json",
+        }))
+        .expect("the hook named a role");
+        assert_eq!(role, "editor");
+        assert_eq!(vars.get("x-donat-user-id").map(String::as_str), Some("7"));
+        assert!(
+            !vars.contains_key("content-type"),
+            "only session namespaces become variables"
+        );
+    }
+
+    #[test]
+    fn a_hook_may_answer_in_the_hasura_namespace() {
+        let (role, vars) = session_from_hook_response(&json!({
+            "X-Hasura-Role": "editor",
+            "X-Hasura-User-Id": "7",
+        }))
+        .expect("the hook named a role");
+        assert_eq!(role, "editor");
+        assert_eq!(vars.get("x-hasura-user-id").map(String::as_str), Some("7"));
+        // Both spellings are populated so a permission may reference either.
+        assert_eq!(
+            vars.get("x-hasura-role").map(String::as_str),
+            Some("editor")
+        );
+        assert_eq!(vars.get("x-donat-role").map(String::as_str), Some("editor"));
+    }
+
+    #[test]
+    fn the_donat_namespace_wins_when_a_hook_answers_in_both() {
+        let (role, vars) = session_from_hook_response(&json!({
+            "X-Hasura-Role": "hasura_user",
+            "X-Donat-Role": "donat_user",
+        }))
+        .expect("the hook named a role");
+        assert_eq!(role, "donat_user");
+        assert_eq!(
+            vars.get("x-hasura-role").map(String::as_str),
+            Some("donat_user")
+        );
+    }
+
+    #[test]
+    fn a_hook_response_that_names_no_role_resolves_nothing() {
+        // There is no admin role to fall back to, and no header the engine
+        // would believe instead.
+        assert!(session_from_hook_response(&json!({ "x-donat-user-id": "7" })).is_none());
+        assert!(session_from_hook_response(&json!({})).is_none());
+        assert!(session_from_hook_response(&json!("not an object")).is_none());
+    }
+
+    #[test]
     fn backend_only_permissions_header_parsing() {
         let with = |v: &str| {
-            session_from_headers(
-                &headers(&[
-                    ("x-donat-role", "u"),
-                    ("x-donat-use-backend-only-permissions", v),
-                ]),
-                None,
-                true,
-            )
+            backend_only_requested(&headers(&[("x-donat-use-backend-only-permissions", v)]))
         };
-        assert!(with("YES").unwrap().backend_request);
-        assert!(!with("f").unwrap().backend_request);
+        assert!(with("YES").unwrap());
+        assert!(!with("f").unwrap());
+        assert!(!backend_only_requested(&HeaderMap::new()).unwrap());
+        // The Hasura spelling is accepted the same way every other session
+        // header is.
+        assert!(
+            backend_only_requested(&headers(&[(
+                "x-hasura-use-backend-only-permissions",
+                "true"
+            )]))
+            .unwrap()
+        );
         let e = with("maybe").unwrap_err();
         assert_eq!(
             e.pointer("/errors/0/extensions/code"),
@@ -2742,8 +2787,8 @@ mod tests {
             engine: tokio::sync::RwLock::new(engine),
             connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: "postgres://unused".to_string(),
-            admin_secret: None,
             unauthorized_role: None,
+            oidc: None,
             stringify_numerics: false,
             infer_function_permissions: true,
             jwt: None,
@@ -2826,17 +2871,14 @@ mod tests {
             json!("field \"restricted_action\" not found in type: 'query_root'")
         );
 
-        let no_role = session_from_headers(&headers(&[("x-donat-user-id", "7")]), None, true)
-            .expect_err("a public action never supplies a missing classic role");
-        assert_eq!(
-            no_role["errors"][0]["message"],
-            json!("x-donat-role header is required (this engine has no admin role)")
-        );
+        // A hook that resolves no role resolves no session either: there is
+        // no admin role for a public action to fall back to.
+        assert!(session_from_hook_response(&json!({ "x-donat-user-id": "7" })).is_none());
         server.abort();
     }
 
     #[tokio::test]
-    async fn trusted_request_without_role_is_denied_before_public_action_even_with_fallback() {
+    async fn a_roleless_request_reaches_a_public_action_only_as_the_unauthorized_role() {
         let calls = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2876,51 +2918,52 @@ mod tests {
             .expect("state is not shared before test setup")
             .unauthorized_role = Some("anonymous".to_string());
 
-        let roleless_headers = HeaderMap::new();
-        let roleless = resolve_session(&state, &roleless_headers).await;
-        if let Ok(session) = &roleless {
-            let (status, response) = execute_full(
-                &state,
-                session,
-                &json!({ "query": "query { public_action }" }),
-                false,
-                &roleless_headers,
-            )
-            .await;
-            assert_eq!(status, axum::http::StatusCode::OK);
-            assert_eq!(response, json!({ "data": { "public_action": "called" } }));
-        }
+        // Nothing authenticates this request, and a role header is not
+        // authentication: the session is the unauthorized role the operator
+        // configured, never the role the header asks for.
+        let asks_for_a_role = headers(&[("x-donat-role", "customer")]);
+        let session = resolve_session(&state, &asks_for_a_role)
+            .await
+            .expect("an unauthorized role is configured");
+        assert_eq!(session.role, "anonymous");
+        assert!(
+            session.vars.is_empty(),
+            "an unauthenticated request carries no session variables"
+        );
+        let (status, response) = execute_full(
+            &state,
+            &session,
+            &json!({ "query": "query { public_action }" }),
+            false,
+            &asks_for_a_role,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(response, json!({ "data": { "public_action": "called" } }));
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            0,
-            "a trusted request without an explicit role must be denied before a public Action webhook can run"
+            1,
+            "an action declaring no permissions is reachable by the role that ran the request"
         );
-        let (status, response) = roleless.expect_err("a trusted request without a role is denied");
+
+        // Take the fallback away and the same request resolves no session at
+        // all, so the Action webhook is never reached.
+        Arc::get_mut(&mut state)
+            .expect("state is not shared")
+            .unauthorized_role = None;
+        let (status, response) = resolve_session(&state, &asks_for_a_role)
+            .await
+            .expect_err("nothing can name a role for this request");
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(
             response,
             json!({
                 "errors": [{
                     "extensions": { "path": "$", "code": "access-denied" },
-                    "message": "x-donat-role header is required (this engine has no admin role)"
+                    "message": "no authentication was supplied and this deployment sets no unauthorized role"
                 }]
             })
         );
-
-        let customer_headers = headers(&[("x-donat-role", "customer")]);
-        let customer = resolve_session(&state, &customer_headers)
-            .await
-            .expect("an explicit role resolves even when a fallback is configured");
-        let (status, response) = execute_full(
-            &state,
-            &customer,
-            &json!({ "query": "query { public_action }" }),
-            false,
-            &customer_headers,
-        )
-        .await;
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(response, json!({ "data": { "public_action": "called" } }));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
     }

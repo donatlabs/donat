@@ -94,10 +94,17 @@ fn write_startup_metadata_from(fixture: &Json, pointer: &str, case: &str) -> Pat
 
 fn startup_output(metadata_dir: &Path, env: &[(&str, Option<&str>)]) -> (bool, String) {
     let mut command = Command::new(engine_binary());
-    command.arg("--metadata-dir").arg(metadata_dir).env(
-        "DONAT_DATABASE_URL",
-        "postgresql://unused:unused@127.0.0.1:1/unused",
-    );
+    command
+        .arg("--metadata-dir")
+        .arg(metadata_dir)
+        .env(
+            "DONAT_DATABASE_URL",
+            "postgresql://unused:unused@127.0.0.1:1/unused",
+        )
+        // These cases are about connector validation, and a boot that can
+        // resolve no session refuses before it gets there. One explicit role
+        // for every request is the cheapest of the three ways to satisfy it.
+        .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous");
     for (name, value) in env {
         match value {
             Some(value) => {

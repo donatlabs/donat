@@ -193,6 +193,11 @@ async fn serve_with_readonly_role_issues_no_ddl_or_dml() {
         .arg(&metadata.path)
         .arg("--port")
         .arg(port.to_string())
+        // This case is about which statements serving issues, not about
+        // authentication — but a deployment that names none of the three ways
+        // to establish a role refuses to boot, so it has to name one to reach
+        // the thing under test.
+        .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

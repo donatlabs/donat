@@ -57,9 +57,10 @@ The ones that shape behaviour rather than merely point at things:
 | `DONAT_GRAPHQL_DATABASE_URL` | the Postgres source |
 | `DONAT_METADATA_DIR` | the metadata directory to boot from |
 | `DONAT_PORT` | listen port |
-| `DONAT_GRAPHQL_ADMIN_SECRET` | marks a request **trusted to assert a role** — API auth, never a permission |
 | `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` | the role an unauthenticated request runs as; unset means such a request is rejected |
-| `DONAT_GRAPHQL_JWT_SECRET` | JWT verification config — the production way to establish role and session variables |
+| `DONAT_GRAPHQL_JWT_SECRET` | JWT verification config — how role and session variables are established |
+| `DONAT_GRAPHQL_AUTH_HOOK` | a service that resolves the session instead, given the request's headers |
+| `DONAT_OIDC` | the engine's own browser login: `/auth/login`, `/auth/callback`, `/auth/logout` |
 | `DONAT_GRAPHQL_ENABLED_APIS` | restrict the mounted surfaces, e.g. `graphql` |
 | `DONAT_GRAPHQL_ENABLE_ALLOWLIST` | serve only saved operations |
 | `DONAT_REQUEST_TIMEOUT_SECONDS`, `DONAT_PG_STATEMENT_TIMEOUT_SECONDS` | request and statement bounds |
@@ -80,19 +81,21 @@ role selects the permission set; the session variables (`x-donat-user-id` and
 friends) are what row filters compare against, and a client cannot influence
 them.
 
-For a local stand or a test, `X-Donat-Admin-Secret` marks the request as
-trusted so it may assert `X-Donat-Role` and session headers by hand:
+A boot with none of `DONAT_GRAPHQL_JWT_SECRET`, `DONAT_GRAPHQL_AUTH_HOOK` or
+`DONAT_GRAPHQL_UNAUTHORIZED_ROLE` **refuses to start**: it could resolve a
+session for nobody. For a local stand, the cheapest of the three is a token you
+sign yourself (`examples/mint-token.sh`), sent like any other:
 
 ```bash
+TOKEN=$(examples/mint-token.sh customer customer-1)
+
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' \
-  -H 'x-donat-role: customer' \
-  -H 'x-donat-user-id: customer-1' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"query":"{ orders { id order_status } }"}'
 ```
 
-A trusted request with **no** role is not privileged: it falls back to
+A request that names **no** role is not privileged: it falls back to
 `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`, or is rejected with
 `x-donat-role header is required`. There is no admin role, so "run it as
 nobody to see everything" is not a thing that exists.
@@ -149,7 +152,8 @@ permission, not a bypass.
 | Symptom | Cause |
 |---|---|
 | Empty result where rows exist | the row filter, usually a session variable that is not what you think — echo it back in a query first |
-| `x-donat-role header is required` | trusted request with no role, and no unauthorized-role configured |
+| `no authentication was supplied and this deployment sets no unauthorized role` | nothing verified the request, and no unauthorized-role configured |
+| `Authentication hook unauthorized this request` | the hook refused it, and no unauthorized-role configured |
 | `validate` fails on an expression | a nullable column read without `not_null:` / `when_present:` — see `donat-validators` |
 | Upsert rejected | `on_conflict.constraint` does not name a real unique constraint |
 | `revision ... is not deployed as active`, retrying forever | the Process deploy step was skipped — the `migrate` that also reads `--metadata-dir` |

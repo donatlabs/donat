@@ -68,8 +68,13 @@ services:
       DONAT_PORT: "8080"
       # Expose only the MCP surface.
       DONAT_GRAPHQL_ENABLED_APIS: mcp
-      # Trusted-request secret; a trusted request must still name a role.
-      DONAT_GRAPHQL_ADMIN_SECRET: petshop-secret
+      # A role reaches this engine from a verified token and from nothing
+      # else — no admin role, no header that names one. The full example
+      # (../petshop) runs a real identity provider; this one shows a single
+      # API surface, so it verifies tokens with a development key and
+      # ../mint-token.sh signs them. Replace both with your provider's JWKS
+      # for anything real.
+      DONAT_GRAPHQL_JWT_SECRET: '{"type":"HS256","key":"donat-example-dev-key-change-me-32bytes"}'
       # Role-less requests fall back to the public catalogue role.
       DONAT_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
     volumes:

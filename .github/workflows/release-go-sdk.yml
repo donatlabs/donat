@@ -27,6 +27,7 @@ jobs:
   publish:
     name: Tag sdk/go/${{ github.event.inputs.version || github.ref_name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:

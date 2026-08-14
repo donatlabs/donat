@@ -19,15 +19,15 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: petshop
-      # Empty unless auth.env is passed, and the initdb script below creates
-      # nothing when it is — so a run without the identity profile is left with
-      # no extra role.
-      RAUTHY_DB_PASSWORD: ${RAUTHY_DB_PASSWORD-}
+      # The IdP's own role inside this Postgres. Identity data never shares a
+      # database with the data plane: password hashes must not sit in the
+      # database donat serves. Change it for anything beyond a demo.
+      RAUTHY_DB_PASSWORD: ${RAUTHY_DB_PASSWORD:-petshop-demo-rauthy-password}
     # Not exposed on the host: only the engine talks to it over the compose
     # network. Add a `ports:` mapping if you want to inspect it with psql.
     volumes:
       - petshop-db:/var/lib/postgresql/data
-      # Creates the database and role for the optional IdP. Entrypoint scripts
+      # Creates the database and role for the IdP. Entrypoint scripts
       # run only on first initialization of the volume.
       - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -117,24 +117,34 @@ services:
       PETSHOP_NOTIFICATION_API_TOKEN: petshop-notification-token
       PETSHOP_PAYOUT_BASE_URL: http://mock-providers:8099
       PETSHOP_PAYOUT_API_TOKEN: petshop-payout-token
+      # `deploy` validates the WHOLE metadata directory, storage.yaml
+      # included, so the storage backend's variables have to resolve here as
+      # well as in the engine. Without them the step exits with
+      # "storage backend `media`: environment variable PETSHOP_S3_KEY is not
+      # set" and the stack never comes up.
+      PETSHOP_FILE_SIGNING_SECRET: petshop-file-signing-secret
+      PETSHOP_S3_KEY: petshopminio
+      PETSHOP_S3_SECRET: petshopminiosecret
     volumes:
       - ./metadata:/metadata:ro
     restart: "no"
 
-  # The identity provider, enabled only with the `auth` env file:
+  # The identity provider.
   #
-  #   docker compose --env-file auth.env up
+  # Not optional: this engine issues no tokens and honours no role header, so
+  # a role reaches it from a verified JWT or an authentication hook and from
+  # nothing else. Everything this one serves (client, roles, users, the
+  # `customer_id` attribute) is declared in ./bootstrap and versioned with the
+  # example, so there is nothing to click in its admin UI.
   #
-  # Opt-in on purpose — the minimal path stays four services and needs no
-  # login. Everything it serves (client, roles, users, the `customer_id`
-  # attribute) is declared in ./bootstrap and versioned with this example, so
-  # there is nothing to click in its admin UI.
+  # Swap it for your own provider by pointing DONAT_GRAPHQL_JWT_SECRET's
+  # `jwk_url`/`issuer`/`audience` and DONAT_OIDC's two endpoints at it. The
+  # engine has no opinion about which provider it is.
   #
   # Note that Rauthy applies ./bootstrap only while initializing an empty
   # database. Editing those files later does nothing until the volume is
   # recreated with `docker compose down -v`.
   rauthy:
-    profiles: ["auth"]
     image: ghcr.io/sebadob/rauthy:0.36.1
     depends_on:
       postgres:
@@ -147,7 +157,7 @@ services:
       PG_HOST: postgres
       PG_PORT: "5432"
       PG_USER: rauthy
-      PG_PASSWORD: ${RAUTHY_DB_PASSWORD-}
+      PG_PASSWORD: ${RAUTHY_DB_PASSWORD:-petshop-demo-rauthy-password}
       PG_DB_NAME: rauthy
       # Plain HTTP on the compose network. A real deployment terminates TLS in
       # front of it; these three settings exist so the demo needs no certs.
@@ -188,23 +198,79 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      rauthy:
+        condition: service_started
     environment:
       <<: *connector-env
       DONAT_METADATA_DIR: /metadata
       DONAT_PORT: "8080"
-      # The secret marks a request as trusted: it may then assert any role
-      # via the X-Donat-Role header (a demo stand-in for real edge auth /
-      # JWTs). There is no admin role — a trusted request must still name a
-      # role. Change the secret for anything real.
-      DONAT_GRAPHQL_ADMIN_SECRET: petshop-secret
-      # Requests with no/role-less auth fall back to the public catalog role.
+      # A request with no token at all is the public catalogue, and nothing
+      # more. There is no admin role and no header that names one.
       DONAT_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
-      # Empty unless auth.env is passed, and an unparseable value simply
-      # leaves JWT mode off — so the default run behaves exactly as before.
-      # With it, a bearer token from the IdP is verified against its JWKS and
-      # `claims_map` turns the token's claims into session variables, so
-      # X-Donat-User-Id arrives from the token instead of from a header.
-      DONAT_GRAPHQL_JWT_SECRET: ${PETSHOP_JWT_CONFIG-}
+      # How a token from the IdP becomes session variables. `claims_map` is a
+      # pure lookup: each session variable is either a JSON path into the
+      # token's claims or a literal. It performs no string surgery, and roles
+      # are matched exactly, which is why roles come from the `roles` claim
+      # rather than from prefixed groups.
+      #
+      #   jwk_url   reached over the compose network; the engine refreshes the
+      #             signing keys from it in the background
+      #   issuer    what the IdP puts in `iss`, derived from its PUB_URL, i.e.
+      #             the address a browser uses — not the internal one
+      #   audience  must equal the client id in bootstrap/clients.json
+      #
+      # x-donat-default-role is read from the token rather than written as a
+      # literal: the default role — unlike a requested one — is not checked
+      # against the token's role set, so taking the first role the token
+      # carries keeps the engine's promise that a session never holds a role
+      # its token did not grant.
+      #
+      # x-donat-user-id comes from the `customer_id` attribute the `donat`
+      # scope carries (bootstrap/scopes.json). Every customer row filter
+      # compares it against customer.customer_id, so this one mapping is what
+      # makes a logged-in shopper see exactly their own carts and orders. The
+      # default matters: staff carry no customer_id, and without it their
+      # login would fail outright. An empty value matches no customer row.
+      DONAT_GRAPHQL_JWT_SECRET: >-
+        {"jwk_url":"http://rauthy:8080/auth/v1/oidc/certs",
+        "issuer":"http://localhost:8081/auth/v1/",
+        "audience":"petshop",
+        "claims_map":{"x-donat-allowed-roles":{"path":"$.roles"},
+        "x-donat-default-role":{"path":"$.roles[0]"},
+        "x-donat-user-id":{"path":"$.custom.customer_id","default":""}}}
+      # The engine's own login: /auth/login redirects a browser to the IdP and
+      # /auth/callback puts the resulting token in a cookie the engine then
+      # verifies like any other. It stores no users and issues no tokens — see
+      # knowledgebase/api-surfaces/decisions/010-donat-does-not-own-identity.md.
+      #
+      # The authorization endpoint is the address a BROWSER uses; the token
+      # endpoint is reached by the engine over the compose network. Any OIDC
+      # provider works here — `session_token` and `client_auth` exist because
+      # providers disagree about which token carries a deployment's claims and
+      # how a confidential client authenticates.
+      #
+      # To put the admin panel's own login screen in front of this provider
+      # instead of its page, three settings move together — the provider is
+      # then reached on the panel's origin, which is what its session cookie
+      # and its `Origin` check both require (apps/admin/README.md):
+      #
+      #   here          "authorization_endpoint":"http://localhost:5180/idp/authorize"
+      #                 "redirect_uri":"http://localhost:5180/auth/callback"
+      #                 "login_api":"http://rauthy:8080"   <- the engine then
+      #                 serves the provider's login API at /auth/v1/…
+      #   rauthy        PUB_URL: localhost:5180, RP_ORIGIN: http://localhost:5180
+      #   JWT above     "issuer":"http://localhost:5180/auth/v1/"
+      #
+      # bootstrap/clients.json already registers that redirect and origin.
+      DONAT_OIDC: >-
+        {"authorization_endpoint":"http://localhost:8081/auth/v1/oidc/authorize",
+        "token_endpoint":"http://rauthy:8080/auth/v1/oidc/token",
+        "client_id":"petshop",
+        "redirect_uri":"http://localhost:8080/auth/callback",
+        "scopes":["openid","donat"],
+        "cookie":"donat_session",
+        "cookie_secure":false,
+        "session_token":"access_token"}
       # Signs the one file URL the engine serves itself — the call reporting an
       # upload finished (see metadata/storage.yaml). Change it for anything
       # real: it is the only proof that call carries.

@@ -1,0 +1,10 @@
+[
+    {
+        "email": "operator@example.com",
+        "given_name": "Olive",
+        "family_name": "Operator",
+        "roles": ["support"],
+        "enabled": true,
+        "email_verified": true
+    }
+]

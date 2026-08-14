@@ -74,6 +74,22 @@ pub async fn read_json(
     response: reqwest::Response,
     limit: usize,
 ) -> Result<Json, UpstreamBodyError> {
+    let body = read_bytes(response, limit).await?;
+    if body.is_empty() {
+        return Ok(Json::Null);
+    }
+    serde_json::from_slice(&body).map_err(|error| UpstreamBodyError::NotJson(error.to_string()))
+}
+
+/// The same bound, for an answer that is not ours to parse.
+///
+/// Whatever the far end sends is held in memory before it is passed on, so
+/// "however much it feels like" is not an option: a store or a provider having
+/// a bad day would otherwise take this process with it.
+pub async fn read_bytes(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, UpstreamBodyError> {
     let mut stream = response.bytes_stream();
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -83,10 +99,7 @@ pub async fn read_json(
         }
         body.extend_from_slice(&chunk);
     }
-    if body.is_empty() {
-        return Ok(Json::Null);
-    }
-    serde_json::from_slice(&body).map_err(|error| UpstreamBodyError::NotJson(error.to_string()))
+    Ok(body)
 }
 
 #[cfg(test)]

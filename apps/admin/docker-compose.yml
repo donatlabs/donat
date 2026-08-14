@@ -1,0 +1,46 @@
+# The admin panel, built and served by nginx.
+#
+#   docker compose up --build          # then open http://localhost:5180
+#
+# It needs an engine to talk to. The default expects the petshop example on
+# this host's port 8080:
+#
+#   docker compose -f ../../examples/petshop/docker-compose.yml up -d
+#
+# Point it somewhere else with DONAT_UPSTREAM, e.g. a stand on another port:
+#
+#   DONAT_UPSTREAM=http://host.docker.internal:8090 docker compose up --build
+#
+# nginx proxies /v1/ and /auth/ to that upstream, so the panel and the engine
+# share one origin — no CORS to configure, and the session cookie is sent back
+# to the engine that set it.
+services:
+  admin:
+    build:
+      context: .
+      args:
+        # Relative on purpose: the bundle asks its own origin, nginx forwards.
+        VITE_DONAT_GRAPHQL_URL: /v1/graphql
+        # The role this panel runs as — whatever the deployment calls its
+        # operator. This engine has no admin role, so the name grants nothing:
+        # the deployment's own per-role permissions decide what it may do.
+        VITE_DONAT_ROLE: ${DONAT_ROLE:-admin}
+        # The deployments served, as JSON; one stand at the engine above when
+        # absent. See .env.example.
+        VITE_DONAT_STANDS: ${DONAT_STANDS:-}
+        # Where /idp/authorize calls the identity provider — this origin,
+        # which nginx forwards to the engine and the engine to the provider
+        # (DONAT_OIDC.login_api). Empty switches that screen off, and the
+        # engine then points at the provider's own login page instead.
+        VITE_DONAT_IDP_BASE: ${DONAT_IDP_BASE:-/auth/v1}
+    environment:
+      DONAT_UPSTREAM: ${DONAT_UPSTREAM:-http://host.docker.internal:8080}
+      # Substitute only our own variable in the nginx template, so nginx's own
+      # $host / $scheme / $http_upgrade are left for nginx to resolve.
+      NGINX_ENVSUBST_FILTER: DONAT_
+    extra_hosts:
+      # Lets the container reach an engine published on the host, which is
+      # where the petshop example puts it.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${DONAT_ADMIN_PORT:-5180}:80"

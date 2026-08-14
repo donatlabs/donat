@@ -1,0 +1,22 @@
+description: >-
+  A request transform rewrites the webhook body before it is sent. This one
+  swaps the two fields, so the mirror handler answers with them exchanged —
+  which is only visible if the transform actually ran.
+url: /v1/graphql
+status: 200
+response:
+  data:
+    mirror_transformed:
+      id: Alice
+      name: some-id
+query:
+  variables:
+    id: some-id
+    name: Alice
+  query: |
+    mutation ($id: ID, $name: String) {
+      mirror_transformed(arg: {id: $id, name: $name}){
+        id
+        name
+      }
+    }

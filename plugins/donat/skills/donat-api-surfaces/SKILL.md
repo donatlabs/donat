@@ -25,7 +25,7 @@ Roles are asserted per request:
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' \
+  -H "authorization: Bearer $TOKEN" \
   -H 'x-donat-role: customer' \
   -H 'x-donat-user-id: customer-1' \
   -d '{"query":"{ orders { id order_status total_minor } }"}'

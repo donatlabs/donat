@@ -168,7 +168,12 @@ def test_a_request_with_no_role_is_denied(library: Library):
     refused = library.attempt("", "{ book { id } }")
 
     assert refused is not None, "a roleless request was served"
-    assert "x-donat-role" in refused.message.lower()
+    # The two hosts refuse at different points, and both are right. The Go host
+    # resolves the caller from headers it was handed, so it can say the role is
+    # missing. The standalone engine honours no header: nothing authenticated
+    # the request, so it never gets as far as a role to complain about.
+    said = refused.message.lower()
+    assert "x-donat-role" in said or "authorization" in said, refused.message
 
 
 def test_concurrent_borrowers_leave_exactly_one_loan(library: Library, shelf):

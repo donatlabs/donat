@@ -164,6 +164,31 @@ struct ActionInvocation<'a> {
     custom_types: &'a CustomTypes,
 }
 
+/// Who a call is attributed to in this engine's journal.
+///
+/// The role is always known — a request without one never reaches an action.
+/// The user is whatever the deployment's `claims_map` put in
+/// `x-donat-user-id`, and a deployment that maps nothing there gets `unknown`
+/// rather than an empty field, because a blank in a log is read as a bug in
+/// the log.
+struct Caller {
+    role: String,
+    user: String,
+}
+
+impl Caller {
+    fn of(session: &Session) -> Self {
+        Self {
+            role: session.role.clone(),
+            user: session
+                .var("x-donat-user-id")
+                .filter(|user| !user.is_empty())
+                .unwrap_or("unknown")
+                .to_string(),
+        }
+    }
+}
+
 async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCode, Json)> {
     let ActionInvocation {
         state,
@@ -196,6 +221,7 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
         "input": input,
         "session_variables": session_vars,
     });
+    let caller = Caller::of(session);
 
     // A handler-less action is resolved in-process by an embedded host. This
     // binary has no such registry, so there is nothing to call. `main` refuses
@@ -212,8 +238,23 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
             ),
         ));
     };
-    let url = resolve_url_template(handler);
-    let mut req = state.http.post(&url).json(&payload);
+    let base_url = resolve_url_template(handler);
+    // The request as it would be sent with no transform: the Donat shape.
+    let mut outgoing = crate::transform::Outgoing::donat(&base_url, &payload);
+    if let Some(transform) = &action.definition.request_transform {
+        let context = crate::transform::context(&base_url, &payload, &session_vars);
+        if let Err(message) = crate::transform::apply(&mut outgoing, transform, &context) {
+            return Err(err(&path, "unexpected", message));
+        }
+    }
+    let mut req = outgoing.into_request(&state.http);
+    // Headers the action declares. `value_from_env` is read here rather than
+    // held in the snapshot, so a credential lives in the process environment
+    // and never in metadata — which is what lets an action stand in front of
+    // an API whose key no browser may ever see.
+    for (name, value) in crate::cron::resolve_headers(&action.definition.headers) {
+        req = req.header(name, value);
+    }
     if let Some(seconds) = action.definition.timeout {
         req = req.timeout(std::time::Duration::from_secs(seconds));
     }
@@ -239,6 +280,23 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
         }
     };
     let status = response.status();
+    // Who did this, in this engine's own journal.
+    //
+    // An action reaches something outside — an identity provider, a payment
+    // API — with a credential the deployment gave it, so what that thing
+    // records is "the engine", not the person who pressed the button. Nobody
+    // else is in a position to say: the session is known here and nowhere
+    // downstream. Written for every action rather than for the ones that
+    // happen to change something, because a read of somebody's account is
+    // worth the same line as a write to it.
+    tracing::info!(
+        target: "donat::action",
+        action = %action.name,
+        role = %caller.role,
+        user = %caller.user,
+        status = status.as_u16(),
+        "action called"
+    );
     // A handler that streams more than the deployment allows is refused here
     // rather than held in memory until the allocator gives up.
     let body: Json =
@@ -279,6 +337,19 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
             json!({ "errors": [ { "extensions": extensions, "message": message } ] }),
         ));
     }
+
+    // A response transform runs before the answer is shaped, because it is
+    // what makes the answer shapeable: the handler's fields become the ones
+    // `output_type` promises.
+    let body = match &action.definition.response_transform {
+        None => body,
+        Some(transform) => {
+            match crate::transform::apply_response(transform, &body, &session_vars) {
+                Ok(body) => body,
+                Err(message) => return Err(err(&path, "unexpected", message)),
+            }
+        }
+    };
 
     let ty = parse_type(&action.definition.output_type);
     let mut shaped = match validate(custom_types, &ty, &body, &field.selection_set.items) {
@@ -712,6 +783,45 @@ fn err(path: &str, code: &str, message: impl Into<String>) -> (StatusCode, Json)
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_call_is_attributed_to_the_session_that_made_it() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("x-donat-user-id".to_string(), "operator-7".to_string());
+        let session = Session {
+            role: "support".to_string(),
+            vars,
+            backend_request: false,
+        };
+
+        let caller = Caller::of(&session);
+        assert_eq!(caller.role, "support");
+        assert_eq!(caller.user, "operator-7");
+    }
+
+    #[test]
+    fn a_deployment_that_maps_no_user_says_so_rather_than_leaving_a_blank() {
+        let mut vars = std::collections::HashMap::new();
+        // What `claims_map`'s `default: ""` produces for a token with no
+        // subject to map — present, and empty.
+        vars.insert("x-donat-user-id".to_string(), String::new());
+        let session = Session {
+            role: "support".to_string(),
+            vars,
+            backend_request: false,
+        };
+
+        assert_eq!(Caller::of(&session).user, "unknown");
+        assert_eq!(
+            Caller::of(&Session {
+                role: "support".to_string(),
+                vars: std::collections::HashMap::new(),
+                backend_request: false,
+            })
+            .user,
+            "unknown"
+        );
+    }
     use graphql_parser::query::Definition;
     use std::sync::{
         Arc,

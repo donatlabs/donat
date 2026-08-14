@@ -60,15 +60,17 @@ fn graphql_insert_permission() {
         "developer_insert_has_keys_any_fail.yaml",
         "user_insert_account_success.yaml",
         "user_insert_account_fail.yaml",
-        // The backend_user cases use check_query_admin_secret, which adds the
-        // admin-secret header only when one is configured; this suite (like
-        // the pytest default run) has none, so they run as plain role'd cases.
+        // The backend_user cases use check_query_admin_secret upstream, which
+        // adds a secret header only when one is configured. This engine has no
+        // secret at all, so they run as plain role'd cases — the suite's
+        // authentication hook turns each fixture's role header into a session.
         "backend_user_insert_fail.yaml",
         "backend_user_insert_pass.yaml",
         "backend_user_insert_invalid_bool.yaml",
         "user_with_no_backend_privilege.yaml",
-        // backend_user_no_admin_secret_fail.yaml: pytest skips it unless
-        // admin-secret + JWT/webhook auth is configured — out of scope here.
+        // backend_user_no_admin_secret_fail.yaml: pytest skips it unless a
+        // secret plus JWT/webhook auth is configured, a combination this
+        // engine cannot have — out of scope here.
         "leads_upsert_check_with_headers.yaml",
         "column_comparison_across_tables.yaml",
     ];

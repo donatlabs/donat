@@ -4,6 +4,7 @@ members = [
     "crates/value-contract",
     "crates/connector-abi",
     "crates/connector-catalog",
+    "crates/kriti",
     "crates/metadata",
     "crates/action",
     "crates/catalog-types",

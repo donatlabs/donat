@@ -1,0 +1,513 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import { useLocation } from 'react-router';
+import {
+  AuthPage,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  Input,
+  Label,
+} from '@refinest/ui-shadcn';
+import { IdpClient, type AuthorizeOutcome } from '../idp/client';
+import { PowSolver } from '../idp/pow-solver';
+import {
+  loginRequest,
+  parseAuthorizeParams,
+  providerPageUrl,
+  type AuthorizeParams,
+} from '../idp/authorize-params';
+import { IDP_BASE, IDP_REGISTRATION } from '../env';
+
+/**
+ * The sign-in screen — our markup, the provider's protocol.
+ *
+ * The engine redirects here instead of to the identity provider's own login
+ * page (`DONAT_OIDC.authorization_endpoint` points at this route), and this
+ * page then speaks to the provider exactly as its own page does: establish a
+ * session, solve its proof of work, `POST /oidc/authorize`, and follow the
+ * `Location` it answers with — which goes to the engine's `/auth/callback`.
+ * Authorization code with PKCE, unchanged; the panel never holds a token and
+ * the provider still owns every credential.
+ *
+ * **Two steps, on purpose.** The email is asked for first and the password only
+ * after the provider says it wants one. That is the provider's design, not a
+ * preference: an account with a passkey and no password never sees a password
+ * field, and a browser cannot autofill one that is not on the page yet. It is
+ * also why this is not the framework's own `<LoginForm>`, which asks for both
+ * at once — the markup here follows that component's structure closely so the
+ * two look like one interface.
+ *
+ * **What this page does not do.** A passkey, a terms update and a forced
+ * enrolment are separate screens with their own protocols. Rather than
+ * half-implement them, this page hands over to the provider's page — one
+ * proxied request away, carrying the same authorization request — so those
+ * accounts sign in correctly rather than almost.
+ */
+
+type Handoff = 'passkey' | 'terms' | 'update' | 'mfa';
+
+const HANDOFF_REASON: Record<Handoff, string> = {
+  passkey: 'This account finishes signing in with a passkey.',
+  terms: 'There are new terms to accept before signing in.',
+  update: 'This account has to be updated before signing in.',
+  mfa: 'This application requires a second factor, and this account has none set up yet.',
+};
+
+export interface IdpAuthorizeFormProps {
+  params: AuthorizeParams;
+  client: IdpClient;
+  solver: PowSolver;
+  /** The provider's own login page, for whatever this one hands over. */
+  providerUrl: string;
+  /**
+   * Offer to create an account. Whether anyone may is the provider's decision
+   * and it announces it nowhere, so this is configuration — see `env.ts`.
+   */
+  registration?: boolean;
+}
+
+export function IdpAuthorizeForm({
+  params,
+  client,
+  solver,
+  providerUrl,
+  registration = false,
+}: IdpAuthorizeFormProps): ReactElement {
+  const [starting, setStarting] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [email, setEmail] = useState(params.loginHint ?? '');
+  const [password, setPassword] = useState('');
+  const [needsPassword, setNeedsPassword] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [handoff, setHandoff] = useState<Handoff | undefined>();
+  const [retryAt, setRetryAt] = useState<number | undefined>();
+  const [offerReset, setOfferReset] = useState(false);
+  const [signingUp, setSigningUp] = useState(false);
+  const [givenName, setGivenName] = useState('');
+  const [familyName, setFamilyName] = useState('');
+  const passwordRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    client
+      .session()
+      .then(() => {
+        if (cancelled) return;
+        setStarting(false);
+        // Start the proof of work now, so it is ready by the time anyone has
+        // finished typing. See `pow-solver.ts`.
+        solver.prepare();
+      })
+      .catch((cause: unknown) => {
+        if (cancelled) return;
+        setStarting(false);
+        setError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, solver]);
+
+  useEffect(() => {
+    if (needsPassword) passwordRef.current?.focus();
+  }, [needsPassword]);
+
+  const apply = useCallback(
+    (outcome: AuthorizeOutcome) => {
+      switch (outcome.kind) {
+        case 'redirect':
+          window.location.replace(outcome.location);
+          return;
+        case 'passkey':
+          setHandoff('passkey');
+          return;
+        case 'update-required':
+          setHandoff('update');
+          return;
+        case 'terms-required':
+          setHandoff('terms');
+          return;
+        case 'mfa-required':
+          setHandoff('mfa');
+          return;
+        case 'password-expired':
+          setError('This password has expired and has to be reset.');
+          setOfferReset(true);
+          return;
+        case 'rate-limited':
+          setRetryAt(outcome.notBefore);
+          setError(
+            outcome.notBefore
+              ? `Too many attempts. Try again after ${new Date(outcome.notBefore * 1000).toLocaleTimeString()}.`
+              : 'Too many attempts. Try again later.',
+          );
+          setPassword('');
+          return;
+        case 'rejected':
+          setError(outcome.message);
+          return;
+        case 'unauthorized':
+          // The provider answers the same way to an unknown email and to a
+          // missing password, so the first one of these means "ask for a
+          // password" and any later one means the credentials were wrong.
+          if (!needsPassword) {
+            setNeedsPassword(true);
+            return;
+          }
+          setError('That email and password did not match.');
+          setOfferReset(true);
+      }
+    },
+    [needsPassword],
+  );
+
+  const submit = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
+      setError('');
+      setNotice('');
+      if (!email) return;
+      if (needsPassword && !password) {
+        setError('A password is required.');
+        return;
+      }
+
+      setBusy(true);
+      try {
+        const pow = await solver.take();
+        apply(
+          await client.authorize(
+            loginRequest(params, {
+              email,
+              password: needsPassword ? password : undefined,
+              pow,
+            }),
+          ),
+        );
+      } catch (cause: unknown) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [apply, client, email, needsPassword, params, password, solver],
+  );
+
+  const registerAccount = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
+      setError('');
+      setNotice('');
+      if (!email || !givenName) {
+        setError('An email and a first name are required.');
+        return;
+      }
+      setBusy(true);
+      try {
+        const pow = await solver.take();
+        const outcome = await client.register({
+          email,
+          given_name: givenName,
+          family_name: familyName || undefined,
+          pow,
+          // No `redirect_uri`: the provider checks it against a list of its
+          // own, and this application's callback is not on it — it refuses the
+          // whole registration for a field that only decides where somebody
+          // lands after setting a password.
+        });
+        if (outcome.kind === 'sent') {
+          // The provider mails a link to set a password; the account is not
+          // usable until they follow it, and saying so avoids a second try.
+          setNotice('Check your email for a link to finish setting up the account.');
+          setSigningUp(false);
+        } else if (outcome.kind === 'closed') {
+          setError('This deployment does not let people create their own accounts.');
+        } else if (outcome.kind === 'rate-limited') {
+          setError('Too many attempts. Try again later.');
+        } else {
+          setError(outcome.message);
+        }
+      } catch (cause: unknown) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [client, email, familyName, givenName, solver],
+  );
+
+  const requestReset = useCallback(async () => {
+    setError('');
+    setNotice('');
+    setBusy(true);
+    try {
+      const pow = await solver.take();
+      const outcome = await client.requestReset({
+        email,
+        pow,
+        redirect_uri: params.redirectUri,
+      });
+      if (outcome.kind === 'sent') {
+        // Said the same way whether or not the account exists — the provider
+        // answers identically, and so should the page.
+        setNotice('If that account exists, a reset link is on its way.');
+        setOfferReset(false);
+      } else if (outcome.kind === 'rate-limited') {
+        setError('Too many attempts. Try again later.');
+      } else {
+        setError(outcome.message);
+      }
+    } catch (cause: unknown) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }, [client, email, params.redirectUri, solver]);
+
+  if (handoff) {
+    return (
+      <Card className="mx-auto w-full max-w-sm" data-testid="idp-handoff">
+        <CardHeader className="space-y-1.5 text-center">
+          <CardTitle className="text-2xl">One more step</CardTitle>
+          <CardDescription className="text-balance">{HANDOFF_REASON[handoff]}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <p className="text-muted-foreground text-sm">
+            Your identity provider handles this screen itself. Continuing takes you there with the
+            same sign-in request.
+          </p>
+        </CardContent>
+        <CardFooter>
+          <Button className="w-full" data-testid="idp-handoff-continue" asChild>
+            <a href={providerUrl}>Continue</a>
+          </Button>
+        </CardFooter>
+      </Card>
+    );
+  }
+
+  const blocked = retryAt !== undefined && retryAt * 1000 > Date.now();
+
+  if (signingUp) {
+    return (
+      <Card className="mx-auto w-full max-w-sm" data-testid="idp-signup">
+        <CardHeader className="space-y-1.5 text-center">
+          <CardTitle className="text-2xl">Create an account</CardTitle>
+          <CardDescription className="text-balance">
+            The provider will email you a link to set a password.
+          </CardDescription>
+        </CardHeader>
+        <form onSubmit={registerAccount} noValidate>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="idp-signup-email" required>
+                Email
+              </Label>
+              <Input
+                id="idp-signup-email"
+                type="email"
+                autoComplete="email"
+                required
+                data-testid="idp-signup-email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="idp-signup-given" required>
+                First name
+              </Label>
+              <Input
+                id="idp-signup-given"
+                autoComplete="given-name"
+                required
+                data-testid="idp-signup-given"
+                value={givenName}
+                onChange={(event) => setGivenName(event.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="idp-signup-family">Last name</Label>
+              <Input
+                id="idp-signup-family"
+                autoComplete="family-name"
+                data-testid="idp-signup-family"
+                value={familyName}
+                onChange={(event) => setFamilyName(event.target.value)}
+              />
+            </div>
+            {error && (
+              <p role="alert" className="font-medium text-destructive text-sm" data-testid="idp-error">
+                {error}
+              </p>
+            )}
+            {notice && (
+              <p role="status" className="text-muted-foreground text-sm" data-testid="idp-notice">
+                {notice}
+              </p>
+            )}
+          </CardContent>
+          <CardFooter className="flex-col gap-2">
+            <Button type="submit" className="w-full" data-testid="idp-signup-submit" disabled={busy}>
+              {busy ? 'Creating…' : 'Create the account'}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              className="w-full"
+              data-testid="idp-signup-cancel"
+              onClick={() => {
+                setSigningUp(false);
+                setError('');
+              }}
+            >
+              Back to signing in
+            </Button>
+          </CardFooter>
+        </form>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="mx-auto w-full max-w-sm">
+      <CardHeader className="space-y-1.5 text-center">
+        <CardTitle className="text-2xl">Sign in</CardTitle>
+        <CardDescription className="text-balance">
+          {needsPassword ? 'Enter the password for this account.' : 'Continue with your account.'}
+        </CardDescription>
+      </CardHeader>
+      <form onSubmit={submit} noValidate>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <Label htmlFor="idp-email" required>
+              Email
+            </Label>
+            <Input
+              id="idp-email"
+              type="email"
+              autoComplete="email"
+              required
+              aria-required="true"
+              data-testid="idp-email"
+              value={email}
+              readOnly={needsPassword}
+              onChange={(event) => setEmail(event.target.value)}
+            />
+          </div>
+
+          {needsPassword && (
+            <div className="space-y-1">
+              <Label htmlFor="idp-password" required>
+                Password
+              </Label>
+              <Input
+                id="idp-password"
+                type="password"
+                autoComplete="current-password"
+                required
+                aria-required="true"
+                data-testid="idp-password"
+                ref={passwordRef}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </div>
+          )}
+
+          {error && (
+            <p role="alert" className="font-medium text-destructive text-sm" data-testid="idp-error">
+              {error}
+            </p>
+          )}
+          {notice && (
+            <p role="status" className="text-muted-foreground text-sm" data-testid="idp-notice">
+              {notice}
+            </p>
+          )}
+        </CardContent>
+        <CardFooter className="flex-col gap-2">
+          <Button
+            type="submit"
+            className="w-full"
+            data-testid="idp-submit"
+            disabled={starting || busy || blocked}
+          >
+            {busy ? 'Signing in…' : needsPassword ? 'Sign in' : 'Continue'}
+          </Button>
+          {offerReset && (
+            <Button
+              type="button"
+              variant="ghost"
+              className="w-full"
+              data-testid="idp-reset"
+              disabled={busy}
+              onClick={() => {
+                void requestReset();
+              }}
+            >
+              Send a password reset link
+            </Button>
+          )}
+          {registration && !needsPassword && (
+            <Button
+              type="button"
+              variant="ghost"
+              className="w-full"
+              data-testid="idp-signup-open"
+              disabled={busy}
+              onClick={() => {
+                setSigningUp(true);
+                setError('');
+                setNotice('');
+              }}
+            >
+              Create an account
+            </Button>
+          )}
+        </CardFooter>
+      </form>
+    </Card>
+  );
+}
+
+/** The route: reads the authorization request, then renders the form. */
+export default function IdpAuthorizePage(): ReactElement {
+  const location = useLocation();
+  const params = useMemo(() => parseAuthorizeParams(location.search), [location.search]);
+  const client = useMemo(() => new IdpClient(IDP_BASE), []);
+  const solver = useMemo(() => new PowSolver(() => client.challenge()), [client]);
+
+  return (
+    <AuthPage footer="donat admin">
+      {params ? (
+        <IdpAuthorizeForm
+          params={params}
+          client={client}
+          solver={solver}
+          providerUrl={providerPageUrl(IDP_BASE, location.search)}
+          registration={IDP_REGISTRATION}
+        />
+      ) : (
+        <Card className="mx-auto w-full max-w-sm">
+          <CardHeader className="space-y-1.5 text-center">
+            <CardTitle className="text-2xl">Nothing to sign in to</CardTitle>
+            <CardDescription className="text-balance">
+              This page renders an authorization request, and none arrived with it.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <p className="text-muted-foreground text-sm">
+              Start at <code>/auth/login</code>, which is where the engine builds the request.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+    </AuthPage>
+  );
+}

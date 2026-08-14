@@ -1,0 +1,15 @@
+# One source, and nothing in it.
+#
+# This example has no application tables — its only resource is the identity
+# provider's own accounts, which are not rows here (see ../actions.yaml). The
+# source still exists because the engine keeps its own schema in a database:
+# cron state, the event log, durable process journals.
+- name: default
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url:
+        from_env: DONAT_GRAPHQL_DATABASE_URL
+      isolation_level: read-committed
+      use_prepared_statements: false
+  tables: "!include default/tables/tables.yaml"

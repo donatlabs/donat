@@ -106,10 +106,11 @@ If a design needs "something that can see everything", the answer is an
 ordinary role with an explicit permission on the tables it needs, and a review
 of why it needs them.
 
-`X-Donat-Admin-Secret` marks a request as *trusted*, which only means it is
-allowed to assert a role via `X-Donat-Role`. It is transport authentication,
-never a permission. A trusted request with no role is rejected, or falls back
-to `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` if one is configured.
+A role is established by a verified JWT or an authentication hook, and by
+nothing else. `X-Donat-Role` only picks between roles the token already
+granted; a request that carries no token at all runs as
+`DONAT_GRAPHQL_UNAUTHORIZED_ROLE` when one is configured, and is refused when
+none is.
 
 **There is no runtime configuration API.** No `run_sql`, no metadata mutation
 over HTTP. If a change is not in a migration or in the metadata directory, it

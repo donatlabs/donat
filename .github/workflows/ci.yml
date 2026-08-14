@@ -9,6 +9,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job carries a `timeout-minutes`, because the default is six hours and
+# nothing here takes ten minutes. A runner that is lost mid-step does not fail:
+# it holds the job until something upstream gives up, and a branch waits on a
+# check that will never answer — which is how one lost runner ate 45 minutes in
+# a step that takes 45 seconds. The budgets below are roughly three times the
+# observed time with a warm cache, which is loose enough for a cold one and
+# still turns a hang into a failure while it is worth looking at.
 jobs:
   # Cheap, no services, and the first thing to go red on a mechanical mistake.
   # The toolchain is pinned in rust-toolchain.toml, so what counts as formatted
@@ -17,6 +24,7 @@ jobs:
   lint:
     name: Format and lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +43,7 @@ jobs:
   test:
     name: Workspace tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
     steps:
@@ -62,6 +71,7 @@ jobs:
   backend-core:
     name: Shared conformance (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -133,6 +143,7 @@ jobs:
     if: always()
     needs: backend-core
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Require every backend
         run: test '${{ needs.backend-core.result }}' = success
@@ -140,6 +151,7 @@ jobs:
   mixed-backend-conformance:
     name: Mixed Postgres and ClickHouse conformance
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       DONAT_EXTERNAL_DB_TESTS: "1"
       PG_URL: postgresql://postgres:postgres@127.0.0.1:15432/postgres
@@ -166,6 +178,7 @@ jobs:
   go-sdk:
     name: Go SDK (cgo-free, tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
@@ -224,6 +237,7 @@ jobs:
   wasm-core:
     name: Go SDK (wasm core rebuilds from source)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -245,6 +259,7 @@ jobs:
   lending-example:
     name: Lending example (commands, rules, in-process handlers)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # The example's storage backend resolves its credentials from the
     # environment, and every command that reads the metadata directory —
     # `migrate --metadata-dir`, `validate`, `dump-core-config` — resolves them
@@ -337,6 +352,7 @@ jobs:
   audit:
     name: Security advisories (cargo-audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -354,6 +370,7 @@ jobs:
   petshop-system:
     name: Petshop system tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -399,6 +416,13 @@ jobs:
   lending-system:
     name: Lending system tests (engine vs Go host)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Both stands sign with it and the suite mints its tokens with it, so it
+      # is set once here: a role reaches the engine from a verified JWT and
+      # from nothing else, and two copies of this value would drift into a
+      # suite that sends no token and a stand that is right to refuse it.
+      LENDING_JWT_KEY: lending-ci-jwt-key-change-me-32bytes+
     services:
       postgres:
         image: postgres:16
@@ -442,7 +466,6 @@ jobs:
         env:
           LENDING_ENGINE_URL: http://127.0.0.1:8090
           LENDING_GO_URL: http://127.0.0.1:8091
-          LENDING_ADMIN_SECRET: lending-secret
         run: .venv/bin/python -m pytest -q
       - name: Stand logs
         if: failure()
@@ -473,6 +496,7 @@ jobs:
           - name: macos-aarch64
             runner: macos-latest
     runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -5,23 +5,19 @@
 //! - test_allowlist_queries.py: TestAllowlistQueries
 //!
 //! The unauthorized-role/cookie classes are marked `@pytest.mark.admin_secret`
-//! AND their tests run with `add_auth=False`: the engine must have the secret
-//! configured (so plain X-Donat-* headers are untrusted) while the checked
-//! request carries no secret.
+//! AND their tests run with `add_auth=False`: upstream, the engine has a
+//! secret configured (so plain X-Donat-* headers are untrusted) while the
+//! checked request carries none.
 //!
-//! With the metadata-driven harness, setup runs in-process (no admin-API
-//! POST), so we use the regular `Suite`/`Running`: `.admin_secret(SECRET)`
-//! configures the engine env, `setup_v1q` accumulates metadata, and the
-//! checked requests use `Running::post` directly with the fixture's own
-//! headers only (`Running::post` never attaches the admin secret), giving
-//! exactly the `add_auth=False` semantics.
+//! This engine has no secret and honors no header, so the same scenario is
+//! spelled `.no_authentication()`: the suite configures no way at all to
+//! authenticate a request, which is what a public deployment looks like.
+//! Every request is then the unauthorized role whatever headers it carries —
+//! exactly the `add_auth=False` semantics these classes assert.
 
 use serde_json::{Map, Value as Json, json};
 
 use donat_conformance::{Running, Suite, Transport, fixture_root, load_fixture, response_matches};
-
-/// Same role as tests-py's --hge-key: an API-level secret, never a data role.
-const SECRET: &str = "conformance_admin_secret";
 
 /// DONAT_GRAPHQL_JWT_SECRET for `@pytest.mark.jwt('rsa')`
 /// (fixtures/jwt.py::init_rsa builds {"type": "RS512", "key": <public pem>}).
@@ -160,14 +156,14 @@ const UNAUTH: &str = "queries/unauthorized_role";
 
 /// test_graphql_queries.py::TestUnauthorizedRolePermission
 /// Marks: parametrize(transport: http+websocket), per_class_tests_db_state,
-/// admin_secret, hge_env(DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous).
+/// hge_env(DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous).
 /// The single test runs check_query_f(..., transport, add_auth=False): the
-/// request carries X-Donat-Role: admin but NO admin secret, so the headers
-/// are untrusted and the session must fall back to the anonymous role.
+/// request carries X-Donat-Role: admin, and nothing authenticates it, so the
+/// header names nothing and the session falls back to the anonymous role.
 #[test]
 fn unauthorized_role_permission() {
     let s = Suite::new("unauth_role")
-        .admin_secret(SECRET)
+        .no_authentication()
         .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous")
         .start();
     s.setup_v1q(&format!("{UNAUTH}/setup.yaml"));
@@ -181,13 +177,12 @@ fn unauthorized_role_permission() {
 }
 
 /// test_graphql_queries.py::TestFallbackUnauthorizedRoleCookie
-/// Marks: per_class_tests_db_state, admin_secret,
-/// hge_env(DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous). check_query_f is
+/// Marks: per_class_tests_db_state, hge_env(DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous). check_query_f is
 /// called without a transport argument -> http only, add_auth=False.
 #[test]
 fn fallback_unauthorized_role_cookie() {
     let s = Suite::new("cookie_fallback")
-        .admin_secret(SECRET)
+        .no_authentication()
         .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous")
         .start();
     s.setup_v1q(&format!("{UNAUTH}/setup.yaml"));
@@ -201,15 +196,13 @@ fn fallback_unauthorized_role_cookie() {
 }
 
 /// test_graphql_queries.py::TestMissingUnauthorizedRoleAndCookie
-/// Marks: per_class_tests_db_state + jwt_configuration, admin_secret,
-/// jwt('rsa') — JWT mode (RS512) and NO DONAT_GRAPHQL_UNAUTHORIZED_ROLE.
+/// Marks: per_class_tests_db_state + jwt_configuration, jwt('rsa') — JWT mode (RS512) and NO DONAT_GRAPHQL_UNAUTHORIZED_ROLE.
 /// The request sends a (non-token) Cookie header and no Authorization, so
 /// JWT auth must fail with invalid-headers. http only, add_auth=False.
 #[test]
 fn missing_unauthorized_role_and_cookie() {
     let jwt = rsa_jwt_secret();
     let s = Suite::new("cookie_missing")
-        .admin_secret(SECRET)
         .env("DONAT_GRAPHQL_JWT_SECRET", &jwt)
         .start();
     s.setup_v1q(&format!("{UNAUTH}/setup.yaml"));
@@ -229,10 +222,9 @@ const FUNC_PERMS: &str = "queries/graphql_query/functions/permissions";
 /// hge_env(DONAT_GRAPHQL_INFER_FUNCTION_PERMISSIONS=false).
 /// Every check_query_f call omits the transport argument -> http only.
 /// per_method_tests_db_state -> setup/teardown wrap EACH test method.
-/// NOTE: the admin_secret mark is purely environmental here — tests-py
-/// sends the secret alongside the X-Donat-Role headers, which yields the
-/// same trusted-role session a secretless engine produces, and no fixture
-/// asserts on the secret itself — so the suite runs without it.
+/// NOTE: the admin_secret mark is purely environmental here — tests-py sends
+/// the secret alongside the X-Donat-Role headers, and no fixture asserts on
+/// the secret itself, so the suite's own authentication hook covers it.
 ///
 /// Each method is its own suite (own engine + metadata): the methods differ
 /// only in which function permissions exist, and the lazy engine boots from a

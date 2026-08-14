@@ -66,15 +66,24 @@ strict — pytest greenness is not evidence of exact conformance.
 
 ## BLOCKING RULE: No Admin Role
 
-**This engine has no admin role.** Only classic explicit roles work — every
-data access goes through an explicit per-role permission. There is no
-permission-bypass role and no admin-over-HTTP surface at all: the runtime
-admin/management API (`run_sql`, metadata mutation) was deleted, and the
-admin DATA role (the `ADMIN_ROLE` permission bypass) was removed too. A
-trusted request with no `X-Donat-Role` is denied ("x-donat-role header is
-required"); `X-Donat-Admin-Secret` is API-level auth only. Any diff that
-re-introduces an admin role or permission bypass must be rejected.
-Configuration is deploy-time: `migrate` (DDL) + YAML metadata at boot.
+**This engine has no admin role, and no admin secret.** Only classic explicit
+roles work — every data access goes through an explicit per-role permission.
+There is no permission-bypass role and no admin-over-HTTP surface at all: the
+runtime admin/management API (`run_sql`, metadata mutation) was deleted, the
+admin DATA role (the `ADMIN_ROLE` permission bypass) was removed, and
+`DONAT_GRAPHQL_ADMIN_SECRET` with it.
+
+**A role is established by a verified JWT or an authentication hook, and by
+nothing else.** No header names one — `X-Donat-Role` only *picks* between roles
+a token already granted. A request nothing authenticated runs as
+`DONAT_GRAPHQL_UNAUTHORIZED_ROLE` when one is set and is refused otherwise, and
+a deployment configuring none of the three refuses to boot. The engine may
+serve the login itself (`DONAT_OIDC` → `/auth/login`, `/auth/callback`), which
+stores no users and issues no tokens: it carries a token from the provider that
+issued it to the cookie this engine verifies. Any diff that re-introduces an
+admin role, a shared secret, a permission bypass, or a header that grants a
+role must be rejected. Configuration is deploy-time: `migrate` (DDL) + YAML
+metadata at boot.
 
 ## BLOCKING RULE: Knowledgebase First
 

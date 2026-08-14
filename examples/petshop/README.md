@@ -48,36 +48,43 @@ is a fixture, not a simulator: see
 `*_BASE_URL` variables in the compose file at real providers and nothing else
 changes; the metadata never carries an endpoint or a secret.
 
-Because the compose file sets `DONAT_GRAPHQL_ADMIN_SECRET`, a request is
-trusted — and may therefore assert a role — only when it presents that secret.
-Without it the request falls back to `DONAT_GRAPHQL_UNAUTHORIZED_ROLE`
-(`anonymous`) and `X-Donat-Role` is ignored, so every example below sends both
-headers. The secret is not an admin role: a trusted request still has to name
-one, and every access still goes through that role's permissions.
+A fifth service, **`rauthy`**, is the identity provider. It is not optional:
+this engine has no admin role and honours no role header on its own, so a role
+reaches it from a verified JWT or an authentication hook and from nothing else.
+A request carrying no token is `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` (`anonymous`)
+— the public catalogue — whatever headers it sends.
+
+So every example below carries a token. Get one:
+
+```
+TOKEN=$(curl -s -X POST localhost:8081/auth/v1/oidc/token \
+  -d 'grant_type=password&client_id=petshop' \
+  -d 'username=alice@example.com&password=petshop-demo-password' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+```
+
+`alice@example.com` and `bob@example.com` are shoppers, `sam@example.com` is
+staff; all three share the demo password above. `X-Donat-Role` still appears
+below, but only to *pick* between several roles one token carries — it can
+never add one, and asking for a role the token does not carry is denied.
 
 ```
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'X-Donat-Admin-Secret: petshop-secret' \
-  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: customer-1' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Donat-Role: customer' \
   -d '{"query":"mutation { start_checkout(cart_id: 1, request_id: \"…\") { cart_id } }"}'
 ```
 
-### Logging in for real
+### How the login works
 
-Passing `X-Donat-Role` and `X-Donat-User-Id` by hand is a stand-in for edge
-auth. To see the same example driven by a real login instead, start it with the
-identity profile:
-
-```
-docker compose --env-file auth.env up
-```
-
-That adds one service — [Rauthy](https://github.com/sebadob/rauthy), an
-OpenID Connect provider — and switches the engine into JWT mode. donat itself
-gains no authentication code: it verifies the token against the provider's
-JWKS and turns its claims into session variables. Any other provider works the
-same way; only the mapping in [`auth.env`](auth.env) changes.
+The provider is [Rauthy](https://github.com/sebadob/rauthy). donat itself has
+no user store: it verifies the token against the provider's JWKS and turns its
+claims into session variables. **Any OIDC provider works the same way** — point
+`DONAT_GRAPHQL_JWT_SECRET`'s `jwk_url` / `issuer` / `audience` and `DONAT_OIDC`'s
+two endpoints at yours and change nothing else. Providers disagree about which
+token carries a deployment's roles and how a confidential client authenticates,
+which is what `session_token` and `client_auth` are for.
 
 The provider is configured entirely by the JSON files in
 [`bootstrap/`](bootstrap), so there is nothing to click in its admin UI. They
@@ -85,15 +92,9 @@ declare the client, the `customer` and `staff` roles, three demo users, and the
 `customer_id` attribute that carries each shopper's business id into the access
 token.
 
-Get a token and use it — note that no role header and no admin secret are
-involved:
+Using a token with no role header at all:
 
 ```
-TOKEN=$(curl -s -X POST localhost:8081/auth/v1/oidc/token \
-  -d 'grant_type=password&client_id=petshop' \
-  -d 'username=alice@example.com&password=petshop-demo-password' \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
-
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
   -H "Authorization: Bearer $TOKEN" \
@@ -109,28 +110,31 @@ to pick between several roles one token carries, and asking for a role the
 token does not carry is denied.
 
 Both role variables are mapped out of the token rather than written as
-literals, and the difference matters if you copy [`auth.env`](auth.env). A
+literals, and the difference matters if you copy this configuration. A
 requested role is checked against the token's role set; a *default* role is
 not. So a literal `x-donat-default-role` hands that role to every valid token,
 including one whose claims never granted it.
 
 The admin UI is at `localhost:8081` (`admin@petshop.local`, same password).
 
-Attaching a real frontend instead of the `curl` above: the browser flow is
-`authorization_code` with PKCE, and the callback it redirects to belongs to
-**your application**, not to donat — the engine never takes part in the login,
-it only verifies the token your app ends up holding. `bootstrap/clients.json`
-points `redirect_uris` and `allowed_origins` at `http://localhost:5173`, a
-plain dev-server default; change them to wherever your app runs. Because the
-provider reads `bootstrap/` only on an empty database, changing them later
-means `docker compose down -v`.
+### Logging in from a browser
 
-Two things worth knowing. The provider reads `bootstrap/` only while
-initializing an empty database, so editing those files later does nothing until
-you recreate the volume with `docker compose down -v`. And the compose file
-still sets `DONAT_GRAPHQL_ADMIN_SECRET`, which outranks the token — a request
-presenting that secret may still assert a role by header. Drop it for anything
-beyond a demo.
+A browser cannot paste a bearer token into every request, so the engine serves
+the login itself: `GET /auth/login` redirects to the provider
+(`authorization_code` + PKCE), and `/auth/callback` puts the resulting token in
+an `HttpOnly` cookie the engine then verifies exactly like a header token. It
+stores no users, holds no passwords and issues no tokens of its own — see
+[ADR 010](../../knowledgebase/api-surfaces/decisions/010-donat-does-not-own-identity.md).
+That is what [`apps/admin`](../../apps/admin) signs in with.
+
+Open <http://localhost:8080/auth/login> and sign in as `sam@example.com`; the
+browser comes back holding a session. `/auth/logout` ends it.
+
+`bootstrap/clients.json` registers two redirect URIs: the engine's own
+`/auth/callback`, and `http://localhost:5173/callback` for an application that
+runs the flow itself. Add yours there. The provider reads `bootstrap/` only
+while initializing an empty database, so editing those files later does nothing
+until you recreate the volume with `docker compose down -v`.
 
 > The image is built and pushed only on release tags (`v*`). Before the first
 > release exists, build it locally from the repo root instead:
@@ -208,7 +212,7 @@ curl -s localhost:8080/v1/graphql -H 'content-type: application/json' -d '{
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'x-donat-role: customer' \
   -H 'x-donat-user-id: customer-1' \
   -d '{ "query": "{ customer { customer_id name email } orders { id order_status total_minor } }" }'
@@ -224,7 +228,7 @@ permission predicates, not application code:
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'x-donat-role: customer' \
   -H 'x-donat-user-id: customer-1' \
   -d '{ "query": "mutation { insert_cart_line(objects: [{cart_id: 1, variant_id: 1, quantity: 1}], on_conflict: {constraint: cart_line_cart_id_variant_id_key, update_columns: [quantity]}) { returning { cart_id variant_id quantity } } }" }'
@@ -237,7 +241,7 @@ Staff see every product, including drafts, and own the catalogue:
 ```bash
 curl -s localhost:8080/v1/graphql \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'x-donat-role: staff' \
   -d '{ "query": "mutation { update_product(where: {slug: {_eq: \"turtle-heat-lamp\"}}, _set: {status: \"published\"}) { affected_rows } }" }'
 ```
@@ -328,8 +332,8 @@ Ask for a URL:
 
 ```sh
 curl -s localhost:8080/v1/graphql \
-  -H 'X-Donat-Admin-Secret: petshop-secret' \
-  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: c-1001' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Donat-Role: customer' \
   -d '{"query":"mutation { donat_request_file_upload(attachment: public_customer_avatar, file_name: \"me.png\", media_type: \"image/png\", size: 1234) { id url method headers { name value } expires_at } }"}'
 ```
 
@@ -344,8 +348,8 @@ curl -s -X PUT --data-binary @me.png \
 curl -s -X POST "<complete_url>"
 
 curl -s localhost:8080/v1/graphql \
-  -H 'X-Donat-Admin-Secret: petshop-secret' \
-  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: c-1001' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Donat-Role: customer' \
   -d '{"query":"mutation { update_customer(where: {customer_id: {_eq: \"c-1001\"}}, _set: {avatar: \"<id>\"}) { affected_rows } }"}'
 ```
 
@@ -361,8 +365,8 @@ database signs while producing the row:
 
 ```sh
 curl -s localhost:8080/v1/graphql \
-  -H 'X-Donat-Admin-Secret: petshop-secret' \
-  -H 'X-Donat-Role: customer' -H 'X-Donat-User-Id: c-1001' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Donat-Role: customer' \
   -d '{"query":"{ customer { name avatar { id file_name size url } } }"}'
 ```
 
@@ -414,7 +418,7 @@ not carry an identity of its own.
 
 ```bash
 curl -s localhost:8080/api/rest/cart \
-  -H 'x-donat-admin-secret: petshop-secret' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'x-donat-role: customer' -H 'x-donat-user-id: customer-1'
 ```
 
@@ -424,7 +428,7 @@ GraphQL mutation it wraps — the body keys bind the operation's variables:
 ```bash
 curl -s -X PUT localhost:8080/api/rest/cart/lines \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'x-donat-role: customer' -H 'x-donat-user-id: customer-1' \
   -d '{"cart_id":1,"variant_id":1,"quantity":2}'
 ```
@@ -456,7 +460,7 @@ Query the inventory as staff (arguments are passed as GraphQL variables — a
 ```bash
 curl -s localhost:8080/mcp \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
+  -H "Authorization: Bearer $TOKEN" -H 'x-donat-role: staff' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
         "name":"query",
         "arguments":{"table":"product","columns":["id","slug","status"],
@@ -471,7 +475,7 @@ three characters comes back as `validation-failed` here too:
 ```bash
 curl -s localhost:8080/mcp \
   -H 'content-type: application/json' \
-  -H 'x-donat-admin-secret: petshop-secret' -H 'x-donat-role: staff' \
+  -H "Authorization: Bearer $TOKEN" -H 'x-donat-role: staff' \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
         "name":"insert",
         "arguments":{"table":"product","objects":[{"category_id":2,"slug":"cat-tunnel","title":"Cat tunnel","status":"draft"}],

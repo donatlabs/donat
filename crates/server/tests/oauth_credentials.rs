@@ -1323,6 +1323,11 @@ async fn oauth_engine_accepts_no_credential_over_http() {
             "DONAT_CREDENTIAL_KEY",
             SealingKey::generate_base64_for_tests(),
         )
+        // This case is about a connector without a credential, not about
+        // authentication — but a deployment that names none of the three ways
+        // to establish a role refuses to boot, so it has to name one to get as
+        // far as the thing under test.
+        .env("DONAT_GRAPHQL_UNAUTHORIZED_ROLE", "anonymous")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

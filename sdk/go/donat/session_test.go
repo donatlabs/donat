@@ -148,18 +148,28 @@ func TestSessionFromHeaders_BackendOnlyPermissions(t *testing.T) {
 	}
 }
 
-// TestSessionFromHeaders_AdminSecretExcluded verifies that X-Donat-Admin-Secret
-// is never included in the returned session vars.
-func TestSessionFromHeaders_AdminSecretExcluded(t *testing.T) {
+// TestSessionFromHeaders_EveryDonatHeaderIsASessionVariable verifies that the
+// whole X-Donat-* namespace reaches the session.
+//
+// An embedded host is the authentication layer: its own middleware decides who
+// the caller is before this handler runs, so there is no header here that is
+// "authentication rather than identity" and none is filtered out. The
+// standalone engine, by contrast, honours no header at all — a role there
+// comes from a verified token or an authentication hook.
+func TestSessionFromHeaders_EveryDonatHeaderIsASessionVariable(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Donat-Role", "user")
-	h.Set("X-Donat-Admin-Secret", "supersecret")
+	h.Set("X-Donat-Tenant-Id", "acme")
+	h.Set("Content-Type", "application/json")
 
 	vars, err := sessionFromHeaders(h)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, ok := vars["x-donat-admin-secret"]; ok {
-		t.Error("x-donat-admin-secret must not appear in session vars")
+	if got := vars["x-donat-tenant-id"]; got != "acme" {
+		t.Errorf("x-donat-tenant-id: got %q, want %q", got, "acme")
+	}
+	if _, ok := vars["content-type"]; ok {
+		t.Error("content-type is not a session variable")
 	}
 }

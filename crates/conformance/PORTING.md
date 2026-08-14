@@ -38,7 +38,11 @@ fixtures copied under `crates/conformance/fixtures/` (same relative paths).
      then PER TEST: `values_setup.yaml` → run case → `values_teardown.yaml`
      (all `/v1/query` for the default backend); `schema_teardown.yaml` at
      the end.
-4. `@pytest.mark.admin_secret` → `Suite::new(..).admin_secret("...")`.
+4. `@pytest.mark.admin_secret` → nothing. This engine has no admin secret;
+   every suite authenticates through the harness's own hook, which turns a
+   fixture's `X-Donat-Role` header into a session (`src/auth_hook.rs`). A
+   class that asserts the *absence* of authentication uses
+   `Suite::new(..).no_authentication()` instead.
    `@pytest.mark.hge_env('K', 'v')` → `.env("K", "v")`.
 5. Engine flags some classes pass via hge-bin (e.g.
    `--stringify-numeric-types`) → `.arg(...)`.

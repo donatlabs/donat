@@ -23,7 +23,7 @@ export DONAT_MOCK_CARRIER_BASE_URL=http://127.0.0.1:8099 DONAT_MOCK_CARRIER_TOKE
 start_engine() {
   local binary="$1" port="$2"
   DONAT_PORT="$port" DONAT_METADATA_DIR="$metadata" \
-  DONAT_GRAPHQL_ADMIN_SECRET=measure DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous \
+  DONAT_GRAPHQL_UNAUTHORIZED_ROLE=anonymous \
     "$binary" --metadata-dir "$metadata" >/dev/null 2>&1 &
   echo $!
 }

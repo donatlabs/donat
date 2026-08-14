@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value as Json, json};
 
-type ParsedRequest = (String, Json, Vec<(String, String)>);
+/// method, path (with query), parsed JSON body, raw body, headers
+type ParsedRequest = (String, String, Json, String, Vec<(String, String)>);
 
 /// Shared handle to the running engine, so callback endpoints (which run a
 /// GraphQL query back against the engine) can reach it once it has spawned.
@@ -28,15 +29,13 @@ pub struct EngineHandle {
 #[derive(Clone)]
 struct EngineInfo {
     base_url: String,
-    admin_secret: Option<String>,
     role: Option<String>,
 }
 
 impl EngineHandle {
-    pub fn set(&self, base_url: &str, admin_secret: Option<String>, role: Option<String>) {
+    pub fn set(&self, base_url: &str, role: Option<String>) {
         *self.inner.lock().unwrap() = Some(EngineInfo {
             base_url: base_url.to_string(),
-            admin_secret,
             role,
         });
     }
@@ -61,8 +60,9 @@ pub fn spawn() -> (String, EngineHandle) {
             let Ok(mut stream) = stream else { continue };
             let engine = engine_for_thread.clone();
             std::thread::spawn(move || {
-                if let Some((path, body, headers)) = read_request(&mut stream) {
-                    let (status, payload) = dispatch(&path, &body, &headers, &engine);
+                if let Some((method, path, body, raw, headers)) = read_request(&mut stream) {
+                    let (status, payload) =
+                        dispatch_any(&method, &path, &body, &raw, &headers, &engine);
                     write_response(&mut stream, status, &payload);
                 }
             });
@@ -91,7 +91,9 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<ParsedRequest> {
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let mut lines = head.split("\r\n");
     let request_line = lines.next()?;
-    let path = request_line.split_whitespace().nth(1)?.to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
 
     let mut headers = Vec::new();
     let mut content_len = 0usize;
@@ -115,8 +117,9 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<ParsedRequest> {
         }
         body_bytes.extend_from_slice(&tmp[..n]);
     }
+    let raw = String::from_utf8_lossy(&body_bytes).to_string();
     let body: Json = serde_json::from_slice(&body_bytes).unwrap_or(Json::Null);
-    Some((path, body, headers))
+    Some((method, path, body, raw, headers))
 }
 
 fn write_response(stream: &mut std::net::TcpStream, status: u16, payload: &Json) {
@@ -137,6 +140,64 @@ fn write_response(stream: &mut std::net::TcpStream, status: u16, payload: &Json)
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// An API that was never written for this engine.
+///
+/// Everything under `/rest/` answers by describing the request it received —
+/// method, path, query string, body and the headers that carry a credential —
+/// so a case can assert what a request transform actually sent rather than
+/// that something arrived. `/rest/users` answers with a list, because an
+/// action's output type has to be satisfied by something.
+fn dispatch_rest(
+    method: &str,
+    path: &str,
+    raw_body: &str,
+    headers: &[(String, String)],
+) -> (u16, Json) {
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
+    };
+    let seen = json!({
+        "method": method,
+        "path": route,
+        "query": query,
+        "body": raw_body,
+        "authorization": header("authorization"),
+        "content_type": header("content-type"),
+    });
+    if route == "/rest/users" && method == "GET" {
+        return (
+            200,
+            json!([
+                { "id": "u-1", "email": "one@example.test", "seen": seen },
+                { "id": "u-2", "email": "two@example.test", "seen": seen }
+            ]),
+        );
+    }
+    (
+        200,
+        json!({ "id": "u-1", "email": "one@example.test", "seen": seen }),
+    )
+}
+
+fn dispatch_any(
+    method: &str,
+    path: &str,
+    body: &Json,
+    raw_body: &str,
+    headers: &[(String, String)],
+    engine: &EngineHandle,
+) -> (u16, Json) {
+    if path.starts_with("/rest/") {
+        return dispatch_rest(method, path, raw_body, headers);
+    }
+    dispatch(path, body, headers, engine)
 }
 
 /// Route a webhook request to its handler, mirroring `ActionsWebhookHandler`
@@ -217,16 +278,15 @@ fn handled_with_engine(path: &str, input: &Json, engine: &EngineHandle) -> Optio
 }
 
 /// POST a GraphQL query to the running engine under the suite's explicit
-/// classic role. Returns the parsed response body.
+/// classic role. The role is named in a header because the suite's
+/// authentication hook is what turns it into a session — the engine honors no
+/// header on its own. Returns the parsed response body.
 fn engine_gql(engine: &EngineHandle, query: &str, variables: Json) -> Option<Json> {
     let info = engine.get()?;
     let client = reqwest::blocking::Client::new();
     let mut req = client
         .post(format!("{}/v1/graphql", info.base_url))
         .json(&json!({ "query": query, "variables": variables }));
-    if let Some(secret) = &info.admin_secret {
-        req = req.header("X-Donat-Admin-Secret", secret);
-    }
     if let Some(role) = &info.role {
         req = req.header("X-Donat-Role", role);
     }

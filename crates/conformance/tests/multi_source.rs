@@ -279,11 +279,13 @@ fn mixed_postgres_clickhouse_query_preserves_order_and_permissions() {
         .expect("Postgres fixture");
     let base_url = suite.base_url();
 
+    // A request that names no role is authenticated by nothing — the suite's
+    // authentication hook refuses it — so no source is ever reached.
     let (status, body) = post_raw(&base_url, None);
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 401, "{body}");
     assert_eq!(
         body,
-        r#"{"errors":[{"extensions":{"path":"$","code":"access-denied"},"message":"x-donat-role header is required (this engine has no admin role)"}]}"#
+        r#"{"errors":[{"extensions":{"path":"$","code":"access-denied"},"message":"Authentication hook unauthorized this request"}]}"#
     );
     assert_eq!(data_request_count(&clickhouse), 0);
 

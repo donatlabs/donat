@@ -583,7 +583,6 @@ impl Drop for Permit {
 
 fn start(name: &str, cfg: &JwtCfg) -> Running {
     let s = Suite::new(name)
-        .admin_secret("conformance-jwt-secret")
         .env("DONAT_GRAPHQL_JWT_SECRET", &cfg.secret_json())
         .start();
     s.setup_v1q(&format!("{PERMS}/setup.yaml"));
