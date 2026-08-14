@@ -20,7 +20,9 @@ import type {
   RequestResetRequest,
   SessionInfoResponse,
   WebauthnLoginResponse,
+  WebauthnStartResponse,
 } from './types';
+import type { WebauthnPurpose } from './webauthn';
 
 /**
  * What `POST /oidc/authorize` can mean.
@@ -186,6 +188,63 @@ export class IdpClient {
       }
       default:
         return { kind: 'unauthorized' };
+    }
+  }
+
+  /**
+   * Ask for a passkey challenge.
+   *
+   * The purpose carries the code the 200 answer to `authorize` gave us, which
+   * is what ties this ceremony to that half-finished login. The session cookie
+   * says who is signing in; nothing here repeats the email.
+   */
+  async webauthnStart(purpose: WebauthnPurpose): Promise<WebauthnStartResponse> {
+    const response = await this.fetchImpl(this.url('/users/webauthn_start'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: this.headers(true),
+      body: JSON.stringify({ purpose }),
+    });
+    if (!response.ok) {
+      const body = await errorBody(response);
+      throw new IdpError(body?.message ?? `the identity provider refused the challenge`);
+    }
+    return (await response.json()) as WebauthnStartResponse;
+  }
+
+  /**
+   * Hand back the signed assertion, and find out what it bought.
+   *
+   * The answers are the login's answers, so they are the login's type: this
+   * can finish the sign-in, or land on the same new-terms and account-update
+   * steps a password can. Unlike `authorize`, where the destination is a
+   * `Location` header, here it is `loc` in the body.
+   */
+  async webauthnFinish(code: string, data: Record<string, unknown>): Promise<AuthorizeOutcome> {
+    const response = await this.fetchImpl(this.url('/users/webauthn_finish'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: this.headers(true),
+      body: JSON.stringify({ code, data }),
+    });
+
+    switch (response.status) {
+      case 202:
+      case 206: {
+        const body = (await response.json()) as { loc?: string; tos_await_code?: string };
+        if (body.loc) return { kind: 'redirect', location: body.loc };
+        if (body.tos_await_code) return { kind: 'terms-required', code: body.tos_await_code };
+        throw new IdpError('the identity provider accepted the key but sent nowhere to go');
+      }
+      case 205:
+        return { kind: 'update-required' };
+      case 429: {
+        const header = response.headers.get('x-retry-not-before');
+        const notBefore = header ? Number.parseInt(header, 10) : Number.NaN;
+        return { kind: 'rate-limited', notBefore: Number.isFinite(notBefore) ? notBefore : undefined };
+      }
+      default:
+        return { kind: 'rejected', message: (await errorBody(response))?.message ?? 'That key was refused.' };
     }
   }
 

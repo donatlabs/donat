@@ -41,6 +41,24 @@ function stubProvider(script: Response[], register?: Response) {
       bodies.push(String(init?.body));
       return Promise.resolve(script.shift() ?? new Response(null, { status: 401 }));
     }
+    if (url.endsWith('/users/webauthn_start')) {
+      bodies.push(String(init?.body));
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ code: 'ceremony', exp: 60, rcr: { publicKey: { challenge: 'AQ' } } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }
+    if (url.endsWith('/users/webauthn_finish')) {
+      bodies.push(String(init?.body));
+      return Promise.resolve(
+        new Response(JSON.stringify({ loc: 'http://localhost:8080/auth/callback?code=key' }), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }
     return Promise.resolve(new Response(null, { status: 200 }));
   });
   // The real solver, but solving inline: a worker is not available in jsdom,
@@ -148,13 +166,53 @@ describe('IdpAuthorizeForm', () => {
     expect(screen.getByTestId('idp-reset')).toBeTruthy();
   });
 
-  it('hands over to the provider for a screen it does not implement', async () => {
-    renderForm([
-      new Response(JSON.stringify({ code: 'mfa', user_id: 'u', exp: 1 }), {
+  it('finishes a passkey sign-in without leaving this page', async () => {
+    // The authenticator, stood in for: jsdom has none, and what is under test
+    // here is that the answer travels — the encoding is `webauthn.test.ts`.
+    Object.defineProperty(navigator, 'credentials', {
+      configurable: true,
+      value: {
+        get: () =>
+          Promise.resolve({
+            id: 'the-key',
+            rawId: new Uint8Array([1]).buffer,
+            type: 'public-key',
+            response: {
+              authenticatorData: new Uint8Array([1]).buffer,
+              clientDataJSON: new Uint8Array([2]).buffer,
+              signature: new Uint8Array([3]).buffer,
+            },
+            getClientExtensionResults: () => ({}),
+          }),
+      },
+    });
+
+    const { bodies } = renderForm([
+      // 200: the password was right, or there was none to give — either way
+      // the account finishes with a key.
+      new Response(JSON.stringify({ code: 'from-authorize', user_id: 'u', exp: 60 }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       }),
     ]);
+    await waitFor(() => expect(screen.getByTestId('idp-submit')).not.toBeDisabled());
+
+    type('idp-email', 'operator@example.test');
+    submit();
+
+    await waitFor(() => expect(screen.getByTestId('idp-passkey')).toBeTruthy());
+    await waitFor(() =>
+      expect(replace).toHaveBeenCalledWith('http://localhost:8080/auth/callback?code=key'),
+    );
+    // The ceremony is tied to the login by the code the 200 carried.
+    expect(JSON.parse(bodies[1])).toEqual({ purpose: { Login: 'from-authorize' } });
+    expect(JSON.parse(bodies[2]).code).toBe('ceremony');
+  });
+
+  it('hands over to the provider for a screen it does not implement', async () => {
+    // 406: the application demands a second factor this account has not set
+    // up. Until that enrolment is ours too, it is the provider's screen.
+    renderForm([new Response(null, { status: 406 })]);
     await waitFor(() => expect(screen.getByTestId('idp-submit')).not.toBeDisabled());
 
     type('idp-email', 'operator@example.test');

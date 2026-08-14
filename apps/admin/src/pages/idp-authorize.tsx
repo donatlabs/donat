@@ -14,6 +14,8 @@ import {
 } from '@refinest/ui-shadcn';
 import { IdpClient, type AuthorizeOutcome } from '../idp/client';
 import { PowSolver } from '../idp/pow-solver';
+import type { WebauthnLoginResponse } from '../idp/types';
+import { signWithPasskey } from '../idp/webauthn';
 import {
   loginRequest,
   parseAuthorizeParams,
@@ -48,10 +50,9 @@ import { IDP_BASE, IDP_REGISTRATION } from '../env';
  * accounts sign in correctly rather than almost.
  */
 
-type Handoff = 'passkey' | 'terms' | 'update' | 'mfa';
+type Handoff = 'terms' | 'update' | 'mfa';
 
 const HANDOFF_REASON: Record<Handoff, string> = {
-  passkey: 'This account finishes signing in with a passkey.',
   terms: 'There are new terms to accept before signing in.',
   update: 'This account has to be updated before signing in.',
   mfa: 'This application requires a second factor, and this account has none set up yet.',
@@ -85,6 +86,7 @@ export function IdpAuthorizeForm({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [handoff, setHandoff] = useState<Handoff | undefined>();
+  const [passkey, setPasskey] = useState<WebauthnLoginResponse | undefined>();
   const [retryAt, setRetryAt] = useState<number | undefined>();
   const [offerReset, setOfferReset] = useState(false);
   const [signingUp, setSigningUp] = useState(false);
@@ -124,7 +126,9 @@ export function IdpAuthorizeForm({
           window.location.replace(outcome.location);
           return;
         case 'passkey':
-          setHandoff('passkey');
+          // Not a step of ours: the browser is about to ask for the key, and
+          // the effect below is where that happens.
+          setPasskey(outcome.challenge);
           return;
         case 'update-required':
           setHandoff('update');
@@ -165,6 +169,36 @@ export function IdpAuthorizeForm({
     },
     [needsPassword],
   );
+
+  /**
+   * The passkey ceremony.
+   *
+   * It runs as soon as the provider asks for one, because it *is* the prompt:
+   * the browser puts up its own dialogue, and a button of ours in front of it
+   * would only be a button in front of a button. What is rendered meanwhile is
+   * the reason that dialogue appeared.
+   */
+  useEffect(() => {
+    if (!passkey) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const challenge = await client.webauthnStart({ Login: passkey.code });
+        const signed = await signWithPasskey(challenge.rcr, challenge.exp);
+        const outcome = await client.webauthnFinish(challenge.code, signed);
+        if (cancelled) return;
+        setPasskey(undefined);
+        apply(outcome);
+      } catch (cause: unknown) {
+        if (cancelled) return;
+        setPasskey(undefined);
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [apply, client, passkey]);
 
   const submit = useCallback(
     async (event: React.FormEvent) => {
@@ -268,6 +302,20 @@ export function IdpAuthorizeForm({
       setBusy(false);
     }
   }, [client, email, params.redirectUri, solver]);
+
+  // The browser's own dialogue is already up; this only says what it is for.
+  if (passkey) {
+    return (
+      <Card className="mx-auto w-full max-w-sm" data-testid="idp-passkey">
+        <CardHeader>
+          <CardTitle>Use your passkey</CardTitle>
+          <CardDescription className="text-balance">
+            This account finishes signing in with a passkey. Your browser is asking for it now.
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
 
   if (handoff) {
     return (
