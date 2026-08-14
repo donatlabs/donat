@@ -246,7 +246,7 @@ was found).
 
 ```
 cd ../..                          # the repository root
-make env && docker compose up -d --build
+make up
 cd apps/admin && npm run e2e
 ```
 

@@ -1,14 +1,16 @@
 # donat, running.
 #
-#   make env                          # fresh secrets, once, on this machine
-#   docker compose up -d --build      # then open http://localhost:5180
+#   make up                           # then open http://localhost:5180
 #
-# Sign in as operator@example.com with the password in that `.env`.
+# One command, and nothing to fill in. It prints the password to sign in as
+# operator@example.com with.
 #
-# Every credential lives in that `.env` and none of it lives here — or in
-# `.env.example`, which ships the names with no values. A file in the
-# repository holding a working secret is a secret everyone who clones it
-# shares, which is a default password by another name.
+# Every credential this deployment uses is generated on the machine that will
+# use it, the first time, into `.env` — because each of them is a secret two
+# programs use to recognise each other rather than something a person chooses.
+# None of them lives here, or in `.env.example`, which ships the names with no
+# values: a file in the repository holding a working secret is a secret
+# everyone who clones it shares, which is a default password by another name.
 #
 # This is the default deployment: a database, an identity provider, object
 # storage, and the engine — which carries the admin panel inside it. It has no application in it — no

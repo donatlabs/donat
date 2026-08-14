@@ -187,3 +187,33 @@ env:
 	@python3 scripts/generate-env.py > .env
 	@echo "wrote .env — sign in as operator@example.com with:"
 	@grep DONAT_ADMIN_PASSWORD .env
+
+# The same thing as a file rule, so `up` below can depend on it. It runs only
+# when `.env` is absent, which is the same refusal as `env`'s, expressed by
+# make rather than by a test.
+.env:
+	@python3 scripts/generate-env.py > .env
+	@echo "no .env, so wrote one."
+
+# The whole stack, from nothing.
+#
+# There is no step here where somebody types a value. Every credential this
+# deployment uses is generated on the machine that will use it, because each is
+# a secret two programs use to recognise each other — not something a person
+# chooses, remembers or should ever see. The one exception is printed at the
+# end, because it is the one a person actually types.
+.PHONY: up
+up: .env
+	# `--remove-orphans` because this stack lost a service: the panel used to be
+	# its own nginx container, and the engine serves it now. Without this, the
+	# old container is still running, still holding the port, and the new engine
+	# cannot bind — which is what upgrading looks like without it.
+	docker compose up -d --build --remove-orphans
+	@echo
+	@port=$$(sed -n 's/^DONAT_ADMIN_PORT=//p' .env); echo "open http://localhost:$${port:-5180}"
+	@echo "sign in as operator@example.com with:"
+	@grep DONAT_ADMIN_PASSWORD .env
+
+.PHONY: down
+down:
+	docker compose down
