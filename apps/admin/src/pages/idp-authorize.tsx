@@ -14,10 +14,12 @@ import {
 } from '@refinest/ui-shadcn';
 import { IdpClient, type AuthorizeOutcome } from '../idp/client';
 import { PowSolver } from '../idp/pow-solver';
+import type { Terms, WebauthnLoginResponse } from '../idp/types';
+import { IdpTerms } from './idp-terms';
+import { signWithPasskey } from '../idp/webauthn';
 import {
   loginRequest,
   parseAuthorizeParams,
-  providerPageUrl,
   type AuthorizeParams,
 } from '../idp/authorize-params';
 import { IDP_BASE, IDP_REGISTRATION } from '../env';
@@ -41,18 +43,18 @@ import { IDP_BASE, IDP_REGISTRATION } from '../env';
  * at once — the markup here follows that component's structure closely so the
  * two look like one interface.
  *
- * **What this page does not do.** A passkey, a terms update and a forced
- * enrolment are separate screens with their own protocols. Rather than
- * half-implement them, this page hands over to the provider's page — one
- * proxied request away, carrying the same authorization request — so those
- * accounts sign in correctly rather than almost.
+ * **Everything that can happen on the way in happens here.** A passkey is
+ * signed on this page, new terms are read on this page, and a reset link from
+ * an email lands on one of ours. Two answers are not sign-in steps at all: an
+ * application demanding a second factor the account has not got, and an
+ * account the provider wants updated first. Its own login page does not handle
+ * those either — it points at the account screen, and so do we, except that
+ * the account screen is now ours as well.
  */
 
-type Handoff = 'passkey' | 'terms' | 'update' | 'mfa';
+type Handoff = 'update' | 'mfa';
 
 const HANDOFF_REASON: Record<Handoff, string> = {
-  passkey: 'This account finishes signing in with a passkey.',
-  terms: 'There are new terms to accept before signing in.',
   update: 'This account has to be updated before signing in.',
   mfa: 'This application requires a second factor, and this account has none set up yet.',
 };
@@ -61,8 +63,6 @@ export interface IdpAuthorizeFormProps {
   params: AuthorizeParams;
   client: IdpClient;
   solver: PowSolver;
-  /** The provider's own login page, for whatever this one hands over. */
-  providerUrl: string;
   /**
    * Offer to create an account. Whether anyone may is the provider's decision
    * and it announces it nowhere, so this is configuration — see `env.ts`.
@@ -74,7 +74,6 @@ export function IdpAuthorizeForm({
   params,
   client,
   solver,
-  providerUrl,
   registration = false,
 }: IdpAuthorizeFormProps): ReactElement {
   const [starting, setStarting] = useState(true);
@@ -85,6 +84,9 @@ export function IdpAuthorizeForm({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [handoff, setHandoff] = useState<Handoff | undefined>();
+  const [passkey, setPasskey] = useState<WebauthnLoginResponse | undefined>();
+  const [termsCode, setTermsCode] = useState<string | undefined>();
+  const [terms, setTerms] = useState<Terms | undefined>();
   const [retryAt, setRetryAt] = useState<number | undefined>();
   const [offerReset, setOfferReset] = useState(false);
   const [signingUp, setSigningUp] = useState(false);
@@ -124,13 +126,16 @@ export function IdpAuthorizeForm({
           window.location.replace(outcome.location);
           return;
         case 'passkey':
-          setHandoff('passkey');
+          // Not a step of ours: the browser is about to ask for the key, and
+          // the effect below is where that happens.
+          setPasskey(outcome.challenge);
           return;
         case 'update-required':
           setHandoff('update');
           return;
         case 'terms-required':
-          setHandoff('terms');
+          // The text itself is a second call; the effect below fetches it.
+          setTermsCode(outcome.code);
           return;
         case 'mfa-required':
           setHandoff('mfa');
@@ -164,6 +169,81 @@ export function IdpAuthorizeForm({
       }
     },
     [needsPassword],
+  );
+
+  /**
+   * The passkey ceremony.
+   *
+   * It runs as soon as the provider asks for one, because it *is* the prompt:
+   * the browser puts up its own dialogue, and a button of ours in front of it
+   * would only be a button in front of a button. What is rendered meanwhile is
+   * the reason that dialogue appeared.
+   */
+  useEffect(() => {
+    if (!passkey) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const challenge = await client.webauthnStart({ Login: passkey.code });
+        const signed = await signWithPasskey(challenge.rcr, challenge.exp);
+        const outcome = await client.webauthnFinish(challenge.code, signed);
+        if (cancelled) return;
+        setPasskey(undefined);
+        apply(outcome);
+      } catch (cause: unknown) {
+        if (cancelled) return;
+        setPasskey(undefined);
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [apply, client, passkey]);
+
+  /** The terms themselves, once the provider says they are what is missing. */
+  useEffect(() => {
+    if (!termsCode) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const latest = await client.terms();
+        if (cancelled) return;
+        if (!latest) {
+          // 204: a deployment withdrew its terms between refusing this login
+          // and being asked for them. Nothing to accept, so try the login again.
+          setTermsCode(undefined);
+          setError('The terms changed while you were signing in. Try again.');
+          return;
+        }
+        setTerms(latest);
+      } catch (cause: unknown) {
+        if (cancelled) return;
+        setTermsCode(undefined);
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, termsCode]);
+
+  const answerTerms = useCallback(
+    async (accept: boolean) => {
+      if (!termsCode || !terms) return;
+      setBusy(true);
+      try {
+        const outcome = await client.answerTerms(accept, termsCode, terms.ts);
+        setTermsCode(undefined);
+        setTerms(undefined);
+        apply(outcome);
+      } catch (cause: unknown) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [apply, client, terms, termsCode],
   );
 
   const submit = useCallback(
@@ -269,6 +349,31 @@ export function IdpAuthorizeForm({
     }
   }, [client, email, params.redirectUri, solver]);
 
+  if (terms) {
+    return (
+      <IdpTerms
+        terms={terms}
+        busy={busy}
+        onAccept={() => void answerTerms(true)}
+        onDecline={() => void answerTerms(false)}
+      />
+    );
+  }
+
+  // The browser's own dialogue is already up; this only says what it is for.
+  if (passkey) {
+    return (
+      <Card className="mx-auto w-full max-w-sm" data-testid="idp-passkey">
+        <CardHeader>
+          <CardTitle>Use your passkey</CardTitle>
+          <CardDescription className="text-balance">
+            This account finishes signing in with a passkey. Your browser is asking for it now.
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
   if (handoff) {
     return (
       <Card className="mx-auto w-full max-w-sm" data-testid="idp-handoff">
@@ -278,13 +383,17 @@ export function IdpAuthorizeForm({
         </CardHeader>
         <CardContent>
           <p className="text-muted-foreground text-sm">
-            Your identity provider handles this screen itself. Continuing takes you there with the
-            same sign-in request.
+            {handoff === 'mfa'
+              ? 'Add a passkey to your account, then sign in again.'
+              : 'Your account has something to settle before this sign-in can finish.'}
           </p>
         </CardContent>
         <CardFooter>
+          {/* A whole page load rather than a route change: this is the one
+              place where the panel has a provider session and no engine one,
+              and the account screen lives outside the guarded shell. */}
           <Button className="w-full" data-testid="idp-handoff-continue" asChild>
-            <a href={providerUrl}>Continue</a>
+            <a href="/account">Go to your account</a>
           </Button>
         </CardFooter>
       </Card>
@@ -490,7 +599,6 @@ export default function IdpAuthorizePage(): ReactElement {
           params={params}
           client={client}
           solver={solver}
-          providerUrl={providerPageUrl(IDP_BASE, location.search)}
           registration={IDP_REGISTRATION}
         />
       ) : (

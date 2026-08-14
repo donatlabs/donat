@@ -198,3 +198,106 @@ describe('IdpClient.requestReset', () => {
     });
   });
 });
+
+/**
+ * The passkey half.
+ *
+ * `webauthn_finish` answers the same questions as `authorize` does — signed
+ * in, new terms, account to update — but it answers them differently: the
+ * destination is `loc` in the body rather than a `Location` header. Reading
+ * one where the provider sends the other strands somebody mid-login with no
+ * error to show, so both readings are pinned here.
+ */
+describe('IdpClient.webauthnStart', () => {
+  it('asks with the code the 200 answer carried', async () => {
+    const { instance, calls } = client(
+      () =>
+        new Response(JSON.stringify({ code: 'ceremony', exp: 60, rcr: { publicKey: {} } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    );
+
+    await expect(instance.webauthnStart({ Login: 'from-authorize' })).resolves.toMatchObject({
+      code: 'ceremony',
+      exp: 60,
+    });
+    expect(calls[0].url).toBe('/auth/v1/users/webauthn_start');
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+      purpose: { Login: 'from-authorize' },
+    });
+  });
+
+  it('says so in the provider\'s words when there is no challenge to give', async () => {
+    const { instance } = client(
+      () =>
+        new Response(JSON.stringify({ error: 'BadRequest', message: 'no such session' }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        }),
+    );
+
+    await expect(instance.webauthnStart({ Login: 'x' })).rejects.toThrow(IdpError);
+  });
+});
+
+describe('IdpClient.webauthnFinish', () => {
+  const answer = (status: number, body: unknown) =>
+    new Response(body === undefined ? null : JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    });
+
+  it('sends the signed assertion under the ceremony code', async () => {
+    const { instance, calls } = client(() => answer(202, { loc: '/auth/callback?code=1' }));
+
+    await instance.webauthnFinish('ceremony', { id: 'the-key' });
+
+    expect(calls[0].url).toBe('/auth/v1/users/webauthn_finish');
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+      code: 'ceremony',
+      data: { id: 'the-key' },
+    });
+  });
+
+  it('follows `loc` from the body, where authorize uses a header', async () => {
+    const { instance } = client(() => answer(202, { loc: '/auth/callback?code=1' }));
+
+    await expect(instance.webauthnFinish('c', {})).resolves.toEqual({
+      kind: 'redirect',
+      location: '/auth/callback?code=1',
+    });
+  });
+
+  it('carries a 206 into the terms step, key or no key', async () => {
+    const { instance } = client(() => answer(206, { tos_await_code: 'tos-1' }));
+
+    await expect(instance.webauthnFinish('c', {})).resolves.toEqual({
+      kind: 'terms-required',
+      code: 'tos-1',
+    });
+  });
+
+  it('reads 205 as the account needing an update', async () => {
+    const { instance } = client(() => answer(205, undefined));
+
+    await expect(instance.webauthnFinish('c', {})).resolves.toEqual({ kind: 'update-required' });
+  });
+
+  it('refuses to guess when the provider accepts the key but says nowhere to go', async () => {
+    const { instance } = client(() => answer(202, {}));
+
+    await expect(instance.webauthnFinish('c', {})).rejects.toThrow(IdpError);
+  });
+
+  it('keeps the provider\'s wording for a key it did not accept', async () => {
+    const { instance } = client(() =>
+      answer(401, { error: 'Unauthorized', message: 'invalid credential' }),
+    );
+
+    await expect(instance.webauthnFinish('c', {})).resolves.toEqual({
+      kind: 'rejected',
+      message: 'invalid credential',
+    });
+  });
+});

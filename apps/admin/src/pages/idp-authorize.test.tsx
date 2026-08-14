@@ -41,6 +41,41 @@ function stubProvider(script: Response[], register?: Response) {
       bodies.push(String(init?.body));
       return Promise.resolve(script.shift() ?? new Response(null, { status: 401 }));
     }
+    if (url.endsWith('/tos/latest')) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ content: '# Terms\n\nBe reasonable.', is_html: false, ts: 17 }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }
+    if (url.endsWith('/tos/accept') || url.endsWith('/tos/deny')) {
+      bodies.push(String(init?.body));
+      return Promise.resolve(
+        new Response(null, {
+          status: 202,
+          headers: { location: 'http://localhost:8080/auth/callback?code=tos' },
+        }),
+      );
+    }
+    if (url.endsWith('/users/webauthn_start')) {
+      bodies.push(String(init?.body));
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ code: 'ceremony', exp: 60, rcr: { publicKey: { challenge: 'AQ' } } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }
+    if (url.endsWith('/users/webauthn_finish')) {
+      bodies.push(String(init?.body));
+      return Promise.resolve(
+        new Response(JSON.stringify({ loc: 'http://localhost:8080/auth/callback?code=key' }), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }
     return Promise.resolve(new Response(null, { status: 200 }));
   });
   // The real solver, but solving inline: a worker is not available in jsdom,
@@ -62,7 +97,6 @@ function renderForm(
       params={params}
       client={provider.client}
       solver={provider.solver}
-      providerUrl="/auth/v1/oidc/authorize?client_id=panel"
       registration={options.registration}
     />,
   );
@@ -148,9 +182,31 @@ describe('IdpAuthorizeForm', () => {
     expect(screen.getByTestId('idp-reset')).toBeTruthy();
   });
 
-  it('hands over to the provider for a screen it does not implement', async () => {
-    renderForm([
-      new Response(JSON.stringify({ code: 'mfa', user_id: 'u', exp: 1 }), {
+  it('finishes a passkey sign-in without leaving this page', async () => {
+    // The authenticator, stood in for: jsdom has none, and what is under test
+    // here is that the answer travels — the encoding is `webauthn.test.ts`.
+    Object.defineProperty(navigator, 'credentials', {
+      configurable: true,
+      value: {
+        get: () =>
+          Promise.resolve({
+            id: 'the-key',
+            rawId: new Uint8Array([1]).buffer,
+            type: 'public-key',
+            response: {
+              authenticatorData: new Uint8Array([1]).buffer,
+              clientDataJSON: new Uint8Array([2]).buffer,
+              signature: new Uint8Array([3]).buffer,
+            },
+            getClientExtensionResults: () => ({}),
+          }),
+      },
+    });
+
+    const { bodies } = renderForm([
+      // 200: the password was right, or there was none to give — either way
+      // the account finishes with a key.
+      new Response(JSON.stringify({ code: 'from-authorize', user_id: 'u', exp: 60 }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       }),
@@ -160,10 +216,53 @@ describe('IdpAuthorizeForm', () => {
     type('idp-email', 'operator@example.test');
     submit();
 
-    await waitFor(() => expect(screen.getByTestId('idp-handoff')).toBeTruthy());
-    expect(screen.getByTestId('idp-handoff-continue').getAttribute('href')).toBe(
-      '/auth/v1/oidc/authorize?client_id=panel',
+    await waitFor(() => expect(screen.getByTestId('idp-passkey')).toBeTruthy());
+    await waitFor(() =>
+      expect(replace).toHaveBeenCalledWith('http://localhost:8080/auth/callback?code=key'),
     );
+    // The ceremony is tied to the login by the code the 200 carried.
+    expect(JSON.parse(bodies[1])).toEqual({ purpose: { Login: 'from-authorize' } });
+    expect(JSON.parse(bodies[2]).code).toBe('ceremony');
+  });
+
+  it('shows new terms here and finishes the login once they are accepted', async () => {
+    const { bodies } = renderForm([
+      // 206: the credentials were right, the terms in force are not accepted.
+      new Response(JSON.stringify({ tos_await_code: 'tos-code' }), {
+        status: 206,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ]);
+    await waitFor(() => expect(screen.getByTestId('idp-submit')).not.toBeDisabled());
+
+    type('idp-email', 'operator@example.test');
+    submit();
+
+    await waitFor(() => expect(screen.getByTestId('idp-terms')).toBeTruthy());
+    // No deadline in this answer, so accepting is the only button.
+    expect(screen.queryByTestId('idp-terms-decline')).toBeNull();
+    fireEvent.click(screen.getByTestId('idp-terms-accept'));
+
+    await waitFor(() =>
+      expect(replace).toHaveBeenCalledWith('http://localhost:8080/auth/callback?code=tos'),
+    );
+    // Which terms were accepted is part of the answer, not just that they were.
+    expect(JSON.parse(bodies[1])).toEqual({ accept_code: 'tos-code', tos_ts: 17 });
+  });
+
+  it('hands over to the provider for a screen it does not implement', async () => {
+    // 406: the application demands a second factor this account has not set
+    // up. Until that enrolment is ours too, it is the provider's screen.
+    renderForm([new Response(null, { status: 406 })]);
+    await waitFor(() => expect(screen.getByTestId('idp-submit')).not.toBeDisabled());
+
+    type('idp-email', 'operator@example.test');
+    submit();
+
+    await waitFor(() => expect(screen.getByTestId('idp-handoff')).toBeTruthy());
+    // Our own account screen, not the provider's page: enrolling a key is
+    // what this needs, and that screen is ours now.
+    expect(screen.getByTestId('idp-handoff-continue').getAttribute('href')).toBe('/account');
     // Nothing was signed in, so nothing was navigated.
     expect(replace).not.toHaveBeenCalled();
   });
@@ -193,7 +292,6 @@ describe('IdpAuthorizeForm', () => {
         params={params}
         client={client}
         solver={new PowSolver(() => client.challenge(), (c) => Promise.resolve(c))}
-        providerUrl="/auth/v1/oidc/authorize"
       />,
     );
 

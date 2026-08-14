@@ -69,6 +69,18 @@ authorization request — so those accounts sign in correctly rather than almost
 `research-what-a-platform-needs` already recorded that almost-right is worse
 than absent; this is that rule applied to ourselves.
 
+> **Amended 2026-08-14.** The rule stands; what changed is what we can finish.
+> A passkey is now signed on our own screen and new terms are read on it, and
+> the reset link an email carries lands on a page of ours because the engine
+> rewrites the provider's URL to it. The two remaining answers — an application
+> demanding a second factor the account has not got, and an account the
+> provider wants updated first — were never login screens: the provider's own
+> page points at its account page for both, and ours points at the account
+> screen described in
+> [004](004-the-account-screens-act-as-the-person-the-identity-screens-act-as-the-deployment.md).
+> Nothing was half-implemented to get there; each protocol was read off the
+> provider's own frontend and pinned by tests before it was written.
+
 **The proof of work is ported, not called.** It is the one part that must run
 in the browser and cannot be a request. `src/idp/pow.ts` is the `spow`
 algorithm in TypeScript — find the smallest counter whose

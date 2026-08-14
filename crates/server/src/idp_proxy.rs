@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, OriginalUri, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 
 /// The path this engine serves the provider's API on.
 ///
@@ -102,6 +102,30 @@ pub fn forwarded_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> 
         .collect()
 }
 
+/// Where a reset link should land: the panel's own page, not the provider's.
+///
+/// The provider mails `GET /auth/v1/users/{id}/reset/{reset_id}` and answers
+/// it with a page of its own. That link arrives on this origin because this
+/// engine proxies `/auth/v1`, which makes it ours to redirect — and the panel
+/// then makes the very same request itself, so the binding cookie that request
+/// sets is still set, on the same origin, before anything is changed.
+///
+/// Only `GET`, and only that exact shape. The `PUT /users/{id}/reset` that
+/// performs the change carries the same prefix and must still reach the
+/// provider.
+fn panel_password_reset(method: &Method, path: &str) -> Option<String> {
+    if method != Method::GET {
+        return None;
+    }
+    let rest = path.strip_prefix(PREFIX)?.strip_prefix("/users/")?;
+    let (user, rest) = rest.split_once('/')?;
+    let reset = rest.strip_prefix("reset/")?;
+    if user.is_empty() || reset.is_empty() || reset.contains('/') {
+        return None;
+    }
+    Some(format!("/idp/reset/{user}/{reset}"))
+}
+
 /// `ANY /auth/v1/*` — hand the request to the provider and the answer back.
 pub async fn forward(
     State(state): State<crate::state::SharedState>,
@@ -125,6 +149,11 @@ pub async fn forward(
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or(uri.path());
+
+    // The one path we answer ourselves rather than forwarding.
+    if let Some(target) = panel_password_reset(&method, uri.path()) {
+        return Redirect::to(&target).into_response();
+    }
 
     let mut request = state
         .http
@@ -284,5 +313,38 @@ mod tests {
         assert!(names.contains(&"set-cookie"));
         assert!(names.contains(&"x-retry-not-before"));
         assert!(!names.contains(&"transfer-encoding"));
+    }
+
+    /// The reset link is the one thing this proxy answers rather than forwards.
+    ///
+    /// The `PUT` that performs the change shares the prefix and most of the
+    /// path, and it must still reach the provider — redirecting it would turn
+    /// a password change into a page load and lose the change.
+    #[test]
+    fn a_reset_link_lands_on_the_panel_and_nothing_else_does() {
+        assert_eq!(
+            panel_password_reset(&Method::GET, "/auth/v1/users/u-1/reset/link-1"),
+            Some("/idp/reset/u-1/link-1".to_string())
+        );
+
+        // The change itself, which happens to be one path segment shorter.
+        assert_eq!(
+            panel_password_reset(&Method::PUT, "/auth/v1/users/u-1/reset"),
+            None
+        );
+        assert_eq!(
+            panel_password_reset(&Method::GET, "/auth/v1/users/u-1/reset"),
+            None
+        );
+        // Everything else the provider serves under the same prefix.
+        for path in [
+            "/auth/v1/users/webauthn_start",
+            "/auth/v1/users/u-1/webauthn",
+            "/auth/v1/oidc/authorize",
+            "/auth/v1/users/u-1/reset/link-1/extra",
+            "/auth/v1/users//reset/link-1",
+        ] {
+            assert_eq!(panel_password_reset(&Method::GET, path), None, "{path}");
+        }
     }
 }
