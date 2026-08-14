@@ -60,7 +60,8 @@ The ones that shape behaviour rather than merely point at things:
 | `DONAT_GRAPHQL_UNAUTHORIZED_ROLE` | the role an unauthenticated request runs as; unset means such a request is rejected |
 | `DONAT_GRAPHQL_JWT_SECRET` | JWT verification config — how role and session variables are established |
 | `DONAT_GRAPHQL_AUTH_HOOK` | a service that resolves the session instead, given the request's headers |
-| `DONAT_OIDC` | the engine's own browser login: `/auth/login`, `/auth/callback`, `/auth/logout` |
+| `DONAT_OIDC` | the engine's own browser login: `/auth/login`, `/auth/callback`, `/auth/logout` — one JSON object |
+| `DONAT_OIDC_*` | the same fields, one variable each: `..._PUBLIC_URL`, `..._LOGIN_API`, `..._TOKEN_ENDPOINT`, `..._CLIENT_ID`, `..._CLIENT_SECRET`, `..._SCOPES`, `..._COOKIE_SECURE`, `..._ADMIN_KEY`, `..._ADMIN_ROLE` |
 | `DONAT_ADMIN_DIR` | a directory of built platform-UI files the engine serves itself; unset or empty serves none |
 | `DONAT_GRAPHQL_ENABLED_APIS` | restrict the mounted surfaces, e.g. `graphql` |
 | `DONAT_GRAPHQL_ENABLE_ALLOWLIST` | serve only saved operations |
@@ -74,6 +75,23 @@ The ones that shape behaviour rather than merely point at things:
 
 Secrets referenced from metadata (`value_from_env:`) are read from the same
 environment. Never put a credential in a metadata file.
+
+Prefer the flat `DONAT_OIDC_*` variables to the JSON object. Two of them are
+not fields but the facts the rest follow from — `..._PUBLIC_URL` is the address
+a **browser** uses, and this engine's sign-in screen and callback are at known
+paths on it; `..._LOGIN_API` is the address the **engine** reaches the provider
+on. Confusing those two is the mistake that produces a login refusing
+everything without saying why, and naming each once is what stops it. A secret
+also gets to be its own variable rather than a substring inside a JSON string,
+which is what lets it come from a file or a secret mount.
+
+Setting the same field both ways is refused at boot, by name. `token_endpoint`
+stays explicit whichever form you use: it differs per provider, and a default
+would be a guess about somebody else's software.
+
+`DONAT_GRAPHQL_JWT_SECRET` stays one object. Its `claims_map` says where in
+*that* provider's token the roles are, and no default can supply it — a wrong
+guess does not fail loudly, it hands somebody a session with no role.
 
 `DONAT_ADMIN_DIR` is why a stand can be one container. The engine serves those
 files as a router fallback — after every one of its own paths, never in front

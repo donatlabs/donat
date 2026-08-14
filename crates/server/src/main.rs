@@ -719,9 +719,15 @@ async fn main() -> anyhow::Result<()> {
     // The login routes exist only where a provider is named. Like the JWT
     // configuration, an unusable value stops the boot rather than quietly
     // leaving the deployment without a way in.
-    let oidc = std::env::var("DONAT_OIDC")
-        .ok()
-        .filter(|raw| !raw.trim().is_empty())
+    //
+    // Either form: one JSON object, or a variable per field. `merge` puts them
+    // together and refuses, by name, when both set the same one.
+    let oidc_json = donat_server::oidc::FlatConfig::merge(
+        std::env::var("DONAT_OIDC").ok().as_deref(),
+        &|name: &str| std::env::var(name).ok(),
+    )
+    .map_err(|e| anyhow::anyhow!("the OpenID Connect configuration is unusable: {e}"))?;
+    let oidc = oidc_json
         .map(|raw| donat_server::oidc::OidcConfig::from_env_value(&raw))
         .transpose()
         .map_err(|e| anyhow::anyhow!("DONAT_OIDC is unusable: {e}"))?;
