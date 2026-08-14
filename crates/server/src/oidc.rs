@@ -262,6 +262,170 @@ impl OidcConfig {
     }
 }
 
+/// The flat `DONAT_OIDC_*` form of the same configuration.
+///
+/// `DONAT_OIDC` is one JSON object, which is how it started and how it stays:
+/// a deployment that already writes it keeps working, and a single value is
+/// convenient to pass through a secret store in one piece. It is also the only
+/// part of this engine's configuration shaped that way — everything else is a
+/// flat `DONAT_*` variable — and the difference shows up in the places that
+/// matter most. A credential ends up *inside* a JSON string, escaped for
+/// whatever templates the file (`$$` in compose), where it can be neither a
+/// file nor a secret mount. And a value repeated in two keys is a value that
+/// can disagree with itself.
+///
+/// So the same fields are readable one per variable. Two of them are not
+/// fields at all but facts the endpoints follow from:
+///
+/// - `DONAT_OIDC_PUBLIC_URL` — the origin a **browser** uses. The engine's own
+///   sign-in screen is at `/idp/authorize` on it and its callback at
+///   `/auth/callback`, so naming the origin names both. These are this
+///   engine's routes rather than a provider's, which is why deriving them is
+///   safe where deriving the provider's own endpoints would not be.
+/// - `DONAT_OIDC_LOGIN_API` — the origin the **engine** reaches the provider
+///   on, from which the admin API already follows.
+///
+/// Those two are the split this configuration keeps getting wrong: the browser
+/// address and the internal one are different, they appear in several keys
+/// each, and mixing them up produces a login that refuses everything without
+/// saying why.
+///
+/// Setting the same field both ways is refused, by name, at boot. Not because
+/// a precedence rule would be hard to write, but because whichever rule we
+/// picked, somebody would one day edit the losing one and watch nothing
+/// happen.
+pub struct FlatConfig;
+
+impl FlatConfig {
+    /// Every flat variable, with the JSON key it fills.
+    const FIELDS: &'static [(&'static str, &'static str)] = &[
+        (
+            "DONAT_OIDC_AUTHORIZATION_ENDPOINT",
+            "authorization_endpoint",
+        ),
+        ("DONAT_OIDC_TOKEN_ENDPOINT", "token_endpoint"),
+        ("DONAT_OIDC_CLIENT_ID", "client_id"),
+        ("DONAT_OIDC_CLIENT_SECRET", "client_secret"),
+        ("DONAT_OIDC_REDIRECT_URI", "redirect_uri"),
+        ("DONAT_OIDC_COOKIE", "cookie"),
+        ("DONAT_OIDC_END_SESSION_ENDPOINT", "end_session_endpoint"),
+        ("DONAT_OIDC_SESSION_TOKEN", "session_token"),
+        ("DONAT_OIDC_CLIENT_AUTH", "client_auth"),
+        ("DONAT_OIDC_LOGIN_API", "login_api"),
+        ("DONAT_OIDC_ADMIN_API", "admin_api"),
+        ("DONAT_OIDC_ADMIN_KEY", "admin_key"),
+        ("DONAT_OIDC_ADMIN_ROLE", "admin_role"),
+    ];
+
+    /// The path this engine serves its own sign-in screen on.
+    const SIGN_IN_PATH: &'static str = "/idp/authorize";
+    /// And the path its callback answers on.
+    const CALLBACK_PATH: &'static str = "/auth/callback";
+
+    /// Build the JSON `from_env_value` reads, from whichever form is in use.
+    ///
+    /// `read` is the environment. Returns `None` when a deployment has named
+    /// no provider at all, which is the ordinary case for an engine with no
+    /// browser login.
+    pub fn merge(
+        json: Option<&str>,
+        read: &impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<String>, OidcConfigError> {
+        let some = |name: &str| read(name).filter(|value| !value.trim().is_empty());
+
+        let mut object = match json.map(str::trim).filter(|raw| !raw.is_empty()) {
+            Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(serde_json::Value::Object(map)) => map,
+                Ok(_) => return Err(OidcConfigError("DONAT_OIDC is not an object".to_string())),
+                Err(e) => {
+                    return Err(OidcConfigError(format!(
+                        "DONAT_OIDC is not valid JSON: {e}"
+                    )));
+                }
+            },
+            None => serde_json::Map::new(),
+        };
+        let from_json = object.clone();
+
+        for (variable, key) in Self::FIELDS {
+            let Some(value) = some(variable) else {
+                continue;
+            };
+            if from_json.contains_key(*key) {
+                return Err(OidcConfigError(format!(
+                    "{variable} and DONAT_OIDC's `{key}` both set it;                      remove one — this engine will not choose"
+                )));
+            }
+            object.insert((*key).to_string(), serde_json::Value::String(value));
+        }
+
+        // `scopes` is a list, so it arrives as a comma-separated string.
+        if let Some(raw) = some("DONAT_OIDC_SCOPES") {
+            if from_json.contains_key("scopes") {
+                return Err(OidcConfigError(
+                    "DONAT_OIDC_SCOPES and DONAT_OIDC's `scopes` both set it;                      remove one — this engine will not choose"
+                        .to_string(),
+                ));
+            }
+            let scopes: Vec<serde_json::Value> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(|scope| serde_json::Value::String(scope.to_string()))
+                .collect();
+            object.insert("scopes".to_string(), serde_json::Value::Array(scopes));
+        }
+
+        // And `cookie_secure` is a boolean, refused rather than guessed at.
+        if let Some(raw) = some("DONAT_OIDC_COOKIE_SECURE") {
+            if from_json.contains_key("cookie_secure") {
+                return Err(OidcConfigError(
+                    "DONAT_OIDC_COOKIE_SECURE and DONAT_OIDC's `cookie_secure` both set it;                      remove one — this engine will not choose"
+                        .to_string(),
+                ));
+            }
+            let value = match raw.trim() {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                other => {
+                    return Err(OidcConfigError(format!(
+                        "DONAT_OIDC_COOKIE_SECURE must be true or false, not {other:?}"
+                    )));
+                }
+            };
+            object.insert("cookie_secure".to_string(), serde_json::Value::Bool(value));
+        }
+
+        // The public origin, last, so it fills only what nothing else named.
+        if let Some(public) = some("DONAT_OIDC_PUBLIC_URL") {
+            let origin = public.trim_end_matches('/');
+            if url::Url::parse(origin).is_err() {
+                return Err(OidcConfigError(
+                    "DONAT_OIDC_PUBLIC_URL is not an absolute URL".to_string(),
+                ));
+            }
+            for (key, path) in [
+                ("authorization_endpoint", Self::SIGN_IN_PATH),
+                ("redirect_uri", Self::CALLBACK_PATH),
+            ] {
+                if from_json.contains_key(key) {
+                    return Err(OidcConfigError(format!(
+                        "DONAT_OIDC_PUBLIC_URL and DONAT_OIDC's `{key}` both set it;                          remove one — this engine will not choose"
+                    )));
+                }
+                object
+                    .entry(key.to_string())
+                    .or_insert_with(|| serde_json::Value::String(format!("{origin}{path}")));
+            }
+        }
+
+        if object.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::Value::Object(object).to_string()))
+    }
+}
+
 /// One authorization run: where to send the browser, and what the callback
 /// will need to recognise it again.
 pub struct Authorization {
@@ -831,6 +995,141 @@ pub async fn logout(State(state): State<crate::state::SharedState>) -> Response 
 
 #[cfg(test)]
 mod tests {
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    fn merged(json: Option<&str>, pairs: &[(&str, &str)]) -> serde_json::Value {
+        let raw = FlatConfig::merge(json, &env(pairs))
+            .expect("the configuration merges")
+            .expect("something was configured");
+        serde_json::from_str(&raw).expect("the merge produces JSON")
+    }
+
+    /// Nothing configured is not an error — it is an engine with no login.
+    #[test]
+    fn no_provider_named_is_no_configuration() {
+        assert!(FlatConfig::merge(None, &env(&[])).unwrap().is_none());
+        assert!(FlatConfig::merge(Some("  "), &env(&[])).unwrap().is_none());
+    }
+
+    /// The flat form alone must produce a configuration that parses.
+    #[test]
+    fn the_flat_form_alone_is_enough() {
+        let merged = merged(
+            None,
+            &[
+                ("DONAT_OIDC_PUBLIC_URL", "http://localhost:5180"),
+                (
+                    "DONAT_OIDC_TOKEN_ENDPOINT",
+                    "http://idp:8080/auth/v1/oidc/token",
+                ),
+                ("DONAT_OIDC_CLIENT_ID", "donat-admin"),
+                ("DONAT_OIDC_LOGIN_API", "http://idp:8080"),
+                ("DONAT_OIDC_SCOPES", "openid, profile ,email"),
+                ("DONAT_OIDC_COOKIE_SECURE", "false"),
+            ],
+        );
+
+        // The two routes are this engine's own, so the browser origin names
+        // both — which is the point of naming it rather than them.
+        assert_eq!(
+            merged["authorization_endpoint"],
+            "http://localhost:5180/idp/authorize"
+        );
+        assert_eq!(
+            merged["redirect_uri"],
+            "http://localhost:5180/auth/callback"
+        );
+        assert_eq!(
+            merged["scopes"],
+            serde_json::json!(["openid", "profile", "email"])
+        );
+        assert_eq!(merged["cookie_secure"], serde_json::json!(false));
+
+        let config = OidcConfig::from_env_value(&merged.to_string()).expect("it parses");
+        assert_eq!(config.client_id, "donat-admin");
+        assert_eq!(config.login_api.as_deref(), Some("http://idp:8080"));
+    }
+
+    /// A trailing slash on the origin must not double up in the derived paths.
+    #[test]
+    fn the_public_origin_is_taken_as_an_origin() {
+        let merged = merged(None, &[("DONAT_OIDC_PUBLIC_URL", "http://localhost:5180/")]);
+        assert_eq!(
+            merged["redirect_uri"],
+            "http://localhost:5180/auth/callback"
+        );
+    }
+
+    /// The two forms compose, so a secret can leave the JSON without the rest
+    /// of it moving.
+    #[test]
+    fn a_secret_can_be_its_own_variable() {
+        let merged = merged(
+            Some(
+                r#"{"authorization_endpoint":"http://p/a","token_endpoint":"http://p/t","client_id":"c","redirect_uri":"http://p/cb"}"#,
+            ),
+            &[
+                ("DONAT_OIDC_ADMIN_KEY", "API-Key donat$secret"),
+                ("DONAT_OIDC_ADMIN_ROLE", "support"),
+            ],
+        );
+        assert_eq!(merged["admin_key"], "API-Key donat$secret");
+        assert_eq!(merged["client_id"], "c");
+    }
+
+    /// And setting one field both ways is refused by name.
+    ///
+    /// Whichever precedence rule we picked, somebody would eventually edit the
+    /// losing one and watch nothing happen. Refusing says which two to look at.
+    #[test]
+    fn one_field_set_twice_is_refused_by_name() {
+        for (variable, json) in [
+            ("DONAT_OIDC_CLIENT_ID", r#"{"client_id":"from-json"}"#),
+            ("DONAT_OIDC_SCOPES", r#"{"scopes":["openid"]}"#),
+            ("DONAT_OIDC_COOKIE_SECURE", r#"{"cookie_secure":true}"#),
+            ("DONAT_OIDC_PUBLIC_URL", r#"{"redirect_uri":"http://p/cb"}"#),
+        ] {
+            let value = if variable == "DONAT_OIDC_PUBLIC_URL" {
+                "http://localhost:5180"
+            } else if variable == "DONAT_OIDC_COOKIE_SECURE" {
+                "false"
+            } else {
+                "flat"
+            };
+            let error = FlatConfig::merge(Some(json), &env(&[(variable, value)]))
+                .expect_err("setting it twice is refused");
+            assert!(error.to_string().contains(variable), "{error}");
+        }
+    }
+
+    /// A boolean that is neither is refused rather than read as false.
+    #[test]
+    fn a_cookie_secure_that_is_not_a_boolean_is_refused() {
+        let error = FlatConfig::merge(None, &env(&[("DONAT_OIDC_COOKIE_SECURE", "yes")]))
+            .expect_err("refused");
+        assert!(error.to_string().contains("true or false"), "{error}");
+    }
+
+    /// An empty variable is an unset one, because that is what a compose file
+    /// with an unset interpolation produces.
+    #[test]
+    fn an_empty_variable_is_not_a_value() {
+        let merged = merged(
+            Some(
+                r#"{"authorization_endpoint":"http://p/a","token_endpoint":"http://p/t","client_id":"c","redirect_uri":"http://p/cb"}"#,
+            ),
+            &[("DONAT_OIDC_CLIENT_SECRET", "   ")],
+        );
+        assert!(merged.get("client_secret").is_none());
+    }
     use super::*;
     use serde_json::json;
 

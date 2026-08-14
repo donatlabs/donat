@@ -246,11 +246,49 @@ services:
     environment:
       DONAT_METADATA_DIR: /metadata
       DONAT_PORT: "8080"
-      DONAT_DATABASE_URL: postgresql://postgres:${DONAT_DB_PASSWORD:?see .env.example}@postgres:5432/donat
+      # One variable, not two: the engine reads `DONAT_DATABASE_URL` and falls
+      # back to this one, so naming both said the same thing twice.
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:${DONAT_DB_PASSWORD:?see .env.example}@postgres:5432/donat
+
+      # The two addresses everything else follows from, and the distinction
+      # this configuration exists to keep straight: what a **browser** reaches,
+      # and what the **engine** reaches. Confusing them is the one mistake here
+      # that produces a login refusing everything without saying why.
+      DONAT_OIDC_PUBLIC_URL: http://localhost:${DONAT_ADMIN_PORT:-5180}
+      DONAT_OIDC_LOGIN_API: http://rauthy:8080
+
+      # From the public URL: this engine's own sign-in screen at
+      # /idp/authorize and its callback at /auth/callback. From the login API:
+      # the provider's admin API, and the fact that a browser can reach the
+      # provider on this origin at /auth/v1/… at all.
+      DONAT_OIDC_TOKEN_ENDPOINT: http://rauthy:8080/auth/v1/oidc/token
+      DONAT_OIDC_CLIENT_ID: donat-admin
+      DONAT_OIDC_SCOPES: openid,profile,email
+      # Off only because this stand is plain HTTP.
+      DONAT_OIDC_COOKIE_SECURE: "false"
+      # A secret in its own variable rather than spliced into a JSON string —
+      # which is what it was, `$$` escaping and all. Now it can come from a
+      # file or a secret mount like any other credential.
+      # `$$$` is `$$` (one literal dollar, which the provider's key format
+      # wants) followed by `${…}` (the interpolation). Two dollars would make
+      # the whole thing a literal, and the engine would authenticate with the
+      # text of a variable name.
+      DONAT_OIDC_ADMIN_KEY: API-Key donat$$${DONAT_IDP_ADMIN_SECRET:?see .env.example}
+      # The one role allowed to manage accounts. That is the panel's whole
+      # Identity section — accounts, roles, groups, scopes, applications,
+      # attributes, blocked addresses, sessions — and there is no metadata for
+      # it: the declaration ships in the binary
+      # (crates/server/src/idp_admin.yaml).
+      DONAT_OIDC_ADMIN_ROLE: support
+
       # A role comes from a verified token and from nothing else. No
       # unauthorized role is set, so a request with no session is refused
       # outright — this deployment has nothing public to show.
+      #
+      # Still one object, because `claims_map` is the one thing no default can
+      # supply: it says where in *this* provider's token the roles are, and a
+      # guess would leave somebody role-less with nothing to read. The name and
+      # shape are the Donat v2 ones.
       DONAT_GRAPHQL_JWT_SECRET: >-
         {"jwk_url":"http://rauthy:8080/auth/v1/oidc/certs",
         "issuer":"http://localhost:${DONAT_ADMIN_PORT:-5180}/auth/v1/",
@@ -259,34 +297,6 @@ services:
         "claims_map":{"x-donat-allowed-roles":{"path":"$$.roles"},
         "x-donat-default-role":{"path":"$$.roles[0]"},
         "x-donat-user-id":{"path":"$$.sub","default":""}}}
-      # The engine is the relying party: /auth/login starts the flow and
-      # /auth/callback exchanges the code for the session cookie.
-      #
-      #   authorization_endpoint  the panel's own sign-in screen, which speaks
-      #                           the provider's protocol unchanged
-      #   login_api               lets it: the engine serves the provider's
-      #                           login API at /auth/v1/… on this origin
-      #   token_endpoint          reached by the engine over this network
-      #   admin_key / admin_role  make the engine serve the provider's own
-      #                           accounts, roles, groups, scopes, clients,
-      #                           attributes, blocked addresses and sessions as
-      #                           GraphQL fields, visible to that one role.
-      #                           That is the panel's whole Identity section,
-      #                           and there is no metadata for it: the
-      #                           declaration ships in the binary
-      #                           (crates/server/src/idp_admin.yaml).
-      DONAT_OIDC: >-
-        {"authorization_endpoint":"http://localhost:${DONAT_ADMIN_PORT:-5180}/idp/authorize",
-        "token_endpoint":"http://rauthy:8080/auth/v1/oidc/token",
-        "login_api":"http://rauthy:8080",
-        "client_id":"donat-admin",
-        "redirect_uri":"http://localhost:${DONAT_ADMIN_PORT:-5180}/auth/callback",
-        "scopes":["openid","profile","email"],
-        "cookie":"donat_session",
-        "cookie_secure":false,
-        "session_token":"access_token",
-        "admin_key":"API-Key donat$$${DONAT_IDP_ADMIN_SECRET:?see .env.example}",
-        "admin_role":"support"}
       # The store in deploy/metadata/storage.yaml, and the secret its signed
       # URLs are minted with.
       DONAT_S3_KEY: ${DONAT_S3_KEY:?see .env.example}
