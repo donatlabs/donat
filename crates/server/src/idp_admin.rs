@@ -142,6 +142,30 @@ mod tests {
         }
     }
 
+    /// Nothing in the built-in declaration is declared twice.
+    ///
+    /// Two people adding the same field to this file is not hypothetical — it
+    /// happened, and the engine refused to boot with a duplicate root while
+    /// the test that should have caught it only listed action names, so a
+    /// duplicated *type* went through. Names and types both, by construction.
+    #[test]
+    fn nothing_is_declared_twice() {
+        let (actions, types) = module(&config()).expect("the declaration parses");
+
+        let mut seen = std::collections::BTreeSet::new();
+        for action in &actions {
+            assert!(seen.insert(action.name.clone()), "{} twice", action.name);
+        }
+
+        let mut named = std::collections::BTreeSet::new();
+        for object in &types.objects {
+            assert!(named.insert(object.name.clone()), "{} twice", object.name);
+        }
+        for input in &types.input_objects {
+            assert!(named.insert(input.name.clone()), "{} twice", input.name);
+        }
+    }
+
     #[test]
     fn the_built_in_declaration_is_readable() {
         let (actions, types) = module(&config()).expect("the declaration parses");
@@ -171,9 +195,10 @@ mod tests {
                 "idp_scope_delete",
                 "idp_clients",
                 "idp_client",
+                "idp_client_update",
                 "idp_client_create",
                 "idp_client_delete",
-                "idp_client_update",
+                "idp_client_secret",
                 // What a deployment can say about a person beyond a name, who
                 // is refused at the door, and who is signed in right now.
                 "idp_user_attributes",
