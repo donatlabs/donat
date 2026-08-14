@@ -11,7 +11,7 @@
 # shares, which is a default password by another name.
 #
 # This is the default deployment: a database, an identity provider, object
-# storage, the engine, and the admin panel. It has no application in it — no
+# storage, and the engine — which carries the admin panel inside it. It has no application in it — no
 # tables, no metadata beyond a source and a store — because an application is
 # what you add on top. What it does have is everything you would otherwise
 # have to assemble before adding one: a way to sign in, a way to say who may
@@ -24,12 +24,15 @@
 # ordinary client holding none of it — see
 # knowledgebase/api-surfaces/decisions/013-*.
 #
-# Everything a browser touches is on the panel's origin (`:5180`), which is
-# split three ways: the app itself, `/v1/` and `/auth/` to the engine, and —
-# through the engine — `/auth/v1/` to the identity provider. That is not
-# tidiness: the provider's session cookie is `__Host-`-prefixed and it compares
+# Everything a browser touches is on one origin (`:5180`), and it is one
+# server: the engine serves the panel's files, answers `/v1/` and `/auth/`
+# itself, and proxies `/auth/v1/` to the identity provider. That is not
+# tidiness. The provider's session cookie is `__Host-`-prefixed and it compares
 # the `Origin` header against its own public URL, so a login page anywhere else
-# is refused.
+# is refused — and the way that used to be arranged was a reverse proxy in
+# front of two containers, with a `DONAT_UPSTREAM` for somebody to get wrong.
+# There is nothing left to get wrong; see
+# knowledgebase/platform/decisions/001-*, amended.
 #
 # The engine is built from this working tree, not pulled: this repository is
 # the engine, and a stack that ran a published image would be demonstrating
@@ -194,6 +197,15 @@ services:
     image: donat:local
     build:
       context: .
+      args:
+        # The image carries the panel, so these are its settings — see the
+        # `engine` service, which serves it. Repeated here because both
+        # services name the same image and compose builds whichever it reaches
+        # first; different arguments would mean a different image depending on
+        # the order, which is the kind of thing that is only ever discovered
+        # once.
+        VITE_DONAT_ROLE: support
+        VITE_DONAT_IDP_REGISTRATION: ${DONAT_IDP_REGISTRATION:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -203,10 +215,27 @@ services:
     restart: "no"
 
   engine:
-    # The same image the migration ran, built once from this tree.
+    # The same image the migration ran, built once from this tree — and the
+    # panel is inside it. `DONAT_ADMIN_DIR` is set in the image, so the engine
+    # serves the panel's files itself and there is no second service, no
+    # reverse proxy, and nothing to keep in step.
     image: donat:local
     build:
       context: .
+      args:
+        # The role this panel asserts. Naming it grants nothing: this engine
+        # has no admin role, and `X-Donat-Role` only selects among the roles a
+        # token already carries. What it may do is `deploy/metadata`.
+        VITE_DONAT_ROLE: support
+        # Offering "create an account" is a second decision: the provider
+        # decides whether anyone may (`OPEN_USER_REG`, off by default) and
+        # announces it nowhere, so this only says whether to show the form.
+        VITE_DONAT_IDP_REGISTRATION: ${DONAT_IDP_REGISTRATION:-false}
+    # The one address a browser uses, and the reason every URL below can name
+    # it: the panel, the engine's API and — proxied through the engine — the
+    # identity provider are now literally one server.
+    ports:
+      - "${DONAT_ADMIN_PORT:-5180}:8080"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -265,28 +294,6 @@ services:
       DONAT_FILE_SIGNING_SECRET: ${DONAT_FILE_SIGNING_SECRET:?see .env.example}
     volumes:
       - ./deploy/metadata:/metadata:ro
-
-  admin:
-    build:
-      context: ./apps/admin
-      args:
-        VITE_DONAT_GRAPHQL_URL: /v1/graphql
-        VITE_DONAT_ROLE: support
-        # No stand is declared: one deployment, one role, and the Identity
-        # screens the panel already knows the shape of.
-        #
-        # Offering "create an account" is a second decision: the provider
-        # decides whether anyone may (`OPEN_USER_REG`, off by default) and
-        # announces it nowhere, so this only says whether to show the form.
-        VITE_DONAT_IDP_REGISTRATION: ${DONAT_IDP_REGISTRATION:-false}
-    depends_on:
-      engine:
-        condition: service_started
-    environment:
-      DONAT_UPSTREAM: http://engine:8080
-      NGINX_ENVSUBST_FILTER: DONAT_
-    ports:
-      - "${DONAT_ADMIN_PORT:-5180}:80"
 
 volumes:
   postgres:

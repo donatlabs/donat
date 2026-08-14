@@ -18,17 +18,26 @@ cp .env.example .env      # point VITE_DONAT_GRAPHQL_URL at your engine
 npm run dev               # http://localhost:5174
 ```
 
-Or built and served by nginx, which is also how it should be deployed:
+Deployed, the engine serves it — one container, one process, no proxy:
 
 ```
-docker compose up --build     # the panel on :5180, proxying to DONAT_UPSTREAM
+npm run build
+DONAT_ADMIN_DIR=/path/to/apps/admin/dist donat serve
 ```
 
-nginx proxies `/v1/` and `/auth/` to the engine (`DONAT_UPSTREAM`, default
-`http://host.docker.internal:8080`), so the panel and the engine share one
-origin. That is not a convenience: a session cookie only comes back to the
-origin that set it, and an engine that delegates CORS to its fronting layer
-would refuse a cross-origin request anyway.
+The repository's root `docker-compose.yml` does exactly that: the engine's
+image builds this panel into `/usr/share/donat/admin` and sets that variable,
+so `docker compose up -d --build` gives you the whole stack on one port.
+
+One origin is the point, and it is not tidiness. A session cookie only comes
+back to the origin that set it; the engine delegates CORS to its fronting layer
+and would refuse a cross-origin request anyway; and the identity provider
+behind `/auth/v1` compares `Origin` against its own public URL and sets a
+`__Host-`-prefixed cookie. Served by the engine, all of that is true by
+construction. The `nginx.conf.template` here still works for a deployment that
+wants the panel somewhere else — set `DONAT_ADMIN_DIR` empty and keep the
+proxy — but then the origin is yours to keep consistent, and getting it wrong
+is a login that refuses everything without saying why.
 
 ## Stands
 
