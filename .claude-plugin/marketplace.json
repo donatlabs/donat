@@ -10,7 +10,7 @@
     {
       "name": "donat",
       "description": "How to build an application on donat: migrations, tracked tables, per-role permissions, validators, rules, commands, durable processes, connectors, and the REST/MCP surfaces generated from them.",
-      "version": "0.3.0",
+      "version": "0.5.0",
       "source": "./plugins/donat",
       "author": { "name": "donat" },
       "homepage": "https://github.com/donatlabs/donat",
