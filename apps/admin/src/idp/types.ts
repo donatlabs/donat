@@ -72,6 +72,21 @@ export interface WebauthnStartResponse {
   rcr: import('./webauthn').CredentialRequest;
 }
 
+/**
+ * `GET /tos/latest` — the terms a deployment put in force.
+ *
+ * `ts` identifies the version and goes back with the answer, so that accepting
+ * says *which* terms were accepted. `opt_until` is a deadline: until it passes,
+ * these terms may be declined and the login still finishes. After it, they may
+ * not, and the only honest screen is one with a single button.
+ */
+export interface Terms {
+  content: string;
+  is_html: boolean;
+  ts: number;
+  opt_until?: number;
+}
+
 export type SessionState = 'Init' | 'Auth' | 'LoggedOut' | 'Unknown';
 
 /** `POST /oidc/session` — establishes the session and hands out the CSRF token. */

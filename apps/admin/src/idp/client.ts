@@ -19,6 +19,7 @@ import type {
   RegisterRequest,
   RequestResetRequest,
   SessionInfoResponse,
+  Terms,
   WebauthnLoginResponse,
   WebauthnStartResponse,
 } from './types';
@@ -245,6 +246,61 @@ export class IdpClient {
       }
       default:
         return { kind: 'rejected', message: (await errorBody(response))?.message ?? 'That key was refused.' };
+    }
+  }
+
+  /**
+   * The terms in force, or nothing if a deployment has none.
+   *
+   * 204 is the provider saying there are none — which, when it has just
+   * refused a login for want of accepting them, is a deployment that removed
+   * its terms mid-flight rather than an error.
+   */
+  async terms(): Promise<Terms | undefined> {
+    const response = await this.fetchImpl(this.url('/tos/latest'), {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: this.headers(false),
+    });
+    if (response.status === 204) return undefined;
+    if (!response.ok) {
+      const body = await errorBody(response);
+      throw new IdpError(body?.message ?? `the identity provider answered ${response.status}`);
+    }
+    return (await response.json()) as Terms;
+  }
+
+  /**
+   * Accept them, or decline them, and carry on with the login.
+   *
+   * Both answers resume the same authorization request — declining is only
+   * offered while the terms are optional, and then it is as valid an answer as
+   * accepting — so both come back as the login's own outcome.
+   */
+  async answerTerms(accept: boolean, code: string, ts: number): Promise<AuthorizeOutcome> {
+    const response = await this.fetchImpl(this.url(accept ? '/tos/accept' : '/tos/deny'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: this.headers(true),
+      body: JSON.stringify({ accept_code: code, tos_ts: ts }),
+      redirect: 'manual',
+    });
+
+    switch (response.status) {
+      case 200:
+      case 202: {
+        const location = response.headers.get('location');
+        if (location) return { kind: 'redirect', location };
+        const body = (await response.json().catch(() => ({}))) as { loc?: string };
+        if (body.loc) return { kind: 'redirect', location: body.loc };
+        throw new IdpError('the identity provider took the answer but sent nowhere to go');
+      }
+      case 205:
+        return { kind: 'update-required' };
+      case 406:
+        return { kind: 'mfa-required' };
+      default:
+        return { kind: 'rejected', message: (await errorBody(response))?.message ?? 'Refused.' };
     }
   }
 

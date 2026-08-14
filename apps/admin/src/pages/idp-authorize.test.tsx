@@ -41,6 +41,23 @@ function stubProvider(script: Response[], register?: Response) {
       bodies.push(String(init?.body));
       return Promise.resolve(script.shift() ?? new Response(null, { status: 401 }));
     }
+    if (url.endsWith('/tos/latest')) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ content: '# Terms\n\nBe reasonable.', is_html: false, ts: 17 }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }
+    if (url.endsWith('/tos/accept') || url.endsWith('/tos/deny')) {
+      bodies.push(String(init?.body));
+      return Promise.resolve(
+        new Response(null, {
+          status: 202,
+          headers: { location: 'http://localhost:8080/auth/callback?code=tos' },
+        }),
+      );
+    }
     if (url.endsWith('/users/webauthn_start')) {
       bodies.push(String(init?.body));
       return Promise.resolve(
@@ -207,6 +224,31 @@ describe('IdpAuthorizeForm', () => {
     // The ceremony is tied to the login by the code the 200 carried.
     expect(JSON.parse(bodies[1])).toEqual({ purpose: { Login: 'from-authorize' } });
     expect(JSON.parse(bodies[2]).code).toBe('ceremony');
+  });
+
+  it('shows new terms here and finishes the login once they are accepted', async () => {
+    const { bodies } = renderForm([
+      // 206: the credentials were right, the terms in force are not accepted.
+      new Response(JSON.stringify({ tos_await_code: 'tos-code' }), {
+        status: 206,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ]);
+    await waitFor(() => expect(screen.getByTestId('idp-submit')).not.toBeDisabled());
+
+    type('idp-email', 'operator@example.test');
+    submit();
+
+    await waitFor(() => expect(screen.getByTestId('idp-terms')).toBeTruthy());
+    // No deadline in this answer, so accepting is the only button.
+    expect(screen.queryByTestId('idp-terms-decline')).toBeNull();
+    fireEvent.click(screen.getByTestId('idp-terms-accept'));
+
+    await waitFor(() =>
+      expect(replace).toHaveBeenCalledWith('http://localhost:8080/auth/callback?code=tos'),
+    );
+    // Which terms were accepted is part of the answer, not just that they were.
+    expect(JSON.parse(bodies[1])).toEqual({ accept_code: 'tos-code', tos_ts: 17 });
   });
 
   it('hands over to the provider for a screen it does not implement', async () => {

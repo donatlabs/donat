@@ -14,7 +14,8 @@ import {
 } from '@refinest/ui-shadcn';
 import { IdpClient, type AuthorizeOutcome } from '../idp/client';
 import { PowSolver } from '../idp/pow-solver';
-import type { WebauthnLoginResponse } from '../idp/types';
+import type { Terms, WebauthnLoginResponse } from '../idp/types';
+import { IdpTerms } from './idp-terms';
 import { signWithPasskey } from '../idp/webauthn';
 import {
   loginRequest,
@@ -50,10 +51,9 @@ import { IDP_BASE, IDP_REGISTRATION } from '../env';
  * accounts sign in correctly rather than almost.
  */
 
-type Handoff = 'terms' | 'update' | 'mfa';
+type Handoff = 'update' | 'mfa';
 
 const HANDOFF_REASON: Record<Handoff, string> = {
-  terms: 'There are new terms to accept before signing in.',
   update: 'This account has to be updated before signing in.',
   mfa: 'This application requires a second factor, and this account has none set up yet.',
 };
@@ -87,6 +87,8 @@ export function IdpAuthorizeForm({
   const [notice, setNotice] = useState('');
   const [handoff, setHandoff] = useState<Handoff | undefined>();
   const [passkey, setPasskey] = useState<WebauthnLoginResponse | undefined>();
+  const [termsCode, setTermsCode] = useState<string | undefined>();
+  const [terms, setTerms] = useState<Terms | undefined>();
   const [retryAt, setRetryAt] = useState<number | undefined>();
   const [offerReset, setOfferReset] = useState(false);
   const [signingUp, setSigningUp] = useState(false);
@@ -134,7 +136,8 @@ export function IdpAuthorizeForm({
           setHandoff('update');
           return;
         case 'terms-required':
-          setHandoff('terms');
+          // The text itself is a second call; the effect below fetches it.
+          setTermsCode(outcome.code);
           return;
         case 'mfa-required':
           setHandoff('mfa');
@@ -199,6 +202,51 @@ export function IdpAuthorizeForm({
       cancelled = true;
     };
   }, [apply, client, passkey]);
+
+  /** The terms themselves, once the provider says they are what is missing. */
+  useEffect(() => {
+    if (!termsCode) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const latest = await client.terms();
+        if (cancelled) return;
+        if (!latest) {
+          // 204: a deployment withdrew its terms between refusing this login
+          // and being asked for them. Nothing to accept, so try the login again.
+          setTermsCode(undefined);
+          setError('The terms changed while you were signing in. Try again.');
+          return;
+        }
+        setTerms(latest);
+      } catch (cause: unknown) {
+        if (cancelled) return;
+        setTermsCode(undefined);
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, termsCode]);
+
+  const answerTerms = useCallback(
+    async (accept: boolean) => {
+      if (!termsCode || !terms) return;
+      setBusy(true);
+      try {
+        const outcome = await client.answerTerms(accept, termsCode, terms.ts);
+        setTermsCode(undefined);
+        setTerms(undefined);
+        apply(outcome);
+      } catch (cause: unknown) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [apply, client, terms, termsCode],
+  );
 
   const submit = useCallback(
     async (event: React.FormEvent) => {
@@ -302,6 +350,17 @@ export function IdpAuthorizeForm({
       setBusy(false);
     }
   }, [client, email, params.redirectUri, solver]);
+
+  if (terms) {
+    return (
+      <IdpTerms
+        terms={terms}
+        busy={busy}
+        onAccept={() => void answerTerms(true)}
+        onDecline={() => void answerTerms(false)}
+      />
+    );
+  }
 
   // The browser's own dialogue is already up; this only says what it is for.
   if (passkey) {
