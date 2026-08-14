@@ -42,7 +42,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 axum = { version = "0.8", features = ["ws"] }
 # The two layers that bound a request: a deadline, and a panic that must become
 # a response instead of a dropped connection.
-tower-http = { version = "0.6", features = ["catch-panic", "timeout"] }
+tower-http = { version = "0.6", features = ["catch-panic", "timeout", "fs"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
 # Every managed Postgres (RDS, Cloud SQL, Neon, Supabase) requires TLS, so the
 # engine has to be able to speak it. `ring` is the provider reqwest's rustls

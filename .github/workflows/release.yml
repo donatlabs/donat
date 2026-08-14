@@ -221,6 +221,28 @@ jobs:
           grep -q 'x-donat-role header is required' <<< "$refusal" \
             || { echo "expected the role-required refusal, got: $refusal"; exit 1; }
 
+      # The image carries the admin panel and serves it itself, so the release
+      # has to prove both halves of that: the panel is reachable, and it has
+      # not swallowed the engine's own paths. A single-page app answers every
+      # unmatched path with its HTML, and the failure that would cause is
+      # silent — a wrong API URL returning a page and HTTP 200.
+      - name: The published image must serve the panel, and only the panel
+        working-directory: examples/petshop-rest
+        run: |
+          page=$(curl -sf -m 5 localhost:8080/)
+          grep -qi '<!doctype html' <<< "$page" \
+            || { echo "expected the panel at /, got: $(head -c 120 <<< "$page")"; exit 1; }
+
+          # A route the panel reaches by a whole page load rather than by its
+          # own router: the engine redirects an emailed reset link here.
+          curl -sf -m 5 localhost:8080/account >/dev/null \
+            || { echo "the panel's own routes must survive a hard load"; exit 1; }
+
+          # And a path that is the engine's stays the engine's, wrong or right.
+          status=$(curl -s -o /dev/null -w '%{http_code}' -m 5 localhost:8080/v1/graphqlx)
+          test "$status" = 404 \
+            || { echo "a mistyped engine path answered $status, not 404"; exit 1; }
+
       - name: Engine logs on failure
         if: failure()
         working-directory: examples/petshop-rest

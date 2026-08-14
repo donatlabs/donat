@@ -175,6 +175,39 @@ jobs:
             --test tandt_clickhouse_contract -- \
             --test-threads=1 --nocapture
 
+  admin-panel:
+    name: Admin panel (types, tests, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Its own npm project, outside the Cargo workspace and outside `make test`
+    # — which until now meant outside CI as well. That stopped being tolerable
+    # when the engine's image began building the panel into itself: a panel
+    # that does not compile is now an engine image that does not build, and the
+    # first place anyone would find out was a release.
+    #
+    # The build is here for the same reason the tests are. `tsc` and `vitest`
+    # both pass on code Vite refuses, and it is Vite's output the engine
+    # serves.
+    defaults:
+      run:
+        working-directory: apps/admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/admin/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Unit and mount tests
+        run: npm test
+      # `build` is `tsc --noEmit && vite build`, so this is the type check too.
+      # Both are here because they disagree: code `tsc` accepts, Vite can still
+      # refuse, and it is Vite's output the engine serves.
+      - name: Types and build
+        run: npm run build
+
   go-sdk:
     name: Go SDK (cgo-free, tests)
     runs-on: ubuntu-latest

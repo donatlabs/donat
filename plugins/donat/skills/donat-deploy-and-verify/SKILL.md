@@ -61,6 +61,7 @@ The ones that shape behaviour rather than merely point at things:
 | `DONAT_GRAPHQL_JWT_SECRET` | JWT verification config — how role and session variables are established |
 | `DONAT_GRAPHQL_AUTH_HOOK` | a service that resolves the session instead, given the request's headers |
 | `DONAT_OIDC` | the engine's own browser login: `/auth/login`, `/auth/callback`, `/auth/logout` |
+| `DONAT_ADMIN_DIR` | a directory of built platform-UI files the engine serves itself; unset or empty serves none |
 | `DONAT_GRAPHQL_ENABLED_APIS` | restrict the mounted surfaces, e.g. `graphql` |
 | `DONAT_GRAPHQL_ENABLE_ALLOWLIST` | serve only saved operations |
 | `DONAT_REQUEST_TIMEOUT_SECONDS`, `DONAT_PG_STATEMENT_TIMEOUT_SECONDS` | request and statement bounds |
@@ -73,6 +74,16 @@ The ones that shape behaviour rather than merely point at things:
 
 Secrets referenced from metadata (`value_from_env:`) are read from the same
 environment. Never put a credential in a metadata file.
+
+`DONAT_ADMIN_DIR` is why a stand can be one container. The engine serves those
+files as a router fallback — after every one of its own paths, never in front
+of one — so the platform UI, the API and the identity provider proxy are one
+origin without a reverse proxy in front of anything. That matters for signing
+in rather than for tidiness: the provider's session cookie is `__Host-`-prefixed
+and it compares `Origin` against its own public URL, so a login page served
+from a second origin is refused. Serving the UI elsewhere is still supported —
+leave the variable unset and put a proxy in front — but then the origin is
+yours to keep consistent.
 
 ## Authentication and roles
 

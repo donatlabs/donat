@@ -78,7 +78,7 @@ explicitly permits, and it was built alongside this panel; see
 
 | Option | Why Not |
 |--------|---------|
-| Serve the panel from the engine (an `/admin` route on `crates/server`) | The engine would then have a surface whose only purpose is administration, which is the shape the no-admin-role rule exists to prevent — and the first request after that is "let it edit metadata". Static assets are also not a thing this binary should be in the business of serving. |
+| Serve the panel from the engine (an `/admin` route on `crates/server`) | The engine would then have a surface whose only purpose is administration, which is the shape the no-admin-role rule exists to prevent — and the first request after that is "let it edit metadata". Static assets are also not a thing this binary should be in the business of serving. **Amended 2026-08-14, see below.** |
 | Generate the panel from metadata at runtime | Requires the engine to publish its per-role permissions over HTTP. That is a new privileged read surface, and it re-creates the admin API by another name. The declarations are cheap; the surface is not. |
 | Build the front end from scratch instead of on `@refinest/*` | The framework's data-provider seam is precisely the boundary this needs, and the reference provider was already ~900 lines of Hasura-shaped GraphQL that donat answers unchanged. Rewriting list/filter/sort/pagination/forms to reach the same place is weeks against days. |
 | Use the `refine` ecosystem (or another off-the-shelf admin) | Nothing off the shelf is closer: the shipped Hasura providers assume Hasura's admin secret and its introspection habits, and both are things this engine deliberately does not have. |
@@ -104,3 +104,50 @@ than a gap: a deployment with no way to say who someone is has no business
 having an operator console. It also means the panel cannot be demonstrated
 without one, which is part of why the example now runs its IdP as an ordinary
 service rather than behind an opt-in profile.
+
+## Amendment, 2026-08-14: the engine may serve the files
+
+`DONAT_ADMIN_DIR` names a directory of built panel files, and the engine serves
+them as a router *fallback* — after every one of its own routes, never in front
+of one. Unset, nothing is mounted, which stays the default.
+
+**The first objection stands and is not what changed.** It is about power: a
+surface that administers. None is granted here. What is served is HTML,
+JavaScript and CSS; the panel is still an ordinary client of `/v1/graphql`,
+still holds no credential, still gets its role from a verified token, and still
+sees exactly what a per-role permission in somebody's YAML allows. There is
+still no admin role, no admin API, and no way for the panel to read this
+engine's permissions — and "let it edit metadata" is refused for the same
+reason it always was.
+
+**The second objection is what changed.** "This binary should not be in the
+business of serving static assets" was written when the engine served no
+browser-facing pages at all. It now serves `/auth/login`, `/auth/callback` and
+`/auth/session`, proxies the whole provider API at `/auth/v1`
+([[002-the-login-screen-is-ours-the-login-protocol-is-the-providers]]), and
+redirects a browser to `/idp/reset/…` — a *panel path*. It already assumes a
+panel exists at a known address. Serving that panel is a smaller assumption
+than pointing at one.
+
+What it buys is the thing the login work depends on: **one origin, without
+anybody configuring it**. The provider's session cookie is `__Host-`-prefixed
+and it compares `Origin` against its own public URL, so the panel, the provider
+proxy and the engine must look like one address to a browser. Until now that
+was a reverse proxy's job and a `DONAT_UPSTREAM` for a deployment to get right;
+the failure mode when it is wrong is a login that refuses everything with no
+explanation. Served from the engine, there is nothing to get right.
+
+**The trap, and the guard.** A single-page application answers every unmatched
+path with `index.html`, so without care a mistyped `/v1/graphqlx` returns HTML
+and HTTP 200 — and whoever typed it goes hunting for a bug in their client.
+`donat_server::panel` keeps the list of paths that stay the engine's, matched on
+whole segments, and answers 404 for them. That list is tested in both
+directions, including that `/healthzz` and `/v1beta` are nobody's endpoints.
+
+**What we still pay.** The engine's Docker image now has a reason to contain
+the panel's build output, so the image build gains a JavaScript step even
+though `cargo build` does not: the directory is read at runtime, so the Rust
+build stays a Rust build and CI does not grow a node toolchain to compile the
+engine. A deployment that wants the panel elsewhere — a CDN, its own nginx —
+leaves `DONAT_ADMIN_DIR` unset and nothing about this exists.
+

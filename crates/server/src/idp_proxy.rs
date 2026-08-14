@@ -110,11 +110,28 @@ pub fn forwarded_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> 
 /// then makes the very same request itself, so the binding cookie that request
 /// sets is still set, on the same origin, before anything is changed.
 ///
+/// **Only a navigation.** That last sentence is the trap: the panel's own
+/// request has the same method and the same path as the link in the email, so
+/// redirecting on those alone sends the panel's `fetch` back to the panel,
+/// which answers with its own HTML, which carries none of the values the reset
+/// needs — and the screen reports a spent link for every reset there is.
+/// `Sec-Fetch-Dest: document` is what separates the two: a browser being sent
+/// somewhere sets it, and a `fetch` sets `empty`. A client that sends neither
+/// gets what it got before this existed, the provider's own page, which is a
+/// worse screen rather than a broken one.
+///
 /// Only `GET`, and only that exact shape. The `PUT /users/{id}/reset` that
 /// performs the change carries the same prefix and must still reach the
 /// provider.
-fn panel_password_reset(method: &Method, path: &str) -> Option<String> {
+fn panel_password_reset(method: &Method, headers: &HeaderMap, path: &str) -> Option<String> {
     if method != Method::GET {
+        return None;
+    }
+    let navigating = headers
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("document"));
+    if !navigating {
         return None;
     }
     let rest = path.strip_prefix(PREFIX)?.strip_prefix("/users/")?;
@@ -151,7 +168,7 @@ pub async fn forward(
         .unwrap_or(uri.path());
 
     // The one path we answer ourselves rather than forwarding.
-    if let Some(target) = panel_password_reset(&method, uri.path()) {
+    if let Some(target) = panel_password_reset(&method, &headers, uri.path()) {
         return Redirect::to(&target).into_response();
     }
 
@@ -320,20 +337,30 @@ mod tests {
     /// The `PUT` that performs the change shares the prefix and most of the
     /// path, and it must still reach the provider — redirecting it would turn
     /// a password change into a page load and lose the change.
+    fn navigation() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-dest", HeaderValue::from_static("document"));
+        headers
+    }
+
     #[test]
     fn a_reset_link_lands_on_the_panel_and_nothing_else_does() {
         assert_eq!(
-            panel_password_reset(&Method::GET, "/auth/v1/users/u-1/reset/link-1"),
+            panel_password_reset(
+                &Method::GET,
+                &navigation(),
+                "/auth/v1/users/u-1/reset/link-1"
+            ),
             Some("/idp/reset/u-1/link-1".to_string())
         );
 
         // The change itself, which happens to be one path segment shorter.
         assert_eq!(
-            panel_password_reset(&Method::PUT, "/auth/v1/users/u-1/reset"),
+            panel_password_reset(&Method::PUT, &navigation(), "/auth/v1/users/u-1/reset"),
             None
         );
         assert_eq!(
-            panel_password_reset(&Method::GET, "/auth/v1/users/u-1/reset"),
+            panel_password_reset(&Method::GET, &navigation(), "/auth/v1/users/u-1/reset"),
             None
         );
         // Everything else the provider serves under the same prefix.
@@ -344,7 +371,37 @@ mod tests {
             "/auth/v1/users/u-1/reset/link-1/extra",
             "/auth/v1/users//reset/link-1",
         ] {
-            assert_eq!(panel_password_reset(&Method::GET, path), None, "{path}");
+            assert_eq!(
+                panel_password_reset(&Method::GET, &navigation(), path),
+                None,
+                "{path}"
+            );
         }
+    }
+
+    /// The panel's own request for that link must reach the provider.
+    ///
+    /// It is the same method and the same path as the link in the email — that
+    /// is the point of it, since it is what plants the binding cookie — so a
+    /// rule written on method and path alone sends it back to the panel, which
+    /// answers with its own HTML, and every reset there is reports a spent
+    /// link. Only a navigation is redirected.
+    #[test]
+    fn the_panels_own_fetch_for_the_same_link_is_not_redirected() {
+        let path = "/auth/v1/users/u-1/reset/link-1";
+
+        let mut fetched = HeaderMap::new();
+        fetched.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
+        assert_eq!(panel_password_reset(&Method::GET, &fetched, path), None);
+
+        // A client that says nothing gets what it got before this existed: the
+        // provider's own page. A worse screen, not a broken one.
+        assert_eq!(
+            panel_password_reset(&Method::GET, &HeaderMap::new(), path),
+            None
+        );
+
+        // And a browser opening the link still lands here.
+        assert!(panel_password_reset(&Method::GET, &navigation(), path).is_some());
     }
 }

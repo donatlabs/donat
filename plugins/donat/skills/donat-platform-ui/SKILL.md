@@ -214,6 +214,33 @@ Note the ratio: the four pages and `app.tsx` are written once and then left
 alone; everything after that is `resources/*.ts`. If a change makes you edit a
 page, ask first whether it belongs in the config.
 
+## Serving it
+
+Build it, and point the engine at the output:
+
+```
+DONAT_ADMIN_DIR=/usr/share/donat/admin
+```
+
+The engine serves those files as a router fallback — after every one of its own
+paths, never in front of one — so one container and one process carry the API
+and the UI. Unset or empty, it serves none, which is what a deployment putting
+the UI on a CDN would do.
+
+Reach for that before reaching for a reverse proxy, because the reason is not
+tidiness. Requests the UI makes are relative (`/v1/graphql`, `/auth/v1`), the
+engine's session cookie only comes back to the origin that set it, and an
+identity provider behind `/auth/v1` compares `Origin` against its own public
+URL and sets a `__Host-`-prefixed cookie. All three want one origin. Served by
+the engine, there is nothing to configure and so nothing to configure wrongly;
+served separately, a `DONAT_UPSTREAM` pointing at the wrong place is a login
+that refuses everything without saying why.
+
+One thing to know before publishing an image: Vite inlines `VITE_*` at build
+time, so the role the UI asserts is baked in. An image meant for more than one
+deployment either takes it as a build argument or reads it from
+`/auth/session`, which already reports the roles the caller's token granted.
+
 For the donat side of the wiring — roles, headers and what the provider talks
 to — see
 [`examples/petshop-rest`](https://github.com/donatlabs/donat/tree/main/examples/petshop-rest),

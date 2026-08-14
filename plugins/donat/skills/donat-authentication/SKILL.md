@@ -169,7 +169,14 @@ Recommend one, name the cost of the alternative, move on.
    its `cookie` equal to the JWT config's cookie name, `cookie_secure` on
    anywhere but a plain-HTTP stand, and `session_token` naming the token your
    provider actually puts the roles in (`access_token` or `id_token`).
-8. Verified with a real token: the right rows for one user, **nothing** for
+8. **One origin** for a browser stand: the UI, `/auth/*` and — where the
+   provider is proxied — `/auth/v1/*` on the same scheme, host and port. A
+   session cookie only returns to the origin that set it, and a provider
+   checking `Origin` against its own public URL refuses anything else. The
+   engine can serve the UI itself (`DONAT_ADMIN_DIR`), which makes this true by
+   construction; a reverse proxy in front of two containers makes it true by
+   configuration, and that configuration is a thing to get wrong.
+9. Verified with a real token: the right rows for one user, **nothing** for
    another user's rows, and a denial when asking for a role the token does not
    carry.
 
