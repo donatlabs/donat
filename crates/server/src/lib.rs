@@ -26,6 +26,7 @@ pub mod local;
 pub mod mcp;
 pub mod migrate;
 pub mod oidc;
+pub mod panel;
 pub mod pgtls;
 pub mod processes;
 pub mod remote;

@@ -62,9 +62,11 @@ ring = { workspace = true }
 base64 = { workspace = true }
 hmac = "0.12"
 url = "2"
+# Already in the tree under axum and tower-http; named here because the admin
+# panel's fallback drives a `ServeDir` by hand (`panel.rs`).
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 insta = { workspace = true }
 # The SDK's local provider stub: an integration test asserts the exact request
 # that reached the wire, including the applied credential header. The feature is

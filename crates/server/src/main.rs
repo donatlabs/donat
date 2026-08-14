@@ -1004,6 +1004,15 @@ async fn main() -> anyhow::Result<()> {
         mcp = enabled_apis.mcp,
         "enabled API surfaces"
     );
+    // The admin panel, when a deployment names a directory for it. A fallback
+    // rather than a route, so nothing above can be shadowed by it, and it
+    // grants nothing — see `donat_server::panel`, which is also where the list
+    // of paths that stay the engine's lives.
+    if let Some(dir) = donat_server::panel::configured() {
+        tracing::info!(target: "donat::panel", %dir, "serving the admin panel");
+        app = donat_server::panel::serve(app, &dir);
+    }
+
     // Outermost, so it also catches a panic raised inside the layers above,
     // and so every log line a request produces — including the panic — carries
     // the request's own span.
