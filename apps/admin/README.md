@@ -130,11 +130,32 @@ account with a passkey and no password never sees a password field. The screen
 also carries the rest of what happens around a login — a reset link on request,
 "too many attempts" with the time it will listen again, and (behind
 `VITE_DONAT_IDP_REGISTRATION`, because the provider decides and announces it
-nowhere) creating an account. A passkey,
-new terms or a forced enrolment are separate screens with their own protocols,
-so this page hands those over to the provider's own page rather than
-half-implementing them — one proxied request away, carrying the same
-authorization request.
+nowhere) creating an account.
+
+**Everything else on the way in is here too.** A passkey is signed on this page
+(`webauthn_start`, `navigator.credentials.get`, `webauthn_finish` — the same
+three calls, in the same order); new terms are read and accepted on this page,
+with declining offered exactly while the provider's `opt_until` still allows
+it; and the reset link an email carries lands on `/idp/reset/…`, because the
+engine turns the provider's own URL into that one. Two answers are not sign-in
+steps at all — an application that demands a second factor the account has not
+got, and an account the provider wants updated first — and for those the
+provider's own page points at the account screen. So do we. The difference is
+that the account screen is ours now.
+
+## Your account
+
+`/account` replaces the provider's `/auth/v1/account`: profile, password and
+passkeys, with the password form stating every unmet rule at once from the
+provider's `/password_policy` rather than one refusal at a time.
+
+It talks to the provider **directly**, on the session cookie of the browser
+that signed in — not through the engine, the way the Identity screens do. Those
+act as the deployment and can reach any account; this one acts as a person and
+can only ever reach their own, because the only thing it holds is their
+session. It also sits outside the guarded shell, since two of the three ways in
+are mid-login, when there is a provider session and no engine one. See
+[ADR platform/004](../../knowledgebase/platform/decisions/004-the-account-screens-act-as-the-person-the-identity-screens-act-as-the-deployment.md).
 
 It needs three things:
 

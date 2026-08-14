@@ -43,11 +43,13 @@ import { IDP_BASE, IDP_REGISTRATION } from '../env';
  * at once — the markup here follows that component's structure closely so the
  * two look like one interface.
  *
- * **What this page does not do.** A passkey, a terms update and a forced
- * enrolment are separate screens with their own protocols. Rather than
- * half-implement them, this page hands over to the provider's page — one
- * proxied request away, carrying the same authorization request — so those
- * accounts sign in correctly rather than almost.
+ * **Everything that can happen on the way in happens here.** A passkey is
+ * signed on this page, new terms are read on this page, and a reset link from
+ * an email lands on one of ours. Two answers are not sign-in steps at all: an
+ * application demanding a second factor the account has not got, and an
+ * account the provider wants updated first. Its own login page does not handle
+ * those either — it points at the account screen, and so do we, except that
+ * the account screen is now ours as well.
  */
 
 type Handoff = 'update' | 'mfa';
