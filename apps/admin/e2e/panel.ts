@@ -40,7 +40,7 @@ export const OPERATOR = {
 };
 
 /** The role the panel acts as, which is also the role a fixture must grant. */
-export const OPERATOR_ROLE = process.env.PANEL_ROLE ?? 'support';
+export const OPERATOR_ROLE = process.env.PANEL_ROLE ?? 'rauthy_admin';
 
 /**
  * Sign in through the real screen.

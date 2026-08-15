@@ -9,7 +9,11 @@ COPY . .
 # The default is relative on purpose — nginx proxies it to the engine below, so
 # the panel and the engine share an origin whatever port the host publishes.
 ARG VITE_DONAT_GRAPHQL_URL=/v1/graphql
-ARG VITE_DONAT_ROLE=admin
+# Empty: the panel sends no `X-Donat-Role` and acts as whatever the
+# token says. Naming one here is for an account holding several roles,
+# where the panel should act as a particular one — and it has to be a
+# role that account actually holds, or every screen is refused.
+ARG VITE_DONAT_ROLE=
 # The deployments this build serves; see .env.example.
 ARG VITE_DONAT_STANDS=
 # Where /idp/authorize reaches the identity provider's API. Relative, because

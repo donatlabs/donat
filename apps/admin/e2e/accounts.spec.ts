@@ -57,8 +57,12 @@ test('an account without the panel\'s role is told so, not shown an error', asyn
 
     // Signed in — the provider minted a token — and still refused here, with
     // the reason and the only action that helps.
+    //
+    // The panel asserts no role of its own, so the reason is not a mismatch
+    // with one: it is that this account was granted nothing at all, which is
+    // the case worth catching whether or not a stand names a role.
     await expect(theirs.getByTestId('wrong-role')).toBeVisible({ timeout: 30_000 });
-    await expect(theirs.getByTestId('wrong-role')).toContainText(OPERATOR_ROLE);
+    await expect(theirs.getByTestId('wrong-role')).toContainText(/no roles/i);
     await expect(theirs.getByTestId('wrong-role-sign-out')).toBeVisible();
     await expect(theirs.getByText(/something went wrong/i)).toHaveCount(0);
     await other.close();

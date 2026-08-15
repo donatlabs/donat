@@ -115,6 +115,9 @@ export default function AppShell({ children }: { children: ReactNode }): React.R
   const { stand } = useStand();
   const location = useLocation();
   const [checked, setChecked] = useState(false);
+  // What the engine says this session is acting as, for the places that
+  // display it. A stand that names no role learns it only from the session.
+  const [sessionRole, setSessionRole] = useState('');
   // Set when the caller is signed in but their token does not grant the role
   // this stand runs as. Not an error: an answer.
   const [wrongRole, setWrongRole] = useState<{ wanted: string; granted: string[] } | undefined>();
@@ -147,9 +150,20 @@ export default function AppShell({ children }: { children: ReactNode }): React.R
       // An engine that says nothing is not second-guessed; one that sends a
       // list this stand's role is not in is answered — including the empty
       // list, which is an account the provider gave no roles at all.
-      if (session.roles && !session.roles.includes(stand.role)) {
-        setWrongRole({ wanted: stand.role, granted: [...session.roles] });
+      // Two different refusals, and both are worth saying rather than letting
+      // every request fail on its own.
+      //
+      // A stand that names a role can predict a mismatch. One that names none
+      // acts as whatever the token says, so there is nothing to disagree with
+      // — except an account the provider granted *nothing*, which can
+      // authenticate and still act as no one. That one is worth catching
+      // whether or not a role was named.
+      if (session.roles) {
+        const granted = [...session.roles];
+        const refused = stand.role ? !granted.includes(stand.role) : granted.length === 0;
+        if (refused) setWrongRole({ wanted: stand.role, granted });
       }
+      setSessionRole(session.role ?? '');
       setChecked(true);
     });
     return () => {
@@ -170,8 +184,14 @@ export default function AppShell({ children }: { children: ReactNode }): React.R
       <div className="mx-auto max-w-md space-y-4 p-10" data-testid="wrong-role">
         <h1 className="font-semibold text-xl">This account cannot use the panel</h1>
         <p className="text-muted-foreground text-sm">
-          It is signed in, but the panel acts as <code>{wrongRole.wanted}</code> and this account
-          holds{' '}
+          It is signed in, but{' '}
+          {wrongRole.wanted ? (
+            <>
+              the panel acts as <code>{wrongRole.wanted}</code> and this account holds{' '}
+            </>
+          ) : (
+            <>this account holds{' '}</>
+          )}
           {wrongRole.granted.length ? (
             <>
               only{' '}
@@ -208,9 +228,9 @@ export default function AppShell({ children }: { children: ReactNode }): React.R
           nav={<NavMain topLabel={null} currentPath={location.pathname} />}
           footer={
             <NavUser
-              name={stand.role}
+              name={stand.role || sessionRole || 'signed in'}
               email="engine session"
-              avatarFallback={stand.role.slice(0, 2).toUpperCase()}
+              avatarFallback={(stand.role || sessionRole || '?').slice(0, 2).toUpperCase()}
               menu={
                 /* The account screen replaces the provider's own page, so the
                    way to it belongs where somebody looks for themselves. */
@@ -228,7 +248,7 @@ export default function AppShell({ children }: { children: ReactNode }): React.R
           breadcrumbs={<AppBreadcrumbs />}
           actions={
             <>
-              <Badge variant="outline">role: {stand.role}</Badge>
+              <Badge variant="outline">role: {stand.role || sessionRole || '—'}</Badge>
               <RefreshButton />
             </>
           }

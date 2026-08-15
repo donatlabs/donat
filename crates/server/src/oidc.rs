@@ -231,7 +231,11 @@ impl OidcConfig {
                 parsed.admin_key.filter(|v| !v.is_empty()),
                 parsed.admin_role.filter(|v| !v.is_empty()),
             ) {
-                (Some(key), Some(role)) => {
+                // The role is what mounts these fields, and it is what decides
+                // who sees them. A key is optional beside it: with one, the
+                // fields act as the deployment; without, they act as whoever
+                // is signed in, on the session their browser already holds.
+                (key, Some(role)) => {
                     // Rauthy serves its admin API under `/auth/v1` of the same
                     // origin the login API is on, so a deployment that named
                     // one has already named the other.
@@ -241,7 +245,8 @@ impl OidcConfig {
                             Some(origin) => format!("{origin}/auth/v1"),
                             None => {
                                 return Err(OidcConfigError(
-                                    "admin_key needs an admin_api (or a login_api to derive it from)"
+                                    "admin_role needs an admin_api (or a login_api to derive it \
+                                     from) to reach the provider with"
                                         .to_string(),
                                 ));
                             }
@@ -250,10 +255,10 @@ impl OidcConfig {
                     Some(crate::idp_admin::IdpAdmin { api, key, role })
                 }
                 (None, None) => None,
-                _ => {
+                (Some(_), None) => {
                     return Err(OidcConfigError(
-                        "admin_key and admin_role are set together or not at all: a key with \
-                         nobody allowed to use it does nothing, and a role with no key cannot work"
+                        "admin_key with no admin_role: a credential nobody is allowed to use \
+                         does nothing"
                             .to_string(),
                     ));
                 }
@@ -423,6 +428,72 @@ impl FlatConfig {
             return Ok(None);
         }
         Ok(Some(serde_json::Value::Object(object).to_string()))
+    }
+}
+
+impl OidcConfig {
+    /// The JWT configuration this provider's tokens need, when none was given.
+    ///
+    /// A deployment that names a provider has already said everything token
+    /// verification needs, in the words of the login rather than the words of
+    /// the verifier: where the provider is, which client this is, and which
+    /// cookie the session lands in. Writing it twice is a second chance to
+    /// write it differently — and the two halves disagreeing produces a login
+    /// that succeeds and a request that is then refused, which reads like a
+    /// permission problem and is not one.
+    ///
+    /// **Only when `login_api` is set.** That field already means more than an
+    /// address: it says this provider serves its login API under `/auth/v1`,
+    /// which is Rauthy's shape, and `admin_api` is already derived from it on
+    /// exactly that premise. Everything below inherits the same premise rather
+    /// than adding a new one. A provider shaped differently names its own
+    /// `DONAT_GRAPHQL_JWT_SECRET`, as it always could.
+    ///
+    /// **Only when there is no JWT configuration at all.** Never completing a
+    /// partial one: today an absent `audience` means *do not check the
+    /// audience* and an absent `header` means *read a bearer token*, so
+    /// filling those in would tighten verification for a deployment that is
+    /// working, which is somebody's outage rather than our tidiness.
+    ///
+    /// Every guess here fails loudly. A wrong issuer or audience makes the
+    /// provider's own tokens invalid; a wrong claim path leaves somebody with
+    /// no role and a refusal. None of them quietly grants anything — which is
+    /// the property that makes a default acceptable at all.
+    pub fn derived_jwt(&self) -> Option<String> {
+        let login_api = self.login_api.as_deref()?;
+        // The issuer is what the provider stamps, and it stamps the address a
+        // browser reaches it on — the same origin it sends people to sign in.
+        let public = url::Url::parse(&self.authorization_endpoint).ok()?;
+        let origin = format!(
+            "{}://{}",
+            public.scheme(),
+            public.host_str().map(|host| match public.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            })?
+        );
+        Some(
+            serde_json::json!({
+                "jwk_url": format!("{login_api}/auth/v1/oidc/certs"),
+                "issuer": format!("{origin}/auth/v1/"),
+                // The token is issued to this client, so this client is its
+                // audience. Nothing else would be.
+                "audience": self.client_id,
+                // The same cookie `/auth/callback` writes. These two names
+                // being one value is the point: separately, a login can
+                // succeed into a cookie the verifier never reads.
+                "header": {"type": "Cookie", "name": self.cookie},
+                // Where a deployment's roles live in a token. This is the
+                // common shape and the one this engine's own provider uses; a
+                // provider that namespaces its claims says so itself.
+                "claims_map": {
+                    "x-donat-allowed-roles": {"path": "$.roles"},
+                    "x-donat-default-role": {"path": "$.roles[0]"},
+                    "x-donat-user-id": {"path": "$.sub", "default": ""}
+                }
+            })
+            .to_string(),
+        )
     }
 }
 
@@ -995,6 +1066,61 @@ pub async fn logout(State(state): State<crate::state::SharedState>) -> Response 
 
 #[cfg(test)]
 mod tests {
+
+    fn oidc(login_api: Option<&str>) -> OidcConfig {
+        let mut object = serde_json::json!({
+            "authorization_endpoint": "http://localhost:5180/idp/authorize",
+            "token_endpoint": "http://idp:8080/auth/v1/oidc/token",
+            "client_id": "donat-admin",
+            "redirect_uri": "http://localhost:5180/auth/callback",
+            "cookie": "donat_session",
+        });
+        if let Some(api) = login_api {
+            object["login_api"] = serde_json::Value::String(api.to_string());
+        }
+        OidcConfig::from_env_value(&object.to_string()).expect("it parses")
+    }
+
+    /// A named provider says everything token verification needs, once.
+    #[test]
+    fn a_named_provider_supplies_the_jwt_configuration() {
+        let derived: serde_json::Value = serde_json::from_str(
+            &oidc(Some("http://idp:8080"))
+                .derived_jwt()
+                .expect("derived"),
+        )
+        .expect("it is JSON");
+
+        assert_eq!(derived["jwk_url"], "http://idp:8080/auth/v1/oidc/certs");
+        // The issuer is the address a *browser* reaches the provider on, which
+        // is the origin people are sent to sign in at — not the one the engine
+        // uses to reach it.
+        assert_eq!(derived["issuer"], "http://localhost:5180/auth/v1/");
+        assert_eq!(derived["audience"], "donat-admin");
+        // One value, not two names that have to agree: a login that writes a
+        // cookie the verifier does not read succeeds and is then refused.
+        assert_eq!(
+            derived["header"],
+            serde_json::json!({"type": "Cookie", "name": "donat_session"})
+        );
+        assert_eq!(
+            derived["claims_map"]["x-donat-default-role"]["path"],
+            "$.roles[0]"
+        );
+
+        // And what it produces has to be a configuration, not just JSON.
+        crate::jwt::JwtConfig::from_env_value(&derived.to_string()).expect("it is usable");
+    }
+
+    /// Without `login_api` there is no premise to derive from.
+    ///
+    /// That field means more than an address — it says this provider serves
+    /// its login API under `/auth/v1`, which is what the derived paths assume.
+    /// A provider shaped differently gets nothing rather than a guess.
+    #[test]
+    fn a_provider_that_is_only_an_endpoint_gets_nothing() {
+        assert!(oidc(None).derived_jwt().is_none());
+    }
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |name: &str| {

@@ -153,13 +153,20 @@ services:
       # What the provider encrypts its own stored secrets with.
       ENC_KEYS: donat/${DONAT_IDP_ENC_KEY:?see .env.example}
       ENC_KEY_ACTIVE: donat
+      # Administering the provider normally needs a second factor, and it is
+      # right that it does: managing other people's identities with only a
+      # password is what that requirement exists to prevent. Off here so the
+      # example works on the first run — a passkey cannot be provisioned by a
+      # container, only created by a person in a browser, and the panel's
+      # account screen is where they would do it.
+      ADMIN_FORCE_MFA: "false"
       BOOTSTRAP_DIR: /bootstrap
       # The provider's own administrator, which is not the operator: this
       # account carries the provider's roles (`admin`, `rauthy_admin`), and
       # the first of them is what `x-donat-default-role` would read. The
       # operator is created below with exactly the role this deployment
       # declares.
-      BOOTSTRAP_ADMIN_EMAIL: admin@example.com
+      BOOTSTRAP_ADMIN_EMAIL: operator@example.com
       BOOTSTRAP_ADMIN_PASSWORD_PLAIN: ${DONAT_ADMIN_PASSWORD:?see .env.example}
       # The API key the engine administers this provider with — the one
       # credential it holds for the provider, and the whole reason the panel
@@ -187,30 +194,6 @@ services:
       - ./deploy/bootstrap:/bootstrap:ro
       - rauthy:/app/data
 
-  # One-shot: create the operator this deployment signs in as.
-  #
-  # Not `deploy/bootstrap/users.json`, which is where this lived and could not
-  # stay: that file requires a `password` field, so declaring the operator
-  # there meant either committing a working password or a stack that panics on
-  # first start. It panicked — and only on a *first* start, which is why it
-  # went unnoticed: bootstrap files apply solely to an empty database.
-  #
-  # Idempotent, and it runs on every `up`, so editing `.env` does what it looks
-  # like it does.
-  operator:
-    image: python:3.13-alpine
-    depends_on:
-      rauthy:
-        condition: service_started
-    environment:
-      IDP_API: http://rauthy:8080/auth/v1
-      IDP_ADMIN_KEY: API-Key donat$$${DONAT_IDP_ADMIN_SECRET:?see .env.example}
-      OPERATOR_PASSWORD: ${DONAT_ADMIN_PASSWORD:?see .env.example}
-    volumes:
-      - ./deploy/provision-operator.py:/provision-operator.py:ro
-    command: ["python3", "/provision-operator.py"]
-    restart: "no"
-
   # Applies the engine's own schema — cron state, the event log, durable
   # process journals. Runs once and exits; the serving engine runs no DDL.
   migrate:
@@ -224,7 +207,6 @@ services:
         # first; different arguments would mean a different image depending on
         # the order, which is the kind of thing that is only ever discovered
         # once.
-        VITE_DONAT_ROLE: support
         VITE_DONAT_IDP_REGISTRATION: ${DONAT_IDP_REGISTRATION:-false}
     depends_on:
       postgres:
@@ -243,10 +225,6 @@ services:
     build:
       context: .
       args:
-        # The role this panel asserts. Naming it grants nothing: this engine
-        # has no admin role, and `X-Donat-Role` only selects among the roles a
-        # token already carries. What it may do is `deploy/metadata`.
-        VITE_DONAT_ROLE: support
         # Offering "create an account" is a second decision: the provider
         # decides whether anyone may (`OPEN_USER_REG`, off by default) and
         # announces it nowhere, so this only says whether to show the form.
@@ -260,8 +238,6 @@ services:
       migrate:
         condition: service_completed_successfully
       minio-init:
-        condition: service_completed_successfully
-      operator:
         condition: service_completed_successfully
     environment:
       DONAT_METADATA_DIR: /metadata
@@ -286,37 +262,34 @@ services:
       DONAT_OIDC_SCOPES: openid,profile,email
       # Off only because this stand is plain HTTP.
       DONAT_OIDC_COOKIE_SECURE: "false"
-      # A secret in its own variable rather than spliced into a JSON string —
-      # which is what it was, `$$` escaping and all. Now it can come from a
-      # file or a secret mount like any other credential.
+      # The credential the identity fields reach the provider with.
+      #
+      # It cannot be the caller's own session, and that is a fact about the
+      # provider rather than a choice: its cookie is issued with `Path=/auth`,
+      # so a browser never sends it to `/v1/graphql` and the engine has
+      # nothing to forward. Managing accounts as the person signed in means
+      # calling `/auth/v1/…` from the browser directly, the way the account
+      # screen already does.
+      #
       # `$$$` is `$$` (one literal dollar, which the provider's key format
-      # wants) followed by `${…}` (the interpolation). Two dollars would make
-      # the whole thing a literal, and the engine would authenticate with the
-      # text of a variable name.
+      # wants) followed by `${…}` — two would make the whole thing a literal.
       DONAT_OIDC_ADMIN_KEY: API-Key donat$$${DONAT_IDP_ADMIN_SECRET:?see .env.example}
-      # The one role allowed to manage accounts. That is the panel's whole
-      # Identity section — accounts, roles, groups, scopes, applications,
-      # attributes, blocked addresses, sessions — and there is no metadata for
-      # it: the declaration ships in the binary
-      # (crates/server/src/idp_admin.yaml).
-      DONAT_OIDC_ADMIN_ROLE: support
+      DONAT_OIDC_ADMIN_ROLE: rauthy_admin
 
       # A role comes from a verified token and from nothing else. No
       # unauthorized role is set, so a request with no session is refused
       # outright — this deployment has nothing public to show.
       #
-      # Still one object, because `claims_map` is the one thing no default can
-      # supply: it says where in *this* provider's token the roles are, and a
-      # guess would leave somebody role-less with nothing to read. The name and
-      # shape are the Donat v2 ones.
-      DONAT_GRAPHQL_JWT_SECRET: >-
-        {"jwk_url":"http://rauthy:8080/auth/v1/oidc/certs",
-        "issuer":"http://localhost:${DONAT_ADMIN_PORT:-5180}/auth/v1/",
-        "audience":"donat-admin",
-        "header":{"type":"Cookie","name":"donat_session"},
-        "claims_map":{"x-donat-allowed-roles":{"path":"$$.roles"},
-        "x-donat-default-role":{"path":"$$.roles[0]"},
-        "x-donat-user-id":{"path":"$$.sub","default":""}}}
+      # There is no `DONAT_GRAPHQL_JWT_SECRET` here on purpose. Naming a
+      # provider above says everything verification needs — where its keys
+      # are, which client this is, which cookie the session lands in — and the
+      # engine derives the rest rather than asking for it twice. Two halves
+      # that can disagree produce a login that succeeds and a request that is
+      # then refused, which reads like a permission problem and is not one.
+      #
+      # A provider shaped differently, or a deployment that wants different
+      # claim paths, sets that variable and this derivation steps aside.
+
       # The store in deploy/metadata/storage.yaml, and the secret its signed
       # URLs are minted with.
       DONAT_S3_KEY: ${DONAT_S3_KEY:?see .env.example}

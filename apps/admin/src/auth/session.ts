@@ -1,3 +1,4 @@
+import { csrfToken } from './csrf';
 /**
  * How a request from this panel is authenticated.
  *
@@ -70,8 +71,27 @@ export function createTransport(defaultRole: string = DONAT_ROLE): AuthTransport
     // stand IS a role: which one is asked for changes with the stand the
     // operator is looking at. It still only selects among the roles the
     // session's token already granted — asking for another is denied.
+    //
+    // Empty means *let the token decide*. A deployment that grants its
+    // operator exactly one role has nothing to select between, and asking it
+    // to name that role here is asking it to repeat, at build time, something
+    // the token already says — which then has to be kept in step with an
+    // identity provider it does not control. Sending no header is not a
+    // weaker request: the engine reads the token's own default role, and a
+    // role that token never granted is refused either way.
     authorize: (role = defaultRole) => ({
-      headers: { 'X-Donat-Role': role },
+      headers: {
+        ...(role ? { 'X-Donat-Role': role } : {}),
+        // The identity provider's CSRF token, when this browser has one.
+        //
+        // The identity fields reach the provider carrying *this* session
+        // rather than a credential of the deployment's, and the provider
+        // refuses a write from a session that cannot prove it meant to make
+        // it. The token is not a secret — it is proof the request came from a
+        // page, not from a link somebody was sent — and it is read from the
+        // provider's own `sessioninfo`, on this origin, by `csrf.ts`.
+        ...(csrfToken() ? { 'x-csrf-token': csrfToken()! } : {}),
+      } as Record<string, string>,
       credentials: 'include',
     }),
     async session() {

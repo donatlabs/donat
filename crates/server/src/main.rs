@@ -708,20 +708,15 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("DONAT_GRAPHQL_AUTH_HOOK_MODE").unwrap_or_else(|_| "GET".to_string());
         (url, mode)
     });
-    // A JWT configuration the engine cannot parse stops the boot. Dropping it
-    // would disable token verification without saying so, and every request
-    // would silently become the unauthorized role.
-    let jwt = std::env::var("DONAT_GRAPHQL_JWT_SECRET")
-        .ok()
-        .map(|raw| jwt::JwtConfig::from_env_value(&raw))
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("DONAT_GRAPHQL_JWT_SECRET is unusable: {e}"))?;
     // The login routes exist only where a provider is named. Like the JWT
     // configuration, an unusable value stops the boot rather than quietly
     // leaving the deployment without a way in.
     //
     // Either form: one JSON object, or a variable per field. `merge` puts them
     // together and refuses, by name, when both set the same one.
+    //
+    // Read before the JWT configuration because it can supply one: see
+    // `OidcConfig::derived_jwt`.
     let oidc_json = donat_server::oidc::FlatConfig::merge(
         std::env::var("DONAT_OIDC").ok().as_deref(),
         &|name: &str| std::env::var(name).ok(),
@@ -731,6 +726,32 @@ async fn main() -> anyhow::Result<()> {
         .map(|raw| donat_server::oidc::OidcConfig::from_env_value(&raw))
         .transpose()
         .map_err(|e| anyhow::anyhow!("DONAT_OIDC is unusable: {e}"))?;
+    // A JWT configuration the engine cannot parse stops the boot. Dropping it
+    // would disable token verification without saying so, and every request
+    // would silently become the unauthorized role.
+    //
+    // Absent, a named provider supplies one — the same facts, said once. What
+    // is derived and why it is safe to derive is `OidcConfig::derived_jwt`.
+    let jwt_raw = match std::env::var("DONAT_GRAPHQL_JWT_SECRET")
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+    {
+        Some(raw) => Some(raw),
+        None => match oidc.as_ref().and_then(|config| config.derived_jwt()) {
+            Some(derived) => {
+                tracing::info!(
+                    target: "donat::auth",
+                    "no DONAT_GRAPHQL_JWT_SECRET; verifying tokens as the configured provider issues them"
+                );
+                Some(derived)
+            }
+            None => None,
+        },
+    };
+    let jwt = jwt_raw
+        .map(|raw| jwt::JwtConfig::from_env_value(&raw))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("DONAT_GRAPHQL_JWT_SECRET is unusable: {e}"))?;
     require_a_way_to_answer(
         jwt.is_some(),
         auth_hook.is_some(),
