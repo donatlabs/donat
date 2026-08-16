@@ -42,7 +42,17 @@ pub struct IdpAdmin {
     /// The provider's admin API — for Rauthy, `<origin>/auth/v1`.
     pub api: String,
     /// The whole `Authorization` header value, e.g. `API-Key name$secret`.
-    pub key: String,
+    ///
+    /// Optional, and absent is the better deployment. With it, these fields
+    /// act as the *deployment*: one credential, the same for everybody the
+    /// role lets through. Without it, they act as the **person**, because the
+    /// engine forwards the session their browser already holds — the provider
+    /// then decides what they may do to whose account, which is the decision
+    /// it exists to make, and there is no key to store, rotate or leak.
+    ///
+    /// A key is still what a deployment reaches for when the panel must manage
+    /// accounts as something other than whoever is signed in.
+    pub key: Option<String>,
     /// The one role allowed to manage accounts. Naming it grants nothing on
     /// its own: the role still has to be in a caller's verified token.
     pub role: String,
@@ -65,11 +75,20 @@ pub fn module(config: &IdpAdmin) -> Result<(Vec<ActionEntry>, CustomTypes), Stri
             // A literal rather than `value_from_env`: the key arrives inside
             // `DONAT_OIDC`, and re-exporting it under a second name would be
             // one more place it can leak from.
-            action.definition.headers = vec![ActionHeader {
-                name: "Authorization".to_string(),
-                value: Some(config.key.clone()),
-                value_from_env: None,
-            }];
+            action.definition.headers = match &config.key {
+                Some(key) => vec![ActionHeader {
+                    name: "Authorization".to_string(),
+                    value: Some(key.clone()),
+                    value_from_env: None,
+                }],
+                None => Vec::new(),
+            };
+            // With no key of its own, the call carries the caller's — the
+            // session their browser is already holding for this provider. The
+            // engine forwards it only because it is the same origin it proxies
+            // for that browser anyway (`crates/server/src/action.rs`), so this
+            // reaches nothing the browser could not reach itself.
+            action.definition.forward_client_headers = config.key.is_none();
             action.permissions = vec![ActionPermission {
                 role: config.role.clone(),
             }];
@@ -137,7 +156,7 @@ mod tests {
     fn config() -> IdpAdmin {
         IdpAdmin {
             api: "http://idp:8080/auth/v1".to_string(),
-            key: "API-Key donat$secret".to_string(),
+            key: Some("API-Key donat$secret".to_string()),
             role: "support".to_string(),
         }
     }
@@ -163,6 +182,49 @@ mod tests {
         }
         for input in &types.input_objects {
             assert!(named.insert(input.name.clone()), "{} twice", input.name);
+        }
+    }
+
+    /// Without a key, the fields carry the caller's own session instead.
+    ///
+    /// That is the difference between managing accounts *as the deployment* —
+    /// one credential, the same for everybody the role lets through — and
+    /// managing them *as the person*, where the provider sees who is asking
+    /// and decides what they may do. The second needs no credential stored
+    /// anywhere, which is the better default when the panel's operator is
+    /// already the provider's administrator.
+    #[test]
+    fn no_key_means_acting_as_whoever_is_signed_in() {
+        let mut config = config();
+        config.key = None;
+        let (actions, _) = module(&config).expect("the declaration parses");
+
+        for action in &actions {
+            assert!(
+                action.definition.headers.is_empty(),
+                "{} still sends a credential of its own",
+                action.name
+            );
+            assert!(
+                action.definition.forward_client_headers,
+                "{} does not carry the caller's session",
+                action.name
+            );
+        }
+    }
+
+    /// And with one, nothing of the caller's travels.
+    #[test]
+    fn a_key_means_acting_as_the_deployment() {
+        let (actions, _) = module(&config()).expect("the declaration parses");
+
+        for action in &actions {
+            assert_eq!(action.definition.headers.len(), 1, "{}", action.name);
+            assert!(
+                !action.definition.forward_client_headers,
+                "{} forwards the caller's session as well as a key",
+                action.name
+            );
         }
     }
 

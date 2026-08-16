@@ -19,17 +19,30 @@ const str = (value: string | undefined, fallback: string): string =>
 export const GRAPHQL_URL = str(import.meta.env.VITE_DONAT_GRAPHQL_URL, '/v1/graphql');
 
 /**
- * The role this panel runs as, unless a stand names its own.
+ * The role this panel runs as — and by default, whichever one the token says.
  *
- * Every deployment calls its operator role something — `admin`, `support`,
- * `operator`, `staff` — so it is configuration, and the default is the word
- * most deployments use. Naming it here grants nothing: this engine has no
- * admin role, and the header only *selects* among the roles the signed-in
- * user's token already granted. What that role may do is decided entirely by
- * the per-role permissions in the deployment's own metadata; a role this panel
- * asserts but the deployment never declared simply sees nothing.
+ * Empty is the default, and it means "do not send `X-Donat-Role` at all". The
+ * engine then reads the token's own default role, which is the ordinary way a
+ * role is established here: the panel is a client like any other, and a client
+ * does not normally tell the server who it is.
+ *
+ * Naming one is for the case the header exists for — an account holding
+ * several roles, where the panel should act as a particular one. Two roles
+ * against one endpoint are two stands, so that is a stand's setting as much as
+ * a build's.
+ *
+ * Naming it grants nothing either way: this engine has no admin role, the
+ * header only *selects* among the roles the token already granted, and what a
+ * role may do is decided entirely by the per-role permissions in the
+ * deployment's own metadata.
+ *
+ * The default used to be a literal, and it cost more than it looks. A panel
+ * that asserts `support` needs a deployment whose operator holds `support`,
+ * which needs somebody to grant it, which needs an account that can already
+ * sign in — a circle the example broke with a one-shot container and a script.
+ * Sending no header removes the circle rather than automating it.
  */
-export const DONAT_ROLE = str(import.meta.env.VITE_DONAT_ROLE, 'admin');
+export const DONAT_ROLE = str(import.meta.env.VITE_DONAT_ROLE, '');
 
 /**
  * The engine's own login routes. `/auth/login` redirects to the configured

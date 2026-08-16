@@ -259,9 +259,31 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
         req = req.timeout(std::time::Duration::from_secs(seconds));
     }
     if action.definition.forward_client_headers {
+        // The caller's session travels only to the provider this engine
+        // already proxies for the same browser.
+        //
+        // A cookie is the one credential a browser attaches without being
+        // asked, so forwarding it to wherever an action points would let
+        // whoever wrote that metadata collect other people's sessions. Here
+        // the destination is not metadata's to choose: it is the origin named
+        // by `DONAT_OIDC`'s `login_api`, which this engine serves at
+        // `/auth/v1` on its own address. The browser can already call it there
+        // with this very cookie, so passing it along reaches nothing new — it
+        // only spares the panel from having to make that call itself.
+        //
+        // Which is what lets the identity fields act as the person signed in
+        // rather than as a credential of the deployment's: the provider sees
+        // their session and decides what they may do to whose account.
+        let proxied_origin = state
+            .oidc
+            .as_ref()
+            .and_then(|config| config.login_api.as_deref());
+        let to_the_provider = proxied_origin.is_some_and(|origin| base_url.starts_with(origin));
         for (name, value) in headers {
             let name = name.as_str();
-            if (is_session_header(name) || name == "authorization")
+            let session = is_session_header(name) || name == "authorization";
+            let browser = to_the_provider && (name == "cookie" || name == "x-csrf-token");
+            if (session || browser)
                 && let Ok(value) = value.to_str()
             {
                 req = req.header(name, value);

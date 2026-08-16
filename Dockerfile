@@ -13,19 +13,22 @@ RUN cargo build --release -p donat-server --bin donat
 # reverse proxy in front of anything. See
 # `knowledgebase/platform/decisions/001-*`, amended.
 #
-# `VITE_*` is inlined at build time, so the two settings that are a
-# deployment's own are build arguments. The defaults suit the common case: an
-# engine on the same origin, and the role name most deployments use. A
-# deployment that calls its operator something else builds this image itself —
-# one `--build-arg` — or leaves `DONAT_ADMIN_DIR` empty and serves the panel
-# however it likes.
+# `VITE_*` is inlined at build time, so a deployment's own settings are build
+# arguments. The defaults suit the common case: an engine on the same origin,
+# and no role asserted — the token says what the operator is, which is the
+# ordinary way a role is established here and the only one that needs no
+# agreement between a build and an identity provider.
 FROM node:22-bookworm-slim AS panel
 WORKDIR /app
 COPY apps/admin/package.json apps/admin/package-lock.json ./
 RUN npm ci
 COPY apps/admin/ ./
 ARG VITE_DONAT_GRAPHQL_URL=/v1/graphql
-ARG VITE_DONAT_ROLE=admin
+# Empty: the panel sends no `X-Donat-Role` and acts as whatever the
+# token says. Naming one here is for an account holding several roles,
+# where the panel should act as a particular one — and it has to be a
+# role that account actually holds, or every screen is refused.
+ARG VITE_DONAT_ROLE=
 ARG VITE_DONAT_IDP_BASE=/auth/v1
 ARG VITE_DONAT_IDP_REGISTRATION=false
 RUN npm run build

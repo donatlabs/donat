@@ -1,5 +1,6 @@
 import { createContext, useContext, useMemo, type ReactNode } from 'react';
 import { DONAT_ROLE } from '../env';
+import { loadCsrfToken } from './csrf';
 import {
   createTransport,
   signIn,
@@ -40,7 +41,14 @@ export function AuthProvider({
     return {
       role: DONAT_ROLE,
       authorize: (role?: string) => active.authorize(role ?? DONAT_ROLE),
-      session: () => active.session(),
+      // The provider's CSRF token comes with the session check, because the
+      // two answer the same question — is this browser still signed in — and
+      // because every write after it needs the token. A deployment whose
+      // identity fields carry a key of their own simply never gets one.
+      session: async () => {
+        const [session] = await Promise.all([active.session(), loadCsrfToken()]);
+        return session;
+      },
       recover: () => active.recover(),
       signIn,
       signOut: () => active.signOut(),

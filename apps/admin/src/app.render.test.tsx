@@ -140,8 +140,10 @@ describe('the panel', () => {
     // The first call establishes who the caller is; the data plane is only
     // asked afterwards, and asked as the stand's role.
     const calls = (globalThis.fetch as ReturnType<typeof engineStub>).mock.calls;
-    expect(String(calls[0]?.[0])).toContain('/auth/session');
-    const dataCalls = calls.filter((call) => !String(call[0]).includes('/auth/session'));
+    // Two calls establish who the caller is — the engine's session and the
+    // provider's CSRF token — and they go together, so neither is "first".
+    expect(calls.some((call) => String(call[0]).includes('/auth/session'))).toBe(true);
+    const dataCalls = calls.filter((call) => !String(call[0]).startsWith('/auth/'));
     expect(dataCalls.length).toBeGreaterThan(0);
     expect(roleOf(dataCalls[0] as never)).toBe('support');
     // Every request carries the cookie; the panel holds no credential itself.
@@ -199,7 +201,9 @@ describe('the panel', () => {
 
     // Nothing was asked of the data plane before the caller was known.
     const calls = (globalThis.fetch as ReturnType<typeof engineStub>).mock.calls;
-    expect(calls.every((call) => String(call[0]).includes('/auth/session'))).toBe(true);
+    // Nothing of the data plane was asked: only the two calls that establish
+    // who the caller is.
+    expect(calls.every((call) => String(call[0]).startsWith('/auth/'))).toBe(true);
   });
   /**
    * Signed in, and still not allowed: a token that grants some role other than
@@ -220,7 +224,9 @@ describe('the panel', () => {
     expect(screen.getByTestId('wrong-role-sign-out')).toBeTruthy();
     // Nothing was asked of the data plane: the answer was already known.
     const calls = (globalThis.fetch as ReturnType<typeof engineStub>).mock.calls;
-    expect(calls.every((call) => String(call[0]).includes('/auth/session'))).toBe(true);
+    // Nothing of the data plane was asked: only the two calls that establish
+    // who the caller is.
+    expect(calls.every((call) => String(call[0]).startsWith('/auth/'))).toBe(true);
   });
 
   it('does not refuse anyone on the strength of a field an older engine never sent', async () => {
