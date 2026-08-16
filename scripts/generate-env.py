@@ -33,8 +33,6 @@ VALUES = {
     "DONAT_ADMIN_PASSWORD": password,
     "DONAT_DB_PASSWORD": lambda: alnum(32),
     "DONAT_IDP_ENC_KEY": lambda: b64(32),
-    # At least 64 alphanumeric characters, says the provider.
-    "DONAT_IDP_ADMIN_SECRET": lambda: alnum(72),
     "DONAT_IDP_RAFT_SECRET": lambda: alnum(32),
     "DONAT_IDP_API_SECRET": lambda: alnum(32),
     "DONAT_S3_KEY": lambda: alnum(20),

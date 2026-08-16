@@ -56,10 +56,42 @@ export function templateValue(html: string, id: string): string | undefined {
   return value ? value : undefined;
 }
 
+/**
+ * The same values, bundled.
+ *
+ * Rauthy 0.36 stopped publishing a template per value and hands its own
+ * frontend one `tpl_password_reset` carrying the lot as JSON. Both shapes are
+ * read here, because which one arrives is the provider's version rather than
+ * the deployment's choice — and reading only the older one is not a graceful
+ * degradation but a lie: against 0.36 this page told people their link "has
+ * been used already, or has expired" seconds after it was emailed.
+ */
+interface BundledReset {
+  csrf_token?: string;
+  magic_link_id?: string;
+  user_id?: string;
+  needs_mfa?: boolean;
+  password_policy?: ResetInfo['policy'];
+}
+
+function bundledReset(html: string): BundledReset | undefined {
+  const raw = templateValue(html, 'tpl_password_reset');
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as BundledReset) : undefined;
+  } catch {
+    // A template that is not JSON tells us nothing. Fall through to the
+    // per-value ids rather than failing on a shape we did not expect.
+    return undefined;
+  }
+}
+
 /** Everything the reset form needs, from that one request. */
 export function parseReset(html: string, fallbackUserId: string): ResetInfo {
-  const csrfToken = templateValue(html, 'tpl_csrf_token');
-  const magicLinkId = templateValue(html, 'tpl_magic_link_id');
+  const bundle = bundledReset(html);
+  const csrfToken = bundle?.csrf_token ?? templateValue(html, 'tpl_csrf_token');
+  const magicLinkId = bundle?.magic_link_id ?? templateValue(html, 'tpl_magic_link_id');
   if (!csrfToken || !magicLinkId) {
     // The provider serves an error page for a link that was used, expired, or
     // never existed — it has no CSRF token in it, because there is nothing to
@@ -68,11 +100,13 @@ export function parseReset(html: string, fallbackUserId: string): ResetInfo {
   }
   const policy = templateValue(html, 'tpl_password_policy');
   return {
-    userId: templateValue(html, 'tpl_user_id') ?? fallbackUserId,
+    userId: bundle?.user_id ?? templateValue(html, 'tpl_user_id') ?? fallbackUserId,
     magicLinkId,
     csrfToken,
-    needsMfa: templateValue(html, 'tpl_needs_mfa') === 'true',
-    policy: policy ? (JSON.parse(policy) as ResetInfo['policy']) : undefined,
+    needsMfa: bundle?.needs_mfa ?? templateValue(html, 'tpl_needs_mfa') === 'true',
+    policy:
+      bundle?.password_policy ??
+      (policy ? (JSON.parse(policy) as ResetInfo['policy']) : undefined),
   };
 }
 

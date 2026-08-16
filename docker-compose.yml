@@ -13,7 +13,7 @@
 # everyone who clones it shares, which is a default password by another name.
 #
 # This is the default deployment: a database, an identity provider, object
-# storage, and the engine — which carries the admin panel inside it. It has no application in it — no
+# storage, and the engine — which carries the UI inside it. It has no application in it — no
 # tables, no metadata beyond a source and a store — because an application is
 # what you add on top. What it does have is everything you would otherwise
 # have to assemble before adding one: a way to sign in, a way to say who may
@@ -115,9 +115,10 @@ services:
   #
   # Swap it for your own by pointing DONAT_GRAPHQL_JWT_SECRET's
   # `jwk_url`/`issuer`/`audience` and DONAT_OIDC's endpoints at it. The engine
-  # has no opinion about which provider it is; `admin_key` below is the one
-  # part that is Rauthy-shaped, and without it the panel simply has no identity
-  # screens.
+  # has no opinion about which provider it is. What is Rauthy-shaped is the
+  # identity section's own requests (`crates/server/src/idp_admin.yaml`), and
+  # they run on the caller's provider session rather than on a credential this
+  # deployment holds — so there is nothing here to hand over with the swap.
   #
   # ./deploy/bootstrap is applied only while initialising an empty database.
   # Editing it later does nothing until the volume is recreated.
@@ -160,6 +161,22 @@ services:
       # container, only created by a person in a browser, and the panel's
       # account screen is where they would do it.
       ADMIN_FORCE_MFA: "false"
+      # Load-bearing, and the least obvious line in this file.
+      #
+      # The provider issues its session cookie with `Path=/auth` by default,
+      # which is correct when it serves its own pages and wrong here: the panel
+      # asks the engine at `/v1/graphql`, and a cookie scoped to `/auth` is one
+      # the browser would not send there. The identity screens run on that
+      # cookie — the engine holds no key for the provider and forwards the
+      # caller's own session — so with the default path every one of them
+      # answers 401 and nothing says why.
+      #
+      # The cost is stated plainly: the provider's session cookie is now sent
+      # with every request to this origin, not only to `/auth/*`. That is
+      # acceptable because this origin is one server — the panel, the engine's
+      # API and the proxied provider — and it is the engine that decides which
+      # headers may go on to the provider (crates/server/src/action.rs).
+      COOKIE_SET_PATH: "false"
       BOOTSTRAP_DIR: /bootstrap
       # The provider's own administrator, which is not the operator: this
       # account carries the provider's roles (`admin`, `rauthy_admin`), and
@@ -168,28 +185,6 @@ services:
       # declares.
       BOOTSTRAP_ADMIN_EMAIL: operator@example.com
       BOOTSTRAP_ADMIN_PASSWORD_PLAIN: ${DONAT_ADMIN_PASSWORD:?see .env.example}
-      # The API key the engine administers this provider with — the one
-      # credential it holds for the provider, and the whole reason the panel
-      # has an Identity section at all.
-      #
-      # It is base64 of a JSON declaration naming what the key may touch, and
-      # it names only what `crates/server/src/idp_admin.yaml` actually calls:
-      # a key that could also read secrets or manage PAM would be a key that
-      # could do things nothing in this repository asks for. Decoded:
-      #
-      #   {"name":"donat","exp":2147483647,"access":[
-      #     {"group":"Users",          "access_rights":["read","create","update","delete"]},
-      #     {"group":"UserAttributes", "access_rights":["read","create","update","delete"]},
-      #     {"group":"Roles",          "access_rights":["read","create","update","delete"]},
-      #     {"group":"Groups",         "access_rights":["read","create","update","delete"]},
-      #     {"group":"Scopes",         "access_rights":["read","create","update","delete"]},
-      #     {"group":"Clients",        "access_rights":["read","create","update","delete"]},
-      #     {"group":"Blacklist",      "access_rights":["read","create","update","delete"]},
-      #     {"group":"Sessions",       "access_rights":["read","delete"]}]}
-      #
-      # The secret half is a credential and lives in `.env`.
-      BOOTSTRAP_API_KEY: eyJuYW1lIjogImRvbmF0IiwgImV4cCI6IDIxNDc0ODM2NDcsICJhY2Nlc3MiOiBbeyJncm91cCI6ICJVc2VycyIsICJhY2Nlc3NfcmlnaHRzIjogWyJyZWFkIiwgImNyZWF0ZSIsICJ1cGRhdGUiLCAiZGVsZXRlIl19LCB7Imdyb3VwIjogIlVzZXJBdHRyaWJ1dGVzIiwgImFjY2Vzc19yaWdodHMiOiBbInJlYWQiLCAiY3JlYXRlIiwgInVwZGF0ZSIsICJkZWxldGUiXX0sIHsiZ3JvdXAiOiAiUm9sZXMiLCAiYWNjZXNzX3JpZ2h0cyI6IFsicmVhZCIsICJjcmVhdGUiLCAidXBkYXRlIiwgImRlbGV0ZSJdfSwgeyJncm91cCI6ICJHcm91cHMiLCAiYWNjZXNzX3JpZ2h0cyI6IFsicmVhZCIsICJjcmVhdGUiLCAidXBkYXRlIiwgImRlbGV0ZSJdfSwgeyJncm91cCI6ICJTY29wZXMiLCAiYWNjZXNzX3JpZ2h0cyI6IFsicmVhZCIsICJjcmVhdGUiLCAidXBkYXRlIiwgImRlbGV0ZSJdfSwgeyJncm91cCI6ICJDbGllbnRzIiwgImFjY2Vzc19yaWdodHMiOiBbInJlYWQiLCAiY3JlYXRlIiwgInVwZGF0ZSIsICJkZWxldGUiXX0sIHsiZ3JvdXAiOiAiQmxhY2tsaXN0IiwgImFjY2Vzc19yaWdodHMiOiBbInJlYWQiLCAiY3JlYXRlIiwgInVwZGF0ZSIsICJkZWxldGUiXX0sIHsiZ3JvdXAiOiAiU2Vzc2lvbnMiLCAiYWNjZXNzX3JpZ2h0cyI6IFsicmVhZCIsICJkZWxldGUiXX1dfQ==
-      BOOTSTRAP_API_KEY_SECRET: ${DONAT_IDP_ADMIN_SECRET:?see .env.example}
     volumes:
       - ./deploy/bootstrap:/bootstrap:ro
       - rauthy:/app/data
@@ -218,7 +213,7 @@ services:
 
   engine:
     # The same image the migration ran, built once from this tree — and the
-    # panel is inside it. `DONAT_ADMIN_DIR` is set in the image, so the engine
+    # panel is inside it. `DONAT_UI_DIR` is set in the image, so the engine
     # serves the panel's files itself and there is no second service, no
     # reverse proxy, and nothing to keep in step.
     image: donat:local
@@ -262,18 +257,21 @@ services:
       DONAT_OIDC_SCOPES: openid,profile,email
       # Off only because this stand is plain HTTP.
       DONAT_OIDC_COOKIE_SECURE: "false"
-      # The credential the identity fields reach the provider with.
+      # Which of the provider's own roles may reach its admin API through the
+      # engine — what the panel's Identity section runs on.
       #
-      # It cannot be the caller's own session, and that is a fact about the
-      # provider rather than a choice: its cookie is issued with `Path=/auth`,
-      # so a browser never sends it to `/v1/graphql` and the engine has
-      # nothing to forward. Managing accounts as the person signed in means
-      # calling `/auth/v1/…` from the browser directly, the way the account
-      # screen already does.
+      # Naming a role is the whole configuration: there is no key here, and
+      # that is the point. The engine forwards the caller's own provider
+      # session and CSRF token, so what a person may do to accounts is the
+      # provider's decision about *them* rather than a shared credential's
+      # decision about everyone. It is `COOKIE_SET_PATH: "false"` above that
+      # makes it possible — with the provider's default `Path=/auth` the
+      # browser would never send that cookie to `/v1/graphql`, and the engine
+      # would have nothing to forward.
       #
-      # `$$$` is `$$` (one literal dollar, which the provider's key format
-      # wants) followed by `${…}` — two would make the whole thing a literal.
-      DONAT_OIDC_ADMIN_KEY: API-Key donat$$${DONAT_IDP_ADMIN_SECRET:?see .env.example}
+      # A deployment that would rather hold a credential still can:
+      # `DONAT_OIDC_ADMIN_KEY` is read when it is set, and then every caller in
+      # this role acts with the key's rights instead of their own.
       DONAT_OIDC_ADMIN_ROLE: rauthy_admin
 
       # A role comes from a verified token and from nothing else. No

@@ -62,7 +62,7 @@ The ones that shape behaviour rather than merely point at things:
 | `DONAT_GRAPHQL_AUTH_HOOK` | a service that resolves the session instead, given the request's headers |
 | `DONAT_OIDC` | the engine's own browser login: `/auth/login`, `/auth/callback`, `/auth/logout` — one JSON object |
 | `DONAT_OIDC_*` | the same fields, one variable each: `..._PUBLIC_URL`, `..._LOGIN_API`, `..._TOKEN_ENDPOINT`, `..._CLIENT_ID`, `..._CLIENT_SECRET`, `..._SCOPES`, `..._COOKIE_SECURE`, `..._ADMIN_KEY`, `..._ADMIN_ROLE` |
-| `DONAT_ADMIN_DIR` | a directory of built platform-UI files the engine serves itself; unset or empty serves none |
+| `DONAT_UI_DIR` | a directory of built platform-UI files the engine serves itself; unset or empty serves none |
 | `DONAT_GRAPHQL_ENABLED_APIS` | restrict the mounted surfaces, e.g. `graphql` |
 | `DONAT_GRAPHQL_ENABLE_ALLOWLIST` | serve only saved operations |
 | `DONAT_REQUEST_TIMEOUT_SECONDS`, `DONAT_PG_STATEMENT_TIMEOUT_SECONDS` | request and statement bounds |
@@ -93,7 +93,7 @@ would be a guess about somebody else's software.
 *that* provider's token the roles are, and no default can supply it — a wrong
 guess does not fail loudly, it hands somebody a session with no role.
 
-`DONAT_ADMIN_DIR` is why a stand can be one container. The engine serves those
+`DONAT_UI_DIR` is why a stand can be one container. The engine serves those
 files as a router fallback — after every one of its own paths, never in front
 of one — so the platform UI, the API and the identity provider proxy are one
 origin without a reverse proxy in front of anything. That matters for signing

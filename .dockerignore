@@ -4,6 +4,15 @@ target/
 tests/donat/tests-py/
 **/*.log
 .claude/
+# Installed dependencies and scratch apps. Neither is build input — `npm ci`
+# recreates the first inside the image — and both are hundreds of megabytes
+# that change constantly. Every change to them invalidates the layer that
+# copies the tree, which turns an incremental image build into a full
+# recompile of the Rust workspace. Measured, not assumed: editing a file under
+# `experiments/` rebuilt the engine from scratch.
+**/node_modules/
+apps/ui/dist/
+experiments/
 # knowledgebase/ is NOT excluded: it is build input, not documentation.
 # crates/connector-catalog/src/canonical.rs embeds ADR 012 with include_str!
 # and parses the owner manifest out of it at compile time, so excluding the

@@ -15,7 +15,7 @@ import { defineConfig } from '@playwright/test';
  * conformance harness expects a Postgres:
  *
  *   make env && docker compose up -d --build
- *   cd apps/admin && npm run e2e
+ *   cd apps/ui && npm run e2e
  *
  * `PANEL_URL` points somewhere else. The operator's password comes from the
  * repository's `.env`, which is the file that stack was started from;

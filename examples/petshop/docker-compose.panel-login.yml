@@ -1,7 +1,7 @@
-# The admin panel's own login screen in front of this example's provider.
+# The UI's own login screen in front of this example's provider.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.panel-login.yml up -d
-#   cd ../../apps/admin
+#   cd ../../apps/ui
 #   DONAT_UPSTREAM=http://host.docker.internal:8090 \
 #   DONAT_STANDS='[{"id":"petshop","label":"Petshop","graphqlUrl":"/v1/graphql",
 #     "role":"support","users":{"table":"customer","nameField":"name",
@@ -18,7 +18,7 @@
 #
 # Then http://localhost:5180 — "Sign in" lands on `/idp/authorize`, which is
 # this repository's own screen speaking the provider's unchanged protocol
-# (apps/admin/README.md, knowledgebase/platform/decisions/002-*).
+# (apps/ui/README.md, knowledgebase/platform/decisions/002-*).
 #
 # Everything here says one thing: **the provider is reached on the panel's
 # origin**. Its session cookie and its `Origin` check both require that, and it

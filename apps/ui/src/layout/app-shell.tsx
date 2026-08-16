@@ -37,7 +37,7 @@ function SidebarBrand(): React.ReactElement {
             <Database className="size-4" />
           </div>
           <div className="grid flex-1 text-left leading-tight">
-            <span className="truncate font-semibold">donat admin</span>
+            <span className="truncate font-semibold">donat</span>
             <span className="truncate text-muted-foreground text-xs">{stand.label}</span>
           </div>
         </SidebarMenuButton>

@@ -8,11 +8,15 @@ import type { StandResource } from './types';
  *
  * These are not this panel's screens invented from scratch: each one renders a
  * field the **engine** serves — `idp_roles`, `idp_groups`, `idp_scopes`,
- * `idp_clients` — which exist when a deployment configures
- * `DONAT_OIDC.admin_key` and are visible only to the role it names
- * (`knowledgebase/platform/decisions/003-*`). Configure no key and the engine
- * has no such fields; the screens then fail loudly at the engine rather than
- * pretending, which is the same bargain every resource here makes.
+ * `idp_clients` — which exist when a deployment names `DONAT_OIDC.admin_role`
+ * and are visible only to that role
+ * (`knowledgebase/platform/decisions/003-*`). What reaches the provider is the
+ * caller's own session, not a credential the deployment holds, so what a
+ * person may do there is the provider's decision about them. A deployment may
+ * still hand the engine an `admin_key` instead, and then every caller in that
+ * role acts with the key's rights rather than their own. Name no role and the
+ * engine has no such fields; the screens then fail loudly at the engine rather
+ * than pretending, which is the same bargain every resource here makes.
  *
  * They are the questions an identity provider answers: who the people are
  * (Users, declared beside them in `types.ts`), what a token may say about them

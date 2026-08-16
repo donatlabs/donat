@@ -1,4 +1,4 @@
-# Build context is this directory (apps/admin), not the repository root: the
+# Build context is this directory (apps/ui), not the repository root: the
 # panel is its own npm project and depends on nothing else in the tree.
 FROM node:22-alpine AS build
 WORKDIR /app

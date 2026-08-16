@@ -38,8 +38,8 @@ export interface StandConfig {
  * The shape assumed when a stand declares no `users` block.
  *
  * Not a guess any more: these are the fields the **engine** serves when a
- * deployment configures an identity provider's admin key
- * (`DONAT_OIDC.admin_key`, `crates/server/src/idp_admin.yaml`). The people who
+ * deployment names the role allowed to administer its identity provider
+ * (`DONAT_OIDC.admin_role`, `crates/server/src/idp_admin.yaml`). The people who
  * can sign in are accounts in that provider rather than rows in a database, so
  * this is what a platform's Users screen is by default, and a deployment
  * configures nothing here to get it.

@@ -30,7 +30,7 @@ three refuses to boot, because it could answer nobody.
 `/auth/login` (redirect to your provider, authorization code + PKCE) and
 `/auth/callback` (the token into an `HttpOnly` cookie it then verifies like any
 other). It still stores no users and issues no tokens — which is what a browser
-needs and a bearer header cannot give it. This is how `apps/admin` signs in.
+needs and a bearer header cannot give it. This is how `apps/ui` signs in.
 
 ## Which provider
 
@@ -173,7 +173,7 @@ Recommend one, name the cost of the alternative, move on.
    provider is proxied — `/auth/v1/*` on the same scheme, host and port. A
    session cookie only returns to the origin that set it, and a provider
    checking `Origin` against its own public URL refuses anything else. The
-   engine can serve the UI itself (`DONAT_ADMIN_DIR`), which makes this true by
+   engine can serve the UI itself (`DONAT_UI_DIR`), which makes this true by
    construction; a reverse proxy in front of two containers makes it true by
    configuration, and that configuration is a thing to get wrong.
 9. Verified with a real token: the right rows for one user, **nothing** for

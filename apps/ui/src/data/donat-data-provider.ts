@@ -30,7 +30,7 @@ import type { RequestAuth } from '../auth/session';
  * here.
  *
  * Ported from the Solar admin panel's Hasura provider
- * (`apps/admin/src/data/hasura-data-provider.ts` in solar-app-mono), trimmed
+ * (`apps/ui/src/data/hasura-data-provider.ts` in solar-app-mono), trimmed
  * of what that deployment needed and this one does not: the 1:1 detail-table
  * upsert, the live scope-merging (`getScope`/`scopeFields`), and the
  * `on_conflict` bulk-insert path.

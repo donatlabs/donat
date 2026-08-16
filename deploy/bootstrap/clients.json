@@ -1,7 +1,7 @@
 [
     {
         "id": "donat-admin",
-        "name": "donat admin panel",
+        "name": "donat",
         "secret": null,
         "redirect_uris": [
             "http://localhost:5180/auth/callback"
@@ -18,9 +18,19 @@
         "id_token_alg": "RS256",
         "auth_code_lifetime": 60,
         "access_token_lifetime": 3600,
-        "scopes": ["openid", "profile", "email"],
-        "default_scopes": ["openid", "profile", "email"],
-        "challenges": ["S256"],
+        "scopes": [
+            "openid",
+            "profile",
+            "email"
+        ],
+        "default_scopes": [
+            "openid",
+            "profile",
+            "email"
+        ],
+        "challenges": [
+            "S256"
+        ],
         "force_mfa": false
     }
 ]

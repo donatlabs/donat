@@ -28,7 +28,7 @@ permission bypass. 5 decisions. **Status: in progress (August 2026).**
 What separates an engine you deploy from a platform a business is built on,
 written after a week of the engine being used to build one. 1 research note,
 1 decision — the admin panel, which is an ordinary role rendered outside the
-engine rather than a surface the engine grows (`apps/admin`).
+engine rather than a surface the engine grows (`apps/ui`).
 **Status: draft, August 2026.**
 
 ## Cross-cutting

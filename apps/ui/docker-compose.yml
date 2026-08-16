@@ -1,4 +1,4 @@
-# The admin panel, built and served by nginx.
+# The UI, built and served by nginx.
 #
 #   docker compose up --build          # then open http://localhost:5180
 #

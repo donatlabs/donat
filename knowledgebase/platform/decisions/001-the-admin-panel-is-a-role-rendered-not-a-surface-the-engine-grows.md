@@ -35,7 +35,7 @@ already serves.
 ## Decision
 
 **The panel is an ordinary role with a UI in front of it, and it lives outside
-the engine.** A new `apps/admin` — the repository's first JavaScript — holds a
+the engine.** A new `apps/ui` — the repository's first JavaScript — holds a
 `@refinest/*` application whose data provider speaks the engine's existing
 GraphQL endpoint. The engine grows nothing: no admin API, no panel-specific
 route, no privileged role. What the panel can do is exactly what the
@@ -93,7 +93,7 @@ is deletable without trace.
 
 What we pay: a second place where a permission is written down, and a
 JavaScript toolchain in a Rust repository (its own `npm` project under
-`apps/admin`, outside the Cargo workspace and outside `make test`). The
+`apps/ui`, outside the Cargo workspace and outside `make test`). The
 duplication is bounded — it is per-resource, it is data, and a mistake fails
 loudly at the engine — but it is real, and a permission change in metadata that
 is not reflected in a mapping shows up as a failed query rather than as a
@@ -107,9 +107,12 @@ service rather than behind an opt-in profile.
 
 ## Amendment, 2026-08-14: the engine may serve the files
 
-`DONAT_ADMIN_DIR` names a directory of built panel files, and the engine serves
+`DONAT_UI_DIR` names a directory of built panel files, and the engine serves
 them as a router *fallback* — after every one of its own routes, never in front
-of one. Unset, nothing is mounted, which stays the default.
+of one. Unset, nothing is mounted, which stays the default. (It was
+`DONAT_ADMIN_DIR` until the panel was renamed; that name is still read, and
+emptying either of them still means *serve nothing* — see
+`crates/server/src/panel.rs`.)
 
 **The first objection stands and is not what changed.** It is about power: a
 surface that administers. None is granted here. What is served is HTML,
@@ -149,5 +152,6 @@ the panel's build output, so the image build gains a JavaScript step even
 though `cargo build` does not: the directory is read at runtime, so the Rust
 build stays a Rust build and CI does not grow a node toolchain to compile the
 engine. A deployment that wants the panel elsewhere — a CDN, its own nginx —
-leaves `DONAT_ADMIN_DIR` unset and nothing about this exists.
+leaves `DONAT_UI_DIR` unset — or, on an image that sets it, empty — and nothing
+about this exists.
 
