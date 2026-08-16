@@ -232,8 +232,6 @@ mod tests {
         );
     }
 
-    /// Both named is not a conflict to refuse: the current name is the answer.
-    #[test]
     /// A directory named under the old name is served, even though the image
     /// names one under the current one.
     ///
