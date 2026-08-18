@@ -593,7 +593,7 @@ export default function IdpAuthorizePage(): ReactElement {
   const solver = useMemo(() => new PowSolver(() => client.challenge()), [client]);
 
   return (
-    <AuthPage footer="donat admin">
+    <AuthPage footer="donat">
       {params ? (
         <IdpAuthorizeForm
           params={params}

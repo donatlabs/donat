@@ -21,7 +21,7 @@ conformance harness (`crates/conformance`).
 | `crates/storage` | File attachments: the resolved S3-compatible store and the URL signing shared by planner and server |
 | `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
-| `apps/admin` | Admin panel (`@refinest/*` + React) over the engine's GraphQL. Its own npm project, outside the Cargo workspace and `make test`. Not an admin surface — an ordinary role rendered; see `knowledgebase/platform/decisions/001-*` |
+| `apps/ui` | Platform UI (`@refinest/*` + React) over the engine's GraphQL. Its own npm project, outside the Cargo workspace and `make test`. Not an admin surface — an ordinary role rendered; see `knowledgebase/platform/decisions/001-*` |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
 

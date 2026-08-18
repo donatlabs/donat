@@ -249,10 +249,10 @@ services:
       # providers disagree about which token carries a deployment's claims and
       # how a confidential client authenticates.
       #
-      # To put the admin panel's own login screen in front of this provider
+      # To put the UI's own login screen in front of this provider
       # instead of its page, three settings move together — the provider is
       # then reached on the panel's origin, which is what its session cookie
-      # and its `Origin` check both require (apps/admin/README.md):
+      # and its `Origin` check both require (apps/ui/README.md):
       #
       #   here          "authorization_endpoint":"http://localhost:5180/idp/authorize"
       #                 "redirect_uri":"http://localhost:5180/auth/callback"

@@ -1,7 +1,7 @@
 //! The identity provider, reachable on this engine's origin.
 //!
 //! The panel renders the provider's login screen in its own interface
-//! (`apps/admin/src/pages/idp-authorize.tsx`) and calls the provider's own API
+//! (`apps/ui/src/pages/idp-authorize.tsx`) and calls the provider's own API
 //! underneath. A browser can only do that same-origin: the provider sets a
 //! `__Host-`-prefixed session cookie and compares the `Origin` header against
 //! its own configured public URL, so a page on one origin calling it on

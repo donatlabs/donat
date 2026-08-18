@@ -159,15 +159,15 @@ petshop-system-tests:
 	@tests-system/.venv/bin/pip install -q -r tests-system/requirements.txt
 	@cd tests-system && eval "$$(./stack.sh env)" && .venv/bin/python -m pytest
 
-# The admin panel (apps/admin) is its own npm project, not part of the Cargo
+# The UI (apps/ui) is its own npm project, not part of the Cargo
 # workspace — `make test` does not reach it, so these targets are how it is
 # run and checked. Point VITE_DONAT_GRAPHQL_URL at an engine first (see
-# apps/admin/.env.example).
+# apps/ui/.env.example).
 admin:
-	cd apps/admin && npm install && npm run dev
+	cd apps/ui && npm install && npm run dev
 
 admin-test:
-	cd apps/admin && npm install && npm run typecheck && npm test
+	cd apps/ui && npm install && npm run typecheck && npm test
 
 claude:
 	claude --dangerously-skip-permissions --teammate-mode tmux

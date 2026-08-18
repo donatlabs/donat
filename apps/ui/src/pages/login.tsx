@@ -29,10 +29,10 @@ export default function LoginPage(): React.ReactElement {
     '/';
 
   return (
-    <AuthPage footer="donat admin">
+    <AuthPage footer="donat">
       <div className="space-y-4">
         <div className="space-y-1">
-          <h1 className="font-semibold text-xl">donat admin</h1>
+          <h1 className="font-semibold text-xl">donat</h1>
           <p className="text-muted-foreground text-sm">
             The panel runs as the <code>{DONAT_ROLE}</code> role and sees exactly what that role's
             permissions grant.

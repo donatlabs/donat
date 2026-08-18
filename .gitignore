@@ -15,10 +15,17 @@ tests/donat/tests-py/
 specs/
 tests-system/.stack/
 
-# The admin panel is the repository's only JavaScript.
+# The UI is the repository's only JavaScript.
 node_modules/
-apps/admin/dist/
+apps/ui/dist/
 
 # System-test stands write their built binaries, pids and logs here.
 tests-system-lending/.stack/
 tests-system-lending/.venv/
+
+# Scratch products built on this engine's stack. `examples/` is published
+# material — someone reads it to learn how to run donat, so it is committed
+# and kept working. `experiments/` is the opposite: unfinished apps that
+# happen to live next to the engine while they are being tried out. Nothing
+# in the repository may depend on it, and nothing in it is reviewed.
+experiments/

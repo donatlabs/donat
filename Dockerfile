@@ -7,8 +7,8 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release -p donat-server --bin donat
 
-# The admin panel, built here so the image is one container and one process:
-# the engine serves these files itself (`DONAT_ADMIN_DIR`), which is what puts
+# The UI, built here so the image is one container and one process:
+# the engine serves these files itself (`DONAT_UI_DIR`), which is what puts
 # the panel, the identity provider proxy and the API on one origin without a
 # reverse proxy in front of anything. See
 # `knowledgebase/platform/decisions/001-*`, amended.
@@ -20,9 +20,9 @@ RUN cargo build --release -p donat-server --bin donat
 # agreement between a build and an identity provider.
 FROM node:22-bookworm-slim AS panel
 WORKDIR /app
-COPY apps/admin/package.json apps/admin/package-lock.json ./
+COPY apps/ui/package.json apps/ui/package-lock.json ./
 RUN npm ci
-COPY apps/admin/ ./
+COPY apps/ui/ ./
 ARG VITE_DONAT_GRAPHQL_URL=/v1/graphql
 # Empty: the panel sends no `X-Donat-Role` and acts as whatever the
 # token says. Naming one here is for an account holding several roles,
@@ -50,10 +50,10 @@ COPY --from=build /src/target/release/donat /usr/local/bin/donat
 COPY migrations/ /usr/share/donat/migrations/
 
 # The panel's built files. Serving them is opt-in by directory, and this image
-# opts in — set `DONAT_ADMIN_DIR=` (empty) and the engine mounts nothing, which
+# opts in — set `DONAT_UI_DIR=` (empty) and the engine mounts nothing, which
 # is exactly what it did before this existed.
-COPY --from=panel /app/dist /usr/share/donat/admin/
-ENV DONAT_ADMIN_DIR=/usr/share/donat/admin
+COPY --from=panel /app/dist /usr/share/donat/ui/
+ENV DONAT_UI_DIR=/usr/share/donat/ui
 
 # Not root.
 #

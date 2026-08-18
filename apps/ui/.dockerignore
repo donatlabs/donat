@@ -1,0 +1,19 @@
+# This directory is its own build context (see Dockerfile), so the
+# repository root's .dockerignore does not apply to it — and without this file
+# `COPY . .` lands *after* `npm ci` and overwrites the dependencies the image
+# just installed with whatever is on the developer's disk. On a host that
+# installed for a different platform that is a build failure in an optional
+# native dependency (rollup, esbuild); on a matching host it is worse, because
+# it succeeds and ships the developer's tree instead of the lockfile's.
+node_modules/
+
+# Build output and test artefacts: rebuilt inside the image, and copying them
+# in only invalidates the layer cache on every run.
+dist/
+test-results/
+playwright-report/
+
+# Local configuration, which is never the image's.
+.env
+.env.*
+!.env.example

@@ -48,6 +48,47 @@ describe('parseReset', () => {
     expect(parseReset(page({ ...good, tpl_needs_mfa: 'true' }), 'u-1').needsMfa).toBe(true);
   });
 
+  it('reads the one template a current provider sends instead of five', () => {
+    // The shape Rauthy 0.36.1 actually served, off a link it had just emailed:
+    // the per-value templates are gone from that page entirely, and reading
+    // only those called a fresh link expired.
+    const bundle = page({
+      tpl_password_reset: JSON.stringify({
+        csrf_token: 'pwd-csrf',
+        magic_link_id: 'link-1',
+        needs_mfa: false,
+        password_policy: { length_min: 14, length_max: 128, include_digits: 1 },
+        user_id: 'u-1',
+      }),
+    });
+    expect(parseReset(bundle, 'fallback')).toEqual({
+      userId: 'u-1',
+      magicLinkId: 'link-1',
+      csrfToken: 'pwd-csrf',
+      needsMfa: false,
+      policy: { length_min: 14, length_max: 128, include_digits: 1 },
+    });
+  });
+
+  it('takes the second factor from the bundle too', () => {
+    const bundle = page({
+      tpl_password_reset: JSON.stringify({
+        csrf_token: 'c',
+        magic_link_id: 'l',
+        needs_mfa: true,
+      }),
+    });
+    expect(parseReset(bundle, 'u-1').needsMfa).toBe(true);
+  });
+
+  it('ignores a bundle it cannot read rather than failing on it', () => {
+    // No provider sends both shapes at once; a bundle that is not JSON must
+    // still not take the per-value ids down with it.
+    expect(parseReset(page({ ...good, tpl_password_reset: 'not json' }), 'u-1').csrfToken).toBe(
+      'pwd-csrf',
+    );
+  });
+
   it('says a link is spent rather than rendering a form that cannot work', () => {
     // The provider answers a used or expired link with a page carrying no
     // token, because there is nothing left to authorise.

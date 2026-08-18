@@ -145,7 +145,7 @@ One command, and nothing to fill in. It prints the password to sign in as
 `operator@example.com` with.
 
 That is the default deployment, built from this tree: Postgres, an identity
-provider, object storage, and the engine — which serves the admin panel
+provider, object storage, and the engine — which serves the UI
 itself, so there is one container answering on one origin rather than a
 reverse proxy in front of two.
 
@@ -161,7 +161,7 @@ who may do what, and somewhere for files to go. The panel's Identity section
 manages the provider's own accounts, roles, groups, scopes, applications,
 attributes, blocked addresses and sessions — none of which is metadata you
 write; see
-[apps/admin](apps/admin) and
+[apps/ui](apps/ui) and
 [ADR platform/003](knowledgebase/platform/decisions/003-the-identity-adapter-ships-in-the-binary-and-grants-nothing.md).
 
 Add tables to `deploy/metadata/databases/default/tables/` with per-role

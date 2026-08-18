@@ -221,7 +221,7 @@ jobs:
           grep -q 'x-donat-role header is required' <<< "$refusal" \
             || { echo "expected the role-required refusal, got: $refusal"; exit 1; }
 
-      # The image carries the admin panel and serves it itself, so the release
+      # The image carries the UI and serves it itself, so the release
       # has to prove both halves of that: the panel is reachable, and it has
       # not swallowed the engine's own paths. A single-page app answers every
       # unmatched path with its HTML, and the failure that would cause is

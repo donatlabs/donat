@@ -1031,12 +1031,12 @@ async fn main() -> anyhow::Result<()> {
         mcp = enabled_apis.mcp,
         "enabled API surfaces"
     );
-    // The admin panel, when a deployment names a directory for it. A fallback
+    // The UI, when a deployment names a directory for it. A fallback
     // rather than a route, so nothing above can be shadowed by it, and it
     // grants nothing — see `donat_server::panel`, which is also where the list
     // of paths that stay the engine's lives.
     if let Some(dir) = donat_server::panel::configured() {
-        tracing::info!(target: "donat::panel", %dir, "serving the admin panel");
+        tracing::info!(target: "donat::panel", %dir, "serving the UI");
         app = donat_server::panel::serve(app, &dir);
     }
 

@@ -126,5 +126,5 @@ proof of work.
 
 The deployment gains a requirement that reads oddly until it is understood: the
 identity provider's public URL must be the panel's origin. Written down here,
-in `apps/admin/README.md` and in the nginx template, because it is the kind of
+in `apps/ui/README.md` and in the nginx template, because it is the kind of
 constraint that looks like a mistake to whoever inherits it.

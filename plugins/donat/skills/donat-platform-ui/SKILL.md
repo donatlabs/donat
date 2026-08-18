@@ -73,7 +73,7 @@ const definition = defineAppDefinition(
 ```
 
 That is the whole surface for a screen. Reference implementation:
-`apps/admin/src/` of a Refinest app — `resources/*.ts`, `refinest-app.ts`,
+`apps/ui/src/` of a Refinest app — `resources/*.ts`, `refinest-app.ts`,
 `data/resource-mappings.ts`, and four generic `pages/resources/*.tsx` shared by
 every resource.
 
@@ -200,7 +200,7 @@ The framework is published on npm and MIT-licensed — `@refinest/core`,
 A reference app has this shape, and it is worth copying wholesale:
 
 ```
-apps/admin/src/
+apps/ui/src/
   refinest-app.ts            defineAppDefinition + groups + setup.use(...)
   resources/<name>.ts        one declarative config per resource
   resources/enums.ts         { value, label } lists mirroring the declared types
@@ -219,7 +219,7 @@ page, ask first whether it belongs in the config.
 Build it, and point the engine at the output:
 
 ```
-DONAT_ADMIN_DIR=/usr/share/donat/admin
+DONAT_UI_DIR=/usr/share/donat/ui
 ```
 
 The engine serves those files as a router fallback — after every one of its own

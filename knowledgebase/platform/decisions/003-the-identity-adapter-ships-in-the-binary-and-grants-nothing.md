@@ -73,7 +73,7 @@ named role with the credential attached and are *absent for another role the
 same token grants*, the other asserts they are absent entirely until a key is
 configured.
 
-**The panel's default follows.** `apps/admin` no longer guesses at a `users`
+**The panel's default follows.** `apps/ui` no longer guesses at a `users`
 table when a stand declares no people; it renders these fields, because these
 are the ones the engine serves. A deployment whose people are rows says so, and
 that declaration replaces all of it.

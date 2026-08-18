@@ -38,7 +38,7 @@ import { standMappings, type Stand } from '../stands';
  * The application mount: router adapter, auth, app runtime, data runtime,
  * i18n, and the action dispatcher.
  *
- * Ported from the Solar admin panel's `components/providers.tsx` and trimmed
+ * Ported from the Solar UI's `components/providers.tsx` and trimmed
  * of what it needed and this does not: the current-event scope provider, the
  * file-storage plugin, and the token-refresh plumbing (donat issues no
  * tokens, so there is nothing to refresh here — see `auth/session.ts`).

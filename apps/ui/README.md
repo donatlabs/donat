@@ -1,6 +1,6 @@
-# donat admin
+# donat ui
 
-A platform admin panel for donat deployments, built on the
+The platform UI for donat deployments, built on the
 [`@refinest/*`](https://www.npmjs.com/package/@refinest/core) resource
 framework. One panel, several **stands** — and it ships with none of them: a
 stand is configuration.
@@ -22,11 +22,11 @@ Deployed, the engine serves it — one container, one process, no proxy:
 
 ```
 npm run build
-DONAT_ADMIN_DIR=/path/to/apps/admin/dist donat serve
+DONAT_UI_DIR=/path/to/apps/ui/dist donat serve
 ```
 
 The repository's root `docker-compose.yml` does exactly that: the engine's
-image builds this panel into `/usr/share/donat/admin` and sets that variable,
+image builds this panel into `/usr/share/donat/ui` and sets that variable,
 so `docker compose up -d --build` gives you the whole stack on one port.
 
 One origin is the point, and it is not tidiness. A session cookie only comes
@@ -35,7 +35,7 @@ and would refuse a cross-origin request anyway; and the identity provider
 behind `/auth/v1` compares `Origin` against its own public URL and sets a
 `__Host-`-prefixed cookie. Served by the engine, all of that is true by
 construction. The `nginx.conf.template` here still works for a deployment that
-wants the panel somewhere else — set `DONAT_ADMIN_DIR` empty and keep the
+wants the panel somewhere else — set `DONAT_UI_DIR` empty and keep the
 proxy — but then the origin is yours to keep consistent, and getting it wrong
 is a login that refuses everything without saying why.
 
@@ -92,18 +92,22 @@ keep a secret, and the addresses it may be sent back to. Everything else about
 a client — scopes, flows, allowed origins, whether it forces a second factor —
 is edited afterwards, because that is what the provider accepts on a
 registration. A confidential client's secret is not shown here and never
-travels through these fields: the provider mints it and serves it to whoever
-holds its API key, which is the engine. Each renders
-fields the engine serves when a deployment configures `DONAT_OIDC.admin_key`
-and `admin_role` — `idp_users`, `idp_roles`, `idp_clients` and the rest, and
-everything its API key can reach is there. Nothing is configured here for that: the panel
-knows those field names because the engine ships the declaration behind them
+travels through these fields: the provider mints it and serves it to the caller
+who registered the client, on its own screens. Each renders fields the engine
+serves when a deployment names `DONAT_OIDC.admin_role` — `idp_users`,
+`idp_roles`, `idp_clients` and the rest. Nothing is configured here for that:
+the panel knows those field names because the engine ships the declaration
+behind them
 ([ADR platform/003](../../knowledgebase/platform/decisions/003-the-identity-adapter-ships-in-the-binary-and-grants-nothing.md)),
 and `src/stands/identity.ts` is where the screens are declared.
 
-That keeps the provider's credential in the engine, where it belongs — the
-panel never holds it — and who may call it stays an ordinary per-role
-permission. It is also what makes the panel provider-agnostic: a different
+What reaches the provider is the **caller's own session**, forwarded by the
+engine, which holds no credential for it: what a person may administer there is
+the provider's decision about that person rather than a shared key's about
+everyone, and who may reach the fields at all stays an ordinary per-role
+permission. A deployment that would rather the engine hold a key can give it
+one (`DONAT_OIDC.admin_key`), and then every caller in that role acts with the
+key's rights. It is also what makes the panel provider-agnostic: a different
 identity provider is a different handler behind the same GraphQL field.
 
 Where the people *are* rows, a stand says so (`users: { table: 'customer', … }`)
@@ -247,7 +251,7 @@ was found).
 ```
 cd ../..                          # the repository root
 make up
-cd apps/admin && npm run e2e
+cd apps/ui && npm run e2e
 ```
 
 Twenty-one cases through a real browser against that running stack: signing in

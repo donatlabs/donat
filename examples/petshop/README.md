@@ -125,7 +125,7 @@ the login itself: `GET /auth/login` redirects to the provider
 an `HttpOnly` cookie the engine then verifies exactly like a header token. It
 stores no users, holds no passwords and issues no tokens of its own — see
 [ADR 010](../../knowledgebase/api-surfaces/decisions/010-donat-does-not-own-identity.md).
-That is what [`apps/admin`](../../apps/admin) signs in with.
+That is what [`apps/ui`](../../apps/ui) signs in with.
 
 Open <http://localhost:8080/auth/login> and sign in as `sam@example.com`; the
 browser comes back holding a session. `/auth/logout` ends it.
