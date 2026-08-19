@@ -1,0 +1,15 @@
+# The counters a ceiling is read against. Readable by the store's own staff so
+# a panel can show "18 of 20 products"; writable by nobody, because a tenant
+# that can write its own counter has no ceiling.
+#
+# The engine moves it: an insert into a counted table updates this row inside
+# the same statement, which is what makes the limit hold when two people add a
+# product at the same moment.
+table:
+  name: tenant_usage
+  schema: public
+select_permissions:
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}

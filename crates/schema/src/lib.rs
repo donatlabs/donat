@@ -12,6 +12,7 @@
 //! permission for that role simply does not exist in that role's schema.
 
 mod commands;
+mod iam;
 mod introspection;
 mod multi_source;
 mod naming;
@@ -19,7 +20,9 @@ mod plan;
 mod plan_mutation;
 mod predicate;
 mod process_effects;
+mod quotas;
 mod rule_catalog;
+mod tenancy;
 mod v1;
 mod validators;
 
@@ -42,3 +45,4 @@ pub use process_effects::{
     ProcessSignalEffectContract,
 };
 pub use rule_catalog::compile_rule_catalog;
+pub use tenancy::validate_tenancy_catalog;

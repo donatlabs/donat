@@ -4,17 +4,25 @@
 //! sqlgen) consumes these types and never re-reads YAML.
 
 pub mod documents;
+pub mod iam;
 pub mod ingest;
 mod loader;
 pub mod local;
 pub mod media;
 mod phone;
+pub mod quotas;
 pub mod recurrence;
+pub mod tenancy;
 mod types;
 
 pub use documents::{
     DOCUMENT_CAPABILITY, DocumentTemplate, DocumentTemplateBounds, DocumentTemplateError,
     DocumentTemplateKind, HTML_SCALAR, RESERVED_INPUT_KEYS, validate_document_templates,
+};
+pub use iam::{
+    ActionMapping, ActionTemplates, CommandActionMapping, CommandActionOverride, GrantRelation,
+    GrantWriteTarget, IamDeclarationError, IamMetadata, IamOperation, ResourceOverride,
+    validate_iam_declaration,
 };
 pub use ingest::{
     INGEST_CAPABILITY, INGEST_INPUT_KEYS, INGEST_SCALARS, IngestBounds, IngestColumn,
@@ -34,9 +42,19 @@ pub use media::{
     validate_media_declarations,
 };
 pub use phone::{PhoneRegion, PhoneRegionError, PhoneRejection, normalize_phone};
+pub use quotas::{
+    Entitlement, QuotaConsumer, QuotaCounters, QuotaDeclarationError, QuotaLimitLookup,
+    QuotaLimits, QuotaMetadata, validate_quota_declaration,
+};
 pub use recurrence::{
     MAX_DECLARABLE_OCCURRENCES, MAX_DECLARABLE_WINDOW_SECONDS, RECURRENCE_CAPABILITY,
     RECURRENCE_OPERATIONS, RecurrenceDeclarationError, RecurrenceMetadata, RecurrencePolicy,
     parse_window_seconds, validate_recurrence_declarations,
+};
+pub use tenancy::{
+    ColumnBinding, CrossTenantRead, SharedAccess, SubjectBinding, TableScope, TenancyBinding,
+    TenancyDeclarationError, TenancyMetadata, TenancyTrust, TenantExemption, TenantKeyOverride,
+    TenantRegistry, TenantStatusGate, UnscopedStepPolicy, validate_tenancy_declaration,
+    validate_untenanted_commands,
 };
 pub use types::*;

@@ -90,6 +90,15 @@ The first is probably right and is cheap. The failure mode is doing neither,
 which is where it stands now: every deployment invents it, and the inventions
 differ in ways that only show up as a leak.
 
+**Resolved (2026-08-18), and closer to the second option than this note
+expected.** See
+[[declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]].
+A tenant is declared once in `tenancy.yaml` and applied by the compiler rather
+than written into each permission, because the repetition *is* the problem this
+section describes: absence cannot be reviewed, so a missing filter has to become
+a boot failure rather than a leak. The operator's cross-tenant view is still not
+a wider filter — it is out of scope until it can be an audited role.
+
 ## 3. Domain modules, not engine features
 
 Recurring billing cost four to five engineer-days of *engine* work, and most

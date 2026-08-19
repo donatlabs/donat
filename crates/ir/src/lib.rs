@@ -487,6 +487,14 @@ pub enum MutationRoot {
 pub struct CommandMutation {
     pub identity: CommandIdentity,
     pub name: String,
+    /// The in-tenant grant this invocation needs, when the caller's role is
+    /// served through grants.
+    ///
+    /// It gates the whole statement rather than each step: a command is one
+    /// domain operation, and a caller who may not perform it should be told
+    /// so, not have its first write quietly affect nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<Box<BoolExp>>,
     pub steps: Vec<CommandExecutionStep>,
     pub guards: Vec<CommandRule>,
     pub result: Vec<CommandResultField>,
@@ -1042,6 +1050,34 @@ pub struct RowValidator {
     pub error_path: String,
 }
 
+/// One plan entitlement a write consumes or releases, moved inside the
+/// statement that performs it.
+///
+/// The counter is updated in the same statement rather than counted before it,
+/// which is the only version that survives concurrency: under READ COMMITTED
+/// a statement's snapshot is fixed before it executes, so every concurrent
+/// writer counting beforehand reads the same pre-lock state and every one of
+/// them passes. Updating the tenant's usage row takes a lock, and the second
+/// writer waits, re-reads, and is refused.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuotaConsumption {
+    pub counters: Table,
+    pub counter_column: String,
+    pub tenant_column: String,
+    pub tenant: String,
+    /// True for a write that consumes a unit, false for one that releases it.
+    pub consumes: bool,
+    pub limits: Table,
+    pub limit_key_column: String,
+    pub maximum_column: String,
+    /// The registry row naming which plan this tenant is on.
+    pub registry: Table,
+    pub registry_plan_column: String,
+    pub registry_match_column: String,
+    pub error_path: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InsertMutation {
     pub table: Table,
@@ -1057,6 +1093,9 @@ pub struct InsertMutation {
     pub check: Option<BoolExp>,
     /// Error path reported on check violation.
     pub check_path: String,
+    /// The plan entitlement these rows consume, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<Box<QuotaConsumption>>,
     /// Ordered per-role value validators over the inserted rows. The first
     /// violated entry is the one reported.
     pub validators: Vec<RowValidator>,
@@ -1130,6 +1169,22 @@ pub enum SetOp {
 pub struct DeleteMutation {
     pub table: Table,
     pub predicate: Option<BoolExp>,
+    /// Evaluated over the rows this delete removed.
+    ///
+    /// A delete has no `check` in the Donat permission format — there is no
+    /// row afterwards to check — so nothing a *deployment* writes lands here.
+    /// What does is the authorization the engine adds: the in-tenant grant for
+    /// the delete action, and whether the tenant is still being served. Both
+    /// are row-independent, and putting them here rather than in the predicate
+    /// is the difference between a caller being refused and a caller quietly
+    /// removing nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<BoolExp>,
+    /// Error path reported on check violation.
+    pub check_path: String,
+    /// The plan entitlement these rows release, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<Box<QuotaConsumption>>,
     pub output: MutationOutput,
 }
 

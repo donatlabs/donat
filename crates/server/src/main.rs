@@ -732,6 +732,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // Absent, a named provider supplies one — the same facts, said once. What
     // is derived and why it is safe to derive is `OidcConfig::derived_jwt`.
+    let mut jwt_is_derived = false;
     let jwt_raw = match std::env::var("DONAT_GRAPHQL_JWT_SECRET")
         .ok()
         .filter(|raw| !raw.trim().is_empty())
@@ -743,6 +744,7 @@ async fn main() -> anyhow::Result<()> {
                     target: "donat::auth",
                     "no DONAT_GRAPHQL_JWT_SECRET; verifying tokens as the configured provider issues them"
                 );
+                jwt_is_derived = true;
                 Some(derived)
             }
             None => None,
@@ -816,8 +818,32 @@ async fn main() -> anyhow::Result<()> {
             media: Default::default(),
             ingest_schemas: vec![],
             recurrence: Default::default(),
+            tenancy: None,
+            iam: None,
+            quotas: None,
         },
     };
+
+    // A tenanted deployment whose tokens cannot carry a tenant refuses every
+    // request to every tenanted table, one at a time, for as long as it runs.
+    // The one place that is worth learning is here.
+    if let Some(tenancy) = &metadata.tenancy
+        && jwt_is_derived
+        && oidc
+            .as_ref()
+            .is_some_and(|oidc| oidc.tenant_claim.is_none())
+    {
+        anyhow::bail!(
+            "source `{}` declares tenancy on {}, but this deployment derives its token \
+             verification from DONAT_OIDC and nothing says where the provider puts the tenant. \
+             Set DONAT_OIDC_TENANT_CLAIM to the JSON path of that claim (for example \
+             `$.tenant_id`), or configure DONAT_GRAPHQL_JWT_SECRET with a claims_map of your \
+             own. Without it every request to a tenanted table is refused for carrying no \
+             tenant.",
+            tenancy.source,
+            tenancy.variable
+        );
+    }
 
     // The identity provider's own accounts, when a deployment configured a key
     // for them. The declaration ships in the binary; what a deployment says is

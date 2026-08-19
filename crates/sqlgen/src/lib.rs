@@ -114,6 +114,8 @@ struct MutationSelectOptions<'a> {
     validators: &'a [RowValidator],
     /// File uploads this write claims (spec 008).
     file_claims: &'a [donat_ir::FileClaim],
+    /// The plan entitlement this write consumes or releases.
+    quota: Option<&'a donat_ir::QuotaConsumption>,
     output: &'a MutationOutput,
 }
 
@@ -1202,6 +1204,30 @@ fn command_to_sql(ctx: &mut Ctx, command: &CommandMutation) -> String {
             )),
         ));
         effect_policy_gate = format!("({effect_policy_gate}) AND {}", command_gate_exists(&cte));
+    }
+    // In-tenant authorization gates the whole statement, ahead of the guards
+    // and everything that depends on them. A caller who does not hold the
+    // action is refused; the alternative — filtering each step — would report
+    // a command that ran and changed nothing.
+    if let Some(authorization) = &command.authorization {
+        let cte = "_cmd_iam_gate";
+        // The predicate is one uncorrelated EXISTS over the grant relation, so
+        // the outer alias is never referenced.
+        let condition = ctx.bool_exp(authorization, "_iam", "_iam");
+        ctes.push(format!(
+            "{gate} AS MATERIALIZED (SELECT TRUE AS {ok} WHERE CASE WHEN ({precondition}) THEN CASE WHEN ({condition}) THEN TRUE ELSE ({schema}.{raise_error}('access-denied', {path}, {message}) IS NULL) END ELSE FALSE END)",
+            gate = quote_ident(cte),
+            ok = quote_ident("ok"),
+            precondition = effect_policy_gate,
+            schema = quote_ident("donat"),
+            raise_error = quote_ident("raise_graphql_error"),
+            path = quote_lit("$"),
+            message = quote_lit(&format!(
+                "no grant in this tenant authorizes command '{}'",
+                command.name
+            )),
+        ));
+        effect_policy_gate = format!("({effect_policy_gate}) AND {}", command_gate_exists(cte));
     }
     let guard_cte = "_cmd_guard_gate";
     ctes.push(command_rule_gate_cte(
@@ -4204,6 +4230,7 @@ fn mutation_to_sql_full(
                 check: insert.check.as_ref(),
                 check_path: &insert.check_path,
                 file_claims: &insert.file_claims,
+                quota: insert.quota.as_deref(),
                 extra_ctes,
                 extra_checks,
                 validators: &insert.validators,
@@ -4262,6 +4289,7 @@ fn mutation_to_sql_full(
                 check: update.check.as_ref(),
                 check_path: &update.check_path,
                 file_claims: &update.file_claims,
+                quota: None,
                 extra_ctes: vec![],
                 extra_checks: vec![],
                 validators: &update.validators,
@@ -4283,9 +4311,10 @@ fn mutation_to_sql_full(
             ctx.mutation_select(MutationSelectOptions {
                 cte: "del",
                 dml: &stmt,
-                check: None,
-                check_path: "$",
+                check: delete.check.as_ref(),
+                check_path: &delete.check_path,
                 file_claims: &[],
+                quota: delete.quota.as_deref(),
                 validators: &[],
                 extra_ctes: vec![],
                 extra_checks: vec![],
@@ -5013,6 +5042,7 @@ impl Ctx {
             check_path,
             validators,
             file_claims,
+            quota,
             extra_ctes,
             extra_checks,
             output,
@@ -5162,9 +5192,66 @@ impl Ctx {
                 quote_lit(&payload)
             );
         }
+        let mut quota_ctes = Vec::new();
+        if let Some(quota) = quota {
+            let quota_ident = quote_ident("__donat_quota");
+            let counter = quote_ident(&quota.counter_column);
+            let sign = if quota.consumes { "+" } else { "-" };
+            // The counter moves by exactly what this statement wrote, so an
+            // `ON CONFLICT DO NOTHING` that stored nothing consumes nothing,
+            // and a multi-row insert consumes as many units as it created.
+            // Referencing the write's own CTE is also what orders the two: the
+            // usage row is locked after the rows exist, never before.
+            quota_ctes.push(format!(
+                "{quota_ident} AS (UPDATE {schema}.{table} SET {counter} = {counter} {sign} \
+                 (SELECT count(*) FROM {cte_ident}) WHERE {tenant_col} = {tenant} \
+                 RETURNING {counter} AS {used})",
+                schema = quote_ident(&quota.counters.schema),
+                table = quote_ident(&quota.counters.name),
+                tenant_col = quote_ident(&quota.tenant_column),
+                tenant = quote_lit(&quota.tenant),
+                used = quote_ident("used"),
+            ));
+            if quota.consumes {
+                // A ceiling the plan does not set is no ceiling: a NULL
+                // maximum compares false and would refuse every write, so it
+                // is spelled as "there is a maximum and we are over it".
+                let ceiling = format!(
+                    "(SELECT {maximum} FROM {lschema}.{ltable} WHERE {lkey} = \
+                     (SELECT {plan} FROM {rschema}.{rtable} WHERE {rmatch} = {tenant}))",
+                    maximum = quote_ident(&quota.maximum_column),
+                    lschema = quote_ident(&quota.limits.schema),
+                    ltable = quote_ident(&quota.limits.name),
+                    lkey = quote_ident(&quota.limit_key_column),
+                    plan = quote_ident(&quota.registry_plan_column),
+                    rschema = quote_ident(&quota.registry.schema),
+                    rtable = quote_ident(&quota.registry.name),
+                    rmatch = quote_ident(&quota.registry_match_column),
+                    tenant = quote_lit(&quota.tenant),
+                );
+                // `IS NOT TRUE` rather than `>`, so a tenant with no usage row
+                // is refused instead of being handed an unlimited plan. The
+                // update matches nothing, `used` is NULL, and `NULL > ceiling`
+                // is NULL — which a bare `>` would fall through as "fine". A
+                // NULL *ceiling* is different and deliberate: a plan that sets
+                // no maximum sets none, so it is coalesced away first.
+                guarded = format!(
+                    "CASE WHEN ((SELECT {used} FROM {quota_ident}) IS NOT NULL \
+                     AND COALESCE((SELECT {used} FROM {quota_ident}) <= \
+                     COALESCE({ceiling}, (SELECT {used} FROM {quota_ident})), FALSE)) \
+                     IS NOT TRUE THEN \
+                     donat.raise_graphql_error('validation-failed', {path}, {message})::json \
+                     ELSE {guarded} END",
+                    used = quote_ident("used"),
+                    path = quote_lit(&quota.error_path),
+                    message = quote_lit(&quota.message),
+                );
+            }
+        }
         let mut ctes = vec![format!("{cte_ident} AS ({dml})")];
         ctes.extend(extra_ctes);
         ctes.extend(claim_ctes);
+        ctes.extend(quota_ctes);
         format!("WITH {} SELECT {guarded} AS root", ctes.join(", "))
     }
 }
@@ -5715,6 +5802,7 @@ mod dialect_dispatch_tests {
         let insert = MutationRoot::Insert {
             alias: "insert_note".into(),
             insert: InsertMutation {
+                quota: None,
                 table: Table {
                     schema: "public".into(),
                     name: "note".into(),
@@ -5791,6 +5879,7 @@ mod dialect_dispatch_tests {
         let insert = |output| MutationRoot::Insert {
             alias: "insert_note".into(),
             insert: InsertMutation {
+                quota: None,
                 table: Table {
                     schema: "donat".into(),
                     name: "note".into(),
@@ -5834,6 +5923,7 @@ mod dialect_dispatch_tests {
         let root = MutationRoot::Insert {
             alias: "insert_author".into(),
             insert: InsertMutation {
+                quota: None,
                 table: Table {
                     schema: "public".into(),
                     name: "author".into(),

@@ -1,0 +1,24 @@
+# The grants a merchant writes for its own people, and the sharpest edge in the
+# whole layer: a role able to grant actions can grant itself anything.
+#
+# Two things stop that. `reserved_actions` in `iam.yaml` is enforced by the
+# database on this table, so no command and no client can write an action that
+# belongs to the platform. And the tenant predicate applies here as everywhere
+# else, so a merchant writes grants in its own store and nowhere else.
+table:
+  name: iam_grant
+  schema: public
+select_permissions:
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+insert_permissions:
+  - role: staff
+    permission:
+      columns: [user_id, action]
+      check: {}
+delete_permissions:
+  - role: staff
+    permission:
+      filter: {}

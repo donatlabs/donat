@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_yaml::Value;
 
-use crate::types::Metadata;
+use crate::types::{CustomTypes, McpMetadata, Metadata, Source, StorageMetadata};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -55,10 +55,97 @@ pub enum LoadError {
     Recurrence { path: PathBuf, message: String },
     #[error("invalid process metadata ({path}): {message}")]
     Processes { path: PathBuf, message: String },
+    #[error("invalid tenancy metadata ({path}): {message}")]
+    Tenancy { path: PathBuf, message: String },
+    #[error("invalid extends ({path}): {message}")]
+    Extends { path: PathBuf, message: String },
+    #[error("invalid iam metadata ({path}): {message}")]
+    Iam { path: PathBuf, message: String },
+    #[error("invalid quota metadata ({path}): {message}")]
+    Quotas { path: PathBuf, message: String },
+}
+
+/// Compose one metadata directory onto another.
+///
+/// `extends.yaml` names one or more base directories, loaded first, with this
+/// directory loaded second and merged on top. It exists so that "the base is
+/// unchanged" can be structural rather than aspirational: there is no copy of
+/// the base to drift out of sync, and `git diff` against it is the proof.
+///
+/// `!include` cannot do this. An include resolves to a nested *value*, while
+/// the source list, the command index, the rule catalogue and the table index
+/// each merge at a different level of the document.
+///
+/// The merge is deliberately unclever, and refusing to override is the
+/// important half of it: an overlay that could quietly replace a base
+/// permission would make every audit of the base meaningless, because you
+/// would have to read both directories to know what is being served.
+#[derive(Debug, Deserialize)]
+struct ExtendsFile {
+    #[serde(default)]
+    extends: Vec<ExtendsEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtendsEntry {
+    path: String,
 }
 
 /// Load and fully resolve a metadata directory.
 pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
+    load_metadata_dir_tracked(dir, &mut Vec::new(), &mut Vec::new())
+}
+
+fn load_metadata_dir_tracked(
+    dir: &Path,
+    loading: &mut Vec<PathBuf>,
+    composed: &mut Vec<PathBuf>,
+) -> Result<Metadata, LoadError> {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if loading.contains(&canonical) {
+        return Err(LoadError::Extends {
+            path: dir.join("extends.yaml"),
+            message: format!("`{}` extends itself", dir.display()),
+        });
+    }
+    loading.push(canonical);
+    let result = load_one_metadata_dir(dir, loading, composed);
+    loading.pop();
+    result
+}
+
+/// One base, loaded once however many overlays reach it.
+///
+/// Only a directory reaching *itself* is a cycle. A base two overlays share is
+/// an ordinary diamond, and merging it twice would refuse the second copy for
+/// declaring everything the first already had — which reads as a collision and
+/// is not one.
+fn compose_base(
+    metadata: Metadata,
+    base_dir: &Path,
+    loading: &mut Vec<PathBuf>,
+    composed: &mut Vec<PathBuf>,
+) -> Result<Metadata, LoadError> {
+    let canonical = base_dir
+        .canonicalize()
+        .unwrap_or_else(|_| base_dir.to_path_buf());
+    if composed.contains(&canonical) {
+        return Ok(metadata);
+    }
+    composed.push(canonical);
+    let base = load_metadata_dir_tracked(base_dir, loading, composed)?;
+    merge_metadata(base, metadata).map_err(|message| LoadError::Extends {
+        path: base_dir.join("extends.yaml"),
+        message: format!("composing `{}`: {message}", base_dir.display()),
+    })
+}
+
+fn load_one_metadata_dir(
+    dir: &Path,
+    loading: &mut Vec<PathBuf>,
+    composed: &mut Vec<PathBuf>,
+) -> Result<Metadata, LoadError> {
     #[derive(Deserialize)]
     struct VersionFile {
         version: u32,
@@ -108,6 +195,9 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         media: load_section(dir, "media.yaml")?,
         ingest_schemas: load_ingest_schemas(dir)?,
         recurrence: load_section(dir, "recurrence.yaml")?,
+        tenancy: load_section(dir, "tenancy.yaml")?,
+        iam: load_section(dir, "iam.yaml")?,
+        quotas: load_section(dir, "quotas.yaml")?,
     };
     // A pin is derived, so a declared one is refused here rather than
     // overwritten by the stamp below — before anything else reads the process.
@@ -123,6 +213,20 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
     resolve_html_paths(&mut metadata);
     stamp_template_pins(&mut metadata);
     stamp_ingest_pins(&mut metadata);
+    // Compose bases underneath this directory before *anything* validates it.
+    // Every rule below is a rule about the merged document: a process in the
+    // overlay may reference a recurrence policy or a document template the
+    // base declared, and tenancy has to see every table the deployment serves.
+    // Validating this directory alone first would refuse exactly the
+    // cross-directory references composition exists to allow.
+    let extends_path = dir.join("extends.yaml");
+    if extends_path.exists() {
+        let file: ExtendsFile = parse_file(&extends_path)?;
+        for entry in &file.extends {
+            metadata = compose_base(metadata, &dir.join(&entry.path), loading, composed)?;
+        }
+    }
+
     let template_errors = crate::documents::validate_document_templates(&metadata);
     if !template_errors.is_empty() {
         return Err(LoadError::Templates {
@@ -179,6 +283,43 @@ pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
         path: dir.join("cron_triggers.yaml"),
         message,
     })?;
+    // Tenancy is checked last because every rule it applies is a rule about
+    // something another section declared: a source, a tracked table, a
+    // relationship, a permission.
+    let mut tenancy_errors = crate::tenancy::validate_tenancy_declaration(&metadata);
+    tenancy_errors.extend(crate::tenancy::validate_untenanted_commands(&metadata));
+    if !tenancy_errors.is_empty() {
+        return Err(LoadError::Tenancy {
+            path: dir.join("tenancy.yaml"),
+            message: tenancy_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    let iam_errors = crate::iam::validate_iam_declaration(&metadata);
+    if !iam_errors.is_empty() {
+        return Err(LoadError::Iam {
+            path: dir.join("iam.yaml"),
+            message: iam_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    let quota_errors = crate::quotas::validate_quota_declaration(&metadata);
+    if !quota_errors.is_empty() {
+        return Err(LoadError::Quotas {
+            path: dir.join("quotas.yaml"),
+            message: quota_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
     Ok(metadata)
 }
 
@@ -1039,4 +1180,250 @@ fn written_columns(
             .collect(),
         _ => vec![],
     }
+}
+
+/// Merge an overlay directory onto a base one.
+///
+/// Sources merge by name and their table and function lists concatenate.
+/// Everything else is keyed by its own identity and must not collide. A
+/// collision is an error, never a silent override — the overlay adds, it never
+/// edits, which is what lets the base be audited on its own.
+fn merge_metadata(base: Metadata, overlay: Metadata) -> Result<Metadata, String> {
+    let Metadata {
+        version: _,
+        sources,
+        inherited_roles,
+        query_collections,
+        allowlist,
+        remote_schemas,
+        actions,
+        custom_types,
+        cron_triggers,
+        rest_endpoints,
+        commands,
+        rules,
+        connectors,
+        processes,
+        mcp,
+        storage,
+        templates,
+        media,
+        ingest_schemas,
+        recurrence,
+        tenancy,
+        iam,
+        quotas,
+    } = base;
+
+    let mut merged = overlay;
+
+    merged.sources = merge_sources(sources, std::mem::take(&mut merged.sources))?;
+    merge_keyed(
+        &mut merged.commands,
+        commands,
+        |command| format!("{}.{}", command.source, command.name),
+        "command",
+    )?;
+    merge_keyed(
+        &mut merged.processes,
+        processes,
+        |process| format!("{}.{}", process.source, process.name),
+        "process",
+    )?;
+    merge_keyed(
+        &mut merged.rules.rules,
+        rules.rules,
+        |rule| rule.name.clone(),
+        "rule",
+    )?;
+    merge_keyed(
+        &mut merged.rules.types,
+        rules.types,
+        |declared| declared.name.clone(),
+        "rule type",
+    )?;
+    merge_keyed(
+        &mut merged.rules.decision_tables,
+        rules.decision_tables,
+        |table| table.name.clone(),
+        "decision table",
+    )?;
+    merge_keyed(
+        &mut merged.connectors,
+        connectors,
+        |connector| connector.name.clone(),
+        "connector instance",
+    )?;
+    merge_keyed(
+        &mut merged.actions,
+        actions,
+        |action| action.name.clone(),
+        "action",
+    )?;
+    merge_keyed(
+        &mut merged.remote_schemas,
+        remote_schemas,
+        |schema| schema.name.clone(),
+        "remote schema",
+    )?;
+    merge_keyed(
+        &mut merged.cron_triggers,
+        cron_triggers,
+        |trigger| trigger.name.clone(),
+        "cron trigger",
+    )?;
+    merge_keyed(
+        &mut merged.rest_endpoints,
+        rest_endpoints,
+        |endpoint| endpoint.name.clone(),
+        "rest endpoint",
+    )?;
+    merge_keyed(
+        &mut merged.query_collections,
+        query_collections,
+        |collection| collection.name.clone(),
+        "query collection",
+    )?;
+    merge_keyed(
+        &mut merged.inherited_roles,
+        inherited_roles,
+        |role| role.role_name.clone(),
+        "inherited role",
+    )?;
+    merge_keyed(
+        &mut merged.templates,
+        templates,
+        |template| template.name.clone(),
+        "document template",
+    )?;
+    merge_keyed(
+        &mut merged.ingest_schemas,
+        ingest_schemas,
+        |schema| schema.name.clone(),
+        "ingest schema",
+    )?;
+    merged.allowlist.extend(allowlist);
+
+    // Sections a deployment has exactly one of. Two answers is the one thing
+    // configuration must never have to choose between, so the overlay is
+    // allowed to supply one only when the base supplied none.
+    merge_single(
+        &mut merged.storage,
+        storage,
+        StorageMetadata::is_empty,
+        "storage",
+    )?;
+    merge_single(
+        &mut merged.media,
+        media,
+        crate::media::MediaMetadata::is_empty,
+        "media",
+    )?;
+    merge_single(
+        &mut merged.recurrence,
+        recurrence,
+        crate::recurrence::RecurrenceMetadata::is_empty,
+        "recurrence",
+    )?;
+    merge_single(
+        &mut merged.custom_types,
+        custom_types,
+        CustomTypes::is_empty,
+        "custom types",
+    )?;
+    merge_single(
+        &mut merged.mcp,
+        mcp,
+        |mcp: &McpMetadata| !mcp.is_configured(),
+        "mcp",
+    )?;
+    match (&merged.quotas, quotas) {
+        (Some(_), Some(_)) => return Err("both directories declare quotas".to_string()),
+        (None, base_quotas) => merged.quotas = base_quotas,
+        (Some(_), None) => {}
+    }
+    match (&merged.iam, iam) {
+        (Some(_), Some(_)) => return Err("both directories declare iam".to_string()),
+        (None, base_iam) => merged.iam = base_iam,
+        (Some(_), None) => {}
+    }
+    match (&merged.tenancy, tenancy) {
+        (Some(_), Some(_)) => return Err("both directories declare tenancy".to_string()),
+        (None, base_tenancy) => merged.tenancy = base_tenancy,
+        (Some(_), None) => {}
+    }
+
+    Ok(merged)
+}
+
+fn merge_sources(base: Vec<Source>, overlay: Vec<Source>) -> Result<Vec<Source>, String> {
+    let mut merged = base;
+    for source in overlay {
+        match merged
+            .iter_mut()
+            .find(|existing| existing.name == source.name)
+        {
+            Some(existing) => {
+                for table in source.tables {
+                    if existing.tables.iter().any(|tracked| {
+                        tracked.table.schema() == table.table.schema()
+                            && tracked.table.name() == table.table.name()
+                    }) {
+                        return Err(format!(
+                            "table `{}` is tracked in both directories",
+                            table.table
+                        ));
+                    }
+                    existing.tables.push(table);
+                }
+                for function in source.functions {
+                    if existing.functions.iter().any(|tracked| {
+                        tracked.function.schema() == function.function.schema()
+                            && tracked.function.name() == function.function.name()
+                    }) {
+                        return Err(format!(
+                            "function `{}` is tracked in both directories",
+                            function.function
+                        ));
+                    }
+                    existing.functions.push(function);
+                }
+            }
+            None => merged.push(source),
+        }
+    }
+    Ok(merged)
+}
+
+/// Append the base's entries under the overlay's, refusing any shared key.
+fn merge_keyed<T>(
+    overlay: &mut Vec<T>,
+    base: Vec<T>,
+    key: impl Fn(&T) -> String,
+    what: &str,
+) -> Result<(), String> {
+    for entry in base {
+        let name = key(&entry);
+        if overlay.iter().any(|existing| key(existing) == name) {
+            return Err(format!("{what} `{name}` is declared in both directories"));
+        }
+        overlay.push(entry);
+    }
+    Ok(())
+}
+
+fn merge_single<T>(
+    overlay: &mut T,
+    base: T,
+    is_absent: impl Fn(&T) -> bool,
+    what: &str,
+) -> Result<(), String> {
+    if is_absent(overlay) {
+        *overlay = base;
+        return Ok(());
+    }
+    if !is_absent(&base) {
+        return Err(format!("both directories declare {what}"));
+    }
+    Ok(())
 }

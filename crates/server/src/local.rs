@@ -98,9 +98,14 @@ pub struct StoredArtifact {
 /// things a test of the *dispatch* should not need. The production
 /// implementation is [`StorageArtifactStore`].
 pub trait ArtifactStore: Send + Sync {
+    /// `tenant` is the store the produced file belongs to, on a deployment
+    /// that has tenants. It puts the object under that tenant's prefix, the
+    /// same one an upload lands in, so bucket policy and per-tenant erasure
+    /// see every object an attachment holds rather than most of them.
     fn store<'a>(
         &'a self,
         artifact: &'a LocalArtifact,
+        tenant: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StoredArtifact, ConnectorFailure>>;
 }
 
@@ -383,6 +388,16 @@ impl LocalCapabilityRegistry {
         }
         let fingerprint = canonical_json_sha256(&input);
 
+        // Read here, before the input is moved into the blocking task, and
+        // never passed to the capability: which store a produced file belongs
+        // to is not a capability's decision, and a capability that could name
+        // one could name another tenant's.
+        let claim_tenant = input
+            .get(CLAIM_TENANT_KEY)
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
         // The one thing resolved between the activity and the execution: a
         // stored file the input names. The bytes go into the execution context
         // and never into the input — the input keeps the identity of the file,
@@ -458,7 +473,10 @@ impl LocalCapabilityRegistry {
         let output = match product {
             LocalProduct::Value(value) => value,
             LocalProduct::Artifact { artifact, metadata } => {
-                let stored = self.artifacts.store(&artifact).await?;
+                let stored = self
+                    .artifacts
+                    .store(&artifact, claim_tenant.as_deref())
+                    .await?;
                 artifact_output(&stored, metadata)?
             }
         };
@@ -468,6 +486,15 @@ impl LocalCapabilityRegistry {
         })
     }
 }
+
+/// The activity-input key naming which tenant a produced file belongs to.
+///
+/// A process declaration supplies it the way it supplies `claim_session_key` —
+/// `{session_variable: x-donat-tenant-id}` — and in a tenanted source that
+/// variable is part of every process's compiled caller contract, so it is
+/// there to be read on every transition, including one that resumes after a
+/// restart.
+pub const CLAIM_TENANT_KEY: &str = "claim_tenant";
 
 /// The stored file an input names, if it names one: the handle exactly as the
 /// activity spelled it, and the identifier it parses to.
@@ -744,6 +771,7 @@ pub fn plan_artifact(
     artifact: &LocalArtifact,
     id: Uuid,
     now: DateTime<Utc>,
+    tenant: Option<&str>,
 ) -> Result<ArtifactPlan, ConnectorFailure> {
     let Some(spec) = storage.attachment(artifact.attachment()) else {
         return Err(refused(
@@ -770,7 +798,9 @@ pub fn plan_artifact(
             "local capability produced a file for a column whose backend is not resolved",
         ));
     };
-    let object_key = spec.object_key(id);
+    // Under the same prefix an upload lands in, so every object an attachment
+    // holds is in one place per tenant.
+    let object_key = spec.object_key_in(tenant, id);
     let (url, headers) = s3.presign_produced_put(
         &object_key,
         artifact.media_type(),
@@ -829,8 +859,12 @@ impl StorageArtifactStore {
         }
     }
 
-    async fn put(&self, artifact: &LocalArtifact) -> Result<StoredArtifact, ConnectorFailure> {
-        let plan = plan_artifact(&self.storage, artifact, Uuid::new_v4(), Utc::now())?;
+    async fn put(
+        &self,
+        artifact: &LocalArtifact,
+        tenant: Option<&str>,
+    ) -> Result<StoredArtifact, ConnectorFailure> {
+        let plan = plan_artifact(&self.storage, artifact, Uuid::new_v4(), Utc::now(), tenant)?;
 
         let mut request = self
             .http
@@ -914,8 +948,9 @@ impl ArtifactStore for StorageArtifactStore {
     fn store<'a>(
         &'a self,
         artifact: &'a LocalArtifact,
+        tenant: Option<&'a str>,
     ) -> BoxFuture<'a, Result<StoredArtifact, ConnectorFailure>> {
-        Box::pin(self.put(artifact))
+        Box::pin(self.put(artifact, tenant))
     }
 }
 
@@ -1235,7 +1270,7 @@ mod tests {
         )
         .expect("a complete artifact declaration is valid");
         let id = Uuid::from_u128(11);
-        let plan = plan_artifact(&storage, &artifact, id, Utc::now())
+        let plan = plan_artifact(&storage, &artifact, id, Utc::now(), None)
             .expect("a declared attachment resolves");
         assert_eq!(plan.object_key, format!("public.pet.photo/{id}"));
         assert_eq!(plan.byte_size, 12);
@@ -1266,7 +1301,7 @@ mod tests {
         .expect("a complete artifact declaration is valid")
         .claimed_by_session(Some("u-1"))
         .expect("a session identity is a plain value");
-        let plan = plan_artifact(&storage, &identified, id, Utc::now())
+        let plan = plan_artifact(&storage, &identified, id, Utc::now(), None)
             .expect("a declared attachment resolves");
         assert_eq!(plan.claim_session_key.as_deref(), Some("u-1"));
         // And the statement that writes the row binds it, rather than the
@@ -1286,7 +1321,7 @@ mod tests {
         )
         .expect("a complete artifact declaration is valid");
         assert_eq!(
-            plan_artifact(&storage, &elsewhere, id, Utc::now())
+            plan_artifact(&storage, &elsewhere, id, Utc::now(), None)
                 .unwrap_err()
                 .code(),
             "local_artifact_attachment_unknown"
@@ -1300,7 +1335,7 @@ mod tests {
         )
         .expect("a complete artifact declaration is valid");
         assert_eq!(
-            plan_artifact(&storage, &oversized, id, Utc::now())
+            plan_artifact(&storage, &oversized, id, Utc::now(), None)
                 .unwrap_err()
                 .code(),
             "local_artifact_too_large"
@@ -1615,7 +1650,7 @@ ingest_schemas:
             assert_eq!(artifact.media_type(), media_type);
 
             let id = Uuid::from_u128(21);
-            let plan = plan_artifact(&storage, &artifact, id, Utc::now())
+            let plan = plan_artifact(&storage, &artifact, id, Utc::now(), None)
                 .unwrap_or_else(|failure| panic!("{operation} resolves its column: {failure:?}"));
             assert_eq!(plan.object_key, format!("public.document.file/{id}"));
             assert_eq!(plan.claim_role, "app");
@@ -1787,7 +1822,7 @@ ingest_schemas:
             assert_eq!(artifact.media_type(), "image/png");
 
             let id = Uuid::from_u128(23);
-            let plan = plan_artifact(&storage, &artifact, id, Utc::now())
+            let plan = plan_artifact(&storage, &artifact, id, Utc::now(), None)
                 .unwrap_or_else(|failure| panic!("{operation} resolves its column: {failure:?}"));
             assert_eq!(plan.object_key, format!("public.pet.photo/{id}"));
             assert_eq!(plan.claim_role, "app");
@@ -1957,6 +1992,7 @@ templates:
         fn store<'a>(
             &'a self,
             artifact: &'a LocalArtifact,
+            _tenant: Option<&'a str>,
         ) -> BoxFuture<'a, Result<StoredArtifact, ConnectorFailure>> {
             Box::pin(async move {
                 Ok(StoredArtifact {
@@ -2262,5 +2298,43 @@ storage:
             _ => None,
         })
         .expect("a resolved test storage registry")
+    }
+
+    /// A produced file lands under its tenant's prefix, the same one an upload
+    /// lands in — so per-tenant bucket policy and erasure see every object an
+    /// attachment holds rather than only the ones a browser sent.
+    #[test]
+    fn a_produced_artifact_lands_under_its_tenants_prefix() {
+        let storage = test_storage();
+        let artifact = LocalArtifact::new(
+            "public.pet.photo",
+            "app",
+            "receipt.txt",
+            "text/plain",
+            b"bytes".to_vec(),
+        )
+        .expect("artifact");
+        let id = Uuid::nil();
+
+        let untenanted = plan_artifact(&storage, &artifact, id, Utc::now(), None).expect("plan");
+        assert_eq!(untenanted.object_key, format!("public.pet.photo/{id}"));
+
+        let tenanted =
+            plan_artifact(&storage, &artifact, id, Utc::now(), Some("tenant-alpha")).expect("plan");
+        assert_eq!(
+            tenanted.object_key,
+            format!("tenant-alpha/public.pet.photo/{id}")
+        );
+
+        // A tenant identifier is opaque and goes into an object key, so a
+        // separator or a traversal segment in one may not address another
+        // tenant's prefix.
+        let hostile =
+            plan_artifact(&storage, &artifact, id, Utc::now(), Some("../other")).expect("plan");
+        assert_eq!(
+            hostile.object_key,
+            format!("___other/public.pet.photo/{id}"),
+            "a hostile tenant reached outside its prefix"
+        );
     }
 }

@@ -86,6 +86,14 @@ query change and must not be smuggled into the pinned document.
 | `subscriptions` | TestSubscriptionBasic + JWT ws-expiry | 4 |
 | `remote_schemas` | Remote-schema permissions/presets/relationships (Rust stub upstream replaces the node services) | 4 |
 
+The table above lists the suites ported from `tests-py`. Engine-native suites
+(commands, processes, connectors, files, rules, MCP, REST, tenancy) have no
+upstream to be ported from and are named by their module. One of them is worth
+pointing at here: `tenancy` proves that two tenants cannot reach each other
+through *unrestricted* permissions — its fixtures deliberately declare
+`filter: {}` and `check: {}`, so every case would pass trivially if the
+isolation were a filter in the metadata rather than a layer the compiler adds.
+
 Out of scope by design: admin/no-role tests (no-admin-role rule — the
 functionality is being removed), enterprise-only classes. Excluded cases
 are commented at their call sites with reasons.

@@ -1,0 +1,11 @@
+# The same source Petshop declares, merged by name. Its table list and this one
+# concatenate; a table declared in both is a collision and is refused.
+- name: default
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url:
+        from_env: DONAT_GRAPHQL_DATABASE_URL
+      isolation_level: read-committed
+      use_prepared_statements: false
+  tables: "!include default/tables/tables.yaml"

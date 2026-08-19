@@ -51,3 +51,11 @@ from that need.
 The active example can temporarily fail to compile while its YAML is ahead of
 runtime support. That state must be explicit and short-lived. Multitenancy
 requires its own design, ADR, conformance boundary, and implementation plan.
+
+*Delivered 2026-08-18:
+[[097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]] and
+[[098-a-compiled-role-is-the-shape-and-a-grant-is-the-scope]], with the
+`tenancy` and `pethub` conformance suites as the boundary. `examples/pethub`
+composes this example's metadata unchanged and adds only a platform layer —
+which is what "an engine-wide capability that composes with every data and
+execution surface" was supposed to mean, now asserted rather than intended.*

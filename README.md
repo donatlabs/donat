@@ -108,6 +108,69 @@ declared role, or as the caller whose session it captured.
 Configuration is deploy-time. `donat migrate` applies DDL, a second `migrate`
 deploys the Process revisions, and the serving engine runs neither.
 
+## Multitenant without writing a filter
+
+A tenant is not a column you remember to compare in every permission of every
+table. It is one declaration, `tenancy.yaml`, naming the source, the claim that
+carries the tenant, the key column, and the registry of tenants:
+
+```yaml
+source: default
+variable: X-Donat-Tenant-Id
+key: tenant_id
+registry:
+  table: { schema: public, name: tenant }
+  key: id
+  status: { column: status, serving: [active] }
+exempt:
+  - table: { schema: public, name: plan }   # platform reference data
+    shared: read_only
+```
+
+From there the compiler does it. Every read — roots, nested relationships,
+aggregates, Relay, subscriptions, REST, MCP — is bounded by the caller's
+tenant, so a permission with `filter: {}` means *every row of my tenant*. Every
+write is bounded the same way and presets the tenant column, so an insert
+naming somebody else's id lands in the caller's own tenant instead of theirs.
+Commands and durable processes are included: a process persists its tenant with
+the instance, and the tenant joins every idempotency scope, because otherwise
+two tenants that pick the same key would replay each other's results.
+
+Two properties are the point:
+
+- **Forgetting a table stops the deployment.** Every tracked table either
+  carries the key or says why it does not. A table that says neither fails
+  `donat validate` and refuses to boot, naming itself. Adding the hundred and
+  fifty-ninth table cannot quietly serve everyone's rows.
+- **The tenant is a claim, never a header.** It arrives the way a role does —
+  from a verified token or an auth hook. `X-Donat-Role` selects among roles a
+  token already granted; there is nothing for a tenant header to select among,
+  so no header names one. A request without a tenant is refused, not answered
+  with an empty page.
+
+`extends:` composes one metadata directory onto another, so the platform layer
+sits on top of a business domain whose YAML it never edits — collisions are
+refused rather than silently overridden.
+
+**Inside a tenant, `iam.yaml` lets the tenant decide.** A compiled role is the
+shape — which tables and operations exist. A grant is the scope: rows a tenant
+writes for itself, saying which `service:action` its own roles hold. The
+compiler turns those rows into the predicate on every root the compiled role
+exposes, so two people with the same role differ by what they were granted, and
+adding a table governs it. `cancel_order` can require `order:cancel` while
+`orders:update` is not enough, and the actions that belong to the platform are
+barred by the database rather than by whichever command writes the grant.
+
+**`quotas.yaml` caps what a tenant holds** without editing the domain's insert
+permission — the counter moves inside the statement that performs the write, so
+the ceiling holds when two writers arrive at once rather than when they happen
+to arrive apart.
+
+See the decisions for what is deliberately out of scope:
+[tenancy](knowledgebase/declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered.md)
+and
+[in-tenant grants](knowledgebase/declarative-saas/decisions/098-a-compiled-role-is-the-shape-and-a-grant-is-the-scope.md).
+
 ## One execution path
 
 A request resolves into a SQL-free intermediate representation before the

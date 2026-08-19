@@ -1,0 +1,13 @@
+# Pethub is Petshop plus a platform layer.
+#
+# The store's metadata is composed in, not copied: there is no second copy to
+# drift, and `git diff ../../petshop` is the proof that making it multitenant
+# changed none of it. If a future change needs a line edited under
+# `../../petshop/metadata`, the tenancy design has failed and is what should be
+# revised.
+#
+# Merging refuses to override. An overlay that could quietly replace one of the
+# store's permissions would make every audit of the store meaningless — you
+# would have to read both directories to know what is being served.
+extends:
+  - path: ../../petshop/metadata

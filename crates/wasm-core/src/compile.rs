@@ -803,6 +803,7 @@ fn request_storage<'a>(
         .with_timezone(&chrono::Utc);
 
     Ok(donat_storage::RequestContext {
+        tenant: None,
         registry: &state.storage,
         now,
         // Production mints a fresh id per request; the entropy comes from the
@@ -877,7 +878,16 @@ pub fn file_completion(state: &CoreState, input: &CompletionInput) -> Completion
         return completion_error(&format!("unknown storage backend '{}'", input.backend));
     };
 
-    let final_key = spec.object_key(upload_id);
+    // Derived from the staging address rather than recomputed, for the same
+    // reason `crates/server/src/files.rs` derives it: the prefix an object was
+    // staged under is a property of the request that minted it, and a
+    // recomputed key would drop a tenant prefix and land the bytes outside it.
+    let final_key = input
+        .staging_key
+        .strip_suffix(".part")
+        .unwrap_or(&input.staging_key)
+        .to_string();
+    let _ = upload_id;
     let (copy_url, copy_headers) = s3.presign_copy(&input.staging_key, &final_key, now, 60);
     CompletionResult::Urls(CompletionUrls {
         head_url: s3.presign("HEAD", &input.staging_key, now, 60),

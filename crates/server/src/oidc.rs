@@ -86,6 +86,14 @@ pub struct OidcConfig {
     /// pointed at this provider with this key and visible to exactly this
     /// role. Absent, those fields do not exist at all.
     pub admin: Option<crate::idp_admin::IdpAdmin>,
+    /// Where in a token this provider puts the tenant, for a deployment that
+    /// declares `tenancy.yaml`.
+    ///
+    /// A JSON path, because only the provider knows the shape it emits. Absent
+    /// in every deployment that has no tenants, and a boot failure in one that
+    /// has — a token with no tenant is refused at every tenanted table, and
+    /// that is worth learning at start-up rather than at the first request.
+    pub tenant_claim: Option<String>,
 }
 
 /// Which token of the exchange becomes the session cookie.
@@ -154,6 +162,9 @@ struct RawConfig {
     /// The one role allowed to manage accounts.
     #[serde(default)]
     admin_role: Option<String>,
+    /// The JSON path this provider puts the tenant at.
+    #[serde(default)]
+    tenant_claim: Option<String>,
 }
 
 impl OidcConfig {
@@ -227,6 +238,7 @@ impl OidcConfig {
                 }
             },
             login_api: login_api.clone(),
+            tenant_claim: parsed.tenant_claim.filter(|value| !value.trim().is_empty()),
             admin: match (
                 parsed.admin_key.filter(|v| !v.is_empty()),
                 parsed.admin_role.filter(|v| !v.is_empty()),
@@ -320,6 +332,7 @@ impl FlatConfig {
         ("DONAT_OIDC_ADMIN_API", "admin_api"),
         ("DONAT_OIDC_ADMIN_KEY", "admin_key"),
         ("DONAT_OIDC_ADMIN_ROLE", "admin_role"),
+        ("DONAT_OIDC_TENANT_CLAIM", "tenant_claim"),
     ];
 
     /// The path this engine serves its own sign-in screen on.
@@ -459,6 +472,12 @@ impl OidcConfig {
     /// provider's own tokens invalid; a wrong claim path leaves somebody with
     /// no role and a refusal. None of them quietly grants anything — which is
     /// the property that makes a default acceptable at all.
+    /// Whether this configuration is the one verifying tokens, rather than a
+    /// `DONAT_GRAPHQL_JWT_SECRET` a deployment wrote itself.
+    pub fn derives_jwt(&self) -> bool {
+        self.login_api.is_some()
+    }
+
     pub fn derived_jwt(&self) -> Option<String> {
         let login_api = self.login_api.as_deref()?;
         // The issuer is what the provider stamps, and it stamps the address a
@@ -472,6 +491,21 @@ impl OidcConfig {
                 None => host.to_string(),
             })?
         );
+        // Where a deployment's roles live in a token. This is the common shape
+        // and the one this engine's own provider uses; a provider that
+        // namespaces its claims says so itself.
+        let mut claims_map = serde_json::json!({
+            "x-donat-allowed-roles": {"path": "$.roles"},
+            "x-donat-default-role": {"path": "$.roles[0]"},
+            "x-donat-user-id": {"path": "$.sub", "default": ""}
+        });
+        // A tenanted deployment needs one more claim, and only the provider
+        // knows where it put it — so the path is named once, here, rather than
+        // guessed. Without it every request to a tenanted table is refused for
+        // carrying no tenant, which is why `serve` refuses to start instead.
+        if let Some(path) = &self.tenant_claim {
+            claims_map["x-donat-tenant-id"] = serde_json::json!({ "path": path });
+        }
         Some(
             serde_json::json!({
                 "jwk_url": format!("{login_api}/auth/v1/oidc/certs"),
@@ -486,11 +520,7 @@ impl OidcConfig {
                 // Where a deployment's roles live in a token. This is the
                 // common shape and the one this engine's own provider uses; a
                 // provider that namespaces its claims says so itself.
-                "claims_map": {
-                    "x-donat-allowed-roles": {"path": "$.roles"},
-                    "x-donat-default-role": {"path": "$.roles[0]"},
-                    "x-donat-user-id": {"path": "$.sub", "default": ""}
-                }
+                "claims_map": claims_map
             })
             .to_string(),
         )
@@ -977,6 +1007,13 @@ pub async fn session(
     headers: HeaderMap,
 ) -> Response {
     let resolved = crate::gql::resolve_session_with_origin(&state, &headers).await;
+    // Which tenant this session is in. A panel showing a store's data should
+    // say which store; without this it would have to guess, and the one place
+    // it must not guess is the one that decides what it is looking at.
+    let tenant = match &resolved {
+        Ok((session, _)) => session_tenant_name(&state, session).await,
+        Err(_) => None,
+    };
     let body = match resolved {
         Ok((session, crate::gql::SessionOrigin::Authenticated)) => serde_json::json!({
             "authenticated": true,
@@ -996,12 +1033,45 @@ pub async fn session(
         }),
         Err(_) => serde_json::json!({ "authenticated": false, "role": Json::Null }),
     };
+    // Present only where it means something. A deployment with no tenants does
+    // not grow a field that is always null — configure nothing and it is
+    // absent, not empty.
+    let body = match tenant {
+        Some(tenant) => {
+            let mut body = body;
+            if let Some(object) = body.as_object_mut() {
+                object.insert("tenant".to_string(), tenant);
+            }
+            body
+        }
+        None => body,
+    };
     (
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
         axum::Json(body),
     )
         .into_response()
+}
+
+/// The tenant this session carries, when the deployment has tenants.
+///
+/// `null` in every deployment that declares none, and in a session that has
+/// not got one — a person signed in but not yet in a store, which is exactly
+/// the state a store switcher exists for.
+async fn session_tenant_name(
+    state: &crate::state::SharedState,
+    session: &donat_schema::Session,
+) -> Option<Json> {
+    let engine = state.engine_snapshot().await;
+    let tenancy = engine.metadata.tenancy.as_ref()?;
+    Some(
+        session
+            .var(&tenancy.variable_key())
+            .filter(|value| !value.is_empty())
+            .map(|value| Json::String(value.to_string()))
+            .unwrap_or(Json::Null),
+    )
 }
 
 /// The roles a session's token granted.

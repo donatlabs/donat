@@ -13,6 +13,10 @@
 
 use std::time::Duration;
 
+/// What marks an object as staged rather than claimed. Set where the key is
+/// minted (`donat_storage::AttachmentSpec::staging_key_in`); read here.
+const STAGING_SUFFIX: &str = ".part";
+
 use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -206,9 +210,18 @@ async fn complete_inner(
     // refuses with a 400 this handler reports as a 502: a failure for a file
     // that is stored and claimable. The comment below already promised this
     // was safe to repeat; now it is.
-    if let Some(spec) = state.storage.attachment(&upload.attachment)
-        && upload.object_key == spec.object_key(upload.id)
-    {
+    // A staging key ends in `.part` and a final key does not, so a row naming
+    // a final key can only mean an earlier call got all the way through — and
+    // a client whose POST timed out after the server had finished is exactly
+    // the caller who retries.
+    //
+    // Tested on the suffix rather than by recomputing the canonical key: once
+    // an object lives under its tenant's prefix, recomputing needs the tenant,
+    // and the tenant is a property of the *request that minted it* rather than
+    // of the one completing it. The stored key is the engine's own, written
+    // when the URL was signed, and this handler already trusts it as the HEAD
+    // target and the copy source.
+    if !upload.object_key.ends_with(STAGING_SUFFIX) {
         return StatusCode::NO_CONTENT.into_response();
     }
 
@@ -251,11 +264,17 @@ async fn complete_inner(
     // leaving the file at the address it writes to would let a caller replace
     // content the claim had already certified. Whatever a late PUT stores at the
     // staging key afterwards is an orphan nothing references.
-    let final_key = match state.storage.attachment(&upload.attachment) {
-        Some(spec) => spec.object_key(upload.id),
-        None => return (StatusCode::NOT_FOUND, "unknown upload").into_response(),
-    };
+    if state.storage.attachment(&upload.attachment).is_none() {
+        return (StatusCode::NOT_FOUND, "unknown upload").into_response();
+    }
     let staging_key = upload.object_key.clone();
+    // The destination is the staging address without its suffix, so the bytes
+    // land in the same prefix they were staged in — a tenant's own, when the
+    // deployment has tenants.
+    let final_key = staging_key
+        .strip_suffix(STAGING_SUFFIX)
+        .unwrap_or(&staging_key)
+        .to_string();
     let (copy_url, copy_headers) = s3.presign_copy(&staging_key, &final_key, Utc::now(), 60);
     let mut request = state.http.put(&copy_url).timeout(Duration::from_secs(20));
     for (name, value) in &copy_headers {

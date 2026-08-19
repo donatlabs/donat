@@ -460,6 +460,16 @@ impl<'a> Planner<'a> {
         let output = self.v1_mutation_output(&ctx, args, session, path)?;
 
         Ok(DeleteMutation {
+            check: self.write_check_expression(
+                &serde_json::Value::Null,
+                &ctx,
+                session,
+                Some(donat_metadata::IamOperation::Delete),
+                crate::tenancy::CheckTenant::SessionBoundElsewhere,
+                path,
+            )?,
+            check_path: path.to_string(),
+            quota: self.quota_consumption(&ctx, session, false, path)?,
             table: Table {
                 schema: ctx.info.schema.clone(),
                 name: ctx.info.name.clone(),
@@ -690,6 +700,7 @@ impl<'a> Planner<'a> {
         let file_claims = self.file_claims(&ctx.entry.table, &typed_columns, &rows, session, "$");
 
         Ok(InsertMutation {
+            quota: self.quota_consumption(&ctx, session, true, path)?,
             table: Table {
                 schema: ctx.info.schema.clone(),
                 name: ctx.info.name.clone(),
