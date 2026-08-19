@@ -8,9 +8,15 @@ runs inside their own isolated tenant.
 
 This example exists to prove one claim:
 
-> Multitenancy is an engine capability, not a domain concern. The Petshop
-> business YAML is composed here **unchanged**. Everything that makes it
-> multitenant lives in `metadata/` and in `migrations/`.
+> Multitenancy is an engine capability, not a domain concern. Nothing that
+> makes Petshop multitenant lives in Petshop. Everything is in `metadata/` and
+> `migrations/` here.
+
+Read that precisely: it is *tenancy* that required no change to the store, not
+that the store is frozen. Petshop is edited when Petshop has a bug — and it had
+one, fixed alongside this: within a single store, sellers were not isolated
+from each other. That is a domain rule, it belongs in the store's own YAML, and
+`crates/conformance/tests/petshop.rs` now holds it there.
 
 `git diff ../petshop` is the proof, and
 `crates/conformance/tests/pethub.rs` is the executable form of it: it asserts

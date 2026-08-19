@@ -463,16 +463,31 @@
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: organization}
+  # A buying organization is somebody's employer, and its credit line is its
+  # own business, so the people are bounded by belonging to it — the same
+  # traversal a seller is bounded by, on the other side of the marketplace.
+  #
+  # `b2b_finance` is deliberately not among them. It is the role the approval
+  # flow runs its own steps as (`run_as: b2b_finance`), and a fixed process
+  # role has no caller session to read a membership out of. `donat validate`
+  # refuses a permission that asks one to, which is how the line between a
+  # person's role and a worker's got drawn here rather than by opinion.
+  array_relationships:
+    - name: memberships
+      using:
+        manual_configuration:
+          remote_table: {schema: public, name: organization_membership}
+          column_mapping: {id: organization_id}
   select_permissions:
     - role: b2b_buyer
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_approver
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_finance
       permission: {columns: "*", filter: {}}
   update_permissions:
     - role: b2b_approver
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}, check: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_finance
       permission: {columns: "*", filter: {}, check: {}}
 
@@ -484,9 +499,15 @@
         filter: {user_id: {_eq: X-Donat-User-Id}}
 
 - table: {schema: public, name: quote}
+  array_relationships:
+    - name: memberships
+      using:
+        manual_configuration:
+          remote_table: {schema: public, name: organization_membership}
+          column_mapping: {organization_id: organization_id}
   select_permissions:
     - role: b2b_approver
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_finance
       permission: {columns: "*", filter: {}}
   command_select_permissions:
@@ -515,38 +536,51 @@
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: purchase_approval}
+  # An approval has no organization of its own — it belongs to the quote it
+  # approves. So the bound is one hop further, through that quote, rather than
+  # a column copied onto this table to make the filter shorter.
+  object_relationships:
+    - name: quote
+      using:
+        foreign_key_constraint_on: quote_id
   select_permissions:
     - role: b2b_approver
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {quote: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}}
     - role: b2b_finance
       permission: {columns: "*", filter: {}}
   command_select_permissions:
     - role: b2b_buyer
       permission:
         columns: [id, quote_id, status]
-        filter: {}
+        filter: {quote: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
   insert_permissions:
     - role: b2b_buyer
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {quote: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}}
   update_permissions:
     - role: b2b_approver
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {quote: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}, check: {quote: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}}
     - role: b2b_finance
       permission: {columns: "*", filter: {}, check: {}}
 
 - table: {schema: public, name: credit_usage}
+  array_relationships:
+    - name: memberships
+      using:
+        manual_configuration:
+          remote_table: {schema: public, name: organization_membership}
+          column_mapping: {organization_id: organization_id}
   command_select_permissions:
     - role: b2b_approver
       permission:
         columns: [id, approval_id, amount_minor, currency]
-        filter: {}
+        filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}
     - role: b2b_finance
       permission:
         columns: [id, approval_id, amount_minor, currency]
         filter: {}
   insert_permissions:
     - role: b2b_approver
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_finance
       permission: {columns: "*", check: {}}
 
@@ -556,9 +590,22 @@
       permission: {columns: "*", filter: {}}
 
 - table: {schema: public, name: vendor_order}
+  # A marketplace sells other people's goods, so a seller is not the shop: it
+  # sees its own lines of an order and nobody else's. The bound is a traversal
+  # of the membership that says who a person sells for — declared here rather
+  # than left to each reader, because a seller reading another seller's orders
+  # is the failure this table exists to avoid.
+  array_relationships:
+    - name: memberships
+      using:
+        manual_configuration:
+          remote_table: {schema: public, name: vendor_membership}
+          column_mapping: {vendor_id: vendor_id}
   select_permissions:
     - role: vendor
-      permission: {columns: "*", filter: {}}
+      permission:
+        columns: "*"
+        filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}
     - role: marketplace_worker
       permission: {columns: "*", filter: {}}
   insert_permissions:
@@ -566,7 +613,10 @@
       permission: {columns: "*", check: {}}
   update_permissions:
     - role: vendor
-      permission: {columns: "*", filter: {}, check: {}}
+      permission:
+        columns: "*"
+        filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}
+        check: {memberships: {user_id: {_eq: X-Donat-User-Id}}}
 
 - table: {schema: public, name: vendor_membership}
   select_permissions:
@@ -576,14 +626,22 @@
         filter: {user_id: {_eq: X-Donat-User-Id}}
 
 - table: {schema: public, name: vendor_order_acceptance}
+  # Accepting an order is a seller acting on its own line. Both halves are
+  # bounded: what it may read, and what it may write.
+  array_relationships:
+    - name: memberships
+      using:
+        manual_configuration:
+          remote_table: {schema: public, name: vendor_membership}
+          column_mapping: {vendor_id: vendor_id}
   command_select_permissions:
     - role: vendor
       permission:
         columns: [id, vendor_order_id, vendor_id, acceptance_id]
-        filter: {}
+        filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}
   insert_permissions:
     - role: vendor
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
 
 - table: {schema: public, name: vendor_payout_candidate}
   select_permissions:
@@ -591,7 +649,18 @@
       permission: {columns: "*", filter: {}}
 
 - table: {schema: public, name: vendor_payout}
+  # A seller may read its own payouts and nobody else's. Without this a seller
+  # could not see what it is owed at all, which is the other half of running a
+  # marketplace: isolation is not only what somebody may not see.
+  array_relationships:
+    - name: memberships
+      using:
+        manual_configuration:
+          remote_table: {schema: public, name: vendor_membership}
+          column_mapping: {vendor_id: vendor_id}
   select_permissions:
+    - role: vendor
+      permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: payout_worker
       permission: {columns: "*", filter: {}}
     - role: support
@@ -633,14 +702,20 @@
       permission: {columns: "*", check: {}}
 
 - table: {schema: public, name: vendor_dispute}
+  array_relationships:
+    - name: memberships
+      using:
+        manual_configuration:
+          remote_table: {schema: public, name: vendor_membership}
+          column_mapping: {vendor_id: vendor_id}
   command_select_permissions:
     - role: vendor
       permission:
         columns: [id, dispute_id, vendor_order_id, vendor_id, status]
-        filter: {}
+        filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}
   insert_permissions:
     - role: vendor
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
 
 - table: {schema: public, name: grooming_booking}
   select_permissions:

@@ -141,6 +141,17 @@ row a person identifies — a customer id — becomes composite, which buys more
 than the constraint it replaces: a child row then *cannot* name a parent in
 another tenant in the database, underneath the predicate rather than beside it.
 
+**Two axes, and only one of them is tenancy.** Building `examples/pethub` made
+the difference visible in the domain it composes. A tenant is *isolation*: a
+caller of one store never crosses into another, and the compiler enforces it
+because forgetting is otherwise invisible. Ownership inside a tenant is not
+that: a marketplace's buyer must see every seller's goods while a seller sees
+only its own orders — the boundary is crossed on purpose in one direction and
+not the other. That is a domain rule, written as an ordinary row filter in the
+domain's own metadata, and it stays there. Petshop had the first axis missing
+and, as it turned out, the second one too: `vendor` read `vendor_order` with
+`filter: {}`. Tenancy could not have fixed it, and should not have.
+
 ## Alternatives
 
 | Option | Why Not |
