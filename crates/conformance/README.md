@@ -87,12 +87,20 @@ query change and must not be smuggled into the pinned document.
 | `remote_schemas` | Remote-schema permissions/presets/relationships (Rust stub upstream replaces the node services) | 4 |
 
 The table above lists the suites ported from `tests-py`. Engine-native suites
-(commands, processes, connectors, files, rules, MCP, REST, tenancy) have no
-upstream to be ported from and are named by their module. One of them is worth
-pointing at here: `tenancy` proves that two tenants cannot reach each other
-through *unrestricted* permissions — its fixtures deliberately declare
-`filter: {}` and `check: {}`, so every case would pass trivially if the
-isolation were a filter in the metadata rather than a layer the compiler adds.
+(commands, processes, connectors, files, rules, MCP, REST, tenancy, pethub,
+petshop) have no upstream to be ported from and are named by their module. Two
+of them are worth pointing at here.
+
+`tenancy` proves that two tenants cannot reach each other through
+*unrestricted* permissions — its fixtures deliberately declare `filter: {}` and
+`check: {}`, so every case would pass trivially if the isolation were a filter
+in the metadata rather than a layer the compiler adds.
+
+`pethub` runs the same proof against a checked-in example instead of a fixture:
+it loads `examples/pethub`, which composes `examples/petshop` unchanged, and
+asserts that composition rather than assuming it. If making the store
+multitenant ever requires editing a line under `examples/petshop/metadata`, the
+case that says so fails.
 
 Out of scope by design: admin/no-role tests (no-admin-role rule — the
 functionality is being removed), enterprise-only classes. Excluded cases

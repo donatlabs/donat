@@ -18,8 +18,11 @@ conformance harness (`crates/conformance`).
 | `crates/schema` | Per-role GraphQL schema generation, introspection |
 | `crates/ir` | Intermediate representation — the SQL-free boundary |
 | `crates/sqlgen` | IR → one Postgres SQL statement (insta snapshot tests) |
+| `crates/storage` | File attachments: the resolved S3-compatible store and the URL signing shared by planner and server |
 | `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
+| `apps/ui` | Platform UI (`@refinest/*` + React) over the engine's GraphQL. Its own npm project, outside the Cargo workspace and `make test`. Not an admin surface — an ordinary role rendered; see `knowledgebase/platform/decisions/001-*` |
+| `examples/pethub` | Petshop composed unchanged (`extends:`) plus a platform layer: tenancy, in-tenant grants, plan ceilings |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
 
@@ -37,6 +40,8 @@ conformance harness (`crates/conformance`).
 | Format and lint gates (CI blocks on both) | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
 | Inspect one Process instance | `donat process inspect --source <name> --instance <uuid>` (read-only) |
 | Check one instance's history | `donat process verify-history --source <name> --instance <uuid>` (read-only, non-zero exit on inconsistency) |
+| Authorize an OAuth2 connector instance | `donat connector authorize --source <name> --instance <name>` (deploy-time only; needs `DONAT_CREDENTIAL_KEY`) |
+| Inspect / remove stored credentials | `donat connector credentials list --source <name>` (read-only, non-zero exit when a configured instance has none), `... credentials revoke --source <name> --instance <name> --subject <id>` |
 
 The conformance harness needs Postgres (`postgis/postgis:16-3.4`) at
 `PG_URL` (default `postgresql://postgres:postgres@127.0.0.1:15432/postgres`).
@@ -127,6 +132,16 @@ fresh verification before completion.
 - **Every change needs tests**: unit/insta in the touched crate AND the
   conformance crate green (`make conformance`) after rebuilding the engine
   binary.
+- **A tenant is declared, never repeated.** Where `tenancy.yaml` exists the
+  predicate is ANDed at one choke point and the preset injected into every
+  write; a tracked table with neither the key nor a declared exemption stops
+  the boot. The tenant is a claim and never a header, for the same reason a
+  role is. Isolation is not ownership: scoping only by tenant still hands every
+  seller every other seller's rows.
+- **What a permission does not bound, it declares.** `permissions.yaml` with
+  `unbounded_permissions: declared` makes every permission that admits rows it
+  does not bound to the caller name a reason — `catalogue`, `operator`,
+  `worker` or `command`. Default is `unchecked`, so v2 metadata still loads.
 - **The toolchain is pinned** in `rust-toolchain.toml`, because `cargo fmt
   --check` and `clippy -D warnings` are CI gates and both change meaning
   between releases. Bumping it is a deliberate commit that carries whatever
@@ -139,5 +154,5 @@ fresh verification before completion.
 
 ## Agents
 
-- `.Codex/agents/spec-writer.md` — researches the codebase + conformance
+- `.claude/agents/spec-writer.md` — researches the codebase + conformance
   fixtures and writes specs to `specs/NNN-<slug>.md`.

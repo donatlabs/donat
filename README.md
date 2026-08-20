@@ -150,7 +150,11 @@ Two properties are the point:
 
 `extends:` composes one metadata directory onto another, so the platform layer
 sits on top of a business domain whose YAML it never edits — collisions are
-refused rather than silently overridden.
+refused rather than silently overridden. `examples/pethub` is that worked
+example: it composes `examples/petshop` and adds tenancy, grants and ceilings in
+four files. `git diff examples/petshop` staying empty is the acceptance
+criterion, and `crates/conformance/tests/pethub.rs` asserts it rather than
+assuming it.
 
 **Inside a tenant, `iam.yaml` lets the tenant decide.** A compiled role is the
 shape — which tables and operations exist. A grant is the scope: rows a tenant
