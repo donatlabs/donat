@@ -13,12 +13,15 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
 insert_permissions:
   - role: staff
     permission:
       columns: [user_id, action]
       check: {}
+      unbounded: operator
 delete_permissions:
   - role: staff
     permission:
       filter: {}
+      unbounded: operator

@@ -384,3 +384,81 @@ fn a_base_two_overlays_share_is_composed_once() {
         "the shared base was composed more than once"
     );
 }
+
+fn bounds_error(result: Result<donat_metadata::Metadata, LoadError>) -> String {
+    match result {
+        Err(LoadError::PermissionBounds { message, .. }) => message,
+        Err(other) => panic!("expected a permission-bounds error, got {other}"),
+        Ok(_) => panic!("expected a permission-bounds error, but the metadata loaded"),
+    }
+}
+
+/// A table whose unbounded permission names its reason, so the base itself is
+/// clean and the overlay is the only thing left to refuse.
+fn declared_table(name: &str) -> String {
+    format!(
+        "\
+table: {{ schema: public, name: {name} }}
+select_permissions:
+  - role: staff
+    permission:
+      columns: \"*\"
+      filter: {{}}
+      unbounded: operator
+"
+    )
+}
+
+/// A base that requires its unbounded permissions to declare themselves keeps
+/// requiring it once something is composed on top.
+///
+/// This is the one section where the merge takes the stricter of two answers
+/// instead of refusing the pair. Everywhere else an overlay supplying a second
+/// answer is an error, because configuration must never have to choose between
+/// two — but here the two answers are not peers: one is a guarantee and the
+/// other is its absence, and an overlay that could drop the guarantee would let
+/// a composition serve what the base refused to.
+#[test]
+fn an_overlay_cannot_relax_the_base_requirement() {
+    let base = tempdir("bounds_base");
+    dir(
+        &base,
+        &[("public_order", &declared_table("order"))],
+        &[("permissions.yaml", "unbounded_permissions: declared\n")],
+    );
+    let overlay = tempdir("bounds_overlay");
+    dir(
+        &overlay,
+        &[("public_invoice", &table("invoice"))],
+        &[(
+            "extends.yaml",
+            &format!("extends:\n  - path: {}\n", base.display()),
+        )],
+    );
+
+    // The overlay says nothing about the policy, and its own table is
+    // unbounded with no reason given.
+    let error = bounds_error(load_metadata_dir(&overlay));
+    assert!(
+        error.contains("public.invoice.select_permissions[staff]"),
+        "the overlay's own table escaped the base's requirement: {error}"
+    );
+    assert!(error.contains("does not bound"), "{error}");
+}
+
+/// And the base's tables are still held to it, which is what makes composing
+/// safe to review: reading the base tells you what the base serves.
+#[test]
+fn the_bases_own_tables_are_still_held_to_it() {
+    let base = tempdir("bounds_base_own");
+    dir(
+        &base,
+        &[("public_order", &table("order"))],
+        &[("permissions.yaml", "unbounded_permissions: declared\n")],
+    );
+    let error = bounds_error(load_metadata_dir(&base));
+    assert!(
+        error.contains("public.order.select_permissions[staff]"),
+        "{error}"
+    );
+}

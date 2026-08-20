@@ -3,6 +3,7 @@
 //! configured"; everything downstream (schema generation, permissions,
 //! sqlgen) consumes these types and never re-reads YAML.
 
+pub mod bounds;
 pub mod documents;
 pub mod iam;
 pub mod ingest;
@@ -15,6 +16,10 @@ pub mod recurrence;
 pub mod tenancy;
 mod types;
 
+pub use bounds::{
+    BoundsError, PermissionsMetadata, UnboundedPolicy, UnboundedReason, binds_caller,
+    validate_permission_bounds,
+};
 pub use documents::{
     DOCUMENT_CAPABILITY, DocumentTemplate, DocumentTemplateBounds, DocumentTemplateError,
     DocumentTemplateKind, HTML_SCALAR, RESERVED_INPUT_KEYS, validate_document_templates,

@@ -15,16 +15,19 @@ select_permissions:
       columns: "*"
       filter: {}
       allow_aggregations: true
+      unbounded: catalogue
   - role: customer
     permission:
       columns: "*"
       filter: {}
       allow_aggregations: true
+      unbounded: catalogue
   - role: staff
     permission:
       columns: "*"
       filter: {}
       allow_aggregations: true
+      unbounded: operator
 insert_permissions:
   - role: staff
     permission:
@@ -32,6 +35,7 @@ insert_permissions:
       columns:
         - slug
         - name
+      unbounded: operator
 update_permissions:
   - role: staff
     permission:
@@ -40,7 +44,9 @@ update_permissions:
         - name
       filter: {}
       check: {}
+      unbounded: operator
 delete_permissions:
   - role: staff
     permission:
       filter: {}
+      unbounded: operator

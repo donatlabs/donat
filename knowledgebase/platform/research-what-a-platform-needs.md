@@ -93,6 +93,16 @@ differ in ways that only show up as a leak.
 **Resolved (2026-08-18), and closer to the second option than this note
 expected.** See
 [[declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]].
+
+**And the half that stayed hand-rolled (2026-08-20).** Isolation became
+declarable; ownership inside one tenant did not, and cannot — the same table
+needs opposite answers for different roles, so there is no single predicate to
+inject. What this note says about tenancy — "every deployment invents it, and
+the inventions differ in ways that only show up as a leak" — turned out to
+apply to ownership too, and the Petshop example was carrying exactly that leak.
+[[declarative-saas/decisions/099-an-unbounded-permission-says-so]] closes it the
+only way left: not by moving the rule, but by making its absence something an
+author writes and a reviewer reads.
 A tenant is declared once in `tenancy.yaml` and applied by the compiler rather
 than written into each permission, because the repetition *is* the problem this
 section describes: absence cannot be reviewed, so a missing filter has to become

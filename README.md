@@ -166,10 +166,50 @@ permission — the counter moves inside the statement that performs the write, s
 the ceiling holds when two writers arrive at once rather than when they happen
 to arrive apart.
 
+## An unbounded permission says so
+
+A tenant can be compiled in because it is one value on one column, the same for
+every table and every role. Ownership cannot: the path to an owner differs per
+table, and whether a table has one at all differs per role — a marketplace's
+catalogue belongs to every shopper and to no seller. So the rule stays in the
+permission's own `filter`, where it can vary.
+
+What *is* uniform is the guarantee. `filter: {}` is a legitimate thing to write
+and it is also what a forgotten bound looks like, so a deployment can require
+the difference to be written down:
+
+```yaml
+# permissions.yaml
+unbounded_permissions: declared
+```
+
+```yaml
+- role: support
+  permission: {columns: "*", filter: {}, unbounded: operator}
+```
+
+Every permission that admits rows it does not bound to the caller then has to
+name a reason — `catalogue` (the rows are nobody's in particular), `operator`
+(the role is a desk), `worker` (a fixed role a process runs as, with no session
+to bound against) or `command` (the row is chosen by a command step). Nothing is
+injected and no query changes; forgetting simply stops looking like deciding.
+
+Unbounded is a question about reaching TRUE, not about being empty: `{status:
+{_eq: 'paid'}}` still shows every caller the same rows. `{_or: [{owner: {_eq:
+X-Donat-User-Id}}, {}]}` names a session variable and admits everything, and is
+read as unbounded. A tenant bound is deliberately not a caller bound — scoping
+only by tenant is every seller's order in one marketplace, which is the case
+worth seeing. `command` is checked rather than believed: it is accepted only
+where no generic root reaches the permission.
+
+The default is `unchecked`, so metadata exported from an existing Donat project
+loads unchanged. An overlay cannot relax a base that asked for it.
+
 See the decisions for what is deliberately out of scope:
-[tenancy](knowledgebase/declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered.md)
+[tenancy](knowledgebase/declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered.md),
+[in-tenant grants](knowledgebase/declarative-saas/decisions/098-a-compiled-role-is-the-shape-and-a-grant-is-the-scope.md)
 and
-[in-tenant grants](knowledgebase/declarative-saas/decisions/098-a-compiled-role-is-the-shape-and-a-grant-is-the-scope.md).
+[declared bounds](knowledgebase/declarative-saas/decisions/099-an-unbounded-permission-says-so.md).
 
 ## One execution path
 

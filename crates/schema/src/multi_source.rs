@@ -1038,6 +1038,10 @@ fn build_role_independent_schema(
                 permission: SelectPermission {
                     columns: Columns::Star,
                     filter: serde_json::json!({}),
+                    // Synthesised after loading, for `validate` to introspect
+                    // through, and never re-validated — so it carries no
+                    // `unbounded:` reason rather than a made-up one.
+                    unbounded: None,
                     limit: None,
                     allow_aggregations: true,
                     computed_fields: table

@@ -91,12 +91,12 @@
         columns: "*"
         filter: {payment: {order: {customer_id: {_eq: X-Donat-User-Id}}}}
     - role: support
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
     - role: payment_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   insert_permissions:
     - role: payment_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
   update_permissions:
     - role: customer
       permission:
@@ -104,20 +104,20 @@
         filter: {payment: {order: {customer_id: {_eq: X-Donat-User-Id}}}}
         check: {payment: {order: {customer_id: {_eq: X-Donat-User-Id}}}}
     - role: support
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
     - role: payment_worker
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
 
 - table: {schema: public, name: payment_capture_claim}
   select_permissions:
     - role: payment_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   insert_permissions:
     - role: payment_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
   update_permissions:
     - role: payment_worker
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
 
 - table: {schema: public, name: payment_capture}
   command_select_permissions:
@@ -125,9 +125,10 @@
       permission:
         columns: [id, payment_id, authorization_id, amount_minor, status]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: payment_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
 
 - table: {schema: public, name: payment_void}
   command_select_permissions:
@@ -135,9 +136,10 @@
       permission:
         columns: [id, payment_id, authorization_id, status]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: payment_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
 
 - table: {schema: public, name: payment_chargeback}
   command_select_permissions:
@@ -145,25 +147,27 @@
       permission:
         columns: [id, payment_id, amount_minor, status]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: payment_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
 
 - table: {schema: public, name: payment_reconciliation}
   select_permissions:
     - role: support
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
   command_select_permissions:
     - role: reconciliation_worker
       permission:
         columns: [id, payment_id, provider_event_id, decision, status]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: reconciliation_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
   update_permissions:
     - role: support
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
 
 - table: {schema: public, name: payment_reconciliation_resolution}
   command_select_permissions:
@@ -173,26 +177,28 @@
           [id, reconciliation_id, resolution_id, actor_role, actor_user_id,
            note]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: support
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: payment_fraud_review}
   select_permissions:
     - role: support
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
   command_select_permissions:
     - role: payment_worker
       permission:
         columns:
           [id, payment_id, provider_event_id, fraud_score, route, status]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: payment_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
   update_permissions:
     - role: support
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
 
 - table: {schema: public, name: payment_fraud_decision}
   command_select_permissions:
@@ -201,25 +207,27 @@
         columns:
           [id, fraud_review_id, decision, decision_route, provider_event_id]
         filter: {}
+        unbounded: worker
     - role: support
       permission:
         columns:
           [id, fraud_review_id, decision_id, decision, actor_role,
            actor_user_id, note]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: payment_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
     - role: support
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: notification_delivery}
   select_permissions:
     - role: notification_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   insert_permissions:
     - role: notification_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
 
 - table: {schema: public, name: order_current_authorization}
   select_permissions:
@@ -228,9 +236,9 @@
         columns: "*"
         filter: {customer_id: {_eq: X-Donat-User-Id}}
     - role: support
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
 
 - table: {schema: public, name: inventory_level}
   command_select_permissions:
@@ -238,35 +246,36 @@
       permission:
         columns: [id, on_hand_quantity, reserved_quantity]
         filter: {}
+        unbounded: operator
   update_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
 
 - table: {schema: public, name: order_inventory_allocation_candidate}
   select_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
 
 - table: {schema: public, name: inventory_allocation}
   select_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
   insert_permissions:
     - role: fulfilment
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
   update_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
 
 - table: {schema: public, name: inventory_allocation_group}
   select_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
 
 - table: {schema: public, name: inventory_allocation_line}
   select_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
 
 - table: {schema: public, name: inventory_backorder}
   command_select_permissions:
@@ -274,9 +283,10 @@
       permission:
         columns: [id, order_line_id, backordered_quantity, status]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: fulfilment
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: shipment_item}
   command_select_permissions:
@@ -284,17 +294,18 @@
       permission:
         columns: [shipment_id, order_line_id, quantity, line_value_minor]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: fulfilment
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: shipment_result}
   select_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
   insert_permissions:
     - role: fulfilment
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: order_return_context}
   select_permissions:
@@ -306,9 +317,9 @@
 - table: {schema: public, name: return_request}
   select_permissions:
     - role: support
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
   command_select_permissions:
     - role: customer
       permission:
@@ -321,9 +332,9 @@
         check: {customer_id: {_eq: X-Donat-User-Id}}
   update_permissions:
     - role: support
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
     - role: fulfilment
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
 
 - table: {schema: public, name: return_item}
   object_relationships:
@@ -332,7 +343,7 @@
         foreign_key_constraint_on: return_request_id
   select_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
   command_select_permissions:
     - role: customer
       permission:
@@ -346,6 +357,7 @@
           [id, return_request_id, order_line_id, requested_quantity,
            approved_quantity]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: customer
       permission:
@@ -353,9 +365,9 @@
         check: {request: {customer_id: {_eq: X-Donat-User-Id}}}
   update_permissions:
     - role: support
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
     - role: fulfilment
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
 
 - table: {schema: public, name: return_event}
   object_relationships:
@@ -371,21 +383,23 @@
       permission:
         columns: [id, return_request_id, event_type, request_id, reason, note]
         filter: {}
+        unbounded: operator
     - role: fulfilment
       permission:
         columns:
           [id, return_request_id, event_type, request_id, inspection_id,
            exchange_id, occurred_at]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: customer
       permission:
         columns: "*"
         check: {request: {customer_id: {_eq: X-Donat-User-Id}}}
     - role: support
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
     - role: fulfilment
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: return_inspection}
   command_select_permissions:
@@ -395,14 +409,15 @@
           [id, return_request_id, inspection_id, decision,
            refund_amount_minor, note]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: fulfilment
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: return_refund_context}
   select_permissions:
     - role: fulfilment
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
 
 - table: {schema: public, name: exchange}
   command_select_permissions:
@@ -410,9 +425,10 @@
       permission:
         columns: [id, return_request_id, order_id, status]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: fulfilment
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: exchange_item}
   command_select_permissions:
@@ -420,9 +436,10 @@
       permission:
         columns: [exchange_id, return_item_id, order_line_id, quantity]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: fulfilment
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: subscription}
   select_permissions:
@@ -431,7 +448,7 @@
         columns: "*"
         filter: {customer_id: {_eq: X-Donat-User-Id}}
     - role: subscription_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   update_permissions:
     - role: customer
       permission:
@@ -439,18 +456,18 @@
         filter: {customer_id: {_eq: X-Donat-User-Id}}
         check: {customer_id: {_eq: X-Donat-User-Id}}
     - role: subscription_worker
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
 
 - table: {schema: public, name: subscription_renewal}
   select_permissions:
     - role: subscription_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   insert_permissions:
     - role: subscription_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
   update_permissions:
     - role: subscription_worker
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
 
 - table: {schema: public, name: subscription_dunning_attempt}
   command_select_permissions:
@@ -458,9 +475,10 @@
       permission:
         columns: [id, renewal_id, attempt, provider_event_id, outcome, occurred_at]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: subscription_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
 
 - table: {schema: public, name: organization}
   # A buying organization is somebody's employer, and its credit line is its
@@ -484,12 +502,12 @@
     - role: b2b_approver
       permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_finance
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   update_permissions:
     - role: b2b_approver
       permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}, check: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_finance
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
 
 - table: {schema: public, name: organization_membership}
   select_permissions:
@@ -509,7 +527,7 @@
     - role: b2b_approver
       permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_finance
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   command_select_permissions:
     - role: b2b_buyer
       permission:
@@ -531,9 +549,10 @@
           [id, quote_id, variant_id, quantity, unit_price_minor,
            line_total_minor, currency]
         filter: {}
+        unbounded: command
   insert_permissions:
     - role: b2b_buyer
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: command}
 
 - table: {schema: public, name: purchase_approval}
   # An approval has no organization of its own — it belongs to the quote it
@@ -547,7 +566,7 @@
     - role: b2b_approver
       permission: {columns: "*", filter: {quote: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}}
     - role: b2b_finance
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   command_select_permissions:
     - role: b2b_buyer
       permission:
@@ -560,7 +579,7 @@
     - role: b2b_approver
       permission: {columns: "*", filter: {quote: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}, check: {quote: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}}
     - role: b2b_finance
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
 
 - table: {schema: public, name: credit_usage}
   array_relationships:
@@ -578,16 +597,17 @@
       permission:
         columns: [id, approval_id, amount_minor, currency]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: b2b_approver
       permission: {columns: "*", check: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: b2b_finance
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
 
 - table: {schema: public, name: order_vendor_split_candidate}
   select_permissions:
     - role: marketplace_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
 
 - table: {schema: public, name: vendor_order}
   # A marketplace sells other people's goods, so a seller is not the shop: it
@@ -607,10 +627,10 @@
         columns: "*"
         filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}
     - role: marketplace_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   insert_permissions:
     - role: marketplace_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
   update_permissions:
     - role: vendor
       permission:
@@ -646,7 +666,7 @@
 - table: {schema: public, name: vendor_payout_candidate}
   select_permissions:
     - role: marketplace_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
 
 - table: {schema: public, name: vendor_payout}
   # A seller may read its own payouts and nobody else's. Without this a seller
@@ -662,9 +682,9 @@
     - role: vendor
       permission: {columns: "*", filter: {memberships: {user_id: {_eq: X-Donat-User-Id}}}}
     - role: payout_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
     - role: support
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
   command_select_permissions:
     - role: marketplace_worker
       permission:
@@ -672,14 +692,15 @@
           [id, payout_key, payout_cycle_id, vendor_id, net_minor, currency,
            status]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: marketplace_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
   update_permissions:
     - role: payout_worker
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
     - role: support
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
 
 - table: {schema: public, name: vendor_payout_event}
   command_select_permissions:
@@ -687,9 +708,10 @@
       permission:
         columns: [id, payout_id, provider_event_id, outcome]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: payout_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
 
 - table: {schema: public, name: vendor_payout_reconciliation}
   command_select_permissions:
@@ -697,9 +719,10 @@
       permission:
         columns: [id, payout_id, payout_cycle_id, reconciliation_id]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: support
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: vendor_dispute}
   array_relationships:
@@ -724,9 +747,9 @@
         columns: "*"
         filter: {customer_id: {_eq: X-Donat-User-Id}}
     - role: groomer
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
     - role: booking_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   insert_permissions:
     - role: customer
       permission:
@@ -739,9 +762,9 @@
         filter: {customer_id: {_eq: X-Donat-User-Id}}
         check: {customer_id: {_eq: X-Donat-User-Id}}
     - role: groomer
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
     - role: booking_worker
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
 
 - table: {schema: public, name: grooming_booking_event}
   command_select_permissions:
@@ -749,21 +772,24 @@
       permission:
         columns: [id, booking_id, event_type, request_id, reason]
         filter: {}
+        unbounded: command
     - role: booking_worker
       permission:
         columns: [id, booking_id, event_type, request_id]
         filter: {}
+        unbounded: worker
     - role: groomer
       permission:
         columns: [id, booking_id, event_type, request_id]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: customer
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: command}
     - role: groomer
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
     - role: booking_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}
 
 - table: {schema: public, name: payment_reconciliation_candidate}
   select_permissions:
@@ -771,6 +797,7 @@
       permission:
         columns: "*"
         filter: {}
+        unbounded: worker
 
 - table: {schema: public, name: customer_prescription_order_line}
   select_permissions:
@@ -786,9 +813,9 @@
         columns: "*"
         filter: {customer_id: {_eq: X-Donat-User-Id}}
     - role: veterinary_reviewer
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: operator}
     - role: prescription_worker
-      permission: {columns: "*", filter: {}}
+      permission: {columns: "*", filter: {}, unbounded: worker}
   insert_permissions:
     - role: customer
       permission:
@@ -796,9 +823,9 @@
         check: {customer_id: {_eq: X-Donat-User-Id}}
   update_permissions:
     - role: veterinary_reviewer
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: operator}
     - role: prescription_worker
-      permission: {columns: "*", filter: {}, check: {}}
+      permission: {columns: "*", filter: {}, check: {}, unbounded: worker}
 
 - table: {schema: public, name: prescription_review}
   command_select_permissions:
@@ -806,9 +833,10 @@
       permission:
         columns: [id, prescription_request_id, decision, decision_id]
         filter: {}
+        unbounded: operator
   insert_permissions:
     - role: veterinary_reviewer
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
 
 - table: {schema: public, name: prescription_event}
   command_select_permissions:
@@ -816,18 +844,21 @@
       permission:
         columns: [id, prescription_request_id, event_type, request_id]
         filter: {}
+        unbounded: command
     - role: veterinary_reviewer
       permission:
         columns: [id, prescription_request_id, event_type, request_id]
         filter: {}
+        unbounded: operator
     - role: prescription_worker
       permission:
         columns: [id, prescription_request_id, event_type, request_id]
         filter: {}
+        unbounded: worker
   insert_permissions:
     - role: customer
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: command}
     - role: veterinary_reviewer
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: operator}
     - role: prescription_worker
-      permission: {columns: "*", check: {}}
+      permission: {columns: "*", check: {}, unbounded: worker}

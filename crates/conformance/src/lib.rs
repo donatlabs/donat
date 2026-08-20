@@ -994,6 +994,7 @@ fn default_metadata_with_configuration(
 ) -> Metadata {
     Metadata {
         version: 3,
+        permissions: Default::default(),
         sources: vec![Source {
             name: "default".to_string(),
             kind: backend.source_kind(),

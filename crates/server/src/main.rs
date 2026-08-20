@@ -799,6 +799,7 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => donat_metadata::Metadata {
             version: 3,
+            permissions: Default::default(),
             sources: vec![],
             inherited_roles: vec![],
             query_collections: vec![],

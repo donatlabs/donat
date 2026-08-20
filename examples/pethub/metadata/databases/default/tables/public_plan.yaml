@@ -11,7 +11,9 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: support
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator

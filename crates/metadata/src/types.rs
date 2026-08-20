@@ -123,6 +123,14 @@ pub struct Metadata {
     /// the ceilings, and which writes consume which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quotas: Option<crate::quotas::QuotaMetadata>,
+
+    /// Deployment-wide permission policy from the optional `permissions.yaml`.
+    /// Absent means the default, which is what unconverted v2 metadata gets.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::bounds::PermissionsMetadata::is_default"
+    )]
+    pub permissions: crate::bounds::PermissionsMetadata,
 }
 
 /// One named deployment instance of a connector module compiled into the
@@ -3209,6 +3217,11 @@ pub struct SelectPermission {
     pub allow_aggregations: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub computed_fields: Vec<String>,
+    /// Why this permission admits rows it does not bound to the caller.
+    /// Required where the deployment sets `unbounded_permissions: declared`,
+    /// and refused wherever the expression does bound one (see `bounds.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded: Option<crate::bounds::UnboundedReason>,
 }
 
 /// One entry of a write permission's `validate` list.
@@ -3281,6 +3294,11 @@ pub struct InsertPermission {
     pub backend_only: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validate: Vec<PermissionValidator>,
+    /// Why this permission admits rows it does not bound to the caller.
+    /// Required where the deployment sets `unbounded_permissions: declared`,
+    /// and refused wherever the expression does bound one (see `bounds.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded: Option<crate::bounds::UnboundedReason>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3295,12 +3313,22 @@ pub struct UpdatePermission {
     pub set: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validate: Vec<PermissionValidator>,
+    /// Why this permission admits rows it does not bound to the caller.
+    /// Required where the deployment sets `unbounded_permissions: declared`,
+    /// and refused wherever the expression does bound one (see `bounds.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded: Option<crate::bounds::UnboundedReason>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeletePermission {
     #[serde(default)]
     pub filter: BoolExp,
+    /// Why this permission admits rows it does not bound to the caller.
+    /// Required where the deployment sets `unbounded_permissions: declared`,
+    /// and refused wherever the expression does bound one (see `bounds.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded: Option<crate::bounds::UnboundedReason>,
 }
 
 /// Column list: either an explicit list or `"*"`.

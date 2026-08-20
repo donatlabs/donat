@@ -15,6 +15,7 @@ select_permissions:
         - provider_event_id
         - created_at
       filter: {}
+      unbounded: worker
 command_select_permissions:
   - role: reconciliation_worker
     permission:
@@ -26,12 +27,15 @@ command_select_permissions:
         - provider_status
         - provider_reference
       filter: {}
+      unbounded: worker
 insert_permissions:
   - role: payment_worker
     permission:
       columns: "*"
       check: {}
+      unbounded: worker
   - role: reconciliation_worker
     permission:
       columns: "*"
       check: {}
+      unbounded: worker

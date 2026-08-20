@@ -13,3 +13,4 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator

@@ -21,6 +21,7 @@ select_permissions:
         status:
           _eq: published
       allow_aggregations: true
+      unbounded: catalogue
   - role: customer
     permission:
       columns: "*"
@@ -28,11 +29,13 @@ select_permissions:
         status:
           _eq: published
       allow_aggregations: true
+      unbounded: catalogue
   - role: staff
     permission:
       columns: "*"
       filter: {}
       allow_aggregations: true
+      unbounded: operator
 insert_permissions:
   - role: staff
     permission:
@@ -60,6 +63,7 @@ insert_permissions:
         - expression: 'size(description) >= 20'
           when_present: description
           message: description must be at least 20 characters when present
+      unbounded: operator
 update_permissions:
   - role: staff
     permission:
@@ -77,7 +81,9 @@ update_permissions:
         - expression: 'size(description) >= 20'
           when_present: description
           message: description must be at least 20 characters when present
+      unbounded: operator
 delete_permissions:
   - role: staff
     permission:
       filter: {}
+      unbounded: operator

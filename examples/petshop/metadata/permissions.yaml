@@ -1,0 +1,13 @@
+# Every permission that admits rows it does not bound to the caller says why.
+#
+# `filter: {}` is a legitimate thing to write — the catalogue is meant to be
+# read by everyone, a support desk is meant to see every customer's order — and
+# it is also exactly what a forgotten bound looks like. The two were
+# indistinguishable, which is how a seller reading every other seller's orders
+# survived review in this very example.
+#
+# Turning this on does not add a bound anywhere or change a single query. It
+# makes the *absence* of one something an author has to write down and a
+# reviewer can read, which is the property tenancy gets from being compiled and
+# permissions could not get any other way.
+unbounded_permissions: declared

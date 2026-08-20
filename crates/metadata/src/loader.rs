@@ -63,6 +63,8 @@ pub enum LoadError {
     Iam { path: PathBuf, message: String },
     #[error("invalid quota metadata ({path}): {message}")]
     Quotas { path: PathBuf, message: String },
+    #[error("permission bounds ({path}): {message}")]
+    PermissionBounds { path: PathBuf, message: String },
 }
 
 /// Compose one metadata directory onto another.
@@ -195,6 +197,7 @@ fn load_one_metadata_dir(
         media: load_section(dir, "media.yaml")?,
         ingest_schemas: load_ingest_schemas(dir)?,
         recurrence: load_section(dir, "recurrence.yaml")?,
+        permissions: load_section(dir, "permissions.yaml")?,
         tenancy: load_section(dir, "tenancy.yaml")?,
         iam: load_section(dir, "iam.yaml")?,
         quotas: load_section(dir, "quotas.yaml")?,
@@ -314,6 +317,19 @@ fn load_one_metadata_dir(
         return Err(LoadError::Quotas {
             path: dir.join("quotas.yaml"),
             message: quota_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    // Last, because it reads the tenancy declaration to know which variable is
+    // the tenant's — and a tenant bound is deliberately not a caller bound.
+    let bounds_errors = crate::bounds::validate_permission_bounds(&metadata);
+    if !bounds_errors.is_empty() {
+        return Err(LoadError::PermissionBounds {
+            path: dir.join("permissions.yaml"),
+            message: bounds_errors
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -1191,6 +1207,7 @@ fn written_columns(
 fn merge_metadata(base: Metadata, overlay: Metadata) -> Result<Metadata, String> {
     let Metadata {
         version: _,
+        permissions,
         sources,
         inherited_roles,
         query_collections,
@@ -1313,6 +1330,13 @@ fn merge_metadata(base: Metadata, overlay: Metadata) -> Result<Metadata, String>
         StorageMetadata::is_empty,
         "storage",
     )?;
+    // The exception to "one answer only": the stricter of the two wins rather
+    // than the pair being refused. An overlay adds, it never edits — and a
+    // base that requires unbounded permissions to declare themselves must not
+    // be quietly relaxed by composing something on top of it.
+    if permissions.unbounded_permissions == crate::bounds::UnboundedPolicy::Declared {
+        merged.permissions.unbounded_permissions = crate::bounds::UnboundedPolicy::Declared;
+    }
     merge_single(
         &mut merged.media,
         media,

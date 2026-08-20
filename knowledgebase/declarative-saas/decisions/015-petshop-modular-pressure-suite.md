@@ -59,3 +59,13 @@ requires its own design, ADR, conformance boundary, and implementation plan.
 composes this example's metadata unchanged and adds only a platform layer —
 which is what "an engine-wide capability that composes with every data and
 execution surface" was supposed to mean, now asserted rather than intended.*
+
+*Amended 2026-08-20:
+[[099-an-unbounded-permission-says-so]]. Doing the tenancy work surfaced the
+half of authorization the compiler cannot own. This example had `vendor`
+reading and updating every other seller's orders under `filter: {}`, and it
+survived review because a deliberate `{}` and a forgotten one are the same
+three characters. The example now declares a reason for each of its 192
+unbounded permissions — 99 desks, 77 workers, 9 catalogue reads and 7 rows a
+command chooses — which is a description of the domain nobody could previously
+state.*
