@@ -114,6 +114,7 @@ Detailed patterns live in `~/.codex/donat/skills/*/SKILL.md` (installed by
 | layer model, directory layout, deploy pipeline | `donat-app-architecture` |
 | migrations, naming, what the database owns | `donat-schema-and-migrations` |
 | tracking, relationships, filter vs check, `_exists` | `donat-tables-and-permissions` |
+| many customer organisations: tenant isolation, grants, plan ceilings | `donat-multitenancy` |
 | per-role value validators, nullability | `donat-validators` |
 | types, rules, decision tables | `donat-rules` |
 | commands: steps, guards, idempotency, effects | `donat-commands` |

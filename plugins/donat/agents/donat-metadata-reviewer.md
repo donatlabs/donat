@@ -35,7 +35,9 @@ Rank by severity and give `file:line` for each.
 **Blocking**
 - An admin-like role, or any permission written to be a bypass.
 - A row filter that lets one caller read or write another's rows — show the
-  session variable and the two rows.
+  session variable and the two rows. Under `tenancy.yaml`, include the case
+  where the only bound is the tenant and the rows belong to someone inside it:
+  isolation is not ownership.
 - A credential as a literal in metadata rather than `value_from_env`.
 - A published REST endpoint or MCP tool whose role has no matching permission.
 
@@ -53,9 +55,18 @@ Rank by severity and give `file:line` for each.
 - A `wait` with no deadline, or a `request` error class with no route.
 - A provider mutation with no read-only lookup, so a timeout is unresolvable.
 
+**High**
+- An `unbounded:` reason that is present but wrong: `operator` on a role that
+  holds a person's own data, `worker` on a role people log into, or `command`
+  where a generic root reaches the same permission.
+
 **Medium**
 - `columns: "*"` on a table whose columns will grow, or `filter: {}` broader
   than the role's stated purpose.
+- An unbounded permission that declares no reason. Where
+  `unbounded_permissions: declared` is set the loader refuses it; where it is
+  not, enumerate them and say which look deliberate — that enumeration is
+  usually the most useful thing in the report.
 - A batch step or `for_each` with no bound.
 - A universal rule expressed as a per-role validator, or a role-specific rule
   expressed as a database CHECK.

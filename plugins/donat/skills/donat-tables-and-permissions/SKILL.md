@@ -162,6 +162,64 @@ customer's cart is not expressible in the API rather than merely refused.
 root. It is off by default because a count over rows you cannot read is still
 an information channel.
 
+## An unbounded permission says so
+
+`filter: {}` means two things and looks the same both times. It is what a
+catalogue permission is supposed to say — every shopper sees the same listings
+— and it is also exactly what a permission looks like when its author forgot
+who the rows belong to. This repository shipped the second kind for months:
+`vendor` read and updated every other seller's orders, and it survived review
+because a deliberate `{}` and a forgotten one are the same three characters.
+
+A deployment can require the difference to be written down:
+
+```yaml
+# metadata/permissions.yaml
+unbounded_permissions: declared
+```
+
+Then every permission admitting rows it does not bound to the caller must name
+a reason:
+
+```yaml
+- role: support
+  permission: {columns: "*", filter: {}, unbounded: operator}
+```
+
+| Reason | Means |
+|---|---|
+| `catalogue` | the rows are nobody's in particular; every caller of the role is meant to see the same ones |
+| `operator` | the role is a desk — support, back office, fulfilment. Seeing everyone's row is the job |
+| `worker` | a fixed role a process runs as. There is no session to bound against, so a caller bound cannot be written here at all |
+| `command` | a command step chooses the row, not the caller |
+
+Nothing is injected and no query changes. What changes is that forgetting stops
+looking like deciding.
+
+**Unbounded is a question about reaching TRUE, not about being empty.**
+`{status: {_eq: 'paid'}}` is non-empty and every caller still sees the same
+rows, so it counts. So does `{_or: [{owner: {_eq: X-Donat-User-Id}}, {}]}` —
+it names the session and admits everything, which is why the check analyses the
+expression instead of grepping for `x-donat-`.
+
+Two rules, both refusing the load rather than the request:
+
+- An unbounded permission with no reason is refused, naming the table, the
+  plane and the role — where the deployment asked for the check.
+- A reason on a permission that *does* bound its caller is refused **always**.
+  A stale `unbounded:` is worse than none: it tells a reviewer a bound was
+  considered and declined where one is present.
+
+`command` is checked rather than believed: it is accepted only on a
+`command_*_permissions` plane, or on an ordinary plane of a table the role has
+no ordinary `select_permissions` on — because a role without one never sees the
+table in its schema and so gets no insert, update or delete root for it either.
+
+The default is `unchecked`, so metadata from an existing Donat project loads
+unconverted. Under tenancy, a tenant bound is deliberately **not** a caller
+bound: scoping only by tenant is every seller's order in one store. See
+`donat-multitenancy`.
+
 ## Value rules belong in `validate`, not here
 
 `filter` and `check` decide *who may write which row*. What the value may
@@ -201,8 +259,11 @@ runs as. If it is unset, such a request is rejected with
    filter *and* check, `delete` filter. Absent means denied; write only what
    the role needs.
 5. Value rules as `validate` entries, each with its own message.
-6. `donat validate --metadata-dir metadata` green against the migrated schema.
-7. A test that the *wrong* role sees nothing — a permission is only proven by
+6. Any permission left unbounded names its reason — and if the deployment has
+   not turned that on yet, say out loud which of the new permissions are
+   unbounded and why.
+7. `donat validate --metadata-dir metadata` green against the migrated schema.
+8. A test that the *wrong* role sees nothing — a permission is only proven by
    the request it refuses.
 
 ## Files to read
@@ -213,5 +274,9 @@ runs as. If it is unset, such a request is rejected with
   preset plus `columns: []`
 - [`examples/petshop/metadata/databases/default/tables/public_customer.yaml`](https://github.com/donatlabs/donat/blob/main/examples/petshop/metadata/databases/default/tables/public_customer.yaml) —
   column masks, a `filter: {}` grant, and a file column
+- [`examples/petshop/metadata/databases/default/tables/public_category.yaml`](https://github.com/donatlabs/donat/blob/main/examples/petshop/metadata/databases/default/tables/public_category.yaml) —
+  all four planes with declared `unbounded:` reasons, `catalogue` and `operator`
+  on the same table
+- [`examples/petshop/metadata/permissions.yaml`](https://github.com/donatlabs/donat/blob/main/examples/petshop/metadata/permissions.yaml) — the policy switch
 - [`examples/petshop-rest/metadata/databases/default/tables/`](https://github.com/donatlabs/donat/tree/main/examples/petshop-rest/metadata/databases/default/tables) — five small
   tables, the easiest starting point

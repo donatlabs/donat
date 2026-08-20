@@ -20,6 +20,15 @@ Look for, in this order:
 **Access**
 - A `filter: {}` or `columns: "*"` that grants more than the role's purpose —
   especially `"*"` on a table whose columns will grow.
+- An unbounded permission with no `unbounded:` reason. If the directory sets
+  `unbounded_permissions: declared` the loader catches it; if it does not, list
+  them anyway — that list is the review. Say which look deliberate and which
+  look forgotten, and remember that a non-empty static filter like
+  `{status: {_eq: 'paid'}}` is just as unbounded as `{}`.
+- An `unbounded:` reason that is *wrong* rather than missing — `operator` on a
+  role that is a person's own data, or `worker` on a role people log into.
+  The engine checks that a reason is present and not stale; whether it is the
+  right reason is what a reviewer is for.
 - An insert `check` that does not bind the row to the caller's session, where a
   preset plus `columns: []` would make forgery inexpressible.
 - An update with a `check` that merely repeats its `filter`, so a row can be
@@ -28,6 +37,18 @@ Look for, in this order:
   There is no admin role; this is a blocking finding.
 - A published MCP tool or REST endpoint whose role has no matching table
   permission.
+
+**Tenancy**, where `tenancy.yaml` exists
+- A permission bounded only by tenant on a table whose rows belong to someone
+  *inside* the tenant — a seller's orders, a member's documents. The tenant
+  predicate is satisfied and the rows are still not theirs.
+- A `shared: read_only` exemption on a table some role can write, or a table in
+  `exempt:` that should have been in `keys:` — putting the registry there
+  publishes every tenant to every tenant.
+- A command writing before the step its `tenant:` comes from, and any
+  `tenant: unscoped` step: each is a deliberate hole and should read like one.
+- A cross-tenant foreign key that is not composite, so the database allows a
+  reference the predicate would refuse.
 
 **Layers**
 - A role-shaped rule in a database CHECK, which binds writers it should not.

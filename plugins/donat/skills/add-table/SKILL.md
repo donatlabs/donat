@@ -34,6 +34,12 @@ Load `donat-tables-and-permissions`, `donat-schema-and-migrations` and
    without saying out loud why, and never reach for an admin role — there
    isn't one.
 
+   Where a permission genuinely does not bound rows to the caller, say which of
+   `catalogue`, `operator`, `worker` or `command` it is — as an `unbounded:`
+   key if the directory sets `unbounded_permissions: declared`, and out loud
+   either way. A forgotten bound and a deliberate one are both `filter: {}`.
+   Under `tenancy.yaml`, being tenant-scoped is not being caller-bound.
+
 5. **Validators** for value rules that bind one role, ordered so the most
    specific diagnosis comes first, each with its own message. Declare presence
    with `not_null:` or `when_present:` on any nullable column.
