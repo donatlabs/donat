@@ -138,8 +138,13 @@ Commands and Processes are Postgres-only.
 | M10 | Multitenancy: the tenant as a compiler layer, in-tenant grants, plan ceilings, `extends` composition | done — `examples/pethub` |
 | — | Embedded SDK and native hooks | deferred — [[embedded-sdk/_index]] |
 
-Feature specifications live in `specs/`, one per delivered capability
-(`001`–`008`).
+Feature specifications live in `specs/`, written before the capability they
+describe. Not every milestone has one: M10 was designed as ADRs
+([[declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]],
+[[declarative-saas/decisions/098-a-compiled-role-is-the-shape-and-a-grant-is-the-scope]],
+[[declarative-saas/decisions/099-an-unbounded-permission-says-so]]) and a
+worked example rather than a spec, and a retrospective spec would only restate
+them.
 
 ## Decision log
 
