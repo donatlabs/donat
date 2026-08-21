@@ -1020,6 +1020,33 @@ impl<'a> Planner<'a> {
         let tenant_bound_by_session = matches!(tenant_source, CommandTenantSource::Session);
         // A step may read outside the tenant, and says so on itself.
         let step_scoped = step.tenant != Some(donat_metadata::StepTenant::Unscoped);
+        // A scoped read is scoped by the *session's* tenant, which is the wrong
+        // tenant whenever this command's is not the session's: a command that
+        // establishes one, or takes it from a looked-up row, would read tenant
+        // A while writing tenant B, in one statement, and nothing about the
+        // answer would say so. There is no third tenant to compare against
+        // here, so the step is refused rather than answered from the wrong one
+        // — the author says `tenant: unscoped` and takes the audit, or reads a
+        // table the declaration already marked shared.
+        if step_scoped
+            && !tenant_bound_by_session
+            && let Some(tenancy) = self.tenancy
+            && let Some(table) = step.operation.read_table()
+            && matches!(
+                tenancy.table_scope(table),
+                donat_metadata::TableScope::Key(_) | donat_metadata::TableScope::ScopeVia(_)
+            )
+        {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "step `{}` reads `{table}` scoped by the caller's tenant, but this command \
+                     takes its own tenant from elsewhere, so the two would disagree. Declare \
+                     `tenant: unscoped` on the step if reading outside the tenant is intended.",
+                    step.name
+                ),
+            ));
+        }
         match &step.operation {
             CommandStepOperation::Assert { assert } => {
                 let rule = self.resolve_command_rule(
@@ -1439,6 +1466,7 @@ impl<'a> Planner<'a> {
                     &permission.check,
                     &context,
                     session,
+                    donat_metadata::IamOperation::Insert,
                     tenant_bound_by_session,
                     path,
                 )?;
@@ -1497,6 +1525,7 @@ impl<'a> Planner<'a> {
                     &permission.check,
                     &context,
                     session,
+                    donat_metadata::IamOperation::Insert,
                     tenant_bound_by_session,
                     path,
                 )?;
@@ -1591,6 +1620,7 @@ impl<'a> Planner<'a> {
                     &permission.check,
                     &context,
                     session,
+                    donat_metadata::IamOperation::Insert,
                     tenant_bound_by_session,
                     path,
                 )?;
@@ -1687,6 +1717,7 @@ impl<'a> Planner<'a> {
                     permission.check.as_ref().unwrap_or(&Json::Null),
                     &context,
                     session,
+                    donat_metadata::IamOperation::Update,
                     tenant_bound_by_session,
                     path,
                 )?;
@@ -1768,6 +1799,7 @@ impl<'a> Planner<'a> {
                     permission.check.as_ref().unwrap_or(&Json::Null),
                     &context,
                     session,
+                    donat_metadata::IamOperation::Update,
                     tenant_bound_by_session,
                     path,
                 )?;
@@ -1914,6 +1946,7 @@ impl<'a> Planner<'a> {
                     permission.check.as_ref().unwrap_or(&Json::Null),
                     &context,
                     session,
+                    donat_metadata::IamOperation::Update,
                     tenant_bound_by_session,
                     path,
                 )?;
@@ -3057,6 +3090,7 @@ impl<'a> Planner<'a> {
         check: &Json,
         context: &TableCtx<'a>,
         session: &Session,
+        operation: donat_metadata::IamOperation,
         bound_by_session: bool,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
@@ -3065,7 +3099,14 @@ impl<'a> Planner<'a> {
         } else {
             crate::tenancy::CheckTenant::Step
         };
-        self.write_check_expression(check, context, session, None, tenant, path)
+        self.write_check_expression(
+            check,
+            context,
+            session,
+            crate::tenancy::CheckAuthorization::CommandStep(operation),
+            tenant,
+            path,
+        )
     }
 
     fn apply_command_presets(
@@ -4080,7 +4121,7 @@ impl<'a> Planner<'a> {
             &perm.check,
             ctx,
             session,
-            Some(donat_metadata::IamOperation::Insert),
+            crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Insert),
             crate::tenancy::CheckTenant::Session,
             path,
         )?;
@@ -4199,6 +4240,23 @@ impl<'a> Planner<'a> {
         let Some(remote_ctx) = self.table_ctx_by_name(&manual.remote_table, &session.role) else {
             return Ok(None);
         };
+        // A nested child lands in a CTE of its own, and the counter moves by
+        // what the *top-level* statement wrote. A ceiling one write path walks
+        // around is a ceiling the tenant chooses to ignore — the same reason
+        // `validate_quota_declaration` refuses a command writer on a counted
+        // table — so the nested path is refused rather than left uncounted.
+        if let Some(quotas) = self.quotas
+            && quotas.consumed_by(&remote_ctx.entry.table).is_some()
+        {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "`{}` is counted against a plan, and a nested insert would create a row \
+                     without moving the counter. Insert it directly instead.",
+                    remote_ctx.entry.table
+                ),
+            ));
+        }
         let remote_perm = self
             .resolve_role_perm(&remote_ctx.entry.insert_permissions, &session.role, |p| {
                 !p.backend_only || session.backend_request
@@ -4707,7 +4765,7 @@ impl<'a> Planner<'a> {
             perm.check.as_ref().unwrap_or(&Json::Null),
             ctx,
             session,
-            Some(donat_metadata::IamOperation::Update),
+            crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Update),
             crate::tenancy::CheckTenant::Session,
             path,
         )?;
@@ -4906,7 +4964,7 @@ impl<'a> Planner<'a> {
                 &Json::Null,
                 ctx,
                 session,
-                Some(donat_metadata::IamOperation::Delete),
+                crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Delete),
                 crate::tenancy::CheckTenant::SessionBoundElsewhere,
                 path,
             )?,

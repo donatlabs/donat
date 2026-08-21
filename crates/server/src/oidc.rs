@@ -472,12 +472,6 @@ impl OidcConfig {
     /// provider's own tokens invalid; a wrong claim path leaves somebody with
     /// no role and a refusal. None of them quietly grants anything — which is
     /// the property that makes a default acceptable at all.
-    /// Whether this configuration is the one verifying tokens, rather than a
-    /// `DONAT_GRAPHQL_JWT_SECRET` a deployment wrote itself.
-    pub fn derives_jwt(&self) -> bool {
-        self.login_api.is_some()
-    }
-
     pub fn derived_jwt(&self) -> Option<String> {
         let login_api = self.login_api.as_deref()?;
         // The issuer is what the provider stamps, and it stamps the address a

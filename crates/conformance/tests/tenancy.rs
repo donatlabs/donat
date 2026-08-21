@@ -510,6 +510,44 @@ fn onboarding_metadata() -> donat_metadata::Metadata {
                     }
                 ],
                 "result": { "joined": { "step": "member", "column": "tenant_id" } }
+            },
+            {
+                // Deliberately malformed, and only ever invoked by the test
+                // that proves it is refused: a scoped read placed after the
+                // step this command takes its tenant from. The read would be
+                // scoped by the caller's tenant while every write went to the
+                // invite's, and one statement would quietly hold both.
+                "name": "join_and_peek",
+                "source": "default",
+                "permissions": [{ "role": "joiner" }],
+                "tenant": { "from": { "step": "invite", "column": "tenant_id" } },
+                "arguments": [
+                    { "name": "token", "type": "String!" },
+                    { "name": "user_id", "type": "String!" }
+                ],
+                "steps": [
+                    {
+                        "name": "invite",
+                        "tenant": "unscoped",
+                        "select_one": {
+                            "table": { "schema": "public", "name": "invite" },
+                            "by": { "token": { "arg": "token" } },
+                            "returning": ["token", "tenant_id"],
+                            "require_found": true
+                        }
+                    },
+                    {
+                        "name": "peek",
+                        "select_many": {
+                            "table": { "schema": "public", "name": "member" },
+                            "by": { "user_id": { "arg": "user_id" } },
+                            "order_by": ["user_id"],
+                            "returning": ["user_id"],
+                            "maximum_rows": 10
+                        }
+                    }
+                ],
+                "result": { "peeked": { "step": "invite", "column": "tenant_id" } }
             }
         ],
         "tenancy": {
@@ -561,6 +599,33 @@ fn onboarding_suite() -> Running {
 /// Signing up a merchant runs no DDL and needs no tenant in the token: the
 /// command writes the tenant row, and every later write in the same statement
 /// takes its key from it.
+/// A scoped read after the step the tenant came from is refused, not answered.
+///
+/// `from:` exists precisely because the command's tenant is not the caller's.
+/// A read left scoped after that point is therefore scoped by the *wrong*
+/// tenant — it would answer from the caller's while every write went to the
+/// invite's, in one statement, with nothing in the result saying so. The step
+/// names itself instead, and the author declares `tenant: unscoped` if reading
+/// outside the tenant is what they meant.
+#[test]
+fn a_scoped_read_after_the_tenant_step_is_refused() {
+    let s = onboarding_suite();
+    let joiner = token_for("joiner", None, "person-joiner");
+
+    let (code, resp) = query(
+        &s,
+        &joiner,
+        json!({ "query": "mutation { join_and_peek(token: \"unguessable-beta-token\", \
+                          user_id: \"person-joiner\") { peeked } }" }),
+    );
+    assert_eq!(code, 200, "{resp}");
+    let message = resp["errors"][0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("peek") && message.contains("tenant"),
+        "the step was answered from the caller's tenant instead of refused: {resp}"
+    );
+}
+
 #[test]
 fn a_command_can_establish_the_tenant_it_writes_into() {
     let s = onboarding_suite();
@@ -1026,6 +1091,164 @@ fn a_tenant_cannot_grant_itself_an_action_the_platform_reserved() {
     }
 }
 
+/// The same reservation, written by a command instead of by CRUD.
+///
+/// The case above says "however the row is written" and then only wrote it one
+/// way. A command step skips the *table's* action deliberately — the command
+/// proved its own — and for a while it skipped the reservation with it, so a
+/// deployment that wrote its grants from a command could grant itself
+/// everything the platform had reserved. The reservation bounds what the row
+/// may say, not who may write it, so it survives the command.
+#[test]
+fn a_command_cannot_write_a_grant_the_platform_reserved() {
+    let s = Suite::new("tenancy_iam_reserved_command")
+        .initial_metadata(
+            serde_json::from_value(json!({
+                "version": 3,
+                "sources": [{
+                    "name": "default",
+                    "kind": "postgres",
+                    "configuration": {
+                        "connection_info": {
+                            "database_url": { "from_env": "DONAT_DATABASE_URL" }
+                        }
+                    },
+                    "tables": [
+                        {
+                            "table": { "schema": "public", "name": "store" },
+                            "select_permissions": [
+                                { "role": "staff", "permission": { "columns": "*", "filter": {} } }
+                            ]
+                        },
+                        {
+                            "table": { "schema": "public", "name": "iam_grant" },
+                            "select_permissions": [
+                                { "role": "staff", "permission": { "columns": "*", "filter": {} } }
+                            ],
+                            "command_insert_permissions": [
+                                {
+                                    "role": "staff",
+                                    "permission": { "columns": "*", "check": {} }
+                                }
+                            ]
+                        }
+                    ]
+                }],
+                "commands": [
+                    {
+                        "name": "grant_action",
+                        "source": "default",
+                        "permissions": [{ "role": "staff" }],
+                        "arguments": [
+                            { "name": "subject", "type": "String!" },
+                            { "name": "action", "type": "String!" }
+                        ],
+                        "steps": [
+                            {
+                                "name": "granted",
+                                "insert": {
+                                    "table": { "schema": "public", "name": "iam_grant" },
+                                    "object": {
+                                        "user_id": { "arg": "subject" },
+                                        "action": { "arg": "action" }
+                                    },
+                                    "returning": ["user_id", "action"]
+                                }
+                            }
+                        ],
+                        "result": { "action": { "step": "granted", "column": "action" } }
+                    }
+                ]
+            }))
+            .expect("metadata"),
+        )
+        .with_migrations()
+        .env(
+            "DONAT_GRAPHQL_JWT_SECRET",
+            &json!({
+                "type": "HS256",
+                "key": SECRET,
+                "claims_map": {
+                    "x-donat-allowed-roles": { "path": "$.roles" },
+                    "x-donat-default-role": { "path": "$.roles[0]" },
+                    "x-donat-tenant-id": { "path": "$.tenant", "default": "" },
+                    "x-donat-user-id": { "path": "$.sub", "default": "" }
+                }
+            })
+            .to_string(),
+        )
+        .start();
+    let mut client =
+        postgres::Client::connect(s.db_url(), postgres::NoTls).expect("connect to suite database");
+    client
+        .batch_execute(
+            "CREATE TABLE public.store (id text PRIMARY KEY, status text NOT NULL);
+             CREATE TABLE public.iam_grant (id bigserial PRIMARY KEY, tenant_id text NOT NULL, \
+                 user_id text NOT NULL, action text NOT NULL);
+             INSERT INTO public.store VALUES ('tenant-alpha', 'active');
+             INSERT INTO public.iam_grant (tenant_id, user_id, action) VALUES \
+                 ('tenant-alpha', 'person-admin', 'iam_grant:*'), \
+                 ('tenant-alpha', 'person-admin', 'grant_action:invoke');",
+        )
+        .expect("schema");
+    s.set_tenancy(json!({
+        "source": "default",
+        "variable": "X-Donat-Tenant-Id",
+        "key": "tenant_id",
+        "registry": {
+            "table": { "schema": "public", "name": "store" },
+            "key": "id",
+            "status": { "column": "status", "serving": ["active"] }
+        },
+        "keys": [{ "table": { "schema": "public", "name": "store" }, "key": "id" }]
+    }));
+    s.set_iam(json!({
+        "source": "default",
+        "grants": {
+            "table": { "schema": "public", "name": "iam_grant" },
+            "subject": { "column": "user_id", "variable": "X-Donat-User-Id" },
+            "tenant": { "column": "tenant_id" },
+            "action": { "column": "action" },
+            "written_via": {
+                "table": { "schema": "public", "name": "iam_grant" },
+                "action": "action"
+            }
+        },
+        "governed_roles": ["staff"],
+        "reserved_actions": ["platform:*", "tenant:create"]
+    }));
+    let admin = token_for("staff", Some(ALPHA), "person-admin");
+
+    // An ordinary in-tenant action still goes through the command.
+    let (code, resp) = query(
+        &s,
+        &admin,
+        json!({ "query": "mutation { grant_action(subject: \"person-a\", \
+                          action: \"product:read\") { action } }" }),
+    );
+    assert_eq!(code, 200, "{resp}");
+    assert_eq!(
+        resp["data"]["grant_action"]["action"], "product:read",
+        "{resp}"
+    );
+
+    for action in ["platform:billing", "tenant:create"] {
+        let (code, resp) = query(
+            &s,
+            &admin,
+            json!({ "query": format!(
+                "mutation {{ grant_action(subject: \"person-admin\", \
+                 action: \"{action}\") {{ action }} }}"
+            )}),
+        );
+        assert_eq!(code, 200, "{resp}");
+        assert!(
+            resp["errors"].is_array(),
+            "a command wrote the reserved action {action}: {resp}"
+        );
+    }
+}
+
 // ------------------------------------------------------- plan entitlements
 //
 // A ceiling is added as a layer, exactly as the tenant predicate is: the
@@ -1279,6 +1502,60 @@ fn a_ceiling_holds_when_two_writers_arrive_at_once() {
 /// same branch as the preset, so the resulting UPDATE would carry no `WHERE`
 /// at all. A caller could then take another tenant's row by colliding with its
 /// unique key, using nothing but an insert permission.
+/// An upsert that only updated consumes nothing.
+///
+/// `ON CONFLICT DO NOTHING` was right from the start, because it returns no
+/// rows. `DO UPDATE` returns the rows it overwrote as well, and counting those
+/// charged a merchant a unit of their plan every time they edited a product
+/// they already owned — until the ceiling locked them out of creating any.
+/// The counter moves by what the statement *created*, which is what `xmax`
+/// distinguishes.
+#[test]
+fn an_upsert_that_only_updated_consumes_no_quota() {
+    let s = quota_suite("tenancy_quota_upsert");
+    let staff = token_for("staff", Some(ALPHA), "person-a");
+
+    // Two products exist and the plan allows three, so exactly one is left.
+    let upsert = |name: &str| {
+        json!({ "query": format!(
+            "mutation {{ insert_product(objects: [{{ id: 1, name: \"{name}\" }}], \
+             on_conflict: {{ constraint: product_pkey, update_columns: [name] }}) \
+             {{ affected_rows }} }}"
+        )})
+    };
+
+    // Rewriting the same row three times touches no new row, so it must not
+    // spend the remaining unit — let alone three of them.
+    for attempt in ["renamed-once", "renamed-twice", "renamed-thrice"] {
+        let (code, resp) = query(&s, &staff, upsert(attempt));
+        assert_eq!(code, 200, "{resp}");
+        assert_eq!(
+            resp["data"]["insert_product"]["affected_rows"], 1,
+            "the upsert did not update: {resp}"
+        );
+    }
+
+    // The third product still fits, which it would not if the updates had been
+    // charged.
+    let (code, resp) = query(&s, &staff, insert_product(3));
+    assert_eq!(code, 200, "{resp}");
+    assert_eq!(
+        resp["data"]["insert_product"]["affected_rows"], 1,
+        "an upsert that only updated consumed the plan: {resp}"
+    );
+
+    // And the ceiling still holds for a genuinely new row.
+    let (code, resp) = query(&s, &staff, insert_product(4));
+    assert_eq!(code, 200, "{resp}");
+    assert!(
+        resp["errors"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no more products"),
+        "the ceiling stopped holding: {resp}"
+    );
+}
+
 #[test]
 fn an_insert_or_ignore_cannot_take_another_tenants_row() {
     let s = suite("tenancy_upsert");

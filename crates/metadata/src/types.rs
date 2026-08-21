@@ -921,6 +921,21 @@ pub enum CommandStepOperation {
     },
 }
 
+impl CommandStepOperation {
+    /// The table a *read* step reads, if this is one.
+    ///
+    /// Only the reads: a write's tenant is a preset resolved from the
+    /// command's own declaration, so it is never scoped by the session and has
+    /// nothing to disagree about.
+    pub fn read_table(&self) -> Option<&QualifiedTable> {
+        match self {
+            CommandStepOperation::SelectOne { select_one } => Some(&select_one.table),
+            CommandStepOperation::SelectMany { select_many } => Some(&select_many.table),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectOneCommandStep {

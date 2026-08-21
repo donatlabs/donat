@@ -378,8 +378,12 @@ impl<'a> Planner<'a> {
         if let Some(w) = args.get("where").filter(|w| !w.is_null()) {
             predicates.push(self.parse_bool_exp(w, &ctx, session, false, path)?);
         }
-        if !perm.filter.is_null() && !perm.filter.as_object().is_some_and(|o| o.is_empty()) {
-            predicates.push(self.parse_bool_exp(&perm.filter, &ctx, session, true, path)?);
+        // Through the shared helper, not the raw filter: a v1 write is a write,
+        // and the tenant bound belongs to the predicate here exactly as it does
+        // on the GraphQL path. Building it by hand is how this planner came to
+        // be the one surface the bound did not reach.
+        if let Some(bounded) = self.write_permission_filter(&perm.filter, &ctx, session, path)? {
+            predicates.push(bounded);
         }
         let predicate = match predicates.len() {
             0 => None,
@@ -448,8 +452,12 @@ impl<'a> Planner<'a> {
         if let Some(w) = args.get("where").filter(|w| !w.is_null()) {
             predicates.push(self.parse_bool_exp(w, &ctx, session, false, path)?);
         }
-        if !perm.filter.is_null() && !perm.filter.as_object().is_some_and(|o| o.is_empty()) {
-            predicates.push(self.parse_bool_exp(&perm.filter, &ctx, session, true, path)?);
+        // Through the shared helper, not the raw filter: a v1 write is a write,
+        // and the tenant bound belongs to the predicate here exactly as it does
+        // on the GraphQL path. Building it by hand is how this planner came to
+        // be the one surface the bound did not reach.
+        if let Some(bounded) = self.write_permission_filter(&perm.filter, &ctx, session, path)? {
+            predicates.push(bounded);
         }
         let predicate = match predicates.len() {
             0 => None,
@@ -464,7 +472,7 @@ impl<'a> Planner<'a> {
                 &serde_json::Value::Null,
                 &ctx,
                 session,
-                Some(donat_metadata::IamOperation::Delete),
+                crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Delete),
                 crate::tenancy::CheckTenant::SessionBoundElsewhere,
                 path,
             )?,
@@ -558,6 +566,16 @@ impl<'a> Planner<'a> {
             }
             preset_values.push((col.clone(), Scalar::Json(resolved)));
         }
+        // The tenant preset, last, so it overrides a declared preset naming the
+        // same column as well as the caller's own value — the same order the
+        // GraphQL insert applies it in, and for the same reason.
+        if let Some((column, _, value)) = self.tenant_preset(&ctx, session, path)? {
+            if !columns.contains(&column) {
+                columns.push(column.clone());
+            }
+            preset_values.retain(|(existing, _)| existing != &column);
+            preset_values.push((column, Scalar::Json(Json::String(value))));
+        }
 
         let typed_columns: Vec<(String, String)> = columns
             .iter()
@@ -584,12 +602,16 @@ impl<'a> Planner<'a> {
             })
             .collect();
 
-        let check = if perm.check.is_null() || perm.check.as_object().is_some_and(|o| o.is_empty())
-        {
-            None
-        } else {
-            Some(self.parse_bool_exp(&perm.check, &ctx, session, true, path)?)
-        };
+        // An insert has no predicate, so the check is the only place the bound
+        // and the serving gate can go.
+        let check = self.write_check_expression(
+            &perm.check,
+            &ctx,
+            session,
+            crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Insert),
+            crate::tenancy::CheckTenant::Session,
+            path,
+        )?;
 
         // v1 on_conflict: { constraint | constraint_on, action: update|ignore }.
         let mut on_conflict = match args.get("on_conflict") {

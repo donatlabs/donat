@@ -478,3 +478,78 @@ fn the_serving_gate_is_repeated_once_per_table_in_a_nested_read() {
     // Parent and child: two tables, two gates.
     assert_eq!(gates, 2, "unexpected gate count: {rendered}");
 }
+
+// --- the v1 planner is a write surface too -------------------------------
+//
+// It has no HTTP route today, which is exactly why it drifted: the tenant
+// reached every GraphQL write and none of these. A planner that is one mount
+// away from serving is not a planner the bound may skip.
+
+fn v1_planner<'a>(md: &'a Metadata, cat: &'a Catalog) -> Planner<'a> {
+    Planner::new(md, cat)
+}
+
+#[test]
+fn a_v1_delete_is_bounded_by_the_tenant() {
+    let md = metadata(json!({}));
+    let cat = catalog();
+    let plan = v1_planner(&md, &cat)
+        .plan_v1_delete(
+            &json!({"table": {"schema": "public", "name": "product"}, "where": {}}),
+            &staff(),
+        )
+        .expect("planning succeeds");
+    let rendered = format!("{plan:?}");
+    assert!(
+        rendered.contains("tenant_id"),
+        "a v1 delete with an empty where reached every tenant: {rendered}"
+    );
+}
+
+#[test]
+fn a_v1_update_is_bounded_by_the_tenant() {
+    let md = metadata(json!({}));
+    let cat = catalog();
+    let plan = v1_planner(&md, &cat)
+        .plan_v1_update(
+            &json!({
+                "table": {"schema": "public", "name": "product"},
+                "where": {},
+                "$set": {"name": "renamed"}
+            }),
+            &staff(),
+        )
+        .expect("planning succeeds");
+    let rendered = format!("{plan:?}");
+    assert!(
+        rendered.contains("tenant_id"),
+        "a v1 update with an empty where rewrote every tenant: {rendered}"
+    );
+}
+
+#[test]
+fn a_v1_insert_presets_the_tenant_over_the_callers_value() {
+    let md = metadata(json!({}));
+    let cat = catalog();
+    let plan = v1_planner(&md, &cat)
+        .plan_v1_insert(
+            &json!({
+                "table": {"schema": "public", "name": "product"},
+                "objects": [{
+                    "name": "smuggled",
+                    "tenant_id": "22222222-2222-2222-2222-222222222222"
+                }]
+            }),
+            &staff(),
+        )
+        .expect("planning succeeds");
+    let rendered = format!("{plan:?}");
+    assert!(
+        rendered.contains("11111111-1111-1111-1111-111111111111"),
+        "the tenant preset never reached the v1 insert: {rendered}"
+    );
+    assert!(
+        !rendered.contains("22222222-2222-2222-2222-222222222222"),
+        "a v1 insert stored the tenant the caller named: {rendered}"
+    );
+}

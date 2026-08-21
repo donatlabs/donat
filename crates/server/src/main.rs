@@ -828,22 +828,40 @@ async fn main() -> anyhow::Result<()> {
     // A tenanted deployment whose tokens cannot carry a tenant refuses every
     // request to every tenanted table, one at a time, for as long as it runs.
     // The one place that is worth learning is here.
-    if let Some(tenancy) = &metadata.tenancy
-        && jwt_is_derived
-        && oidc
+    if let Some(tenancy) = &metadata.tenancy {
+        let derived_says_nothing = jwt_is_derived
+            && oidc
+                .as_ref()
+                .is_some_and(|oidc| oidc.tenant_claim.is_none());
+        // A configuration a deployment wrote itself is checked the same way,
+        // where it can be: a `claims_map` is an exhaustive list, so a tenant
+        // variable missing from it can never arrive. Restricting this to the
+        // derived case left the deployment most likely to have hand-written
+        // the map — and therefore most likely to have forgotten an entry —
+        // as the one that found out a request at a time.
+        let declared_says_nothing = jwt
             .as_ref()
-            .is_some_and(|oidc| oidc.tenant_claim.is_none())
-    {
-        anyhow::bail!(
-            "source `{}` declares tenancy on {}, but this deployment derives its token \
-             verification from DONAT_OIDC and nothing says where the provider puts the tenant. \
-             Set DONAT_OIDC_TENANT_CLAIM to the JSON path of that claim (for example \
-             `$.tenant_id`), or configure DONAT_GRAPHQL_JWT_SECRET with a claims_map of your \
-             own. Without it every request to a tenanted table is refused for carrying no \
-             tenant.",
-            tenancy.source,
-            tenancy.variable
-        );
+            .and_then(|jwt| jwt.can_carry(&tenancy.variable))
+            == Some(false);
+        if derived_says_nothing || declared_says_nothing {
+            anyhow::bail!(
+                "source `{}` declares tenancy on {}, but nothing in this deployment says where \
+                 a token carries it: {}. Without it every request to a tenanted table is \
+                 refused for carrying no tenant.",
+                tenancy.source,
+                tenancy.variable,
+                if derived_says_nothing {
+                    "token verification is derived from DONAT_OIDC, so set \
+                     DONAT_OIDC_TENANT_CLAIM to the JSON path of that claim (for example \
+                     `$.tenant_id`), or configure DONAT_GRAPHQL_JWT_SECRET with a claims_map \
+                     of your own"
+                } else {
+                    "DONAT_GRAPHQL_JWT_SECRET declares a claims_map and that map has no entry \
+                     for this variable, so add one naming the claim the provider puts the \
+                     tenant in"
+                }
+            );
+        }
     }
 
     // The identity provider's own accounts, when a deployment configured a key

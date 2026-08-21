@@ -462,3 +462,79 @@ fn the_bases_own_tables_are_still_held_to_it() {
         "{error}"
     );
 }
+
+/// A base two overlays share, where one of them is itself a base.
+///
+/// `A extends [C, B]` and `B extends C` is an ordinary diamond. Loading it in
+/// that order composes C into A first, and the "load a base once" set then
+/// makes B's own `extends: C` a no-op — so B is loaded and validated *without*
+/// the directory it declares it needs. The same three directories written
+/// `[B, C]` load fine, which is the tell: the answer depends on the order the
+/// list happens to be in.
+#[test]
+fn a_base_that_is_also_a_base_is_loaded_with_its_own() {
+    let c = tempdir("diamond_c");
+    dir(&c, &[("public_shared", &table("shared"))], &[]);
+
+    // B needs C for more than tables: its tenancy names C's registry, so B
+    // validated without C is B refused.
+    let b = tempdir("diamond_b");
+    dir(
+        &b,
+        &[("public_middle", &table("middle"))],
+        &[
+            (
+                "extends.yaml",
+                &format!("extends:\n  - path: {}\n", c.display()),
+            ),
+            (
+                "tenancy.yaml",
+                "\
+source: default
+variable: X-Donat-Tenant-Id
+key: tenant_id
+registry:
+  table: { schema: public, name: shared }
+  key: id
+  status: { column: status, serving: [active] }
+keys:
+  - { table: { schema: public, name: shared }, key: id }
+",
+            ),
+        ],
+    );
+
+    // The order that trips it: the shared base first, the directory that also
+    // needs it second.
+    let a = tempdir("diamond_a");
+    dir(
+        &a,
+        &[("public_top", &table("top"))],
+        &[(
+            "extends.yaml",
+            &format!(
+                "extends:\n  - path: {}\n  - path: {}\n",
+                c.display(),
+                b.display()
+            ),
+        )],
+    );
+
+    let loaded = load_metadata_dir(&a).expect("the diamond composes");
+    let tables: Vec<String> = loaded.sources[0]
+        .tables
+        .iter()
+        .map(|entry| entry.table.name().to_string())
+        .collect();
+    for wanted in ["top", "middle", "shared"] {
+        assert!(
+            tables.iter().any(|name| name == wanted),
+            "`{wanted}` is missing from the composition: {tables:?}"
+        );
+    }
+    assert_eq!(
+        tables.iter().filter(|name| *name == "shared").count(),
+        1,
+        "the shared base was merged twice: {tables:?}"
+    );
+}

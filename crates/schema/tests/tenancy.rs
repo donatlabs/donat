@@ -214,3 +214,78 @@ fn a_table_the_database_does_not_have_is_left_to_the_check_that_owns_it() {
         .remove("public.product");
     assert!(messages(&metadata, &catalogs).is_empty());
 }
+
+// --- the counters table is read as one row -------------------------------
+
+/// A quota declaration whose counters live in `usage`, keyed by `tenant_id`.
+fn with_counters(unique: bool) -> (Metadata, HashMap<String, Catalog>) {
+    let mut catalogs = catalog(vec![
+        col("id", "uuid"),
+        col("tenant_id", "uuid"),
+        col("name", "text"),
+    ]);
+    let usage = TableInfo {
+        schema: "public".into(),
+        name: "usage".into(),
+        relation_kind: RelationKind::Table,
+        columns: vec![col("tenant_id", "uuid"), col("product_count", "int8")],
+        primary_key: if unique {
+            vec!["tenant_id".into()]
+        } else {
+            vec![]
+        },
+        unique_keys: vec![],
+        foreign_keys: vec![],
+    };
+    catalogs
+        .get_mut("default")
+        .expect("the default source")
+        .tables
+        .insert("public.usage".to_string(), usage);
+
+    let mut metadata = metadata(declaration());
+    metadata.quotas = Some(
+        serde_json::from_value(json!({
+            "source": "default",
+            "counters": {
+                "table": { "schema": "public", "name": "usage" },
+                "tenant": { "column": "tenant_id" }
+            },
+            "limits": {
+                "table": { "schema": "public", "name": "plan" },
+                "key": { "column": "code" },
+                "via": { "table": { "schema": "public", "name": "tenant" }, "column": "plan_code" }
+            },
+            "entitlements": [{
+                "name": "products",
+                "counter": "product_count",
+                "maximum": "max_products",
+                "consumes": [{ "table": { "schema": "public", "name": "product" } }]
+            }]
+        }))
+        .expect("quotas deserialize"),
+    );
+    (metadata, catalogs)
+}
+
+#[test]
+fn a_counters_table_keyed_by_its_tenant_passes() {
+    let (metadata, catalogs) = with_counters(true);
+    let found = messages(&metadata, &catalogs);
+    assert!(
+        !found.iter().any(|message| message.contains("not unique")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_counters_table_that_allows_two_rows_per_tenant_is_refused() {
+    // Read as a scalar subquery, so a second row is a database error on every
+    // gated write rather than a refusal the caller can understand.
+    let (metadata, catalogs) = with_counters(false);
+    let found = messages(&metadata, &catalogs);
+    assert!(
+        found.iter().any(|message| message.contains("not unique")),
+        "a counters table with no unique tenant was accepted: {found:?}"
+    );
+}

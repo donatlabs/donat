@@ -104,6 +104,43 @@ pub fn validate_tenancy_catalog(
         }
     }
 
+    // The counters table is read as a scalar subquery — `(SELECT used FROM
+    // __donat_quota)` — so a tenant with two usage rows turns every gated write
+    // into PostgreSQL's own "more than one row returned by a subquery" instead
+    // of a Donat error shape. One row per tenant is what the design assumes;
+    // this is where the database is asked to agree.
+    if let Some(quotas) = &metadata.quotas {
+        let counters = &quotas.counters.table;
+        let column = &quotas.counters.tenant.column;
+        match catalog.table(counters.schema(), counters.name()) {
+            None => errors.push(PlanError::validation(
+                &format!("quotas.counters.table.{counters}"),
+                format!(
+                    "counters table \"{counters}\" is absent from source `{}`",
+                    tenancy.source
+                ),
+            )),
+            Some(info) => {
+                let one_per_tenant = info.primary_key == [column.clone()]
+                    || info
+                        .unique_keys
+                        .iter()
+                        .any(|key| key == std::slice::from_ref(column));
+                if !one_per_tenant {
+                    errors.push(PlanError::validation(
+                        &format!("quotas.counters.table.{counters}"),
+                        format!(
+                            "\"{counters}.{column}\" is not unique, so a tenant may have two \
+                             usage rows. The counter is read as a single value, so the second \
+                             row turns every write this gates into a database error rather than \
+                             a refusal. Add a unique constraint on \"{column}\"."
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     errors
 }
 
@@ -148,6 +185,20 @@ use donat_metadata::QualifiedTable as MetadataTable;
 
 use crate::Session;
 use crate::plan::{Planner, TableCtx};
+
+/// Which authorization a write's check carries.
+///
+/// The two differ in exactly one place, and the difference is easy to get
+/// backwards: a command step skips the *table's* action because the command
+/// already proved its own, but it must still carry the reservation, because
+/// that one bounds what the row may say rather than who may write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckAuthorization {
+    /// Ordinary CRUD: the table's own action gates the write.
+    Table(donat_metadata::IamOperation),
+    /// One step of a command, already authorized by the command's action.
+    CommandStep(donat_metadata::IamOperation),
+}
 
 /// Where a write's check gets its tenant, and whether it needs to state the
 /// bound again.
@@ -575,7 +626,7 @@ impl<'a> Planner<'a> {
         check: &serde_json::Value,
         ctx: &TableCtx<'a>,
         session: &Session,
-        operation: Option<donat_metadata::IamOperation>,
+        authorization: CheckAuthorization,
         tenant: CheckTenant,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
@@ -606,12 +657,34 @@ impl<'a> Planner<'a> {
             1 => conjuncts.pop(),
             _ => Some(BoolExp::And(conjuncts)),
         };
-        // `None` for a command step: a command is authorized once, by its own
-        // action, and applying the table's action inside it as well would mean
-        // two grants for one operation.
-        match operation {
-            Some(operation) => self.with_iam(declared, ctx, session, operation, path),
-            None => Ok(declared),
+        match authorization {
+            CheckAuthorization::Table(operation) => {
+                self.with_iam(declared, ctx, session, operation, path)
+            }
+            // A command is authorized once, by its own action, so the table's
+            // action is not applied again inside it — that would mean two
+            // grants for one operation. The reservation is not the table's
+            // action: it is a property of the row, and it must hold however
+            // the row arrives, or a deployment that writes its grants from a
+            // command can grant itself anything the platform reserved.
+            CheckAuthorization::CommandStep(operation) => {
+                let mut conjuncts = Vec::new();
+                if let Some(declared) = declared {
+                    conjuncts.push(declared);
+                }
+                if matches!(
+                    operation,
+                    donat_metadata::IamOperation::Insert | donat_metadata::IamOperation::Update
+                ) && let Some(reserved) = self.reserved_action_bound(ctx, path)?
+                {
+                    conjuncts.push(reserved);
+                }
+                Ok(match conjuncts.len() {
+                    0 => None,
+                    1 => conjuncts.pop(),
+                    _ => Some(BoolExp::And(conjuncts)),
+                })
+            }
         }
     }
 

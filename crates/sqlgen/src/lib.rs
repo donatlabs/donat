@@ -116,6 +116,11 @@ struct MutationSelectOptions<'a> {
     file_claims: &'a [donat_ir::FileClaim],
     /// The plan entitlement this write consumes or releases.
     quota: Option<&'a donat_ir::QuotaConsumption>,
+    /// Whether the write's CTE carries a marker saying which of its rows it
+    /// actually created. An `ON CONFLICT DO UPDATE` returns the rows it merely
+    /// updated as well, and counting those against a plan would charge a
+    /// merchant for editing a product they already own.
+    quota_counts_created_only: bool,
     output: &'a MutationOutput,
 }
 
@@ -4175,6 +4180,17 @@ fn mutation_to_sql_full(
                 }
             }
             stmt.push_str(" RETURNING *");
+            // `xmax` is zero on a row this statement inserted and the updating
+            // transaction's id on one an `ON CONFLICT DO UPDATE` overwrote,
+            // which is the only way the returned set distinguishes them. Added
+            // only where a quota reads it, so every other statement's shape —
+            // and every snapshot of one — is unchanged.
+            if insert.quota.is_some() {
+                stmt.push_str(&format!(
+                    ", (xmax = 0) AS {}",
+                    quote_ident("__donat_created")
+                ));
+            }
             let mut extra_ctes = vec![];
             let mut extra_checks = vec![];
             for (idx, nested) in insert.nested_object_inserts.iter().enumerate() {
@@ -4231,6 +4247,7 @@ fn mutation_to_sql_full(
                 check_path: &insert.check_path,
                 file_claims: &insert.file_claims,
                 quota: insert.quota.as_deref(),
+                quota_counts_created_only: insert.quota.is_some(),
                 extra_ctes,
                 extra_checks,
                 validators: &insert.validators,
@@ -4290,6 +4307,7 @@ fn mutation_to_sql_full(
                 check_path: &update.check_path,
                 file_claims: &update.file_claims,
                 quota: None,
+                quota_counts_created_only: false,
                 extra_ctes: vec![],
                 extra_checks: vec![],
                 validators: &update.validators,
@@ -4315,6 +4333,7 @@ fn mutation_to_sql_full(
                 check_path: &delete.check_path,
                 file_claims: &[],
                 quota: delete.quota.as_deref(),
+                quota_counts_created_only: false,
                 validators: &[],
                 extra_ctes: vec![],
                 extra_checks: vec![],
@@ -5043,6 +5062,7 @@ impl Ctx {
             validators,
             file_claims,
             quota,
+            quota_counts_created_only,
             extra_ctes,
             extra_checks,
             output,
@@ -5202,9 +5222,17 @@ impl Ctx {
             // and a multi-row insert consumes as many units as it created.
             // Referencing the write's own CTE is also what orders the two: the
             // usage row is locked after the rows exist, never before.
+            let moved_by = if quota_counts_created_only {
+                format!(
+                    "(SELECT count(*) FROM {cte_ident} WHERE {})",
+                    quote_ident("__donat_created")
+                )
+            } else {
+                format!("(SELECT count(*) FROM {cte_ident})")
+            };
             quota_ctes.push(format!(
                 "{quota_ident} AS (UPDATE {schema}.{table} SET {counter} = {counter} {sign} \
-                 (SELECT count(*) FROM {cte_ident}) WHERE {tenant_col} = {tenant} \
+                 {moved_by} WHERE {tenant_col} = {tenant} \
                  RETURNING {counter} AS {used})",
                 schema = quote_ident(&quota.counters.schema),
                 table = quote_ident(&quota.counters.name),

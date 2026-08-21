@@ -96,7 +96,9 @@ struct ExtendsEntry {
 
 /// Load and fully resolve a metadata directory.
 pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
-    load_metadata_dir_tracked(dir, &mut Vec::new(), &mut Vec::new())
+    let metadata = load_metadata_dir_tracked(dir, &mut Vec::new(), &mut Vec::new())?;
+    validate_composed(dir, &metadata)?;
+    Ok(metadata)
 }
 
 fn load_metadata_dir_tracked(
@@ -230,7 +232,19 @@ fn load_one_metadata_dir(
         }
     }
 
-    let template_errors = crate::documents::validate_document_templates(&metadata);
+    Ok(metadata)
+}
+
+/// Every rule that is decided once, over the composition that will be served.
+///
+/// Deliberately not run on each directory as it is composed. A base that
+/// declares tenancy over tables *its own* base tracks is refused when read
+/// alone, and whether it is read alone used to depend on the order an
+/// overlay happened to list its bases in — `[C, B]` skipping C inside B
+/// because C was already merged, while `[B, C]` worked. What a deployment
+/// serves is the composition, so the composition is what is checked.
+fn validate_composed(dir: &Path, metadata: &Metadata) -> Result<(), LoadError> {
+    let template_errors = crate::documents::validate_document_templates(metadata);
     if !template_errors.is_empty() {
         return Err(LoadError::Templates {
             path: dir.join("documents.yaml"),
@@ -241,7 +255,7 @@ fn load_one_metadata_dir(
                 .join("; "),
         });
     }
-    let ingest_errors = crate::ingest::validate_ingest_schemas(&metadata);
+    let ingest_errors = crate::ingest::validate_ingest_schemas(metadata);
     if !ingest_errors.is_empty() {
         return Err(LoadError::Ingest {
             path: dir.join("ingest.yaml"),
@@ -252,7 +266,7 @@ fn load_one_metadata_dir(
                 .join("; "),
         });
     }
-    let media_errors = crate::media::validate_media_declarations(&metadata);
+    let media_errors = crate::media::validate_media_declarations(metadata);
     if !media_errors.is_empty() {
         return Err(LoadError::Media {
             path: dir.join("media.yaml"),
@@ -263,7 +277,7 @@ fn load_one_metadata_dir(
                 .join("; "),
         });
     }
-    let recurrence_errors = crate::recurrence::validate_recurrence_declarations(&metadata);
+    let recurrence_errors = crate::recurrence::validate_recurrence_declarations(metadata);
     if !recurrence_errors.is_empty() {
         return Err(LoadError::Recurrence {
             path: dir.join("recurrence.yaml"),
@@ -274,23 +288,23 @@ fn load_one_metadata_dir(
                 .join("; "),
         });
     }
-    validate_mcp_references(&metadata).map_err(|message| LoadError::Mcp {
+    validate_mcp_references(metadata).map_err(|message| LoadError::Mcp {
         path: dir.join("mcp.yaml"),
         message,
     })?;
-    validate_storage(&metadata).map_err(|message| LoadError::Storage {
+    validate_storage(metadata).map_err(|message| LoadError::Storage {
         path: dir.join("storage.yaml"),
         message,
     })?;
-    validate_cron_triggers(&metadata).map_err(|message| LoadError::CronTriggers {
+    validate_cron_triggers(metadata).map_err(|message| LoadError::CronTriggers {
         path: dir.join("cron_triggers.yaml"),
         message,
     })?;
     // Tenancy is checked last because every rule it applies is a rule about
     // something another section declared: a source, a tracked table, a
     // relationship, a permission.
-    let mut tenancy_errors = crate::tenancy::validate_tenancy_declaration(&metadata);
-    tenancy_errors.extend(crate::tenancy::validate_untenanted_commands(&metadata));
+    let mut tenancy_errors = crate::tenancy::validate_tenancy_declaration(metadata);
+    tenancy_errors.extend(crate::tenancy::validate_untenanted_commands(metadata));
     if !tenancy_errors.is_empty() {
         return Err(LoadError::Tenancy {
             path: dir.join("tenancy.yaml"),
@@ -301,7 +315,7 @@ fn load_one_metadata_dir(
                 .join("; "),
         });
     }
-    let iam_errors = crate::iam::validate_iam_declaration(&metadata);
+    let iam_errors = crate::iam::validate_iam_declaration(metadata);
     if !iam_errors.is_empty() {
         return Err(LoadError::Iam {
             path: dir.join("iam.yaml"),
@@ -312,7 +326,7 @@ fn load_one_metadata_dir(
                 .join("; "),
         });
     }
-    let quota_errors = crate::quotas::validate_quota_declaration(&metadata);
+    let quota_errors = crate::quotas::validate_quota_declaration(metadata);
     if !quota_errors.is_empty() {
         return Err(LoadError::Quotas {
             path: dir.join("quotas.yaml"),
@@ -325,7 +339,7 @@ fn load_one_metadata_dir(
     }
     // Last, because it reads the tenancy declaration to know which variable is
     // the tenant's — and a tenant bound is deliberately not a caller bound.
-    let bounds_errors = crate::bounds::validate_permission_bounds(&metadata);
+    let bounds_errors = crate::bounds::validate_permission_bounds(metadata);
     if !bounds_errors.is_empty() {
         return Err(LoadError::PermissionBounds {
             path: dir.join("permissions.yaml"),
@@ -336,7 +350,7 @@ fn load_one_metadata_dir(
                 .join("; "),
         });
     }
-    Ok(metadata)
+    Ok(())
 }
 
 /// Check the timezone half of a cron declaration. A schedule that names a zone
