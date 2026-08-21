@@ -412,7 +412,20 @@ impl<'a> Planner<'a> {
             },
             sets,
             predicate,
-            check: None,
+            // The predicate says which rows may change; the check says the row
+            // is allowed to exist afterwards, and carries the in-tenant grant
+            // with it. Dropping it here left this surface bounded but not
+            // authorized — a role with no grant edited rows its predicate
+            // admitted. `SessionBoundElsewhere` because the predicate above
+            // already states the tenant.
+            check: self.write_check_expression(
+                perm.check.as_ref().unwrap_or(&Json::Null),
+                &ctx,
+                session,
+                crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Update),
+                crate::tenancy::CheckTenant::SessionBoundElsewhere,
+                path,
+            )?,
             check_path: "$".to_string(),
             validators: validators.rows,
             file_claims,
@@ -639,7 +652,7 @@ impl<'a> Planner<'a> {
                 // may change, and its presets are applied.
                 let update_perm =
                     self.resolve_role_perm(&ctx.entry.update_permissions, &session.role, |_| true);
-                let update_columns = match (action, update_perm) {
+                let mut update_columns = match (action, update_perm) {
                     ("ignore", _) | (_, None) => vec![],
                     (_, Some(permission)) => columns
                         .iter()
@@ -652,16 +665,18 @@ impl<'a> Planner<'a> {
                 if !update_columns.is_empty()
                     && let Some(update_perm) = update_perm
                 {
-                    if !update_perm.filter.is_null()
-                        && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
+                    // Through the shared helper for the same reason the
+                    // ordinary predicate is: this branch updates an *existing*
+                    // row, and without the tenant bound a caller colliding on a
+                    // key that does not include the tenant overwrites another
+                    // tenant's row and takes it.
+                    if let Some(filter) =
+                        self.write_permission_filter(&update_perm.filter, &ctx, session, path)?
                     {
-                        predicate = Some(self.parse_bool_exp(
-                            &update_perm.filter,
-                            &ctx,
-                            session,
-                            true,
-                            path,
-                        )?);
+                        predicate = Some(match predicate.take() {
+                            Some(existing) => BoolExp::And(vec![existing, filter]),
+                            None => filter,
+                        });
                     }
                     for (col, value) in &update_perm.set {
                         let Some(info) = ctx.info.column(col) else {
@@ -671,6 +686,26 @@ impl<'a> Planner<'a> {
                             column: col.clone(),
                             pg_type: info.sql_type().to_string(),
                             value: Scalar::Json(resolve_preset(value, session)?),
+                        });
+                    }
+                    // Last, and confined to this branch. The tenant is now one
+                    // of the inserted `columns`, so `update_columns` would
+                    // otherwise carry `tenant_id = EXCLUDED.tenant_id` and let
+                    // a colliding write move an existing row into the caller's
+                    // tenant. Adding it unconditionally is equally wrong: on an
+                    // insert-or-ignore it would turn DO NOTHING into a DO
+                    // UPDATE, on the one branch the bound above does not guard.
+                    if let Some((column, pg_type, value)) =
+                        self.tenant_preset(&ctx, session, path)?
+                    {
+                        update_columns.retain(|existing| existing != &column);
+                        set_ops.retain(|op| {
+                            !matches!(op, SetOp::Set { column: existing, .. } if existing == &column)
+                        });
+                        set_ops.push(SetOp::Set {
+                            column,
+                            pg_type,
+                            value: Scalar::Json(Json::String(value)),
                         });
                     }
                 }

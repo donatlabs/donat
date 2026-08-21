@@ -553,3 +553,39 @@ fn a_v1_insert_presets_the_tenant_over_the_callers_value() {
         "a v1 insert stored the tenant the caller named: {rendered}"
     );
 }
+
+#[test]
+fn a_v1_upsert_cannot_take_another_tenants_row_on_conflict() {
+    // The `DO UPDATE` branch changes an *existing* row. Without the bound, a
+    // caller colliding on a key that does not include the tenant overwrites
+    // somebody else's row — and with the tenant among the re-applied columns,
+    // `tenant_id = EXCLUDED.tenant_id` moves it into the caller's tenant on the
+    // way. Both halves are the same sentence: an upsert is an update.
+    let md = metadata(json!({}));
+    let cat = catalog();
+    let plan = v1_planner(&md, &cat)
+        .plan_v1_insert(
+            &json!({
+                "table": {"schema": "public", "name": "product"},
+                "objects": [{"name": "collided"}],
+                "on_conflict": {"constraint": "product_pkey", "action": "update"}
+            }),
+            &staff(),
+        )
+        .expect("planning succeeds");
+    let rendered = format!("{plan:?}");
+
+    let on_conflict = rendered
+        .split_once("on_conflict")
+        .map(|(_, tail)| tail.to_string())
+        .expect("the plan carries an on_conflict");
+    assert!(
+        on_conflict.contains("tenant_id"),
+        "the DO UPDATE branch reached every tenant's rows: {rendered}"
+    );
+    assert!(
+        !on_conflict.contains("update_columns: [\"tenant_id\"")
+            && !on_conflict.contains("\"tenant_id\"]"),
+        "the tenant was re-applied from EXCLUDED, which moves the row: {rendered}"
+    );
+}

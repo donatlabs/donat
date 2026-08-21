@@ -738,7 +738,7 @@ async fn main() -> anyhow::Result<()> {
         .filter(|raw| !raw.trim().is_empty())
     {
         Some(raw) => Some(raw),
-        None => match oidc.as_ref().and_then(|config| config.derived_jwt()) {
+        None => match oidc.as_ref().and_then(|config| config.derived_jwt(None)) {
             Some(derived) => {
                 tracing::info!(
                     target: "donat::auth",
@@ -750,7 +750,7 @@ async fn main() -> anyhow::Result<()> {
             None => None,
         },
     };
-    let jwt = jwt_raw
+    let mut jwt = jwt_raw
         .map(|raw| jwt::JwtConfig::from_env_value(&raw))
         .transpose()
         .map_err(|e| anyhow::anyhow!("DONAT_GRAPHQL_JWT_SECRET is unusable: {e}"))?;
@@ -825,6 +825,21 @@ async fn main() -> anyhow::Result<()> {
         },
     };
 
+    // The derived claims map is built before the metadata is read, so it keys
+    // the tenant under the default spelling. A deployment scoping on
+    // `X-Hasura-Tenant-Id` is legal, and that map would carry the claim under a
+    // name nothing reads — so once the declaration is known, it is rebuilt.
+    if jwt_is_derived
+        && let Some(tenancy) = &metadata.tenancy
+        && let Some(config) = &oidc
+        && let Some(raw) = config.derived_jwt(Some(&tenancy.variable_key()))
+    {
+        jwt =
+            Some(jwt::JwtConfig::from_env_value(&raw).map_err(|e| {
+                anyhow::anyhow!("the derived token configuration is unusable: {e}")
+            })?);
+    }
+
     // A tenanted deployment whose tokens cannot carry a tenant refuses every
     // request to every tenanted table, one at a time, for as long as it runs.
     // The one place that is worth learning is here.
@@ -839,10 +854,17 @@ async fn main() -> anyhow::Result<()> {
         // derived case left the deployment most likely to have hand-written
         // the map — and therefore most likely to have forgotten an entry —
         // as the one that found out a request at a time.
-        let declared_says_nothing = jwt
-            .as_ref()
-            .and_then(|jwt| jwt.can_carry(&tenancy.variable))
-            == Some(false);
+        // Only where the claims_map is what actually answers. An auth hook
+        // returns a session before `state.jwt` is ever consulted, so its map is
+        // dead configuration and refusing over it would stop a deployment whose
+        // every request does carry a tenant. A derived map is covered by the
+        // branch above, which knows why it is short.
+        let declared_says_nothing = !jwt_is_derived
+            && auth_hook.is_none()
+            && jwt
+                .as_ref()
+                .and_then(|jwt| jwt.can_carry(&tenancy.variable))
+                == Some(false);
         if derived_says_nothing || declared_says_nothing {
             anyhow::bail!(
                 "source `{}` declares tenancy on {}, but nothing in this deployment says where \

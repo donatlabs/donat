@@ -472,7 +472,7 @@ impl OidcConfig {
     /// provider's own tokens invalid; a wrong claim path leaves somebody with
     /// no role and a refusal. None of them quietly grants anything — which is
     /// the property that makes a default acceptable at all.
-    pub fn derived_jwt(&self) -> Option<String> {
+    pub fn derived_jwt(&self, tenant_variable: Option<&str>) -> Option<String> {
         let login_api = self.login_api.as_deref()?;
         // The issuer is what the provider stamps, and it stamps the address a
         // browser reaches it on — the same origin it sends people to sign in.
@@ -498,7 +498,14 @@ impl OidcConfig {
         // guessed. Without it every request to a tenanted table is refused for
         // carrying no tenant, which is why `serve` refuses to start instead.
         if let Some(path) = &self.tenant_claim {
-            claims_map["x-donat-tenant-id"] = serde_json::json!({ "path": path });
+            // Keyed by the variable the declaration names, not by a fixed
+            // spelling: a deployment scoping on `X-Hasura-Tenant-Id` is legal,
+            // and writing `x-donat-tenant-id` for it produced a map that
+            // carried the claim under a name nothing ever read.
+            let key = tenant_variable
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_else(|| "x-donat-tenant-id".to_string());
+            claims_map[key] = serde_json::json!({ "path": path });
         }
         Some(
             serde_json::json!({
@@ -1150,7 +1157,7 @@ mod tests {
     fn a_named_provider_supplies_the_jwt_configuration() {
         let derived: serde_json::Value = serde_json::from_str(
             &oidc(Some("http://idp:8080"))
-                .derived_jwt()
+                .derived_jwt(None)
                 .expect("derived"),
         )
         .expect("it is JSON");
@@ -1180,10 +1187,42 @@ mod tests {
     ///
     /// That field means more than an address — it says this provider serves
     /// its login API under `/auth/v1`, which is what the derived paths assume.
+    /// The tenant claim is keyed by the variable the deployment declared.
+    ///
+    /// `x-donat-tenant-id` is the usual spelling and was for a while the only
+    /// one written, so a deployment scoping on `X-Hasura-Tenant-Id` — which the
+    /// declaration allows — got a map carrying the claim under a name nothing
+    /// ever read, and every request to a tenanted table was refused for
+    /// carrying no tenant.
+    #[test]
+    fn the_derived_map_keys_the_tenant_by_the_declared_variable() {
+        let mut config = oidc(Some("http://idp:8080"));
+        config.tenant_claim = Some("$.org".to_string());
+
+        let default: serde_json::Value =
+            serde_json::from_str(&config.derived_jwt(None).expect("derived")).expect("it is JSON");
+        assert_eq!(default["claims_map"]["x-donat-tenant-id"]["path"], "$.org");
+
+        let declared: serde_json::Value = serde_json::from_str(
+            &config
+                .derived_jwt(Some("x-hasura-tenant-id"))
+                .expect("derived"),
+        )
+        .expect("it is JSON");
+        assert_eq!(
+            declared["claims_map"]["x-hasura-tenant-id"]["path"],
+            "$.org"
+        );
+        assert!(
+            declared["claims_map"]["x-donat-tenant-id"].is_null(),
+            "the claim was also written under a name the deployment does not read"
+        );
+    }
+
     /// A provider shaped differently gets nothing rather than a guess.
     #[test]
     fn a_provider_that_is_only_an_endpoint_gets_nothing() {
-        assert!(oidc(None).derived_jwt().is_none());
+        assert!(oidc(None).derived_jwt(None).is_none());
     }
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {

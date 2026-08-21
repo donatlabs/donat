@@ -596,9 +596,6 @@ fn onboarding_suite() -> Running {
     s
 }
 
-/// Signing up a merchant runs no DDL and needs no tenant in the token: the
-/// command writes the tenant row, and every later write in the same statement
-/// takes its key from it.
 /// A scoped read after the step the tenant came from is refused, not answered.
 ///
 /// `from:` exists precisely because the command's tenant is not the caller's.
@@ -626,6 +623,9 @@ fn a_scoped_read_after_the_tenant_step_is_refused() {
     );
 }
 
+/// Signing up a merchant runs no DDL and needs no tenant in the token: the
+/// command writes the tenant row, and every later write in the same statement
+/// takes its key from it.
 #[test]
 fn a_command_can_establish_the_tenant_it_writes_into() {
     let s = onboarding_suite();
@@ -1494,14 +1494,6 @@ fn a_ceiling_holds_when_two_writers_arrive_at_once() {
     assert_eq!(names(&resp).len(), 3, "{resp}");
 }
 
-/// An insert-or-ignore must stay an ignore.
-///
-/// The tenant preset is applied to an upsert's `DO UPDATE` branch, and it has
-/// to be applied *only* there: a preset added unconditionally turns
-/// `update_columns: []` into a `DO UPDATE` — and the tenant bound lives on the
-/// same branch as the preset, so the resulting UPDATE would carry no `WHERE`
-/// at all. A caller could then take another tenant's row by colliding with its
-/// unique key, using nothing but an insert permission.
 /// An upsert that only updated consumes nothing.
 ///
 /// `ON CONFLICT DO NOTHING` was right from the start, because it returns no
@@ -1556,6 +1548,14 @@ fn an_upsert_that_only_updated_consumes_no_quota() {
     );
 }
 
+/// An insert-or-ignore must stay an ignore.
+///
+/// The tenant preset is applied to an upsert's `DO UPDATE` branch, and it has
+/// to be applied *only* there: a preset added unconditionally turns
+/// `update_columns: []` into a `DO UPDATE` — and the tenant bound lives on the
+/// same branch as the preset, so the resulting UPDATE would carry no `WHERE`
+/// at all. A caller could then take another tenant's row by colliding with its
+/// unique key, using nothing but an insert permission.
 #[test]
 fn an_insert_or_ignore_cannot_take_another_tenants_row() {
     let s = suite("tenancy_upsert");

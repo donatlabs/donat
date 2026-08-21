@@ -97,8 +97,42 @@ struct ExtendsEntry {
 /// Load and fully resolve a metadata directory.
 pub fn load_metadata_dir(dir: &Path) -> Result<Metadata, LoadError> {
     let metadata = load_metadata_dir_tracked(dir, &mut Vec::new(), &mut Vec::new())?;
-    validate_composed(dir, &metadata)?;
+    validate_composed(dir, &metadata).map_err(|error| composed_from(dir, error))?;
     Ok(metadata)
+}
+
+/// Say where the declaration might actually live.
+///
+/// Validation runs over the composition, so its errors are reported against the
+/// directory that was loaded — and where that directory extends another, the
+/// file named may well belong to a base. The path is still the right place to
+/// start; the sentence stops it from being read as the only one.
+fn composed_from(dir: &Path, error: LoadError) -> LoadError {
+    if !dir.join("extends.yaml").exists() {
+        return error;
+    }
+    let note = |message: String| {
+        format!("{message} (this directory extends another, so the declaration may be in a base)")
+    };
+    match error {
+        LoadError::Tenancy { path, message } => LoadError::Tenancy {
+            path,
+            message: note(message),
+        },
+        LoadError::Iam { path, message } => LoadError::Iam {
+            path,
+            message: note(message),
+        },
+        LoadError::Quotas { path, message } => LoadError::Quotas {
+            path,
+            message: note(message),
+        },
+        LoadError::PermissionBounds { path, message } => LoadError::PermissionBounds {
+            path,
+            message: note(message),
+        },
+        other => other,
+    }
 }
 
 fn load_metadata_dir_tracked(
