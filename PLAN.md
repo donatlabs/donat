@@ -64,6 +64,24 @@ can serve that login itself without owning any identity
 are the only operator entry points, and they are permitted by name in
 [[declarative-saas/decisions/002-durable-process-operational-contracts]].
 
+**A tenant is a compiler layer, and it is a claim.** Where `tenancy.yaml`
+exists the tenant predicate is ANDed into every permission at one choke point
+and the tenant preset injected into every write, so a tracked table is scoped
+because it was tracked. A table carrying neither the key nor a declared
+exemption stops the boot, naming itself. The tenant arrives the way a role does
+— a verified token or an auth hook — and no header names one, for the same
+reason no header names a role
+([[declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]]).
+
+**A bound belongs in a predicate, a gate in a check.** A caller missing a grant,
+or in a suspended tenant, must be *refused* rather than told their update
+changed nothing — so gates live in `check` and every write, delete included, can
+say no. What a permission does not bound is declared rather than inferred:
+`unbounded_permissions: declared` makes a permission that admits rows it does
+not bound to the caller name its reason, so a forgotten bound stops looking
+like a decided one
+([[declarative-saas/decisions/099-an-unbounded-permission-says-so]]).
+
 **One statement per operation.** Response JSON is assembled in the database.
 The documented carve-out is SQLite *mutations*, which fold one statement's
 `RETURNING` rows in Rust because SQLite forbids DML inside a CTE —
@@ -117,10 +135,16 @@ Commands and Processes are Postgres-only.
 | M7 | Declarative services: rules, commands, processes, connectors | done — [[declarative-saas/_index]] |
 | M8 | File attachments on S3-compatible storage | done — `specs/008-file-attachments.md` |
 | M9 | Deployability: TLS to Postgres, bounded requests, readiness and drain | done — [[operations/_index]] |
+| M10 | Multitenancy: the tenant as a compiler layer, in-tenant grants, plan ceilings, `extends` composition | done — `examples/pethub` |
 | — | Embedded SDK and native hooks | deferred — [[embedded-sdk/_index]] |
 
-Feature specifications live in `specs/`, one per delivered capability
-(`001`–`008`).
+Feature specifications live in `specs/`, written before the capability they
+describe. Not every milestone has one: M10 was designed as ADRs
+([[declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]],
+[[declarative-saas/decisions/098-a-compiled-role-is-the-shape-and-a-grant-is-the-scope]],
+[[declarative-saas/decisions/099-an-unbounded-permission-says-so]]) and a
+worked example rather than a spec, and a retrospective spec would only restate
+them.
 
 ## Decision log
 
@@ -129,11 +153,12 @@ Decisions are ADRs in the knowledge base, not entries here. Each domain's
 
 | Domain | ADRs | Covers |
 |---|---|---|
-| [[declarative-saas/_index]] | 36 | Commands, rules, durable processes, connectors, files |
+| [[declarative-saas/_index]] | 82 | Commands, rules, durable processes, connectors, files, tenancy, grants, declared bounds |
 | [[multi-backend/_index]] | 15 | The backend trait, per-dialect assembly, the matrix, multi-source |
-| [[api-surfaces/_index]] | 12 | REST and MCP, session compatibility, identity boundaries |
-| [[embedded-sdk/_index]] | 7 | Embedding and native hooks (deferred) |
-| [[operations/_index]] | 5 | Bounded requests, TLS posture, drain and readiness, upstream ceilings, the deploy gate |
+| [[api-surfaces/_index]] | 13 | REST and MCP, session compatibility, identity boundaries |
+| [[embedded-sdk/_index]] | 9 | Embedding and native hooks (deferred) |
+| [[operations/_index]] | 6 | Bounded requests, TLS posture, drain and readiness, upstream ceilings, the deploy gate |
+| [[platform/_index]] | 4 | The platform UI as an ordinary role rendered, and what a platform still lacks |
 
 Cross-cutting: [[security-audit]] ranks the security findings and their
 resolution under the deployment threat model.

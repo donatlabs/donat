@@ -915,13 +915,25 @@ fn a_large_b2b_quote_is_routed_to_an_approver_who_consumes_the_credit() {
         )
         .expect("seed one organization with credit")
         .get(0);
+    // The approver is a person of this organization, not a role that floats
+    // above one: `purchase_approval` is bounded by membership, so an approver
+    // who belongs to nobody approves nothing.
+    client
+        .execute(
+            "INSERT INTO customer (customer_id, name, email)
+             VALUES ('approver-1', 'Approver', 'approver-1@example.com')
+             ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .expect("seed the approver as a person");
     client
         .execute(
             "INSERT INTO organization_membership (organization_id, user_id)
-             SELECT id, $2 FROM organization WHERE id::text = $1",
+             SELECT id, u FROM organization, unnest(ARRAY[$2, 'approver-1']) u
+             WHERE id::text = $1",
             &[&organization_id, &CUSTOMER],
         )
-        .expect("seed the buyer's membership");
+        .expect("seed the buyer's and the approver's membership");
     let cart_id: i64 = client
         .query_one(
             "INSERT INTO cart (customer_id) VALUES ($1) RETURNING id",

@@ -123,7 +123,22 @@ impl AttachmentSpec {
     /// unreserved characters plus '/', which is what lets the SQL half skip
     /// percent-encoding entirely.
     pub fn object_key(&self, id: Uuid) -> String {
-        format!("{}/{}", self.key, id)
+        self.object_key_in(None, id)
+    }
+
+    /// The final key, under a tenant's own prefix when the deployment has
+    /// tenants.
+    ///
+    /// The prefix is what makes a bucket policy, an export and an erasure
+    /// per-tenant operations rather than a full-bucket scan. Access itself is
+    /// already decided by the row the column hangs on — a caller who cannot
+    /// see the row never gets a URL for its file — so this is the operational
+    /// half of isolation, not the gate.
+    pub fn object_key_in(&self, tenant: Option<&str>, id: Uuid) -> String {
+        match tenant {
+            Some(tenant) => format!("{}/{}/{}", sanitize_prefix(tenant), self.key, id),
+            None => format!("{}/{}", self.key, id),
+        }
     }
 
     /// Where a provider-side upload lands before the engine has seen it.
@@ -134,7 +149,34 @@ impl AttachmentSpec {
     /// final key and drops the staging one; whatever a late PUT writes
     /// afterwards is an orphan nothing references.
     pub fn staging_key(&self, id: Uuid) -> String {
-        format!("{}/{}.part", self.key, id)
+        self.staging_key_in(None, id)
+    }
+
+    /// The staging key under the same tenant prefix as the final one, so that
+    /// completion is a rename within one prefix and never across two.
+    pub fn staging_key_in(&self, tenant: Option<&str>, id: Uuid) -> String {
+        format!("{}.part", self.object_key_in(tenant, id))
+    }
+}
+
+/// A tenant identifier is opaque to this engine and goes into an object key, so
+/// it is reduced to characters that cannot change what the key means. A
+/// traversal segment or a slash would address somebody else's prefix.
+fn sanitize_prefix(tenant: &str) -> String {
+    let cleaned: String = tenant
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "_".to_string()
+    } else {
+        cleaned
     }
 }
 
@@ -716,6 +758,9 @@ pub struct RequestContext<'a> {
     /// Absolute prefix for engine-served URLs, e.g. `https://api.example.com`.
     /// Empty means same-origin, which is what a browser needs by default.
     pub external_base_url: String,
+    /// The caller's tenant, when the deployment has tenants. Every object this
+    /// request mints lands under it.
+    pub tenant: Option<String>,
 }
 
 impl RequestContext<'_> {
@@ -801,7 +846,7 @@ impl RequestContext<'_> {
                 let key = self.day_key(signed_at)?;
                 // The presigned PUT writes to a staging key, never to the
                 // address the claimed file will live at.
-                let object_key = attachment.staging_key(upload_id);
+                let object_key = attachment.staging_key_in(self.tenant.as_deref(), upload_id);
                 let headers = vec![
                     ("Content-Length".to_string(), declared_bytes.to_string()),
                     ("Content-Type".to_string(), media_type.to_string()),
@@ -1020,6 +1065,7 @@ storage:
     fn context(registry: &StorageRegistry, offset: i64) -> RequestContext<'_> {
         let start = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
         RequestContext {
+            tenant: None,
             registry,
             now: start + chrono::Duration::seconds(offset),
             fixed_upload_id: None,

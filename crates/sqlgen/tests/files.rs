@@ -147,6 +147,7 @@ fn insert_with_claims(claims: Vec<FileClaim>) -> MutationRoot {
     MutationRoot::Insert {
         alias: "insert_pet".into(),
         insert: InsertMutation {
+            quota: None,
             table: table("public", "pet"),
             columns: vec![
                 ("name".into(), "text".into()),

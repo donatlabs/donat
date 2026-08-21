@@ -732,23 +732,25 @@ async fn main() -> anyhow::Result<()> {
     //
     // Absent, a named provider supplies one — the same facts, said once. What
     // is derived and why it is safe to derive is `OidcConfig::derived_jwt`.
+    let mut jwt_is_derived = false;
     let jwt_raw = match std::env::var("DONAT_GRAPHQL_JWT_SECRET")
         .ok()
         .filter(|raw| !raw.trim().is_empty())
     {
         Some(raw) => Some(raw),
-        None => match oidc.as_ref().and_then(|config| config.derived_jwt()) {
+        None => match oidc.as_ref().and_then(|config| config.derived_jwt(None)) {
             Some(derived) => {
                 tracing::info!(
                     target: "donat::auth",
                     "no DONAT_GRAPHQL_JWT_SECRET; verifying tokens as the configured provider issues them"
                 );
+                jwt_is_derived = true;
                 Some(derived)
             }
             None => None,
         },
     };
-    let jwt = jwt_raw
+    let mut jwt = jwt_raw
         .map(|raw| jwt::JwtConfig::from_env_value(&raw))
         .transpose()
         .map_err(|e| anyhow::anyhow!("DONAT_GRAPHQL_JWT_SECRET is unusable: {e}"))?;
@@ -797,6 +799,7 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => donat_metadata::Metadata {
             version: 3,
+            permissions: Default::default(),
             sources: vec![],
             inherited_roles: vec![],
             query_collections: vec![],
@@ -816,8 +819,72 @@ async fn main() -> anyhow::Result<()> {
             media: Default::default(),
             ingest_schemas: vec![],
             recurrence: Default::default(),
+            tenancy: None,
+            iam: None,
+            quotas: None,
         },
     };
+
+    // The derived claims map is built before the metadata is read, so it keys
+    // the tenant under the default spelling. A deployment scoping on
+    // `X-Hasura-Tenant-Id` is legal, and that map would carry the claim under a
+    // name nothing reads — so once the declaration is known, it is rebuilt.
+    if jwt_is_derived
+        && let Some(tenancy) = &metadata.tenancy
+        && let Some(config) = &oidc
+        && let Some(raw) = config.derived_jwt(Some(&tenancy.variable_key()))
+    {
+        jwt =
+            Some(jwt::JwtConfig::from_env_value(&raw).map_err(|e| {
+                anyhow::anyhow!("the derived token configuration is unusable: {e}")
+            })?);
+    }
+
+    // A tenanted deployment whose tokens cannot carry a tenant refuses every
+    // request to every tenanted table, one at a time, for as long as it runs.
+    // The one place that is worth learning is here.
+    if let Some(tenancy) = &metadata.tenancy {
+        let derived_says_nothing = jwt_is_derived
+            && oidc
+                .as_ref()
+                .is_some_and(|oidc| oidc.tenant_claim.is_none());
+        // A configuration a deployment wrote itself is checked the same way,
+        // where it can be: a `claims_map` is an exhaustive list, so a tenant
+        // variable missing from it can never arrive. Restricting this to the
+        // derived case left the deployment most likely to have hand-written
+        // the map — and therefore most likely to have forgotten an entry —
+        // as the one that found out a request at a time.
+        // Only where the claims_map is what actually answers. An auth hook
+        // returns a session before `state.jwt` is ever consulted, so its map is
+        // dead configuration and refusing over it would stop a deployment whose
+        // every request does carry a tenant. A derived map is covered by the
+        // branch above, which knows why it is short.
+        let declared_says_nothing = !jwt_is_derived
+            && auth_hook.is_none()
+            && jwt
+                .as_ref()
+                .and_then(|jwt| jwt.can_carry(&tenancy.variable))
+                == Some(false);
+        if derived_says_nothing || declared_says_nothing {
+            anyhow::bail!(
+                "source `{}` declares tenancy on {}, but nothing in this deployment says where \
+                 a token carries it: {}. Without it every request to a tenanted table is \
+                 refused for carrying no tenant.",
+                tenancy.source,
+                tenancy.variable,
+                if derived_says_nothing {
+                    "token verification is derived from DONAT_OIDC, so set \
+                     DONAT_OIDC_TENANT_CLAIM to the JSON path of that claim (for example \
+                     `$.tenant_id`), or configure DONAT_GRAPHQL_JWT_SECRET with a claims_map \
+                     of your own"
+                } else {
+                    "DONAT_GRAPHQL_JWT_SECRET declares a claims_map and that map has no entry \
+                     for this variable, so add one naming the claim the provider puts the \
+                     tenant in"
+                }
+            );
+        }
+    }
 
     // The identity provider's own accounts, when a deployment configured a key
     // for them. The declaration ships in the binary; what a deployment says is

@@ -1,0 +1,58 @@
+# In-tenant authorization: what a merchant's own roles may do inside the store
+# the tenant predicate already put them in.
+#
+# A compiled role decides the *shape* — which tables and operations exist at
+# all. It lives in Petshop's metadata, in git, and changes by deploying. A
+# grant decides the *scope*: rows this store writes for its own people, so two
+# people holding `staff` can differ without a deploy and without a second
+# compiled role.
+source: default
+
+grants:
+  table: { schema: public, name: iam_grant }
+  subject: { column: user_id, variable: X-Donat-User-Id }
+  tenant: { column: tenant_id }
+  action: { column: action }
+  # Where a merchant writes them, and therefore where `reserved_actions` is
+  # enforced — by the database, not by whichever command happens to write the
+  # row.
+  written_via:
+    table: { schema: public, name: iam_grant }
+    action: action
+
+# Only the merchant's own people. The workers are platform machinery and hold
+# no grants; `customer` and `anonymous` are shoppers of a store, not staff of
+# one, and forcing either through the grant relation would deny every request
+# they make.
+governed_roles: [staff]
+
+# `service:action`, AWS-style, expanded here into a short list of equalities an
+# index answers. Nothing a merchant wrote is ever executed as a pattern.
+wildcards: ["{resource}:*", "*:{verb}", "*:*"]
+
+actions:
+  # The default derives the action from the table name, so a table is governed
+  # the moment it is tracked.
+  default:
+    select: "{table}:read"
+    insert: "{table}:create"
+    update: "{table}:update"
+    delete: "{table}:delete"
+  overrides:
+    # A product and its variants are one thing a merchant grants access to.
+    - tables:
+        - { schema: public, name: product }
+        - { schema: public, name: product_variant }
+        - { schema: public, name: category }
+      resource: catalog
+    - tables:
+        - { schema: public, name: orders }
+        - { schema: public, name: order_line }
+      resource: order
+
+# Actions that belong to the platform, whatever a merchant writes into its own
+# grant rows.
+reserved_actions:
+  - "platform:*"
+  - "tenant:create"
+  - "tenant:suspend"

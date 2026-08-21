@@ -1,0 +1,45 @@
+# The entire multitenant surface of the store domain.
+#
+# No Petshop table, permission, command, rule or flow is modified. The compiler
+# ANDs the tenant predicate into every permission and injects the tenant preset
+# into every write, so every surface — GraphQL, Relay, subscriptions, REST,
+# MCP, commands, durable processes, files — is scoped by construction rather
+# than by a filter somebody remembered to write.
+source: default
+
+# One database, one schema, a tenant column on every table. Onboarding a store
+# therefore runs no DDL: it is rows. The other bindings a platform eventually
+# wants are deliberately absent from the enum rather than declared and ignored.
+binding: row_key
+
+# Read only from a verified token. Unlike `X-Donat-Role`, which selects among
+# roles a token already granted, there is nothing here for a header to select
+# among — so no header names a tenant, and a request that carries none is
+# refused rather than answered with an empty page.
+variable: X-Donat-Tenant-Id
+trust: jwt_claim
+
+# The column every tracked table carries unless it says otherwise below. A
+# table that carries neither this nor an entry under `keys:`/`exempt:` fails
+# `donat validate` and refuses to boot, naming itself: forgetting the sixtieth
+# table has to be impossible rather than merely unlikely.
+key: tenant_id
+
+registry:
+  table: { schema: public, name: store }
+  key: id
+  status:
+    column: status
+    serving: [active]
+
+# Not an exemption. The registry's rows still belong to exactly one store each
+# — the store they are — so it is keyed by its own identifier. Putting it under
+# `exempt:` instead would publish every store to every store.
+keys:
+  - { table: { schema: public, name: store }, key: id }
+
+exempt:
+  # Platform-owned reference data. `shared: read_only` makes a write permission
+  # for a tenant-facing role a deploy-time refusal.
+  - table: { schema: public, name: plan }
+    shared: read_only

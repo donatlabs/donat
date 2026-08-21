@@ -7,6 +7,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 
 - [[decisions/001-declarative-saas-runtime-and-porting-policy]]
 - [[decisions/002-durable-process-operational-contracts]]
+- [[decisions/003-rules-profile-canonical-artifacts-and-null-access]]
 - [[decisions/004-command-literal-db-scalar-validation]]
 - [[decisions/005-executable-command-resolved-ir]]
 - [[decisions/006-command-claim-election-separate-from-canonical-result-journal]]
@@ -82,6 +83,10 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/082-an-instance-a-deployment-operates-is-a-whole-origin-it-names]]
 - [[decisions/090-a-put-against-a-fixed-identity-is-the-method-half-and-a-version-pin-belongs-to-the-operation]]
 - [[decisions/095-a-credential-adjacent-value-is-not-a-credential-and-the-fingerprint-is-where-the-difference-shows]]
+- [[decisions/096-the-document-renderers-advisories-are-ignored-by-name-with-a-reachability-argument]]
+- [[decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]]
+- [[decisions/098-a-compiled-role-is-the-shape-and-a-grant-is-the-scope]]
+- [[decisions/099-an-unbounded-permission-says-so]]
 
 ## Reference governance
 

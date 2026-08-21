@@ -719,6 +719,31 @@ impl PureEngineCandidate {
     }
 }
 
+/// Every catalog-backed tenancy problem, joined into the one error a failed
+/// publication carries.
+///
+/// They are joined rather than reported one at a time because the check that
+/// matters most fires per table: an operator who added a table and forgot its
+/// tenant column should see every table that is missing one, not the
+/// alphabetically first.
+fn tenancy_candidate_error(
+    metadata: &Metadata,
+    catalogs: &HashMap<String, Catalog>,
+) -> Option<PlanError> {
+    let errors = donat_schema::validate_tenancy_catalog(metadata, catalogs);
+    if errors.is_empty() {
+        return None;
+    }
+    Some(PlanError::validation(
+        "tenancy",
+        errors
+            .iter()
+            .map(|error| format!("{}: {}", error.path, error.message))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
 /// Compile one all-or-nothing serving candidate in dependency order without
 /// touching a database or publishing mutable state.
 pub fn compile_pure_engine_candidate(
@@ -727,6 +752,13 @@ pub fn compile_pure_engine_candidate(
     connectors: &crate::connectors::ConnectorRegistry,
     infer_function_permissions: bool,
 ) -> Result<PureEngineCandidate, PlanError> {
+    // Before anything compiles: a tenanted source whose tables cannot carry
+    // the predicate must not reach a listener. This runs on every reload too,
+    // so a migration that drops a tenant column fails the publication rather
+    // than the next request.
+    if let Some(error) = tenancy_candidate_error(metadata, catalogs) {
+        return Err(error);
+    }
     let rule_catalog = Arc::new(compile_rule_catalog(metadata)?);
     let command_catalog = Arc::new(compile_command_catalog(
         metadata,
@@ -1154,12 +1186,16 @@ impl AppState {
     /// The signing material one request plans against: the registry plus the
     /// clock every URL in the response is signed for. `None` when the
     /// deployment declares no attachments.
-    pub fn storage_request_context(&self) -> Option<donat_storage::RequestContext<'_>> {
+    pub fn storage_request_context(
+        &self,
+        tenant: Option<String>,
+    ) -> Option<donat_storage::RequestContext<'_>> {
         (!self.storage.is_empty()).then(|| donat_storage::RequestContext {
             registry: &self.storage,
             now: chrono::Utc::now(),
             fixed_upload_id: None,
             external_base_url: self.external_base_url.clone(),
+            tenant,
         })
     }
 

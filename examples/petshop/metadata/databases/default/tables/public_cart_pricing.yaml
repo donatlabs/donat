@@ -22,6 +22,7 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: b2b_buyer
     permission:
       columns: "*"

@@ -39,6 +39,16 @@ export interface SessionState {
    * same as an empty list, and must not be read as "this account holds none".
    */
   readonly roles: readonly string[] | undefined;
+  /**
+   * The tenant this session is in, on a deployment that has tenants.
+   *
+   * `null` means either that the deployment has none or that this person is
+   * signed in and not in one yet — the state a store switcher exists for. The
+   * panel reads it to *say* which store it is looking at; it never sends it.
+   * The tenant reaches the engine in the token and nowhere else, so a value
+   * the browser could set would be a value the browser could change.
+   */
+  readonly tenant: string | null;
 }
 
 export interface AuthTransport {
@@ -97,7 +107,8 @@ export function createTransport(defaultRole: string = DONAT_ROLE): AuthTransport
     async session() {
       try {
         const response = await fetch(SESSION_PATH, { credentials: 'include' });
-        if (!response.ok) return { authenticated: false, role: null, roles: undefined };
+        if (!response.ok)
+          return { authenticated: false, role: null, roles: undefined, tenant: null };
         const body = (await response.json()) as Partial<SessionState>;
         return {
           authenticated: body.authenticated === true,
@@ -107,11 +118,12 @@ export function createTransport(defaultRole: string = DONAT_ROLE): AuthTransport
           roles: Array.isArray(body.roles)
             ? body.roles.filter((role): role is string => typeof role === 'string' && role !== '')
             : undefined,
+          tenant: typeof body.tenant === 'string' && body.tenant !== '' ? body.tenant : null,
         };
       } catch {
         // An engine that cannot be reached is not a signed-out browser; say
         // so rather than bouncing the operator to a login that will not help.
-        return { authenticated: false, role: null, roles: undefined };
+        return { authenticated: false, role: null, roles: undefined, tenant: null };
       }
     },
     async recover() {

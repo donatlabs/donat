@@ -279,6 +279,22 @@ fn token_from_request(
     configured.or_else(|| oidc.and_then(|oidc| cookie_named(&oidc.cookie)))
 }
 
+/// The caller's tenant, when the deployment declares one.
+///
+/// Read here rather than inside the storage registry because the variable's
+/// name is a tenancy declaration, and storage has no business knowing what
+/// tenancy is — it only needs the prefix every object this request mints goes
+/// under.
+fn session_tenant(engine: &crate::state::Engine, session: &Session) -> Option<String> {
+    engine
+        .metadata
+        .tenancy
+        .as_ref()
+        .and_then(|tenancy| session.var(&tenancy.variable_key()))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// The session a request gets when nothing authenticated it.
 ///
 /// There is no admin role and no trusted header: a role reaches this engine
@@ -797,7 +813,7 @@ async fn execute_parsed_full(
     // File attachments: the request's clock and signing material. Every URL in
     // this response is signed against them, so they are resolved once here and
     // never per row.
-    let storage_context = state.storage_request_context();
+    let storage_context = state.storage_request_context(session_tenant(&engine, session));
     if let Some(storage) = storage_context.as_ref() {
         planner.set_storage(storage);
     }
@@ -1152,7 +1168,7 @@ pub(crate) async fn execute_select_internal(
         .map_err(|e| error_json("unexpected", format!("internal query parse error: {e}")))?
         .into_static();
 
-    let storage_context = state.storage_request_context();
+    let storage_context = state.storage_request_context(session_tenant(engine, session));
     let (_, roots, runtime) = plan_internal_select_from_snapshot(
         engine,
         session,
@@ -2044,6 +2060,7 @@ mod tests {
         let roots = vec![donat_ir::MutationRoot::Command {
             alias: "submitted".to_string(),
             command: donat_ir::CommandMutation {
+                authorization: None,
                 identity: donat_ir::CommandIdentity {
                     source: "default".to_string(),
                     name: "create_order".to_string(),
@@ -2477,6 +2494,7 @@ mod tests {
         let root = donat_ir::MutationRoot::Command {
             alias: "submit".to_owned(),
             command: donat_ir::CommandMutation {
+                authorization: None,
                 identity: donat_ir::CommandIdentity {
                     source: "default".to_owned(),
                     name: "create_order".to_owned(),

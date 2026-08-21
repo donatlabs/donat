@@ -249,7 +249,7 @@ pub struct Planner<'a> {
     inherited_roles: &'a [donat_metadata::InheritedRole],
     metadata: &'a Metadata,
     remote_schemas: &'a [donat_metadata::RemoteSchema],
-    catalog: &'a Catalog,
+    pub(crate) catalog: &'a Catalog,
     tables: &'a [TableEntry],
     functions: &'a [donat_metadata::FunctionEntry],
     commands: Option<&'a CompiledSourceCommandCatalog>,
@@ -264,6 +264,14 @@ pub struct Planner<'a> {
     /// against. Absent while compiling the role-independent schema, which needs
     /// the *shape* of a file column but never a signature.
     pub(crate) storage: Option<&'a donat_storage::RequestContext<'a>>,
+    /// The tenancy declaration, present only on the planner for the source it
+    /// names. It is resolved once here rather than looked up per table so that
+    /// a planner for an untenanted source cannot accidentally consult it.
+    pub(crate) tenancy: Option<&'a donat_metadata::TenancyMetadata>,
+    /// In-tenant grants, present only on the planner for the source they name.
+    pub(crate) iam: Option<&'a donat_metadata::IamMetadata>,
+    /// Plan entitlements, present only on the planner for the source they name.
+    pub(crate) quotas: Option<&'a donat_metadata::QuotaMetadata>,
     index: Arc<PlannerIndex>,
 }
 
@@ -366,7 +374,7 @@ impl<'a> Planner<'a> {
         finalized_commands: Option<&'a FinalizedSourceCommandCatalog>,
         expose_all_commands: bool,
     ) -> Self {
-        Self::from_parts(
+        let mut planner = Self::from_parts(
             metadata,
             catalog,
             source.tables.as_slice(),
@@ -378,7 +386,22 @@ impl<'a> Planner<'a> {
                 expose_all_commands,
             },
             index,
-        )
+        );
+        // Tenancy names one source. A planner for any other source must not
+        // see the declaration at all, so this is the only place it is attached.
+        planner.tenancy = metadata
+            .tenancy
+            .as_ref()
+            .filter(|tenancy| tenancy.source == source.name);
+        planner.iam = metadata
+            .iam
+            .as_ref()
+            .filter(|iam| iam.source == source.name);
+        planner.quotas = metadata
+            .quotas
+            .as_ref()
+            .filter(|quotas| quotas.source == source.name);
+        planner
     }
 
     fn compile_index_parts(
@@ -490,6 +513,9 @@ impl<'a> Planner<'a> {
             source_kind: command_config.source_kind,
             expose_all_commands: command_config.expose_all_commands,
             storage: None,
+            tenancy: None,
+            iam: None,
+            quotas: None,
             index,
         }
     }
@@ -1556,16 +1582,98 @@ impl<'a> Planner<'a> {
         })
     }
 
-    /// The role's row filter as an IR predicate (session vars substituted).
+    /// The role's row filter as an IR predicate (session vars substituted),
+    /// with this deployment's tenant predicate ANDed onto it.
     /// Parsed in a permission-filter context: the filter may reference
     /// columns outside the role's column mask.
+    ///
+    /// The tenant is ANDed *here* rather than inside [`Self::combined_filter`]
+    /// for one reason worth stating: `combined_filter` answers `None` — no
+    /// restriction — as soon as any of the role's filters is `{}`. A role with
+    /// an unrestricted filter on a tenanted table is the ordinary case, and it
+    /// is exactly the case that must still be scoped. Applying the tenant
+    /// after the OR of the role's filters, rather than inside it, is what
+    /// makes `filter: {}` mean "every row of my tenant" instead of "every row".
+    ///
+    /// An empty `ctx.perms` is not a role's view of a table: it is the context
+    /// used while parsing a permission's own filter, where the tenant is
+    /// already being applied one level up. Adding it again there would compare
+    /// the same column twice and, in a relationship filter, against the wrong
+    /// row.
     pub(crate) fn permission_predicate(
         &self,
         ctx: &TableCtx,
         session: &Session,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
-        self.combined_filter(ctx, &ctx.perms, session, path)
+        self.permission_predicate_scoped(ctx, session, true, path)
+    }
+
+    /// [`Self::permission_predicate`], with the tenant bound optionally left
+    /// off.
+    ///
+    /// One caller passes `false`: a command step that declared
+    /// `tenant: unscoped`, which is how somebody reads the invitation that
+    /// admits them to a tenant they do not belong to yet. It is legal only
+    /// under `unscoped_steps: audited`, only on a `select_one` keyed on a
+    /// unique constraint, and only when the command then declares
+    /// `tenant: { from: <this step> }` — so the rest of the statement is
+    /// scoped by what that row said. `donat validate` lists every one.
+    pub(crate) fn permission_predicate_scoped(
+        &self,
+        ctx: &TableCtx,
+        session: &Session,
+        apply_tenant: bool,
+        path: &str,
+    ) -> Result<Option<BoolExp>, PlanError> {
+        self.permission_predicate_full(ctx, session, apply_tenant, true, path)
+    }
+
+    /// [`Self::permission_predicate_scoped`], with the grant bound optionally
+    /// left off.
+    ///
+    /// Command steps pass `false`. A command is authorized once, by its own
+    /// action, and its steps run under a separate narrower permission plane
+    /// that never falls back to the ordinary one. Applying the *table's*
+    /// action inside it as well would mean a merchant had to grant
+    /// `orders:read` before `cancel_order` would run — two grants for one
+    /// operation, one of which nobody asked for.
+    pub(crate) fn permission_predicate_full(
+        &self,
+        ctx: &TableCtx,
+        session: &Session,
+        apply_tenant: bool,
+        apply_iam: bool,
+        path: &str,
+    ) -> Result<Option<BoolExp>, PlanError> {
+        let declared = self.combined_filter(ctx, &ctx.perms, session, path)?;
+        if ctx.perms.is_empty() {
+            return Ok(declared);
+        }
+        let tenant = if apply_tenant {
+            self.tenant_predicate(ctx, session, path)?
+        } else {
+            None
+        };
+        let bounded = match (declared, tenant) {
+            (Some(declared), Some(tenant)) => Some(BoolExp::And(vec![declared, tenant])),
+            (Some(declared), None) => Some(declared),
+            (None, Some(tenant)) => Some(tenant),
+            (None, None) => None,
+        };
+        if !apply_iam {
+            return Ok(bounded);
+        }
+        // A governed role sees the rows its grants allow. A read is the one
+        // operation where "no action" answering with no rows is the right
+        // shape: it is what a role that cannot see a table already gets.
+        self.with_iam(
+            bounded,
+            ctx,
+            session,
+            donat_metadata::IamOperation::Select,
+            path,
+        )
     }
 
     /// A declared file column's projection (spec 008): the closed object built

@@ -1,0 +1,33 @@
+# What a plan caps, compiled into the writes it gates.
+#
+# Petshop exposes `product` as ordinary CRUD with its own insert permission,
+# and Pethub may not edit that permission to add a ceiling — an overlay that
+# could quietly rewrite the base would make every audit of the base
+# meaningless. So the ceiling is a layer, exactly as the tenant predicate is.
+source: default
+
+# The counter moves *inside* the statement that performs the write. A
+# `COUNT(*)` taken beforehand is the version everybody writes and the one that
+# does not hold: under READ COMMITTED every concurrent writer reads the same
+# pre-lock count and every one of them passes. Updating this row takes a lock,
+# and the second writer waits, re-reads, and is refused.
+counters:
+  table: { schema: public, name: tenant_usage }
+  tenant: { column: tenant_id }
+
+# The ceiling comes from the store's plan, so raising a limit is a row change
+# rather than a deploy.
+limits:
+  table: { schema: public, name: plan }
+  key: { column: code }
+  via: { table: { schema: public, name: store }, column: plan_code }
+
+entitlements:
+  - name: products
+    counter: product_count
+    maximum: max_products
+    # Variants do not count separately: a merchant thinks in products, and a
+    # limit that counts something the user cannot see is a support ticket
+    # waiting to happen.
+    consumes:
+      - table: { schema: public, name: product }

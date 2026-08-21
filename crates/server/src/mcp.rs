@@ -6685,6 +6685,7 @@ mod tests {
 
     fn select_perm(cols: donat_metadata::Columns) -> donat_metadata::SelectPermission {
         donat_metadata::SelectPermission {
+            unbounded: None,
             columns: cols,
             filter: json!({}),
             limit: None,
@@ -6830,12 +6831,14 @@ mod tests {
             perm_entry(
                 "left",
                 donat_metadata::DeletePermission {
+                    unbounded: None,
                     filter: json!({ "id": { "_eq": 1 } }),
                 },
             ),
             perm_entry(
                 "right",
                 donat_metadata::DeletePermission {
+                    unbounded: None,
                     filter: json!({ "id": { "_eq": 2 } }),
                 },
             ),

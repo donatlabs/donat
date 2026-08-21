@@ -10,22 +10,27 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: fulfilment
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: payment_worker
     permission:
       columns: "*"
       filter: {}
+      unbounded: worker
 insert_permissions:
   - role: fulfilment
     permission:
       columns: "*"
       check: {}
+      unbounded: operator
 update_permissions:
   - role: payment_worker
     permission:
       columns: "*"
       filter: {}
       check: {}
+      unbounded: worker

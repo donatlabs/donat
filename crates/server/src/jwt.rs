@@ -74,6 +74,20 @@ fn is_session_claim(name: &str) -> bool {
 }
 
 impl JwtConfig {
+    /// Whether this configuration can carry a named session variable at all.
+    ///
+    /// `Some(false)` is the only answer worth acting on: a `claims_map` is an
+    /// exhaustive list, so a variable absent from it can never arrive. A
+    /// namespace configuration reads whatever the namespace object holds, which
+    /// is a property of the tokens rather than of the configuration, so the
+    /// honest answer there is `None` — undecidable here, and not something to
+    /// refuse a boot over.
+    pub fn can_carry(&self, variable: &str) -> Option<bool> {
+        let map = self.claims_map.as_ref()?;
+        let wanted = variable.to_ascii_lowercase();
+        Some(map.keys().any(|key| key.to_ascii_lowercase() == wanted))
+    }
+
     /// Parse the DONAT_GRAPHQL_JWT_SECRET JSON.
     ///
     /// Every failure is returned, never swallowed. A configuration the engine

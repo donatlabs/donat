@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use donat_conformance::{Suite, Transport, apply_sql_migration_dir};
+use serde_json::Value as Json;
 
 fn petshop_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/petshop")
@@ -424,4 +425,196 @@ fn seed_customer_one_rows(database_url: &str) {
                ('00000000-0000-0000-0000-000000000001', 'customer-1');",
         )
         .expect("seed customer-1 rows that customer-2 must not read");
+}
+
+/// A marketplace sells other people's goods.
+///
+/// That makes two rules pull in opposite directions, and both have to hold at
+/// once: a **buyer** sees the whole catalogue, because a catalogue split by
+/// seller is not a marketplace; and a **seller** sees only its own orders,
+/// payouts and disputes, because the others are somebody else's business.
+///
+/// Before this the second rule was absent — `vendor` read `vendor_order` with
+/// `filter: {}` and could update it too, so every seller saw and could move
+/// every other seller's lines.
+#[test]
+fn a_seller_sees_only_its_own_orders_while_a_buyer_sees_every_sellers_catalogue() {
+    let running = petshop_suite("petshop_marketplace_isolation");
+    let mut client = postgres::Client::connect(running.db_url(), postgres::NoTls)
+        .expect("connect to the Petshop marketplace database");
+
+    client
+        .batch_execute(
+            "INSERT INTO customer (customer_id, name, email) VALUES
+               ('seller-a', 'Seller A', 'a@example.com'),
+               ('seller-b', 'Seller B', 'b@example.com');
+             INSERT INTO vendor_membership (vendor_id, user_id) VALUES
+               ('11111111-1111-1111-1111-111111111111', 'seller-a'),
+               ('22222222-2222-2222-2222-222222222222', 'seller-b');
+
+             INSERT INTO orders (id, customer_id) VALUES
+               ('00000000-0000-0000-0000-0000000000a1', 'customer-1');
+             INSERT INTO order_line (id, order_id, variant_id, quantity,
+                                     unit_price_minor, currency)
+             SELECT '00000000-0000-0000-0000-0000000000b1',
+                    '00000000-0000-0000-0000-0000000000a1', v.id, 1, 500, 'USD'
+               FROM product_variant v ORDER BY v.id LIMIT 1;
+
+             INSERT INTO vendor_order (id, order_id, order_line_id, vendor_id,
+                                       offer_id, line_sequence, product_category,
+                                       gross_minor, currency, commission_tier,
+                                       commission_bps, status) VALUES
+               ('00000000-0000-0000-0000-0000000000c1',
+                '00000000-0000-0000-0000-0000000000a1',
+                '00000000-0000-0000-0000-0000000000b1',
+                '11111111-1111-1111-1111-111111111111',
+                '00000000-0000-0000-0000-0000000000d1',
+                1, 'food', 500, 'USD', 'standard', 1000, 'pending_acceptance'),
+               ('00000000-0000-0000-0000-0000000000c2',
+                '00000000-0000-0000-0000-0000000000a1',
+                '00000000-0000-0000-0000-0000000000b1',
+                '22222222-2222-2222-2222-222222222222',
+                '00000000-0000-0000-0000-0000000000d2',
+                2, 'food', 700, 'USD', 'standard', 1000, 'pending_acceptance');
+
+             INSERT INTO vendor_payout (id, payout_cycle_id, vendor_id, payout_key,
+                                        vendor_order_count, gross_minor,
+                                        commission_minor, net_minor, currency, status)
+             VALUES
+               ('00000000-0000-0000-0000-0000000000e1',
+                '00000000-0000-0000-0000-0000000000f1',
+                '11111111-1111-1111-1111-111111111111', 'cycle:a:USD',
+                1, 500, 50, 450, 'USD', 'pending'),
+               ('00000000-0000-0000-0000-0000000000e2',
+                '00000000-0000-0000-0000-0000000000f1',
+                '22222222-2222-2222-2222-222222222222', 'cycle:b:USD',
+                1, 700, 70, 630, 'USD', 'pending');",
+        )
+        .expect("seed two sellers with a line and a payout each");
+
+    let as_seller = |user: &str| {
+        vec![
+            ("X-Donat-Role".to_string(), "vendor".to_string()),
+            ("X-Donat-User-Id".to_string(), user.to_string()),
+        ]
+    };
+    let gross = |body: &Json| -> Vec<i64> {
+        let mut v: Vec<i64> = body["data"]["vendor_order"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected data.vendor_order in {body}"))
+            .iter()
+            .map(|row| row["gross_minor"].as_i64().expect("gross_minor"))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+
+    // Each seller sees its own line and only its own.
+    for (user, expected) in [("seller-a", 500_i64), ("seller-b", 700)] {
+        let (status, body) = running.post(
+            "/v1/graphql",
+            &serde_json::json!({ "query": "query { vendor_order { gross_minor } }" }),
+            &as_seller(user),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            gross(&body),
+            vec![expected],
+            "{user} saw another seller's line: {body}"
+        );
+    }
+
+    // ...and cannot move the other seller's line either. The update is bounded
+    // by the same membership, so it matches nothing rather than accepting an
+    // order that is not this seller's to accept.
+    let (status, body) = running.post(
+        "/v1/graphql",
+        &serde_json::json!({
+            "query": "mutation { update_vendor_order(\
+                        where: {gross_minor: {_eq: 700}}, \
+                        _set: {status: \"accepted\"}) { affected_rows } }"
+        }),
+        &as_seller("seller-a"),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["data"]["update_vendor_order"]["affected_rows"], 0,
+        "a seller accepted another seller's line: {body}"
+    );
+
+    // A payout is the same rule on the money side.
+    for (user, expected) in [("seller-a", 450_i64), ("seller-b", 630)] {
+        let (status, body) = running.post(
+            "/v1/graphql",
+            &serde_json::json!({ "query": "query { vendor_payout { net_minor } }" }),
+            &as_seller(user),
+        );
+        assert_eq!(status, 200, "{body}");
+        let rows = body["data"]["vendor_payout"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{user} saw another seller's payout: {body}");
+        assert_eq!(rows[0]["net_minor"], expected, "{body}");
+    }
+
+    // The other direction, and the one that makes this a marketplace rather
+    // than a row of separate shops: a shopper sees every seller's goods.
+    let (status, body) = running.post(
+        "/v1/graphql",
+        &serde_json::json!({ "query": "query { product { slug } }" }),
+        &[
+            ("X-Donat-Role".to_string(), "customer".to_string()),
+            ("X-Donat-User-Id".to_string(), "customer-1".to_string()),
+        ],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["data"]["product"].as_array().expect("products").len() > 1,
+        "a shopper saw a catalogue split by seller: {body}"
+    );
+}
+
+/// The buying side of the same rule: an approver approves for the organization
+/// they belong to, and for no other.
+#[test]
+fn an_approver_outside_an_organization_sees_none_of_its_quotes() {
+    let running = petshop_suite("petshop_b2b_isolation");
+    let mut client = postgres::Client::connect(running.db_url(), postgres::NoTls)
+        .expect("connect to the Petshop B2B database");
+
+    client
+        .batch_execute(
+            "INSERT INTO customer (customer_id, name, email) VALUES
+               ('insider', 'Insider', 'in@example.com'),
+               ('outsider', 'Outsider', 'out@example.com');
+             INSERT INTO organization (id, currency, available_credit_minor)
+             VALUES ('33333333-3333-3333-3333-333333333333', 'USD', 100000);
+             INSERT INTO organization_membership (organization_id, user_id)
+             VALUES ('33333333-3333-3333-3333-333333333333', 'insider');
+             INSERT INTO cart (id, customer_id) VALUES (9001, 'insider');
+             INSERT INTO quote (id, organization_id, customer_id, cart_id, status,
+                                total_minor, currency, available_credit_minor)
+             VALUES ('44444444-4444-4444-4444-444444444444',
+                     '33333333-3333-3333-3333-333333333333',
+                     'insider', 9001, 'submitted', 5000, 'USD', 100000);",
+        )
+        .expect("seed one organization and a quote inside it");
+
+    let as_approver = |user: &str| {
+        vec![
+            ("X-Donat-Role".to_string(), "b2b_approver".to_string()),
+            ("X-Donat-User-Id".to_string(), user.to_string()),
+        ]
+    };
+    for (user, expected) in [("insider", 1_usize), ("outsider", 0)] {
+        let (status, body) = running.post(
+            "/v1/graphql",
+            &serde_json::json!({ "query": "query { quote { total_minor } }" }),
+            &as_approver(user),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["data"]["quote"].as_array().expect("rows").len(),
+            expected,
+            "{user} saw the wrong number of quotes: {body}"
+        );
+    }
 }

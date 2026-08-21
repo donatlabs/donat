@@ -20,6 +20,7 @@ select_permissions:
               product:
                 status:
                   _eq: published
+      unbounded: catalogue
   - role: customer
     permission:
       columns:
@@ -34,10 +35,12 @@ select_permissions:
               product:
                 status:
                   _eq: published
+      unbounded: catalogue
   - role: staff
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
 command_select_permissions:
   - role: customer
     permission:
@@ -54,12 +57,14 @@ command_select_permissions:
               product:
                 status:
                   _eq: published
+      unbounded: catalogue
   - role: payment_worker
     permission:
       columns:
         - variant_id
         - reserved
       filter: {}
+      unbounded: worker
 insert_permissions:
   - role: staff
     permission:
@@ -68,6 +73,7 @@ insert_permissions:
         - variant_id
         - on_hand
         - reserved
+      unbounded: operator
 command_update_permissions:
   - role: customer
     permission:
@@ -75,6 +81,7 @@ command_update_permissions:
         - reserved
       filter: {}
       check: {}
+      unbounded: command
 update_permissions:
   - role: staff
     permission:
@@ -83,9 +90,11 @@ update_permissions:
         - reserved
       filter: {}
       check: {}
+      unbounded: operator
   - role: payment_worker
     permission:
       columns:
         - reserved
       filter: {}
       check: {}
+      unbounded: worker
