@@ -58,8 +58,17 @@ order: the engine's migrations, the application's, then the Process revisions.
 **One database and one engine per test case.** The waits an application test
 expresses — "this process reached a terminal state", "this table received a
 row" — are keyed by process or table, not by instance; two cases in one
-database would see each other. The cost equals what the 22 Rust `#[test]`s
-already paid, and files run in parallel.
+database would see each other. Isolation stays; its price does not: the
+migrated state every case shares — postgis, the engine's schema, the
+application's migrations, the Process revisions — is built once into a
+template database and copied per case with `CREATE DATABASE … TEMPLATE`
+(~0.25 s against ~3 s of migrating). The template's name carries a content
+hash, so it survives across runs and rebuilds exactly when a migration, the
+metadata or the engine changes; a deployed revision binds the resolved
+provider URL (ADR declarative-saas/046), so each worker keeps one stub on a
+stable port and the port is part of the template's identity. Cases run in a
+worker pool across and within files. What remains per case is the engine's
+own boot (~2.5 s), which only an engine change can shrink.
 
 **The step vocabulary is the minimal set the petshop's 22 tests needed**, and
 nothing more: `url` (the fixture shape, compared exactly), `sql` with `expect`

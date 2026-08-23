@@ -274,11 +274,26 @@ fn run_jobs(app: &AppTestConfig, run: &RunConfig, jobs: Vec<Job<'_>>) -> Vec<Cas
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
+                // One provider stub and one auth hook per worker, kept across
+                // its cases. The stub prefers a port from a fixed pool so its
+                // URL — which the deployed revisions bind to — is stable, and
+                // every case of this worker shares one template database.
+                let providers = crate::provider_stub::spawn_preferring(preferred_stub_ports());
+                let auth = crate::auth_hook::spawn();
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(job) = jobs.get(index) else { break };
+                    providers.reset();
                     let started = Instant::now();
-                    let outcome = match run_case(app, run, job.file, job.vars, job.case) {
+                    let outcome = match run_case(
+                        app,
+                        run,
+                        job.file,
+                        job.vars,
+                        job.case,
+                        providers.clone(),
+                        auth.clone(),
+                    ) {
                         Ok(()) => Outcome::Ok,
                         Err(error) => Outcome::Failed(format!("{error:#}")),
                     };
@@ -303,19 +318,29 @@ fn run_jobs(app: &AppTestConfig, run: &RunConfig, jobs: Vec<Job<'_>>) -> Vec<Cas
     results.into_iter().map(|(_, report)| report).collect()
 }
 
+/// The pool the per-worker stubs draw their stable ports from. Falling back
+/// to an ephemeral port only costs template reuse, never correctness.
+fn preferred_stub_ports() -> impl Iterator<Item = u16> {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let start = NEXT.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+    (start..start + 4).map(|offset| 19730 + (offset % 64))
+}
+
 fn run_case(
     app: &AppTestConfig,
     run: &RunConfig,
     file: &Path,
     vars: &BTreeMap<String, Json>,
     case: &TestCase,
+    providers: crate::provider_stub::ProviderStub,
+    auth: crate::auth_hook::AuthHook,
 ) -> Result<()> {
     let stem = file
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("test")
         .trim_end_matches(TEST_FILE_SUFFIX);
-    let stand = Stand::boot(&StandConfig {
+    let config = StandConfig {
         name: stem.to_string(),
         engine_binary: run.engine_binary.clone(),
         engine_migrations_dir: run.engine_migrations_dir.clone(),
@@ -329,8 +354,8 @@ fn run_case(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-    })
-    .context("booting the stand")?;
+    };
+    let stand = Stand::boot_with(&config, providers, auth).context("booting the stand")?;
     let mut cx = CaseContext {
         stand,
         source: app.source.clone(),

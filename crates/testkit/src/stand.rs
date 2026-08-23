@@ -67,12 +67,25 @@ pub struct Stand {
 
 impl Stand {
     pub fn boot(cfg: &StandConfig) -> Result<Self> {
-        let providers = provider_stub::spawn();
-        let auth = auth_hook::spawn();
+        Self::boot_with(cfg, provider_stub::spawn(), auth_hook::spawn())
+    }
+
+    /// Boot against a stub and hook the caller keeps between cases. A stable
+    /// stub port lets every case of a worker share one template database,
+    /// revisions included — the deploy's fingerprint covers the resolved
+    /// provider configuration (see ADR declarative-saas/046), so the URL must
+    /// not change between the deploy and the serve.
+    pub fn boot_with(cfg: &StandConfig, providers: ProviderStub, auth: AuthHook) -> Result<Self> {
         let db_name = database_name(&cfg.name);
-        let database = DropDatabase::create(&cfg.admin_database_url, &db_name)?;
+        let template = template_name(cfg, providers.base_url())?;
+        let database = DropDatabase::create_from_template(
+            &cfg.admin_database_url,
+            &db_name,
+            &template,
+            cfg,
+            providers.base_url(),
+        )?;
         let db_url = database.url.clone();
-        create_postgis(&db_url)?;
         let env = child_environment(
             std::env::vars(),
             cfg.env
@@ -91,23 +104,6 @@ impl Stand {
                 ("DONAT_GRAPHQL_DATABASE_URL".to_string(), db_url.clone()),
             ],
         );
-
-        // The production order: the engine's schema, then the application's,
-        // then the Process revisions the metadata declares.
-        run_migrate(cfg, &env, &[])?;
-        if let Some(dir) = &cfg.app_migrations_dir {
-            apply_sql_migration_dir(&db_url, dir)?;
-        }
-        run_migrate(
-            cfg,
-            &env,
-            &[
-                "--metadata-dir".into(),
-                cfg.metadata_dir.display().to_string(),
-                "--source".into(),
-                cfg.source.clone(),
-            ],
-        )?;
 
         std::fs::create_dir_all(&cfg.log_dir)
             .with_context(|| format!("creating log directory {}", cfg.log_dir.display()))?;
@@ -287,6 +283,166 @@ fn run_migrate(cfg: &StandConfig, env: &[(String, String)], extra: &[String]) ->
     Ok(())
 }
 
+/// The migrated state every case shares — postgis, the engine's schema, the
+/// application's migrations, the Process revisions — built once into a
+/// template database and copied per case with `CREATE DATABASE … TEMPLATE`,
+/// which is an order of magnitude cheaper than migrating each time. The
+/// template's name carries a hash of everything that shaped it, so it is
+/// reused across runs and rebuilt exactly when a migration, the metadata or
+/// the engine changes. A Postgres advisory lock serializes concurrent
+/// builders (parallel cases, and parallel test binaries).
+fn template_name(cfg: &StandConfig, providers_url: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut feed_dir = |dir: &Path| -> Result<()> {
+        let mut files = Vec::new();
+        collect_files(dir, &mut files)?;
+        files.sort();
+        for file in files {
+            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // A test beside the metadata shapes no database state.
+            if name.ends_with("_test.yaml") {
+                continue;
+            }
+            hasher.update(
+                file.strip_prefix(dir)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+            hasher.update(
+                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
+            );
+        }
+        Ok(())
+    };
+    feed_dir(&cfg.engine_migrations_dir)?;
+    if let Some(dir) = &cfg.app_migrations_dir {
+        feed_dir(dir)?;
+    }
+    feed_dir(&cfg.metadata_dir)?;
+    hasher.update(cfg.source.as_bytes());
+    for (k, v) in &cfg.env {
+        hasher.update(k.as_bytes());
+        hasher.update(v.as_bytes());
+    }
+    // The engine deploys the revisions, so its build participates.
+    let engine = std::fs::metadata(&cfg.engine_binary)
+        .with_context(|| format!("reading {}", cfg.engine_binary.display()))?;
+    hasher.update(engine.len().to_le_bytes());
+    if let Ok(modified) = engine.modified()
+        && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
+    {
+        hasher.update(since.as_nanos().to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    // The resolved provider URL participates in the deployed revisions (ADR
+    // declarative-saas/046), so the port is part of the template's identity —
+    // as a suffix, not in the hash, so cleanup can tell "same content, another
+    // worker's port" from "stale content".
+    let port = providers_url.rsplit(':').next().unwrap_or("0");
+    Ok(format!(
+        "apptest_tpl_{}_p{port}",
+        digest[..6]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_files(&path, files)?;
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Build the template if this hash's database does not exist yet: create it,
+/// with the worker's real provider URL in the environment — the deploy binds
+/// to it, and the copies must serve under the same one.
+/// install postgis, run the engine's migrations, the application's, and the
+/// Process revision deploy — the same production order a real stand walks.
+/// Old templates (a previous hash) are dropped opportunistically.
+fn ensure_template(
+    admin_url: &str,
+    template: &str,
+    cfg: &StandConfig,
+    providers_url: &str,
+) -> Result<()> {
+    let mut admin = postgres::Client::connect(admin_url, postgres::NoTls)
+        .with_context(|| format!("connecting to {admin_url} (is postgres up?)"))?;
+    // One builder at a time, across processes.
+    let key = i64::from_le_bytes(
+        template.as_bytes()[template.len() - 8..]
+            .try_into()
+            .unwrap(),
+    );
+    admin.execute("SELECT pg_advisory_lock($1)", &[&key])?;
+    let build = (|| -> Result<()> {
+        let exists: bool = admin
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+                &[&template],
+            )?
+            .get(0);
+        if exists {
+            return Ok(());
+        }
+        // Same content prefix, another port: a sibling worker's template.
+        // A different prefix is a stale build to reclaim.
+        let prefix = &template[..template.rfind("_p").unwrap_or(template.len())];
+        for stale in admin.query(
+            "SELECT datname FROM pg_database WHERE datname LIKE 'apptest_tpl_%' \
+             AND position($1 in datname) <> 1",
+            &[&prefix],
+        )? {
+            let name: String = stale.get(0);
+            let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
+        }
+        let building = format!("{template}_building");
+        admin.batch_execute(&format!("DROP DATABASE IF EXISTS {building} WITH (FORCE)"))?;
+        admin.batch_execute(&format!("CREATE DATABASE {building}"))?;
+        let db_url = with_db(admin_url, &building)?;
+        create_postgis(&db_url)?;
+        // The revision deploy resolves the application's environment (a
+        // connector names its base-url variable); no provider answers during
+        // a deploy, so `${providers}` points at a closed port.
+        let env = child_environment(
+            std::env::vars(),
+            cfg.env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.replace("${providers}", providers_url))),
+            [
+                ("DONAT_DATABASE_URL".to_string(), db_url.clone()),
+                ("DONAT_GRAPHQL_DATABASE_URL".to_string(), db_url.clone()),
+            ],
+        );
+        run_migrate(cfg, &env, &[])?;
+        if let Some(dir) = &cfg.app_migrations_dir {
+            apply_sql_migration_dir(&db_url, dir)?;
+        }
+        run_migrate(
+            cfg,
+            &env,
+            &[
+                "--metadata-dir".into(),
+                cfg.metadata_dir.display().to_string(),
+                "--source".into(),
+                cfg.source.clone(),
+            ],
+        )?;
+        admin.batch_execute(&format!("ALTER DATABASE {building} RENAME TO {template}"))?;
+        Ok(())
+    })();
+    let _ = admin.execute("SELECT pg_advisory_unlock($1)", &[&key]);
+    build
+}
+
 /// Concurrent `CREATE EXTENSION` across databases races inside Postgres
 /// (shared library/template locks): serialize within this process and retry
 /// to cover other test processes.
@@ -345,11 +501,20 @@ struct DropDatabase {
 }
 
 impl DropDatabase {
-    fn create(admin_url: &str, name: &str) -> Result<Self> {
+    fn create_from_template(
+        admin_url: &str,
+        name: &str,
+        template: &str,
+        cfg: &StandConfig,
+        providers_url: &str,
+    ) -> Result<Self> {
+        ensure_template(admin_url, template, cfg, providers_url)?;
         let mut client = postgres::Client::connect(admin_url, postgres::NoTls)
             .with_context(|| format!("connecting to {admin_url} (is postgres up?)"))?;
         client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))?;
-        client.batch_execute(&format!("CREATE DATABASE {name}"))?;
+        client
+            .batch_execute(&format!("CREATE DATABASE {name} TEMPLATE {template}"))
+            .with_context(|| format!("copying template {template}"))?;
         Ok(Self {
             admin_url: admin_url.to_string(),
             name: name.to_string(),

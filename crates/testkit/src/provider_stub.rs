@@ -184,6 +184,19 @@ impl ProviderStub {
         }
     }
 
+    /// Back to a blank slate: no scripts, no defaults, no holds, no recorded
+    /// calls. What a fresh stub would be, without giving up the port.
+    pub fn reset(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.scripts.clear();
+        state.defaults.clear();
+        state.held.clear();
+        state.calls.clear();
+        drop(state);
+        // Anyone parked on a hold is answered by the default now.
+        self.resumed.notify_all();
+    }
+
     /// Every provider call recorded so far, in arrival order.
     pub fn calls(&self) -> Vec<ProviderCall> {
         self.state.lock().unwrap().calls.clone()
@@ -255,7 +268,17 @@ impl ProviderStub {
 
 /// Start the stub on an ephemeral localhost port.
 pub fn spawn() -> ProviderStub {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider stub");
+    spawn_preferring(std::iter::empty())
+}
+
+/// Spawn on the first free port from `preferred`, or an ephemeral one. A
+/// stable port keeps the stub's URL — and everything a deploy derives from
+/// it — identical across test cases and across runs.
+pub fn spawn_preferring(preferred: impl IntoIterator<Item = u16>) -> ProviderStub {
+    let listener = preferred
+        .into_iter()
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .unwrap_or_else(|| TcpListener::bind("127.0.0.1:0").expect("bind provider stub"));
     let port = listener.local_addr().unwrap().port();
     let stub = ProviderStub {
         base: format!("http://127.0.0.1:{port}"),
