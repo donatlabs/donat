@@ -146,3 +146,59 @@ async fn an_unscoped_unique_index_over_a_tenant_identity_is_found() {
     assert!(sql.contains("cart_open"), "{sql}");
     assert!(sql.contains("(tenant_id, customer_id)"), "{sql}");
 }
+
+/// The order against the sixty tables Pethub actually has.
+///
+/// A three-table fixture orders trivially. This is the shape the ordering was
+/// written for, and the assertion is the one that matters: every reference
+/// between two tables in the walk is broken before the row it points at goes.
+#[tokio::test]
+async fn the_offboarding_walk_removes_children_before_parents() {
+    let Some(client) = migrated("tenancy_offboard_order").await else {
+        eprintln!("no Postgres at PG_URL; skipping");
+        return;
+    };
+    let metadata = donat_metadata::load_metadata_dir(&repo().join("examples/pethub/metadata"))
+        .expect("pethub metadata loads");
+    let catalog = donat_catalog::introspect(&client)
+        .await
+        .expect("introspection");
+    let plan = donat_schema::tenancy_offboard::plan_offboarding(&metadata, &catalog);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert!(
+        plan.steps.len() > 50,
+        "only {} tables in the walk",
+        plan.steps.len()
+    );
+
+    let position: std::collections::HashMap<&str, usize> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| (step.table.as_str(), index))
+        .collect();
+
+    for step in &plan.steps {
+        let (schema, table) = step.table.split_once('.').expect("qualified");
+        let info = catalog.table(schema, table).expect("in the catalogue");
+        for foreign in &info.foreign_keys {
+            let referenced = format!("{}.{}", foreign.referenced_schema, foreign.referenced_table);
+            if referenced == step.table {
+                continue;
+            }
+            let (Some(child), Some(parent)) = (
+                position.get(step.table.as_str()),
+                position.get(referenced.as_str()),
+            ) else {
+                continue;
+            };
+            assert!(
+                child < parent,
+                "{} references {} and would be removed after it",
+                step.table,
+                referenced
+            );
+        }
+    }
+}

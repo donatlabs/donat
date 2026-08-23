@@ -23,6 +23,7 @@ mod process_effects;
 mod quotas;
 mod rule_catalog;
 mod tenancy;
+pub mod tenancy_offboard;
 pub mod tenancy_plan;
 mod v1;
 mod validators;

@@ -182,3 +182,171 @@ pub async fn plan(
     println!("wrote {}", path.display());
     Ok(())
 }
+
+// --------------------------------------------------------------- offboarding
+
+use donat_schema::tenancy_offboard::{Offboarding, Reach, plan_offboarding};
+
+async fn offboarding(
+    metadata_dir: &std::path::Path,
+    database_url: &str,
+) -> anyhow::Result<(Offboarding, tokio_postgres::Client)> {
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
+        .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
+    let (client, connection) = tokio_postgres::connect(database_url, crate::pgtls::connector())
+        .await
+        .context("connecting to database")?;
+    tokio::spawn(connection);
+    let catalog = donat_catalog::introspect(&client)
+        .await
+        .context("introspecting database")?;
+    let plan = plan_offboarding(&metadata, &catalog);
+    if !plan.refusals.is_empty() {
+        for refusal in &plan.refusals {
+            eprintln!("  {} {}", refusal.object, refusal.reason);
+        }
+        anyhow::bail!("the walk cannot be ordered; nothing was read or removed");
+    }
+    Ok((plan, client))
+}
+
+/// `SELECT`/`DELETE` over one table, however the tenant is reached on it.
+fn predicate(reach: &Reach, table: &str, tenant: &str) -> String {
+    match reach {
+        Reach::Key(column) => format!("{} = {}", quote_ident(column), quote_literal(tenant)),
+        // The declaration says these are reached through a relationship whose
+        // remote carries the key; the join is that relationship spelled out.
+        Reach::Via { remote, .. } => format!(
+            "EXISTS (SELECT 1 FROM {remote} AS r WHERE r.tenant_id = {} \
+             AND r.id::text = {table}.id::text)",
+            quote_literal(tenant)
+        ),
+    }
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Read one tenant's rows out, in the reverse of the removal order — parents
+/// before children, which is how a person reads them.
+pub async fn export(
+    metadata_dir: &std::path::Path,
+    database_url: &str,
+    tenant: &str,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    let (plan, client) = offboarding(metadata_dir, database_url).await?;
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+
+    let mut total = 0usize;
+    for step in plan.steps.iter().rev() {
+        let sql = format!(
+            "SELECT coalesce(json_agg(t), '[]'::json) FROM {} AS t WHERE {}",
+            step.table,
+            predicate(&step.reach, "t", tenant)
+        );
+        let rows: serde_json::Value = client
+            .query_one(&sql, &[])
+            .await
+            .with_context(|| format!("reading {}", step.table))?
+            .get(0);
+        let count = rows.as_array().map(Vec::len).unwrap_or_default();
+        total += count;
+        if count == 0 {
+            continue;
+        }
+        let path = out.join(format!("{}.json", step.table));
+        std::fs::write(&path, serde_json::to_vec_pretty(&rows)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    println!("wrote {total} row(s) for `{tenant}` to {}", out.display());
+    println!(
+        "not included, and no tool here can include them: rows in backups, and anything a \
+         connector sent to an upstream."
+    );
+    Ok(())
+}
+
+/// Take one tenant away, children first.
+pub async fn erase(
+    metadata_dir: &std::path::Path,
+    database_url: &str,
+    tenant: &str,
+    confirm: &str,
+) -> anyhow::Result<()> {
+    if confirm != tenant {
+        anyhow::bail!(
+            "`--confirm` has to repeat the tenant id. A flag that is merely present is a flag \
+             that gets pasted."
+        );
+    }
+    let metadata = donat_metadata::load_metadata_dir(metadata_dir)
+        .with_context(|| format!("loading metadata from {}", metadata_dir.display()))?;
+    let tenancy = metadata
+        .tenancy
+        .as_ref()
+        .context("this deployment declares no tenancy, so it has no tenant to remove")?;
+
+    let (plan, mut client) = offboarding(metadata_dir, database_url).await?;
+
+    // Two deliberate acts with a gap between them, and the gap is where
+    // somebody notices.
+    let serving: Vec<String> = tenancy
+        .registry
+        .status
+        .serving
+        .iter()
+        .map(|value| quote_literal(value))
+        .collect();
+    let still_serving: bool = client
+        .query_one(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM {} WHERE {} = {} AND {} IN ({}))",
+                tenancy.registry.table,
+                quote_ident(&tenancy.registry.key),
+                quote_literal(tenant),
+                quote_ident(&tenancy.registry.status.column),
+                serving.join(", ")
+            ),
+            &[],
+        )
+        .await
+        .context("reading the registry")?
+        .get(0);
+    if still_serving {
+        anyhow::bail!(
+            "`{tenant}` is still being served. Stop serving it in the registry first, so removal \
+             is two deliberate acts rather than one."
+        );
+    }
+
+    let transaction = client
+        .build_transaction()
+        .start()
+        .await
+        .context("beginning")?;
+    let mut total = 0u64;
+    for step in &plan.steps {
+        let sql = format!(
+            "DELETE FROM {} AS t WHERE {}",
+            step.table,
+            predicate(&step.reach, "t", tenant)
+        );
+        let removed = transaction
+            .execute(&sql, &[])
+            .await
+            .with_context(|| format!("removing from {}", step.table))?;
+        if removed > 0 {
+            println!("  {:<40} {removed}", step.table);
+        }
+        total += removed;
+    }
+    transaction.commit().await.context("committing")?;
+    println!("removed {total} row(s) for `{tenant}`");
+    println!(
+        "still there, and no tool here can reach them: rows in backups, and anything a connector \
+         sent to an upstream."
+    );
+    Ok(())
+}

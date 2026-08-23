@@ -176,6 +176,39 @@ enum TenancyCommand {
     Plan(TenancyPlanArgs),
     /// Report what differs, write nothing, exit non-zero if anything does.
     Check(TenancyCheckArgs),
+    /// Read one tenant's rows out, before removing it or on request.
+    Export(TenancyExportArgs),
+    /// Remove one tenant. Refuses while the registry still serves it.
+    Erase(TenancyEraseArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct TenancyExportArgs {
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    #[arg(long)]
+    source: Option<String>,
+    /// The tenant to read out.
+    #[arg(long)]
+    tenant: String,
+    /// Where to write one JSON file per table that has rows.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct TenancyEraseArgs {
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    #[arg(long)]
+    source: Option<String>,
+    /// The tenant to remove.
+    #[arg(long)]
+    tenant: String,
+    /// Repeat the tenant id. A flag that is merely present is a flag that gets
+    /// pasted; this one has to be typed.
+    #[arg(long)]
+    confirm: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1216,6 +1249,46 @@ async fn main() -> anyhow::Result<()> {
 /// database — and they are resolved the same way, so a deployment that can run
 /// `validate` can run these without learning new arguments.
 async fn run_tenancy_command(args: &Args, command: &TenancyCommand) -> anyhow::Result<()> {
+    // The two that remove or read a tenant resolve the same selection and
+    // then go their own way.
+    match command {
+        TenancyCommand::Export(export) => {
+            let selected = resolve_validate_selection(
+                args,
+                &ValidateArgs {
+                    metadata_dir: export.metadata_dir.clone(),
+                    source: export.source.clone(),
+                },
+                |name| std::env::var(name),
+            )?;
+            return donat_server::tenancy_cli::export(
+                &selected.metadata_dir,
+                &selected.database_url,
+                &export.tenant,
+                &export.out,
+            )
+            .await;
+        }
+        TenancyCommand::Erase(erase) => {
+            let selected = resolve_validate_selection(
+                args,
+                &ValidateArgs {
+                    metadata_dir: erase.metadata_dir.clone(),
+                    source: erase.source.clone(),
+                },
+                |name| std::env::var(name),
+            )?;
+            return donat_server::tenancy_cli::erase(
+                &selected.metadata_dir,
+                &selected.database_url,
+                &erase.tenant,
+                &erase.confirm,
+            )
+            .await;
+        }
+        _ => {}
+    }
+
     let (metadata_dir, source, out, stamp, backfill) = match command {
         TenancyCommand::Plan(plan) => (
             plan.metadata_dir.clone(),
@@ -1231,6 +1304,9 @@ async fn run_tenancy_command(args: &Args, command: &TenancyCommand) -> anyhow::R
             None,
             None,
         ),
+        // Handled above; the match is exhaustive so a third command cannot be
+        // added without deciding what it does here.
+        TenancyCommand::Export(_) | TenancyCommand::Erase(_) => unreachable!(),
     };
     let selected = resolve_validate_selection(
         args,
