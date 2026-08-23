@@ -35,9 +35,11 @@ fn donat_test(args: &[&str]) -> Output {
 fn a_filtered_run_reports_its_cases_and_exits_zero() {
     let junit = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/app-test-logs/app_test_cli.junit.xml");
+    // One case by its full name: the file beside it keeps growing, and this
+    // test is about the subcommand, not the suite's size.
     let output = donat_test(&[
         "--filter",
-        "public_cart_line_test",
+        "the schema refuses a non-positive quantity",
         "--junit",
         junit.to_str().unwrap(),
     ]);
