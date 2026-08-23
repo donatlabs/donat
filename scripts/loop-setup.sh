@@ -24,9 +24,17 @@ timer="donat-loop-nightly.timer"
 state="${DONAT_LOOP_STATE:-$HOME/.local/state/donat-loops}"
 hour="${DONAT_LOOP_AT:-03:30}"
 
+# The PATH the timer will run under, spelled out because a systemd unit does
+# not read your shell profile: claude lives in ~/.local/bin, cargo and
+# cargo-audit in ~/.cargo/bin. The prerequisite check below looks here and not
+# on the caller's PATH, so `make setup-loop-infrastructure` — which runs with
+# make's own stripped PATH — passes exactly when the timer would find the tool.
+unit_path="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+
 need() {
-  if ! command -v "$1" >/dev/null 2>&1; then
+  if ! PATH="$unit_path" command -v "$1" >/dev/null 2>&1; then
     echo "missing: $1 — $2" >&2
+    echo "  (looked on the timer's PATH: $unit_path)" >&2
     exit 1
   fi
 }
@@ -42,8 +50,6 @@ case "$cmd" in
     git -C "$repo" remote get-url origin >/dev/null 2>&1 || { echo "no origin remote in $repo" >&2; exit 1; }
 
     mkdir -p "$units" "$state"
-    # PATH is spelled out because a timer does not read your shell profile:
-    # claude lives in ~/.local/bin, cargo and cargo-audit in ~/.cargo/bin.
     cat >"$units/$service" <<EOF
 [Unit]
 Description=donat nightly loops (scripts/loop-nightly.sh in $repo)
@@ -53,7 +59,7 @@ Type=oneshot
 WorkingDirectory=$repo
 ExecStart=$repo/scripts/loop-nightly.sh
 Environment=HOME=$HOME
-Environment=PATH=$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$unit_path
 Environment=DONAT_LOOP_STATE=$state
 EOF
     cat >"$units/$timer" <<EOF
