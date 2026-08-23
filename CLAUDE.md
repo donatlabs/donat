@@ -142,9 +142,9 @@ in the pull request description, one line per kind, `gate:<kind> <reason>`.
 `make gate` prints the lines it is missing. A new fixture or snapshot is free;
 rewriting an existing one is what needs a reason.
 
-A change under `plugins/donat/skills/` names its paired `make evals-compare
-BEFORE=<arm> AFTER=<arm>` result (DonatBench, `evals/`), or says why the edit
-needs no measurement. A skill with a wrong rule in it makes every later agent worse and
+A change under `plugins/donat/skills/` names a measurement that the edit helps
+a skill — a paired benchmark arm, where a corpus to run one exists — or says why
+it needs none. A skill with a wrong rule in it makes every later agent worse and
 never cleans itself up.
 
 ## Essential Rules
