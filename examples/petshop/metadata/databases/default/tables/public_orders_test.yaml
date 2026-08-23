@@ -2,6 +2,9 @@
 # totals from the storefront, lifecycle mutations from anyone but the role
 # that owns them, and the MCP surface as a way around any of it. Seeded with
 # customer-1's cart and order so that customer-2 has something not to see.
+vars:
+  customer: customer-1
+  order: 00000000-0000-0000-0000-000000000001
 tests:
   - name: every role is refused what it does not own
     steps:
@@ -43,123 +46,37 @@ tests:
             cart: []
             orders: []
 
-      - description: Customers cannot create catalogue variants with a price.
-        url: /v1/graphql
-        status: 200
-        headers:
-          X-Donat-Role: customer
-          X-Donat-User-Id: customer-1
-        query:
-          query: |
-            mutation {
-              insert_product_variant(objects: [{product_id: 1, sku: "BAD-PRICE", price_minor: 1, currency: "USD"}]) {
-                affected_rows
-              }
-            }
-        response:
-          errors:
-            - extensions:
-                path: $.selectionSet.insert_product_variant
-                code: validation-failed
-              message: "field 'insert_product_variant' not found in type: 'mutation_root'"
-
-      - description: Customers cannot write order line prices.
-        url: /v1/graphql
-        status: 200
-        headers:
-          X-Donat-Role: customer
-          X-Donat-User-Id: customer-1
-        query:
-          query: |
-            mutation {
-              insert_order_line(objects: [{order_id: "00000000-0000-0000-0000-000000000001", variant_id: 1, quantity: 1, unit_price_minor: 1, currency: "USD", line_total_minor: 1}]) {
-                affected_rows
-              }
-            }
-        response:
-          errors:
-            - extensions:
-                path: $.selectionSet.insert_order_line
-                code: validation-failed
-              message: "field 'insert_order_line' not found in type: 'mutation_root'"
-
-      - description: Customers cannot write order totals or lifecycle state.
-        url: /v1/graphql
-        status: 200
-        headers:
-          X-Donat-Role: customer
-          X-Donat-User-Id: customer-1
-        query:
-          query: |
-            mutation {
-              update_orders(where: {id: {_eq: "00000000-0000-0000-0000-000000000001"}}, _set: {total_minor: 1, order_status: "paid"}) {
-                affected_rows
-              }
-            }
-        response:
-          errors:
-            - extensions:
-                path: $.selectionSet.update_orders
-                code: validation-failed
-              message: "field 'update_orders' not found in type: 'mutation_root'"
-
-      - description: Customers cannot reserve stock directly.
-        url: /v1/graphql
-        status: 200
-        headers:
-          X-Donat-Role: customer
-          X-Donat-User-Id: customer-1
-        query:
-          query: |
-            mutation {
-              update_inventory_stock(where: {variant_id: {_eq: 1}}, _set: {reserved: 1}) {
-                affected_rows
-              }
-            }
-        response:
-          errors:
-            - extensions:
-                path: $.selectionSet.update_inventory_stock
-                code: validation-failed
-              message: "field 'update_inventory_stock' not found in type: 'mutation_root'"
-
-      - description: Staff cannot invoke fulfilment-only shipment mutations.
-        url: /v1/graphql
-        status: 200
-        headers:
-          X-Donat-Role: staff
-        query:
-          query: |
-            mutation {
-              update_shipment(where: {id: {_eq: 1}}, _set: {fulfilment_status: "shipped"}) {
-                affected_rows
-              }
-            }
-        response:
-          errors:
-            - extensions:
-                path: $.selectionSet.update_shipment
-                code: validation-failed
-              message: "field 'update_shipment' not found in type: 'mutation_root'"
-
-      - description: Staff cannot invoke support-only refund mutations.
-        url: /v1/graphql
-        status: 200
-        headers:
-          X-Donat-Role: staff
-        query:
-          query: |
-            mutation {
-              update_refund(where: {id: {_eq: 1}}, _set: {status: "refunded"}) {
-                affected_rows
-              }
-            }
-        response:
-          errors:
-            - extensions:
-                path: $.selectionSet.update_refund
-                code: validation-failed
-              message: "field 'update_refund' not found in type: 'mutation_root'"
+      # A role that was not granted a mutation does not see it in the schema:
+      # the refusal is "field not found", never a permission error that would
+      # confirm the field exists. One table, one example per (role, field).
+      - for:
+          - { role: customer, field: insert_product_variant,
+              call: 'insert_product_variant(objects: [{product_id: 1, sku: "BAD-PRICE", price_minor: 1, currency: "USD"}])',
+              why: customers cannot create catalogue variants with a price }
+          - { role: customer, field: insert_order_line,
+              call: 'insert_order_line(objects: [{order_id: "${order}", variant_id: 1, quantity: 1, unit_price_minor: 1, currency: "USD", line_total_minor: 1}])',
+              why: customers cannot write order line prices }
+          - { role: customer, field: update_orders,
+              call: 'update_orders(where: {id: {_eq: "${order}"}}, _set: {total_minor: 1, order_status: "paid"})',
+              why: customers cannot write order totals or lifecycle state }
+          - { role: customer, field: update_inventory_stock,
+              call: 'update_inventory_stock(where: {variant_id: {_eq: 1}}, _set: {reserved: 1})',
+              why: customers cannot reserve stock directly }
+          - { role: staff, field: update_shipment,
+              call: 'update_shipment(where: {id: {_eq: 1}}, _set: {fulfilment_status: "shipped"})',
+              why: staff cannot invoke fulfilment-only shipment mutations }
+          - { role: staff, field: update_refund,
+              call: 'update_refund(where: {id: {_eq: 1}}, _set: {status: "refunded"})',
+              why: staff cannot invoke support-only refund mutations }
+        do:
+          - as: { role: "${item.role}", user: "${customer}" }
+          - graphql: "mutation { ${item.call} { affected_rows } }"
+            expect:
+              errors:
+                - extensions:
+                    path: $.selectionSet.${item.field}
+                    code: validation-failed
+                  message: "field '${item.field}' not found in type: 'mutation_root'"
 
       - description: >-
           A request that names no role is refused before any permission is read.

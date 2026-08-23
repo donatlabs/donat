@@ -71,6 +71,21 @@ Sugar that no test needed — `seed: {table: rows}`, subject-derived
 `select`/`insert`, `run: {command}` — was left out, to be added when a test
 asks for it and with its own test.
 
+**The format is data, not a language, and `for` is where that line is.** A
+file is a list of facts — request → response, statement → rows, process →
+terminal — readable top to bottom without executing it in one's head.
+Constants (`vars`), references to captured values (`${name}`), typed matchers
+(`@uuid`, `@gt 0`) and `!include` keep it data. One construct is borrowed
+from programming, because Go table tests earn it: `for` runs the same steps
+once per listed example, with the example bound as `${item}`. It does not
+nest, has no condition, no expression and no computed range. Ansible, GitHub
+Actions and Helm each added `if`, `range` and a template language to YAML
+and each became a language with no debugger, no types and runtime errors;
+Venom's `skip`/`retry_if`/`range` is the same road. A test that wants a
+branch or a loop over a computed value is a check on the wrong level — it
+belongs in a decision table's `test_cases`, a validator, a CHECK constraint,
+or, rarely, a Rust test that says why it could not be data.
+
 **`expect` is a subset match; a fixture's `response` stays exact.** A
 conformance fixture pins a contract byte for byte and a changed byte is a
 bug. An application test asserts a behaviour, and a column added tomorrow
@@ -94,7 +109,8 @@ is the honest statement of what it checks.
 | Move `Suite`/`Running` into the shared crate and build the runner on them | Drags four backends, in-memory metadata and the admin-API interception into the shipped binary, for a runner whose metadata is already on disk. |
 | One database per file, seeds per case | Faster, but every `await` would need an instance id the test does not have, and cases would have to be written to tolerate each other's rows. A `CREATE DATABASE … TEMPLATE` optimisation is available later without changing a test. |
 | Exact matching for `expect`, as for fixtures | Every generated id and every added column becomes a test edit; application tests would drift toward `@any` everywhere, which is weaker than a subset. |
-| A richer vocabulary up front (`seed`, `select`, `run`, `@uuid`) | Every step that no test uses is a step whose semantics were never checked by one. |
+| A richer vocabulary up front (`seed`, `select`, `run`) | Every step that no test uses is a step whose semantics were never checked by one. |
+| `if`, `retry_if`, nested `for`, a template language (Venom, Step CI, Ansible) | That is a programming language in YAML: no debugger, no types, errors at run time, and worse to read than Python. A check that needs control flow is on the wrong level. |
 
 ## Consequences
 

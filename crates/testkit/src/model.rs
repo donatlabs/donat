@@ -29,6 +29,10 @@ use serde_json::Value as Json;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestFile {
+    /// Constants every step may reference as `${name}`: the request ids,
+    /// the user ids, the fixed values a file repeats.
+    #[serde(default)]
+    pub vars: BTreeMap<String, Json>,
     pub tests: Vec<TestCase>,
 }
 
@@ -42,6 +46,7 @@ pub struct TestCase {
 
 /// The kinds of step, each named by the key that identifies it.
 const STEP_KEYS: &[&str] = &[
+    "for",
     "url",
     "sql",
     "as",
@@ -83,6 +88,15 @@ pub enum Step {
     Hold(String),
     /// Answer the requests held on a path, with whatever `providers` now says.
     Release(String),
+    /// A table-driven step: run `do` once per item, with the item bound as
+    /// `${item}` (and `${item.field}`). This is the whole of what the format
+    /// borrows from a programming language — a list of examples over the same
+    /// steps, as a Go table test — and it does not nest: a `for` inside a
+    /// `for` is refused, and there is no condition, no expression and no
+    /// loop over a computed value. A test that needs one of those is a
+    /// test whose check belongs elsewhere: a decision table's `test_cases`,
+    /// a validator, a CHECK constraint.
+    For { items: Vec<Json>, steps: Vec<Json> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +258,24 @@ impl Step {
             return Err(anyhow!("a step is a mapping"));
         };
         let has = |k: &str| map.contains_key(k);
+        if has("for") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Wrapper {
+                #[serde(rename = "for")]
+                items: Vec<Json>,
+                #[serde(rename = "do")]
+                steps: Vec<Json>,
+            }
+            let w: Wrapper = serde_json::from_value(raw)?;
+            if w.steps.iter().any(|s| s.get("for").is_some()) {
+                return Err(anyhow!("a `for` does not nest"));
+            }
+            return Ok(Step::For {
+                items: w.items,
+                steps: w.steps,
+            });
+        }
         if has("url") {
             return Ok(Step::Http(raw));
         }
@@ -307,10 +339,7 @@ pub fn substitute(value: &Json, vars: &BTreeMap<String, Json>) -> Result<Json> {
         Json::String(s)
             if s.starts_with("${") && s.ends_with('}') && s.matches("${").count() == 1 =>
         {
-            let name = &s[2..s.len() - 1];
-            vars.get(name)
-                .cloned()
-                .ok_or_else(|| anyhow!("`${{{name}}}` was never captured"))?
+            lookup(&s[2..s.len() - 1], vars)?.clone()
         }
         Json::String(s) if s.contains("${") => Json::String(substitute_str(s, vars)?),
         Json::Array(xs) => Json::Array(
@@ -337,9 +366,7 @@ fn substitute_str(s: &str, vars: &BTreeMap<String, Json>) -> Result<String> {
             .find('}')
             .ok_or_else(|| anyhow!("unterminated `${{` in {s:?}"))?;
         let name = &after[..end];
-        let value = vars
-            .get(name)
-            .ok_or_else(|| anyhow!("`${{{name}}}` was never captured"))?;
+        let value = lookup(name, vars)?;
         match value {
             Json::String(v) => out.push_str(v),
             other => out.push_str(&other.to_string()),
@@ -348,4 +375,19 @@ fn substitute_str(s: &str, vars: &BTreeMap<String, Json>) -> Result<String> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// `name` or `name.field.inner`: a captured or declared value, or a field of
+/// one — the way a `for` item's columns are reached.
+fn lookup<'a>(path: &str, vars: &'a BTreeMap<String, Json>) -> Result<&'a Json> {
+    let (name, rest) = path.split_once('.').unwrap_or((path, ""));
+    let root = vars.get(name).ok_or_else(|| {
+        anyhow!("`${{{path}}}`: `{name}` is neither declared in `vars` nor captured")
+    })?;
+    if rest.is_empty() {
+        return Ok(root);
+    }
+    let pointer = format!("/{}", rest.replace('.', "/"));
+    root.pointer(&pointer)
+        .ok_or_else(|| anyhow!("`${{{path}}}`: no `{rest}` in {root}"))
 }

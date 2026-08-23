@@ -33,7 +33,14 @@ fn donat_test(args: &[&str]) -> Output {
 
 #[test]
 fn a_filtered_run_reports_its_cases_and_exits_zero() {
-    let output = donat_test(&["--filter", "public_cart_line_test"]);
+    let junit = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/app-test-logs/app_test_cli.junit.xml");
+    let output = donat_test(&[
+        "--filter",
+        "public_cart_line_test",
+        "--junit",
+        junit.to_str().unwrap(),
+    ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),

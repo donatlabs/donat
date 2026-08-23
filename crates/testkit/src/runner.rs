@@ -92,6 +92,72 @@ impl Report {
     }
 }
 
+impl Report {
+    /// JUnit XML, one `<testsuite>` per file, for CI annotations.
+    pub fn write_junit(
+        &self,
+        out: &mut impl std::io::Write,
+        relative_to: &Path,
+    ) -> std::io::Result<()> {
+        fn escape(s: &str) -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+        }
+        writeln!(out, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
+        writeln!(
+            out,
+            r#"<testsuites tests="{}" failures="{}">"#,
+            self.cases.len(),
+            self.failed()
+        )?;
+        let mut by_file: Vec<(&Path, Vec<&CaseReport>)> = Vec::new();
+        for case in &self.cases {
+            match by_file.iter_mut().find(|(f, _)| *f == case.file.as_path()) {
+                Some((_, cases)) => cases.push(case),
+                None => by_file.push((case.file.as_path(), vec![case])),
+            }
+        }
+        for (file, cases) in by_file {
+            let name = file
+                .strip_prefix(relative_to)
+                .unwrap_or(file)
+                .display()
+                .to_string();
+            let failures = cases
+                .iter()
+                .filter(|c| matches!(c.outcome, Outcome::Failed(_)))
+                .count();
+            writeln!(
+                out,
+                r#"  <testsuite name="{}" tests="{}" failures="{failures}">"#,
+                escape(&name),
+                cases.len()
+            )?;
+            for case in cases {
+                write!(
+                    out,
+                    r#"    <testcase classname="{}" name="{}" time="{:.3}""#,
+                    escape(&name),
+                    escape(&case.name),
+                    case.elapsed.as_secs_f64()
+                )?;
+                match &case.outcome {
+                    Outcome::Ok => writeln!(out, "/>")?,
+                    Outcome::Failed(reason) => writeln!(
+                        out,
+                        ">\n      <failure message=\"{}\"/>\n    </testcase>",
+                        escape(reason)
+                    )?,
+                }
+            }
+            writeln!(out, "  </testsuite>")?;
+        }
+        writeln!(out, "</testsuites>")
+    }
+}
+
 /// Every `*_test.yaml` under `metadata_dir`, sorted.
 pub fn discover(metadata_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
@@ -181,7 +247,7 @@ pub fn run_file(app: &AppTestConfig, run: &RunConfig, file: &Path) -> Result<Rep
             continue;
         }
         let started = Instant::now();
-        let outcome = match run_case(app, run, file, case) {
+        let outcome = match run_case(app, run, file, &parsed.vars, case) {
             Ok(()) => Outcome::Ok,
             Err(error) => Outcome::Failed(format!("{error:#}")),
         };
@@ -195,7 +261,13 @@ pub fn run_file(app: &AppTestConfig, run: &RunConfig, file: &Path) -> Result<Rep
     Ok(report)
 }
 
-fn run_case(app: &AppTestConfig, run: &RunConfig, file: &Path, case: &TestCase) -> Result<()> {
+fn run_case(
+    app: &AppTestConfig,
+    run: &RunConfig,
+    file: &Path,
+    vars: &BTreeMap<String, Json>,
+    case: &TestCase,
+) -> Result<()> {
     let stem = file
         .file_name()
         .and_then(|n| n.to_str())
@@ -221,19 +293,9 @@ fn run_case(app: &AppTestConfig, run: &RunConfig, file: &Path, case: &TestCase) 
         stand,
         source: app.source.clone(),
         actor: None,
-        vars: BTreeMap::new(),
+        vars: vars.clone(),
     };
-    for (index, raw) in case.steps.iter().enumerate() {
-        let kind = Step::kind_of(raw);
-        cx.run_step(raw).with_context(|| {
-            format!(
-                "step {} {kind}; engine log: {}",
-                index + 1,
-                cx.stand.log_path().display()
-            )
-        })?;
-    }
-    Ok(())
+    cx.run_steps(&case.steps, "step")
 }
 
 const AWAIT_DEADLINE: Duration = Duration::from_secs(60);
@@ -247,9 +309,41 @@ struct CaseContext {
 }
 
 impl CaseContext {
+    fn run_steps(&mut self, steps: &[Json], label: &str) -> Result<()> {
+        for (index, raw) in steps.iter().enumerate() {
+            let kind = Step::kind_of(raw);
+            self.run_step(raw).with_context(|| {
+                format!(
+                    "{label} {} {kind}; engine log: {}",
+                    index + 1,
+                    self.stand.log_path().display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn run_step(&mut self, raw: &Json) -> Result<()> {
+        // A `for` binds its item before its steps are substituted, so the
+        // wrapper itself is parsed raw.
+        if raw.get("for").is_some() {
+            let Step::For { items, steps } = Step::parse(raw.clone())? else {
+                unreachable!("a step with `for` parses as For");
+            };
+            let previous = self.vars.remove("item");
+            for (index, item) in items.into_iter().enumerate() {
+                self.vars.insert("item".to_string(), item.clone());
+                self.run_steps(&steps, &format!("item {} ({item}) step", index + 1))?;
+            }
+            self.vars.remove("item");
+            if let Some(previous) = previous {
+                self.vars.insert("item".to_string(), previous);
+            }
+            return Ok(());
+        }
         let step = Step::parse(substitute(raw, &self.vars)?)?;
         match step {
+            Step::For { .. } => unreachable!("handled above"),
             Step::Http(conf) => self.http(&conf),
             Step::Sql(sql) => self.sql(&sql),
             Step::As(step) => {

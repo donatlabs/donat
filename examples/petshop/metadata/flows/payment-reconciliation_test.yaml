@@ -43,4 +43,4 @@ tests:
       # publishes the durable reconciliation it recorded.
       - await:
           terminal: payment_reconciliation
-          expect: { reconciliation_status: matched, reconciliation_id: "@present" }
+          expect: { reconciliation_status: matched, reconciliation_id: "@uuid" }

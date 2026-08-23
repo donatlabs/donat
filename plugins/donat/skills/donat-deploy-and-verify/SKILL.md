@@ -169,6 +169,7 @@ runner's authentication hook, which turns `X-Donat-Role` / `X-Donat-User-Id`
 into a session. Steps, in the order they run:
 
 ```yaml
+vars: { customer: customer-1 }                           # constants, as ${customer}
 tests:
   - name: a shopper checks out and the process authorizes the order
     steps:
@@ -177,7 +178,7 @@ tests:
         capture: { cart_id: id }                         # ${cart_id} in every later step
       - as: { role: customer, user: customer-1 }
       - graphql: 'mutation { start_checkout(cart_id: ${cart_id}, request_id: "…") { cart_id } }'
-        expect: { data: { start_checkout: { cart_id: "${cart_id}" } } }   # subset; "@present", "@any"
+        expect: { data: { start_checkout: { cart_id: "${cart_id}" } } }   # subset; matchers below
       - await: { terminal: checkout_payment, expect: { payment_status: authorized } }
       - await: { receptive: return_refund, state: await_support_decision }  # before sending a signal
       - await: { row: grooming_booking, capture: { booking_id: id } }
@@ -193,7 +194,24 @@ tests:
         headers: { X-Donat-Role: anonymous }
         query: { query: "{ customer { id } }" }
         response: { errors: [ … ] }
+      - for:                                             # a table: the same steps, one row per example
+          - { role: customer, field: update_orders }
+          - { role: staff, field: update_refund }
+        do:
+          - as: { role: "${item.role}" }
+          - graphql: "mutation { ${item.field}(where: {}, _set: {}) { affected_rows } }"
+            expect: { errors: [{ message: "field '${item.field}' not found in type: 'mutation_root'" }] }
 ```
+
+Matchers in an `expect`: `@any`, `@present`, `@uuid`, `@number`, `@string`,
+`@bool`, `@gt N` / `@gte N` / `@lt N` / `@lte N`, `@regex R`, `@len N`.
+
+That `for` is the whole of what the format takes from a programming language.
+There is no `if`, no expression, no nested loop, no loop over a computed
+value — and there will not be. A test that seems to need one is a check that
+belongs elsewhere: a decision table's `test_cases`, a validator, a CHECK
+constraint, or, rarely, a Rust test in `crates/server/tests` that says why it
+could not be data.
 
 `await` polls the journal, never the clock; a failure prints the durable
 process state and names the engine log. A whole-string `${name}` keeps the

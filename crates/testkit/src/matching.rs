@@ -153,15 +153,57 @@ pub fn strip_mcp_content(v: &Json) -> Json {
 ///   of one row is a claim about how many rows there are;
 /// - the string `"@any"` matches any value, null included;
 /// - the string `"@present"` matches any value except null;
+/// - `"@uuid"`, `"@number"`, `"@string"`, `"@bool"` match by type;
+/// - `"@gt N"`, `"@gte N"`, `"@lt N"`, `"@lte N"` compare a number;
+/// - `"@regex R"` matches a string against an anchored-as-written regex;
+/// - `"@len N"` matches an array or string of that length;
 /// - numbers compare by value (`1 == 1.0`); everything else by equality.
 ///
 /// Conformance fixtures keep the exact [`response_matches`]: they pin a
 /// contract byte for byte. An application test asserts a behaviour, and a
 /// column added tomorrow should not fail it.
+fn matcher(spec: &str, act: &Json) -> bool {
+    let (name, arg) = spec.split_once(' ').unwrap_or((spec, ""));
+    let arg = arg.trim();
+    let number = || act.as_f64();
+    let bound = || arg.parse::<f64>().ok();
+    match name {
+        "@any" => true,
+        "@present" => !act.is_null(),
+        "@uuid" => act.as_str().is_some_and(|s| {
+            s.len() == 36
+                && s.bytes().enumerate().all(|(i, b)| {
+                    if matches!(i, 8 | 13 | 18 | 23) {
+                        b == b'-'
+                    } else {
+                        b.is_ascii_hexdigit()
+                    }
+                })
+        }),
+        "@number" => act.is_number(),
+        "@string" => act.is_string(),
+        "@bool" => act.is_boolean(),
+        "@gt" => number().zip(bound()).is_some_and(|(a, b)| a > b),
+        "@gte" => number().zip(bound()).is_some_and(|(a, b)| a >= b),
+        "@lt" => number().zip(bound()).is_some_and(|(a, b)| a < b),
+        "@lte" => number().zip(bound()).is_some_and(|(a, b)| a <= b),
+        "@regex" => act
+            .as_str()
+            .zip(regex::Regex::new(arg).ok())
+            .is_some_and(|(s, re)| re.is_match(s)),
+        "@len" => arg.parse::<usize>().ok().is_some_and(|n| match act {
+            Json::Array(xs) => xs.len() == n,
+            Json::String(s) => s.chars().count() == n,
+            _ => false,
+        }),
+        // Not a matcher: a literal string that happens to start with `@`.
+        _ => act.as_str() == Some(spec),
+    }
+}
+
 pub fn subset_matches(exp: &Json, act: &Json) -> bool {
     match (exp, act) {
-        (Json::String(s), _) if s == "@any" => true,
-        (Json::String(s), _) if s == "@present" => !act.is_null(),
+        (Json::String(s), _) if s.starts_with('@') => matcher(s, act),
         (Json::Object(e), Json::Object(a)) => e
             .iter()
             .all(|(k, ve)| a.get(k).is_some_and(|va| subset_matches(ve, va))),

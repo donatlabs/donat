@@ -332,3 +332,61 @@ fn a_whole_string_reference_keeps_the_captured_type() {
     assert!(substitute(&json!("${missing}"), &vars).is_err());
     assert!(substitute(&json!("x ${missing}"), &vars).is_err());
 }
+
+// ---------------------------------------------------- matchers
+
+#[test]
+fn typed_matchers() {
+    let uuid = json!("550e8400-e29b-41d4-a716-446655440900");
+    assert!(subset_matches(&json!("@uuid"), &uuid));
+    assert!(!subset_matches(&json!("@uuid"), &json!("not-a-uuid")));
+    assert!(subset_matches(&json!("@number"), &json!(2.5)));
+    assert!(!subset_matches(&json!("@number"), &json!("2")));
+    assert!(subset_matches(&json!("@string"), &json!("x")));
+    assert!(subset_matches(&json!("@bool"), &json!(false)));
+    assert!(subset_matches(&json!("@gt 0"), &json!(1)));
+    assert!(!subset_matches(&json!("@gt 0"), &json!(0)));
+    assert!(subset_matches(&json!("@gte 0"), &json!(0)));
+    assert!(subset_matches(&json!("@lt 10"), &json!(9.5)));
+    assert!(subset_matches(&json!("@lte 10"), &json!(10)));
+    assert!(!subset_matches(&json!("@gt 0"), &json!("1")));
+    assert!(subset_matches(
+        &json!("@regex ^TRACK-\\d+$"),
+        &json!("TRACK-1")
+    ));
+    assert!(!subset_matches(
+        &json!("@regex ^TRACK-\\d+$"),
+        &json!("track-1")
+    ));
+    assert!(subset_matches(&json!("@len 2"), &json!([1, 2])));
+    assert!(subset_matches(&json!("@len 3"), &json!("abc")));
+    assert!(!subset_matches(&json!("@len 2"), &json!([1])));
+}
+
+#[test]
+fn a_literal_at_sign_is_not_a_matcher() {
+    assert!(subset_matches(&json!("@handle"), &json!("@handle")));
+    assert!(!subset_matches(&json!("@handle"), &json!("other")));
+}
+
+// ---------------------------------------------------- vars and for items
+
+#[test]
+fn dotted_references_reach_into_a_bound_item() {
+    let vars = BTreeMap::from([("item".to_string(), json!({"role": "staff", "n": 2}))]);
+    assert_eq!(
+        substitute(
+            &json!({"as": {"role": "${item.role}"}, "count": "${item.n}"}),
+            &vars
+        )
+        .unwrap(),
+        json!({"as": {"role": "staff"}, "count": 2})
+    );
+    assert!(substitute(&json!("${item.missing}"), &vars).is_err());
+}
+
+#[test]
+fn a_for_step_does_not_nest() {
+    let raw = json!({"for": [1], "do": [{"for": [2], "do": []}]});
+    assert!(crate::model::Step::parse(raw).is_err());
+}

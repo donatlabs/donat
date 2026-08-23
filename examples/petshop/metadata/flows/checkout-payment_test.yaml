@@ -35,5 +35,5 @@ tests:
       - calls:
           path: /v1/payment-authorizations
           count: 1
-          body: { currency: USD, amount_minor: "@present" }
+          body: { currency: USD, amount_minor: "@gt 0" }
           headers: { authorization: petshop-test-payment }

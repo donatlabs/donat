@@ -187,6 +187,9 @@ struct TestArgs {
     /// Where engine logs go (one per test case).
     #[arg(long, default_value = "target/app-test-logs")]
     log_dir: PathBuf,
+    /// Also write a JUnit XML report here, for CI annotations.
+    #[arg(long)]
+    junit: Option<PathBuf>,
 }
 
 impl TestArgs {
@@ -691,6 +694,11 @@ async fn main() -> anyhow::Result<()> {
                 .join()
                 .map_err(|_| anyhow::anyhow!("the test runner panicked"))??;
             report.write(&mut std::io::stdout(), &metadata_dir)?;
+            if let Some(path) = &t.junit {
+                let mut file = std::fs::File::create(path)
+                    .with_context(|| format!("creating {}", path.display()))?;
+                report.write_junit(&mut file, &metadata_dir)?;
+            }
             if report.cases.is_empty() {
                 anyhow::bail!(
                     "no test case ran under {} (no `*_test.yaml`, or --filter matched none)",

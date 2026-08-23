@@ -1299,6 +1299,7 @@ dependencies = [
  "anyhow",
  "graphql-parser",
  "postgres",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
