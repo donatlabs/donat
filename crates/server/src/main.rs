@@ -190,6 +190,10 @@ struct TestArgs {
     /// Also write a JUnit XML report here, for CI annotations.
     #[arg(long)]
     junit: Option<PathBuf>,
+    /// Test cases to run at once (each is its own database and engine);
+    /// default one per core.
+    #[arg(long, short = 'j', env = "DONAT_TEST_JOBS")]
+    jobs: Option<usize>,
 }
 
 impl TestArgs {
@@ -226,6 +230,7 @@ impl TestArgs {
                 admin_database_url,
                 log_dir: self.log_dir.clone(),
                 filter: self.filter.clone(),
+                jobs: self.jobs,
             },
         ))
     }

@@ -29,6 +29,8 @@ pub struct RunConfig {
     pub log_dir: PathBuf,
     /// Run only test cases whose `<file>::<name>` contains this.
     pub filter: Option<String>,
+    /// Cases run at once; `None` means one per core.
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -187,28 +189,109 @@ pub fn load_test_file(path: &Path) -> Result<TestFile> {
     serde_json::from_value(json).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Run every test file under the application's metadata directory. Files
-/// run in parallel, as many at a time as there are cores, the way cargo runs
-/// test binaries; the report keeps the files in discovery order.
+/// Run every test file under the application's metadata directory. Every
+/// case is its own stand, so cases run in parallel across files and within
+/// them, `jobs` at a time; the report keeps discovery order.
 pub fn run_all(app: &AppTestConfig, run: &RunConfig) -> Result<Report> {
     let files = discover(&app.metadata)?;
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
+    let mut jobs = Vec::new();
+    let mut report = Report::default();
+    let mut parsed_files = Vec::new();
+    for file in &files {
+        match load_test_file(file) {
+            Ok(parsed) => parsed_files.push((file.clone(), parsed)),
+            // A file that does not load fails as one case of its own; the
+            // other files' outcomes are still reported.
+            Err(error) => report.cases.push(CaseReport {
+                file: file.clone(),
+                name: "(file)".to_string(),
+                elapsed: Duration::ZERO,
+                outcome: Outcome::Failed(format!("{error:#}")),
+            }),
+        }
+    }
+    for (file, parsed) in &parsed_files {
+        for case in &parsed.tests {
+            jobs.push(Job {
+                file,
+                vars: &parsed.vars,
+                case,
+            });
+        }
+    }
+    report.cases.extend(run_jobs(app, run, jobs));
+    report.cases.sort_by_key(|c| {
+        files
+            .iter()
+            .position(|f| f == &c.file)
+            .unwrap_or(usize::MAX)
+    });
+    Ok(report)
+}
+
+/// Run one test file, its cases in parallel.
+pub fn run_file(app: &AppTestConfig, run: &RunConfig, file: &Path) -> Result<Report> {
+    let parsed = load_test_file(file)?;
+    let jobs = parsed
+        .tests
+        .iter()
+        .map(|case| Job {
+            file,
+            vars: &parsed.vars,
+            case,
+        })
+        .collect();
+    Ok(Report {
+        cases: run_jobs(app, run, jobs),
+    })
+}
+
+struct Job<'a> {
+    file: &'a Path,
+    vars: &'a BTreeMap<String, Json>,
+    case: &'a TestCase,
+}
+
+/// `jobs` at a time — `RunConfig::jobs`, else the core count — each on a
+/// plain thread: a stand is a child process and blocking clients, not
+/// anything a runtime needs to schedule. Results come back in job order.
+fn run_jobs(app: &AppTestConfig, run: &RunConfig, jobs: Vec<Job<'_>>) -> Vec<CaseReport> {
+    let jobs: Vec<Job<'_>> = jobs
+        .into_iter()
+        .filter(|job| {
+            run.filter.as_ref().is_none_or(|filter| {
+                format!("{}::{}", job.file.display(), job.case.name).contains(filter.as_str())
+            })
+        })
+        .collect();
+    let workers = run
+        .jobs
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
         .unwrap_or(1)
-        .min(files.len().max(1));
+        .clamp(1, jobs.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let results = std::sync::Mutex::new(Vec::new());
+    let results = std::sync::Mutex::new(Vec::with_capacity(jobs.len()));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(file) = files.get(index) else { break };
-                    let result = run_file(app, run, file);
+                    let Some(job) = jobs.get(index) else { break };
+                    let started = Instant::now();
+                    let outcome = match run_case(app, run, job.file, job.vars, job.case) {
+                        Ok(()) => Outcome::Ok,
+                        Err(error) => Outcome::Failed(format!("{error:#}")),
+                    };
+                    let report = CaseReport {
+                        file: job.file.to_path_buf(),
+                        name: job.case.name.clone(),
+                        elapsed: started.elapsed(),
+                        outcome,
+                    };
                     results
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push((index, result));
+                        .push((index, report));
                 }
             });
         }
@@ -217,48 +300,7 @@ pub fn run_all(app: &AppTestConfig, run: &RunConfig) -> Result<Report> {
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     results.sort_by_key(|(index, _)| *index);
-    let mut report = Report::default();
-    for (index, result) in results {
-        match result {
-            Ok(file_report) => report.cases.extend(file_report.cases),
-            // A file that does not load fails as one case of its own; the
-            // other files' outcomes are still reported.
-            Err(error) => report.cases.push(CaseReport {
-                file: files[index].clone(),
-                name: "(file)".to_string(),
-                elapsed: Duration::ZERO,
-                outcome: Outcome::Failed(format!("{error:#}")),
-            }),
-        }
-    }
-    Ok(report)
-}
-
-/// Run one test file. A file that does not parse is a failure of every case
-/// it would have held — there is no silent skip.
-pub fn run_file(app: &AppTestConfig, run: &RunConfig, file: &Path) -> Result<Report> {
-    let parsed = load_test_file(file)?;
-    let mut report = Report::default();
-    for case in &parsed.tests {
-        let label = format!("{}::{}", file.display(), case.name);
-        if let Some(filter) = &run.filter
-            && !label.contains(filter.as_str())
-        {
-            continue;
-        }
-        let started = Instant::now();
-        let outcome = match run_case(app, run, file, &parsed.vars, case) {
-            Ok(()) => Outcome::Ok,
-            Err(error) => Outcome::Failed(format!("{error:#}")),
-        };
-        report.cases.push(CaseReport {
-            file: file.to_path_buf(),
-            name: case.name.clone(),
-            elapsed: started.elapsed(),
-            outcome,
-        });
-    }
-    Ok(report)
+    results.into_iter().map(|(_, report)| report).collect()
 }
 
 fn run_case(

@@ -281,6 +281,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
@@ -325,6 +326,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
@@ -416,6 +418,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests-system/requirements.txt
       # Raises the example the way its README deploys it — migrate, deploy the
       # Process revisions, then serve — with the engine built from this commit.
       - name: Raise the stand
@@ -488,6 +492,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests-system-lending/requirements.txt
       # stack.sh builds both binaries from this commit, applies the platform's
       # migrations and then the example's, and serves each stand against its
       # own database.

@@ -34,6 +34,9 @@ fn run(rel: &str) {
         admin_database_url: pg_admin_url(),
         log_dir: workspace_root().join("target/app-test-logs"),
         filter: None,
+        // Cargo already runs one test binary per file in parallel; within a
+        // file, two stands at a time keeps the machine's share bounded.
+        jobs: Some(2),
     };
     let file = app.metadata.join(rel);
     let report = runner::run_file(&app, &run, &file).expect("test file runs");
