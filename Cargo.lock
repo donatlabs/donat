@@ -1056,6 +1056,7 @@ dependencies = [
  "base64",
  "donat-backend",
  "donat-metadata",
+ "donat-testkit",
  "graphql-parser",
  "hmac 0.12.1",
  "jsonwebtoken",
@@ -1288,6 +1289,19 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "uuid",
+]
+
+[[package]]
+name = "donat-testkit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "graphql-parser",
+ "postgres",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

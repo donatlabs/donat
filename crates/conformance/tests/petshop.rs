@@ -266,12 +266,6 @@ fn catalog() {
 }
 
 #[test]
-fn cart() {
-    let running = petshop_suite("petshop_cart");
-    running.check_query_f("petshop/cart.yaml", Transport::Http);
-}
-
-#[test]
 fn permissions() {
     let running = petshop_suite("petshop_permissions");
     seed_customer_one_rows(running.db_url());

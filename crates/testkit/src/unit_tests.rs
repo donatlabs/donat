@@ -1,0 +1,271 @@
+//! Unit tests for the pure parts of the kit: fixture loading (`!include`),
+//! the tests-py-faithful response comparison, and migration-file validation.
+//! They need neither Postgres nor a running engine.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use serde_json::json;
+
+use super::*;
+
+static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn tempdir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "donat_conformance_fixture_{tag}_{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn write(root: &Path, rel: &str, content: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+#[test]
+fn duplicate_migration_versions_are_rejected() {
+    let dir = tempdir("duplicate_migration_versions");
+    write(&dir, "V2__first.sql", "SELECT 1;");
+    write(&dir, "V2__second.sql", "SELECT 2;");
+
+    let err = apply_sql_migration_dir("postgresql://unused", &dir)
+        .expect_err("duplicate migration versions must be rejected");
+    assert!(
+        format!("{err:#}").contains("duplicate version 2"),
+        "{err:#}"
+    );
+
+    std::fs::remove_dir_all(dir).expect("remove migration test directory");
+}
+
+#[test]
+fn load_fixture_resolves_string_include_relative_to_file() {
+    // The quoted-string spelling, resolved against the *including*
+    // file's directory — including transitively from a subdirectory.
+    let dir = tempdir("string");
+    write(
+        &dir,
+        "suite/case.yaml",
+        "setup: \"!include sub/inner.yaml\"\nname: top\n",
+    );
+    write(
+        &dir,
+        "suite/sub/inner.yaml",
+        "deep: \"!include leaf.yaml\"\n",
+    );
+    write(&dir, "suite/sub/leaf.yaml", "- 1\n- two\n");
+
+    let v = load_fixture(&dir.join("suite/case.yaml")).unwrap();
+    assert_eq!(v["name"], json!("top"));
+    assert_eq!(v["setup"]["deep"], json!([1, "two"]));
+}
+
+#[test]
+fn load_fixture_resolves_real_yaml_tag_include() {
+    let dir = tempdir("tag");
+    write(&dir, "case.yaml", "steps: !include steps.yaml\n");
+    write(&dir, "steps.yaml", "- url: /v1/graphql\n  status: 200\n");
+
+    let v = load_fixture(&dir.join("case.yaml")).unwrap();
+    assert_eq!(v["steps"][0]["url"], json!("/v1/graphql"));
+    assert_eq!(v["steps"][0]["status"], json!(200));
+}
+
+#[test]
+fn load_fixture_missing_include_target_errors() {
+    let dir = tempdir("missing");
+    write(&dir, "case.yaml", "setup: \"!include nope.yaml\"\n");
+    let err = load_fixture(&dir.join("case.yaml")).unwrap_err();
+    assert!(format!("{err:#}").contains("nope.yaml"), "got: {err:#}");
+}
+
+#[test]
+fn load_fixture_preserves_numbers_and_non_string_keys() {
+    let dir = tempdir("scalars");
+    write(
+        &dir,
+        "case.yaml",
+        "int: 5\nbig: 18446744073709551615\nfloat: 1.5\nmap:\n  1: one\n",
+    );
+    let v = load_fixture(&dir.join("case.yaml")).unwrap();
+    assert_eq!(v["int"], json!(5));
+    assert_eq!(v["big"], json!(18446744073709551615u64));
+    assert_eq!(v["float"], json!(1.5));
+    // Non-string YAML keys are stringified.
+    assert_eq!(v["map"]["1"], json!("one"));
+}
+
+// ----------------------------------------- json/response matching
+
+#[test]
+fn numbers_coerce_across_int_and_float() {
+    assert!(json_matches(&json!(1), &json!(1.0), None));
+    assert!(json_matches(&json!(1.0), &json!(1), None));
+    assert!(!json_matches(&json!(1), &json!(2.0), None));
+    assert!(json_matches(&json!({"n": 1}), &json!({"n": 1.0}), None));
+}
+
+#[test]
+fn objects_without_selection_tree_compare_unordered() {
+    let exp = json!({"a": 1, "b": 2});
+    let act = json!({"b": 2, "a": 1});
+    assert!(json_matches(&exp, &act, None));
+}
+
+#[test]
+fn object_key_set_mismatch_fails() {
+    // Missing, extra, and renamed keys all fail even order-insensitively.
+    assert!(!json_matches(
+        &json!({"a": 1}),
+        &json!({"a": 1, "b": 2}),
+        None
+    ));
+    assert!(!json_matches(
+        &json!({"a": 1, "b": 2}),
+        &json!({"a": 1}),
+        None
+    ));
+    assert!(!json_matches(&json!({"a": 1}), &json!({"b": 1}), None));
+}
+
+#[test]
+fn arrays_require_equal_length_and_order() {
+    assert!(json_matches(&json!([1, 2]), &json!([1, 2]), None));
+    assert!(!json_matches(&json!([1, 2]), &json!([2, 1]), None));
+    assert!(!json_matches(&json!([1, 2]), &json!([1, 2, 3]), None));
+}
+
+#[test]
+fn data_key_order_is_enforced_per_selection_tree() {
+    let query = "query { a b }";
+    let exp = json!({"data": {"a": 1, "b": 2}});
+    let in_order = json!({"data": {"a": 1, "b": 2}});
+    let reordered = json!({"data": {"b": 2, "a": 1}});
+    assert!(response_matches(&exp, &in_order, Some(query)));
+    assert!(!response_matches(&exp, &reordered, Some(query)));
+}
+
+#[test]
+fn nested_selection_order_is_enforced_per_level() {
+    let query = "query { items { x y } }";
+    let exp = json!({"data": {"items": [{"x": 1, "y": 2}]}});
+    let good = json!({"data": {"items": [{"x": 1, "y": 2}]}});
+    let bad = json!({"data": {"items": [{"y": 2, "x": 1}]}});
+    assert!(response_matches(&exp, &good, Some(query)));
+    assert!(!response_matches(&exp, &bad, Some(query)));
+}
+
+#[test]
+fn aliases_key_the_selection_tree() {
+    // The response key is the alias; ordering is enforced on aliases.
+    let query = "query { first: item { v } second: item { v } }";
+    let exp = json!({"data": {"first": {"v": 1}, "second": {"v": 2}}});
+    let good = json!({"data": {"first": {"v": 1}, "second": {"v": 2}}});
+    let swapped = json!({"data": {"second": {"v": 2}, "first": {"v": 1}}});
+    assert!(response_matches(&exp, &good, Some(query)));
+    assert!(!response_matches(&exp, &swapped, Some(query)));
+}
+
+#[test]
+fn fragment_spread_fields_join_the_selection_tree() {
+    let query = "
+        query { item { ...F } }
+        fragment F on Item { p q }
+    ";
+    let exp = json!({"data": {"item": {"p": 1, "q": 2}}});
+    let good = json!({"data": {"item": {"p": 1, "q": 2}}});
+    let bad = json!({"data": {"item": {"q": 2, "p": 1}}});
+    assert!(response_matches(&exp, &good, Some(query)));
+    assert!(
+        !response_matches(&exp, &bad, Some(query)),
+        "fragment fields must take part in order enforcement"
+    );
+}
+
+#[test]
+fn inline_fragment_fields_join_the_selection_tree() {
+    let query = "query { item { ... on Item { p q } } }";
+    let exp = json!({"data": {"item": {"p": 1, "q": 2}}});
+    let bad = json!({"data": {"item": {"q": 2, "p": 1}}});
+    assert!(!response_matches(&exp, &bad, Some(query)));
+}
+
+#[test]
+fn jsonb_value_under_data_leaf_is_not_order_enforced() {
+    // `payload` is a leaf field (no sub-selection): its object value is
+    // a jsonb column, where Postgres does not guarantee key order.
+    let query = "query { item { payload } }";
+    let exp = json!({"data": {"item": {"payload": {"x": 1, "y": 2}}}});
+    let act = json!({"data": {"item": {"payload": {"y": 2, "x": 1}}}});
+    assert!(response_matches(&exp, &act, Some(query)));
+}
+
+#[test]
+fn keys_outside_the_selection_tree_are_not_order_enforced() {
+    // Only keys present in the selection tree participate in the
+    // relative-order check (collapse_order_not_selset semantics).
+    let query = "query { a }";
+    let exp = json!({"data": {"extra": 0, "a": 1}});
+    let act = json!({"data": {"a": 1, "extra": 0}});
+    assert!(response_matches(&exp, &act, Some(query)));
+}
+
+#[test]
+fn errors_compare_unordered() {
+    // `errors` is outside `data`: key order inside error objects is free.
+    let query = "query { a }";
+    let exp = json!({"errors": [{
+        "message": "boom",
+        "extensions": {"code": "x", "path": "$"}
+    }]});
+    let act = json!({"errors": [{
+        "extensions": {"path": "$", "code": "x"},
+        "message": "boom"
+    }]});
+    assert!(response_matches(&exp, &act, Some(query)));
+    // ...but error values still have to match.
+    let wrong = json!({"errors": [{
+        "message": "other",
+        "extensions": {"code": "x", "path": "$"}
+    }]});
+    assert!(!response_matches(&exp, &wrong, Some(query)));
+}
+
+#[test]
+fn top_level_response_keys_compare_unordered() {
+    let query = "query { a }";
+    let exp = json!({"data": {"a": 1}, "errors": [{"message": "partial"}]});
+    let act = json!({"errors": [{"message": "partial"}], "data": {"a": 1}});
+    assert!(response_matches(&exp, &act, Some(query)));
+}
+
+#[test]
+fn unparsable_query_disables_order_enforcement() {
+    assert!(sel_tree_from_query("not a graphql query {{{").is_none());
+    let exp = json!({"data": {"a": 1, "b": 2}});
+    let act = json!({"data": {"b": 2, "a": 1}});
+    assert!(response_matches(
+        &exp,
+        &act,
+        Some("not a graphql query {{{")
+    ));
+    assert!(response_matches(&exp, &act, None));
+}
+
+#[test]
+fn sel_tree_covers_operations_and_marks_leaves() {
+    let tree = sel_tree_from_query("mutation { insert_x { affected_rows } }").unwrap();
+    assert!(tree.contains_key("insert_x"));
+    let child = tree.get("insert_x").unwrap().as_ref().unwrap();
+    assert!(child.contains_key("affected_rows"));
+    // Leaf fields carry no sub-tree.
+    assert!(child.get("affected_rows").unwrap().is_none());
+}
