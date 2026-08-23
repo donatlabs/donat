@@ -257,6 +257,45 @@ That is a different bargain and it should look like one: a worker lost
 mid-send leaves an outcome nobody knows, which is why `on_ambiguous` is
 mandatory (`knowledgebase/declarative-saas/decisions/063-*`).
 
+### Templating
+
+The relay renders; the module carries. Every single send posts:
+
+```json
+{
+  "message_key": "…", "recipient": "…",
+  "subject": "Your order shipped", "body": "It is on its way.",
+  "workflow": "order_shipped",
+  "locale": "en",
+  "payload": { "order": "A-1", "tracking": "TRK-9" }
+}
+```
+
+`subject` and `body` are the caller's own words and are always there, so a relay
+that templates nothing forwards them and is done. The other three are what make
+a template possible: `workflow` chooses one, `locale` chooses its language — read
+from your own recipient binding — and `payload` is the data it renders from.
+
+`payload` is optional and **opaque to the module**: it is declared as
+`NotificationPayload`, a bounded JSON document (4 KiB, depth 8, 128 nodes),
+because it crosses a Process journal and a provider request and both deserve a
+ceiling that was declared rather than discovered. Nothing here reads inside it.
+
+```graphql
+mutation Notify($p: NotificationPayload) {
+  notify(workflow: "order_shipped", recipient_id: "…",
+         title: "Your order shipped", body: "It is on its way.",
+         payload: $p, request_id: "…") { dispatch_id }
+}
+```
+
+The digest send carries `workflow`, `locale` and `pending` for the same reason.
+
+When `plans/004` lands, a render state goes in front of the send, the template
+becomes deployment metadata pinned into the Process revision, and the contract
+gains `html` and `text` — the relay then delivers what the engine composed
+instead of composing it itself.
+
 ### The digest
 
 `notify_digested` rings the bell immediately and records the email as
@@ -304,11 +343,14 @@ being silent.
 
 ## What it does not do
 
-- **It does not render.** Both sends carry a subject and a body, or a workflow
-  and a count, and the relay composes the message. The engine has an MJML
-  renderer built for exactly this and it is unreachable from a Process —
-  `plans/004-a-local-capability-no-process-can-name.md`. When that is closed the
-  module gains a render state and the contract gains `html` and `text`.
+- **It does not render.** There is no template in this module and no templating
+  language. The engine has an MJML renderer built for exactly this — a declared
+  template, typed inputs, escaping decided by the declaration rather than by the
+  value — and it is unreachable from a Process
+  (`plans/004-a-local-capability-no-process-can-name.md`). Until that is closed,
+  rendering belongs to whatever you point `NOTIFICATION_MAIL_BASE_URL` at, and
+  the module's job is to hand it everything a template needs: see *Templating*
+  below.
 - **No SMS, push or chat.** The engine has connectors for all of them; adding
   one here is a channel and a send state, and nobody has asked yet.
 - **A digest is per workflow, not per person.** Someone owed notifications from

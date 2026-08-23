@@ -1382,3 +1382,58 @@ fn an_inherited_role_carries_the_reads_and_not_the_commands() {
          a caller that must run the sweep holds `notification_scheduler` itself"
     );
 }
+
+#[test]
+fn the_relay_is_given_what_a_template_needs() {
+    // The module renders nothing — the engine's own renderer is unreachable
+    // from a Process (`plans/004-*`) — so what "templating" means here is that
+    // whatever does render is handed the three things it needs: which
+    // notification this is, the recipient's language, and the data. A relay
+    // that templates nothing ignores them and still works.
+    let (s, mail) = stand("notifications_template_inputs");
+    let mut db = client(s.db_url());
+    add_user(&mut db, ALICE, "alice@example.test");
+
+    let (status, sent) = s.post(
+        "/v1/graphql",
+        &json!({
+            "query": "mutation Notify($p: NotificationPayload) { \
+                        notify(workflow: \"order_shipped\", \
+                               recipient_id: \"11111111-1111-4111-8111-111111111111\", \
+                               title: \"Your order shipped\", body: \"It is on its way.\", \
+                               payload: $p, \
+                               request_id: \"11111111-1111-4111-8111-111111111111\") \
+                        { dispatch_id } }",
+            "variables": { "p": { "order": "A-1", "tracking": "TRK-9" } }
+        }),
+        &headers("notification_sender", ALICE),
+    );
+    assert_eq!(status, 200, "notify with a payload: {sent}");
+    assert!(sent.get("errors").is_none(), "notify failed: {sent}");
+    let dispatch_id = sent["data"]["notify"]["dispatch_id"]
+        .as_str()
+        .expect("notify returns the dispatch it recorded")
+        .to_string();
+
+    assert_eq!(await_delivery(&mut db, &dispatch_id, "email"), "sent");
+    let calls = wait_for("the relay to be called", || {
+        let calls = mail.calls_for(MAIL_PATH);
+        (!calls.is_empty()).then_some(calls)
+    });
+    let body = &calls[0].body;
+    assert_eq!(
+        body["payload"],
+        json!({ "order": "A-1", "tracking": "TRK-9" }),
+        "the data reaches the relay opaque and whole: {body}"
+    );
+    assert_eq!(
+        body["workflow"],
+        json!("order_shipped"),
+        "and which notification it is, so a template can be chosen"
+    );
+    assert_eq!(
+        body["locale"],
+        json!("en"),
+        "and the recipient's language, from the deployment's own binding"
+    );
+}

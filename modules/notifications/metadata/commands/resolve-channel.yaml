@@ -16,7 +16,7 @@ steps:
       table: { schema: notification, name: dispatch }
       by:
         id: { arg: dispatch_id }
-      returning: [id, workflow, recipient_id, title, body, url, digest]
+      returning: [id, workflow, recipient_id, title, body, url, digest, payload]
       require_found: true
   # The address comes from the application's own binding, read at send time
   # rather than copied at trigger time — an address that changed between the
@@ -52,6 +52,8 @@ result:
   recipient_id: { step: dispatch, column: recipient_id }
   title: { step: dispatch, column: title }
   body: { step: dispatch, column: body }
+  payload: { step: dispatch, column: payload }
+  locale: { step: recipient, column: locale }
   digest: { step: dispatch, column: digest }
   email: { step: recipient, column: email }
   opted_out: { step: counted, column: opted_out }

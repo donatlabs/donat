@@ -22,10 +22,13 @@ create table if not exists notification.dispatch (
     id           uuid primary key default gen_random_uuid(),
     workflow     text not null,
     recipient_id text not null,
-    payload      jsonb not null default '{}'::jsonb,
-    -- What the in-app channel shows. Email renders from `payload` and a
-    -- template instead; these three are the caller's own words, and nothing in
-    -- the module authors them.
+    -- What a message is rendered from, when the caller has structured data
+    -- rather than a sentence. The module never reads it: it carries it to
+    -- whatever renders, which today is the relay (see the README, and
+    -- `plans/004-*` for the renderer the engine cannot reach).
+    payload      jsonb,
+    -- What the in-app channel shows. These three are the caller's own words,
+    -- and nothing in the module authors them.
     title        text not null,
     body         text not null,
     url          text,

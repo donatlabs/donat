@@ -31,16 +31,26 @@ operations:
     version: v1
     method: POST
     path: /v1/email/messages
+    # `subject` and `body` are the caller's own words and always present;
+    # `workflow`, `locale` and `payload` are what let the relay render a
+    # template instead of forwarding them. A relay that templates nothing can
+    # ignore the last three and still work.
     input_contract:
       message_key: string!
       recipient: string!
       subject: string!
       body: string!
+      workflow: string!
+      locale: string
+      payload: NotificationPayload
     body:
       message_key: { input: message_key }
       recipient: { input: recipient }
       subject: { input: subject }
       body: { input: body }
+      workflow: { input: workflow }
+      locale: { input: locale }
+      payload: { input: payload }
     success_statuses: [200, 201, 202]
     response:
       provider_message_id: { json_pointer: /message_id, type: string!, max_bytes: 256 }
@@ -93,7 +103,7 @@ operations:
     # The recipient's address and the message itself never reach a log.
     redaction:
       request_headers: [Authorization]
-      request_body: [recipient, subject, body]
+      request_body: [recipient, subject, body, payload]
       response_body: [provider_message_id]
 
   # The digest's own send. It carries a count rather than a composed
@@ -112,11 +122,13 @@ operations:
       message_key: string!
       recipient: string
       workflow: string!
+      locale: string
       pending: bigint!
     body:
       message_key: { input: message_key }
       recipient: { input: recipient }
       workflow: { input: workflow }
+      locale: { input: locale }
       pending: { input: pending }
     success_statuses: [200, 201, 202]
     response:

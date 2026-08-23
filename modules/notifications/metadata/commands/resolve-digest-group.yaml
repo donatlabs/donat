@@ -37,10 +37,11 @@ steps:
       table: { schema: notification, name: recipient }
       by:
         id: { arg: recipient_id }
-      returning: [id, email]
+      returning: [id, email, locale]
       require_found: true
 result:
   recipient_id: { arg: recipient_id }
   workflow: { arg: workflow }
   email: { step: recipient, column: email }
+  locale: { step: recipient, column: locale }
   pending: { step: counted, column: pending }

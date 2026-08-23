@@ -1938,7 +1938,11 @@ fn command_result_types(name: &str) -> BTreeMap<String, String> {
             ("title", "string!"),
             ("body", "string!"),
             ("digest", "bool!"),
+            // Nullable: both come from the application's own binding view, and
+            // a view carries no `not null`.
             ("email", "string"),
+            ("locale", "string"),
+            ("payload", "NotificationPayload"),
             ("opted_out", "bigint!"),
         ],
         "notification_check_in_app_seen" => &[("seen", "bigint!")],
@@ -1946,6 +1950,7 @@ fn command_result_types(name: &str) -> BTreeMap<String, String> {
             ("recipient_id", "string!"),
             ("workflow", "string!"),
             ("email", "string"),
+            ("locale", "string"),
             ("pending", "bigint!"),
         ],
         "notification_claim_digest" => &[

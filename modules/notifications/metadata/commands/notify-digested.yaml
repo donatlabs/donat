@@ -17,6 +17,10 @@ arguments:
     type: string!
   - name: body
     type: string!
+  # Optional, and opaque to the module: the data a template renders from, for a
+  # caller that has fields rather than a finished sentence.
+  - name: payload
+    type: NotificationPayload
   # Where the notification points. Nullable, because plenty of notifications
   # are not about a page; the feed row carries it through so a client can make
   # the message clickable.
@@ -40,6 +44,7 @@ steps:
         recipient_id: { arg: recipient_id }
         title: { arg: title }
         body: { arg: body }
+        payload: { arg: payload }
         url: { arg: url }
         digest: { literal: true }
       returning: [id, workflow, recipient_id]

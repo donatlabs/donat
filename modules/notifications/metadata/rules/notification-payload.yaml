@@ -1,0 +1,11 @@
+# The data a message is rendered from, as a bounded opaque document.
+#
+# Bounded because it crosses a Process journal and a provider request: the
+# ceilings are declared here rather than discovered when something large is
+# retained forever. It is opaque because the module does not read it — only the
+# thing that renders the message does, and today that is the relay.
+name: NotificationPayload
+opaque_json:
+  maximum_bytes: 4096
+  maximum_depth: 8
+  maximum_nodes: 128

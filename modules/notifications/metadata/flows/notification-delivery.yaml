@@ -187,6 +187,9 @@ states:
         recipient: { state: resolve_email, field: email, require_non_null: true }
         subject: { state: resolve_email, field: title, require_non_null: true }
         body: { state: resolve_email, field: body, require_non_null: true }
+        workflow: { state: resolve_email, field: workflow, require_non_null: true }
+        locale: { state: resolve_email, field: locale }
+        payload: { state: resolve_email, field: payload }
       # Stable across retries and takeovers, which is what the relay's
       # `Idempotency-Key` is derived from.
       idempotency_key:

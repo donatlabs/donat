@@ -190,6 +190,9 @@ types:
       maximum_depth: 8
       maximum_nodes: 128
 
+  # --- the notification module -----------------------------------------
+  - "!include ../../../modules/notifications/metadata/rules/notification-payload.yaml"
+
 rules:
   - name: can_reserve_stock
     parameters: { on_hand: int!, reserved: int!, requested: int! }

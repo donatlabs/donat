@@ -4,6 +4,8 @@
 # `rules.yaml`, and it is a mapping — so a second wrapper cannot be `!include`d
 # into it. An adopting application adds these same lines to the lists inside its
 # own file; see the module README.
+types:
+  - "!include rules/notification-payload.yaml"
 rules:
   - "!include rules/channel-is-enabled.yaml"
   - "!include rules/was-not-seen.yaml"
