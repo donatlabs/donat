@@ -420,6 +420,8 @@ pub struct AppState {
     /// DONAT_EXTERNAL_URL: the absolute prefix for engine-served file URLs.
     /// Empty means same-origin, which is what a browser needs by default.
     pub external_base_url: String,
+    /// Counted per role and tenant, per replica. See `ratelimit`.
+    pub rate_limiter: crate::ratelimit::RateLimiter,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -2060,6 +2062,7 @@ mod snapshot_tests {
 
     fn state(engine: Engine) -> AppState {
         AppState {
+            rate_limiter: Default::default(),
             engine: RwLock::new(Arc::new(engine)),
             connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: "sqlite::memory:".to_string(),

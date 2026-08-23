@@ -29,6 +29,7 @@ pub mod oidc;
 pub mod panel;
 pub mod pgtls;
 pub mod processes;
+pub mod ratelimit;
 pub mod remote;
 pub mod rest;
 pub mod shutdown;

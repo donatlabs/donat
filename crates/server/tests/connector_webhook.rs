@@ -81,6 +81,7 @@ fn state() -> SharedState {
         ConnectorRegistry::build(&metadata).expect("Stripe webhook instance compiles at startup"),
     );
     Arc::new(AppState {
+        rate_limiter: Default::default(),
         engine: tokio::sync::RwLock::new(Arc::new(
             Engine::bootstrap_checked(metadata).expect("empty test engine compiles"),
         )),

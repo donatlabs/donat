@@ -173,6 +173,7 @@ fn app_state(url: &str) -> Arc<AppState> {
 
 fn app_state_with_metadata(metadata: Metadata) -> Arc<AppState> {
     Arc::new(AppState {
+        rate_limiter: Default::default(),
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata))),
         connectors: Arc::new(donat_server::connectors::ConnectorRegistry::empty()),
         default_url: "postgres://unused".to_string(),

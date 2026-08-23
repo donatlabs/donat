@@ -344,9 +344,47 @@ pub async fn resolve_session(
     state: &crate::state::AppState,
     headers: &HeaderMap,
 ) -> Result<Session, (axum::http::StatusCode, Json)> {
-    resolve_session_with_origin(state, headers)
+    let session = resolve_session_with_origin(state, headers)
         .await
-        .map(|(session, _)| session)
+        .map(|(session, _)| session)?;
+    refuse_over_rate(state, &session).await?;
+    Ok(session)
+}
+
+/// Count this request against the role's ceiling, and against the tenant's
+/// where one is declared.
+///
+/// Here rather than at each surface for the reason the tenant predicate is
+/// ANDed at one choke point: GraphQL, the websocket start, REST and MCP all
+/// arrive through this function, and a ceiling that covered three of them
+/// would be a ceiling somebody routes around.
+async fn refuse_over_rate(
+    state: &crate::state::AppState,
+    session: &Session,
+) -> Result<(), (axum::http::StatusCode, Json)> {
+    let engine = state.engine_snapshot().await;
+    let Some(per_minute) = engine
+        .metadata
+        .limits
+        .requests_per_minute
+        .for_role(&session.role)
+    else {
+        return Ok(());
+    };
+    let tenant = session_tenant(&engine, session).unwrap_or_default();
+    if state.rate_limiter.admit(&session.role, &tenant, per_minute) {
+        return Ok(());
+    }
+    Err((
+        axum::http::StatusCode::OK,
+        error_json(
+            "rate-limit-exceeded",
+            format!(
+                "role \"{}\" is limited to {per_minute} operations a minute here",
+                session.role
+            ),
+        ),
+    ))
 }
 
 /// [`resolve_session`], plus how the session was established.
@@ -2802,6 +2840,7 @@ mod tests {
 
     fn shared_state(engine: Arc<Engine>) -> SharedState {
         Arc::new(AppState {
+            rate_limiter: Default::default(),
             engine: tokio::sync::RwLock::new(engine),
             connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: "postgres://unused".to_string(),

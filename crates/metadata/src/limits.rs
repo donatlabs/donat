@@ -49,10 +49,17 @@ pub struct LimitsMetadata {
     /// is planned.
     #[serde(default, skip_serializing_if = "Ceiling::is_empty")]
     pub nodes: Ceiling,
+    /// Operations per minute, counted per tenant where one is declared.
+    ///
+    /// Only what a proxy cannot key on: the tenant and the role both come out
+    /// of a verified token, and verifying it is this engine's job. An address
+    /// or a header is a proxy's to bound and has no spelling here.
+    #[serde(default, skip_serializing_if = "Ceiling::is_empty")]
+    pub requests_per_minute: Ceiling,
 }
 
 impl LimitsMetadata {
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.nodes.is_empty() && self.requests_per_minute.is_empty()
     }
 }

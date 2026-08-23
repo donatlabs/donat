@@ -109,6 +109,7 @@ fn session() -> Session {
 
 fn state(fixtures: &SqliteFixtures) -> Arc<AppState> {
     Arc::new(AppState {
+        rate_limiter: Default::default(),
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata(fixtures)))),
         connectors: Arc::new(donat_server::connectors::ConnectorRegistry::empty()),
         default_url: "postgres://unused".to_string(),
@@ -482,6 +483,7 @@ async fn secondary_mysql_mutation_never_falls_back_to_default_source() {
     }))
     .expect("multi-source MySQL metadata");
     let state = Arc::new(AppState {
+        rate_limiter: Default::default(),
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata))),
         connectors: Arc::new(donat_server::connectors::ConnectorRegistry::empty()),
         default_url: "postgres://unused".to_string(),

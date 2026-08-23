@@ -1015,6 +1015,7 @@ async fn main() -> anyhow::Result<()> {
         jwt.spawn_refresher(reqwest::Client::new());
     }
     let state: SharedState = Arc::new(AppState {
+        rate_limiter: Default::default(),
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap_checked(metadata)?)),
         connectors,
         default_url: database_url,

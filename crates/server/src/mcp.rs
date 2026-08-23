@@ -4779,6 +4779,7 @@ mod tests {
         )
         .expect("MCP engine snapshot compiles");
         Arc::new(crate::state::AppState {
+            rate_limiter: Default::default(),
             engine: tokio::sync::RwLock::new(Arc::new(engine)),
             connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: url,
