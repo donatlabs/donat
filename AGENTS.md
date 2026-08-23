@@ -6,16 +6,21 @@ conformance harness with Donat-derived fixtures (`crates/conformance`).
 
 ## Who This Is For
 
-**donat is a framework for people who do not write code.** An application —
-its schema, its rules, its permissions, its processes, its integrations, and
-its tests — is declared in SQL migrations and YAML, and nothing else. The
-measure of every engine feature is whether someone with no development
-experience can use it by declaring it; a feature that needs a script, a
-service, or a Rust file on the application side is not finished. Rust is the
+**donat is for an analyst working with an AI agent, not for a developer.**
+The person says what the business needs; the agent declares it — schema,
+rules, permissions, processes, integrations, and tests — in SQL migrations
+and YAML, and nothing else. Nobody writes code, and nobody should have to
+read code to check the result. So the measure of every engine feature is two
+questions: can an agent produce the right declaration from a plain sentence
+on the first try, and can the analyst read what came out and see their own
+requirement in it? A feature that needs a script, a service, a Rust file, or
+a developer's eye on the application side is not finished. What the agent
+reads before it acts — the skills in `plugins/donat/skills` — and what the
+engine says when a declaration is wrong — `validate`, `donat test`, the
+error bodies — are the product's surface as much as the API is. Rust is the
 engine's language only: `crates/*` and their tests are about the engine,
-never a stand-in for what an application author should have been able to
-declare. `examples/petshop` is the proof — a whole store, tests included,
-with not one line of code.
+never a stand-in for what should have been declarable. `examples/petshop` is
+the proof — a whole store, tests included, with not one line of code.
 
 ## Tech Stack
 
