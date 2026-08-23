@@ -111,3 +111,30 @@ return to every deployment writing its own, which is what
 - [Supabase RLS](https://supabase.com/docs/guides/database/postgres/row-level-security), [RLS patterns for multi-tenant SaaS](https://makerkit.dev/blog/tutorials/supabase-rls-best-practices)
 - [PgBouncer transaction pooling and `SET LOCAL`](https://multi-tenant-saas.com/tenant-aware-data-routing-query-scoping/connection-pooling-in-multi-tenant-systems/pgbouncer-transaction-pooling-for-multi-tenant-saas/), [Approaches to tenancy in Postgres](https://planetscale.com/blog/approaches-to-tenancy-in-postgres)
 - [Nile](https://www.thenile.dev/), [Re-engineering Postgres for Millions of Tenants](https://www.scylladb.com/tech-talk/the-nile-approach-re-engineering-postgres-for-millions-of-tenants/)
+
+## What is left, sized (2026-08-23)
+
+Written after building the rest, because a list of deferrals is only useful
+once somebody has looked at what each costs.
+
+**Per-tenant connector credentials** — smaller than it reads. The credential
+table is already keyed by `subject`, the runtime already refuses more than one
+per instance for want of anything to choose with, and a tenant is that thing.
+What is missing is threading a request-scoped tenant into the credential path.
+Sized in
+[[declarative-saas/decisions/010-static-community-connector-factory-and-runtime-boundaries]].
+
+**Per-tenant cron fan-out** — a capability gap, not an isolation one, and this
+note previously implied otherwise. A cron trigger fires a webhook and touches
+no table, so there is no occurrence for one tenant to take from another;
+`donat.cron_events` being unique on `(trigger_name, scheduled_time)` is
+therefore correct as it stands. What cannot be expressed is "once per tenant",
+and the workaround — a receiver that enumerates tenants and acts as each — puts
+the fan-out outside the engine where nothing bounds it.
+
+**Support impersonation** — partly answered already. `cross_tenant_reads:`
+substitutes a subject bound for the tenant bound, which is what a store
+switcher is built on; what is absent is an audited way for an operator to act
+*as* a tenant, which is a different and more dangerous feature and should stay
+absent until somebody needs it enough to describe the audit.
+
