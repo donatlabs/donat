@@ -1,0 +1,30 @@
+# A grooming hold: the process reserves the slot, and the shopper's
+# confirmation completes it.
+tests:
+  - name: a shopper confirms a grooming hold and the process completes
+    steps:
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_grooming_booking(
+              service_resource_id: "550e8400-e29b-41d4-a716-446655440920",
+              slot_key: "2026-08-01T10:00",
+              starts_at: "2030-01-02T10:00:00Z",
+              hold_expires_at: "2030-01-01T10:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440921"
+            ) { slot_key }
+          }
+      # The booking process reserves its hold before anyone can confirm it.
+      - await:
+          row: grooming_booking
+          capture: { booking_id: id }
+      - graphql: |
+          mutation {
+            confirm_booking(booking_id: "${booking_id}", request_id: "550e8400-e29b-41d4-a716-446655440922") {
+              booking_id
+            }
+          }
+      # The booking process reports the hold it confirmed.
+      - await:
+          terminal: grooming_booking
+          expect: { booking_id: "${booking_id}" }

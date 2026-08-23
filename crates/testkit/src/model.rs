@@ -63,7 +63,8 @@ pub enum Step {
     /// list is a queue of `{status, body}` answers consumed in order before
     /// the default applies. Allowed at any point in a test.
     Providers(BTreeMap<String, ProviderAnswer>),
-    /// Wait for durable state: a process reaching a terminal status.
+    /// Wait for durable state — a process reaching a terminal status, a
+    /// table receiving a row — polling the database, never the clock.
     Await(AwaitStep),
     /// What the provider stub recorded for a path.
     Calls(CallsStep),
@@ -164,15 +165,23 @@ pub struct AwaitStep {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Await {
+#[serde(untagged)]
+pub enum Await {
     /// A process (by name) whose instance reaches the `terminal` status;
     /// `expect` and `capture` then apply to its terminal output.
-    pub terminal: String,
-    #[serde(default)]
-    pub expect: Option<Json>,
-    #[serde(default)]
-    pub capture: BTreeMap<String, String>,
+    Terminal {
+        terminal: String,
+        #[serde(default)]
+        expect: Option<Json>,
+        #[serde(default)]
+        capture: BTreeMap<String, String>,
+    },
+    /// A table receiving its first row; `capture` names its columns.
+    Row {
+        row: String,
+        #[serde(default)]
+        capture: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,9 +262,20 @@ impl Step {
 }
 
 /// Replace `${name}` in every string of `value` with the captured value.
-/// A captured string is spliced as is; anything else as its JSON text.
+/// A string that is exactly one reference becomes the captured value itself,
+/// whatever its type — a number captured from a row stays a number in a
+/// provider body. Inside a longer string a captured string is spliced as is
+/// and anything else as its JSON text.
 pub fn substitute(value: &Json, vars: &BTreeMap<String, Json>) -> Result<Json> {
     Ok(match value {
+        Json::String(s)
+            if s.starts_with("${") && s.ends_with('}') && s.matches("${").count() == 1 =>
+        {
+            let name = &s[2..s.len() - 1];
+            vars.get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("`${{{name}}}` was never captured"))?
+        }
         Json::String(s) if s.contains("${") => Json::String(substitute_str(s, vars)?),
         Json::Array(xs) => Json::Array(
             xs.iter()

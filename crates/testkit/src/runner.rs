@@ -251,7 +251,14 @@ impl CaseContext {
                 self.providers(answers);
                 Ok(())
             }
-            Step::Await(step) => self.await_terminal(&step.what),
+            Step::Await(step) => match &step.what {
+                Await::Terminal {
+                    terminal,
+                    expect,
+                    capture,
+                } => self.await_terminal(terminal, expect.as_ref(), capture),
+                Await::Row { row, capture } => self.await_row(row, capture),
+            },
             Step::Calls(step) => self.calls(&step.calls),
         }
     }
@@ -310,8 +317,10 @@ impl CaseContext {
         }
         // Postgres renders each row as JSON, so a test compares values the
         // way the API would show them rather than through a type mapping here.
+        // A CTE, not a subquery: `INSERT ... RETURNING` is a valid statement
+        // to capture from, and only a CTE admits it.
         let wrapped = format!(
-            "select to_jsonb(donat_test_row) from ({}) donat_test_row",
+            "WITH donat_test_row AS ({}) SELECT to_jsonb(donat_test_row) FROM donat_test_row",
             step.sql.trim().trim_end_matches(';')
         );
         let rows = client
@@ -421,17 +430,47 @@ impl CaseContext {
         }
     }
 
-    fn await_terminal(&mut self, what: &Await) -> Result<()> {
+    fn await_row(&mut self, table: &str, capture: &BTreeMap<String, String>) -> Result<()> {
         let mut client = self.stand.pg()?;
         let deadline = Instant::now() + AWAIT_DEADLINE;
-        let process = &what.terminal;
+        let sql = format!("SELECT to_jsonb(donat_test_row) FROM {table} donat_test_row LIMIT 1");
+        let row = loop {
+            if let Some(row) = client
+                .query_opt(&sql, &[])
+                .with_context(|| format!("polling {table}"))?
+            {
+                break row.get::<_, Json>(0);
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "{table} never received a row: {}",
+                    process_diagnostics(&mut client, &self.source)
+                ));
+            }
+            std::thread::sleep(AWAIT_POLL);
+        };
+        let pointers = capture
+            .iter()
+            .map(|(name, column)| (name.clone(), format!("/{column}")))
+            .collect();
+        self.capture(&pointers, &row, &format!("the first {table} row"))
+    }
+
+    fn await_terminal(
+        &mut self,
+        process: &str,
+        expect: Option<&Json>,
+        capture: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut client = self.stand.pg()?;
+        let deadline = Instant::now() + AWAIT_DEADLINE;
         let output = loop {
             let row = client
                 .query_opt(
                     "SELECT status, terminal_output_json
                      FROM donat.process_instances
                      WHERE source_name = $1 AND process_name = $2",
-                    &[&self.source, process],
+                    &[&self.source, &process],
                 )
                 .context("polling donat.process_instances")?;
             if let Some(row) = row {
@@ -454,7 +493,7 @@ impl CaseContext {
             }
             std::thread::sleep(AWAIT_POLL);
         };
-        if let Some(expect) = &what.expect
+        if let Some(expect) = expect
             && !subset_matches(expect, &output)
         {
             return Err(anyhow!(
@@ -463,7 +502,7 @@ impl CaseContext {
                 pretty(&output)
             ));
         }
-        self.capture(&what.capture, &output, "the terminal output")
+        self.capture(capture, &output, "the terminal output")
     }
 
     fn calls(&mut self, calls: &Calls) -> Result<()> {

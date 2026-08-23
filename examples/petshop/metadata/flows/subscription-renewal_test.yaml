@@ -1,0 +1,26 @@
+# A scheduled renewal: the first authorization renews the subscription
+# without entering dunning, and the audit records only that attempt.
+tests:
+  - name: a scheduled subscription renewal authorizes and renews
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO subscription
+              (customer_id, variant_id, quantity, unit_price_minor, line_total_minor, currency, status)
+          VALUES ('customer-1', 2, 1, 2499, 2499, 'USD', 'active')
+          RETURNING id
+        capture: { subscription_id: id }
+      - as: { role: subscription_worker }
+      - graphql: |
+          mutation {
+            start_subscription_renewal(
+              subscription_id: "${subscription_id}", cron_occurrence: "2030-02-01T00:00:00Z"
+            ) { subscription_id status }
+          }
+      - await:
+          terminal: subscription_renewal
+          expect: { status: renewed }
+      # The audit records every attempt, the scheduled cycle included. One
+      # row at attempt 0 means the ladder was never walked.
+      - sql: SELECT attempt, outcome FROM subscription_dunning_attempt ORDER BY attempt
+        expect: [{ attempt: 0, outcome: authorized }]

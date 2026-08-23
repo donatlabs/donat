@@ -83,7 +83,13 @@ yaml_files! {
     public_product => "databases/default/tables/public_product_test.yaml",
     public_product_variant => "databases/default/tables/public_product_variant_test.yaml",
     prepare_checkout_quote => "commands/checkout/prepare-checkout-quote_test.yaml",
+    authorized_order_cancellation => "flows/authorized-order-cancellation_test.yaml",
     checkout_payment => "flows/checkout-payment_test.yaml",
+    grooming_booking => "flows/grooming-booking_test.yaml",
+    partial_fulfilment => "flows/partial-fulfilment_test.yaml",
+    payment_reconciliation => "flows/payment-reconciliation_test.yaml",
+    subscription_renewal => "flows/subscription-renewal_test.yaml",
+    vendor_payout => "flows/vendor-payout_test.yaml",
 }
 
 #[test]

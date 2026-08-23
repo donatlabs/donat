@@ -1,0 +1,46 @@
+# Reconciliation compares the provider's answer against what the store
+# recorded. An answer that agrees on every compared fact is matched
+# automatically; anything else would park on a support decision instead.
+tests:
+  - name: a reconciliation matches a payment the provider confirms
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440a00") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { payment_id: /payment_id }
+      - sql: SELECT amount_minor::bigint, currency, provider_reference FROM payment WHERE id = '${payment_id}'
+        capture:
+          amount_minor: amount_minor
+          currency: currency
+          provider_reference: provider_reference
+      # The provider agrees with the store on every compared fact.
+      - providers:
+          /v1/payment-reconciliations:
+            provider_event_id: $request:/provider_event_id
+            reconciliation_id: recon_petshop_1
+            amount_minor: ${amount_minor}
+            currency: ${currency}
+            status: authorized
+            provider_reference: ${provider_reference}
+            normalized_payload: { gateway: mock, reconciled: true }
+      - as: { role: reconciliation_worker }
+      - graphql: |
+          mutation {
+            start_payment_reconciliation(
+              payment_id: "${payment_id}", provider_event_id: "evt_petshop_reconcile_1",
+              expected_status: authorized, request_id: "550e8400-e29b-41d4-a716-446655440a01"
+            ) { payment_id }
+          }
+      # An agreeing answer is matched without support, and the match
+      # publishes the durable reconciliation it recorded.
+      - await:
+          terminal: payment_reconciliation
+          expect: { reconciliation_status: matched, reconciliation_id: "@present" }

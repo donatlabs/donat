@@ -5,21 +5,7 @@
 tests:
   - name: a shopper checks out and the process authorizes the order
     steps:
-      - providers:
-          # The tax provider echoes the quote it was asked about: the process
-          # asserts the answer belongs to the checkout quote it sent.
-          /v1/tax-quotes:
-            tax_quote_id: tax_quote_petshop_1
-            checkout_quote_id: $request:/checkout_quote_id
-            tax_minor: 160
-            tax_code: US-STANDARD
-            currency: USD
-          /v1/payment-authorizations:
-            provider_event_id: evt_petshop_authorize_1
-            authorization_id: auth_petshop_1
-            provider_reference: ref_petshop_1
-            status: authorized
-            normalized_payload: { gateway: mock, captured: false }
+      - providers: !include ../testdata/providers.yaml
       # One open cart holding a single in-stock variant.
       - sql: |
           INSERT INTO cart (customer_id) VALUES ('customer-1');

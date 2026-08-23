@@ -189,14 +189,16 @@ impl ProviderStub {
         self.state.lock().unwrap().calls.clone()
     }
 
-    /// Calls recorded for one request path.
+    /// Calls recorded for one request path. A key with a `*` matches the
+    /// way a registration does, so a test can count the calls to a path that
+    /// carries a runtime id.
     pub fn calls_for(&self, path: &str) -> Vec<ProviderCall> {
         self.state
             .lock()
             .unwrap()
             .calls
             .iter()
-            .filter(|call| call.path == path)
+            .filter(|call| call.path == path || prefix_matches(path, &call.path))
             .cloned()
             .collect()
     }

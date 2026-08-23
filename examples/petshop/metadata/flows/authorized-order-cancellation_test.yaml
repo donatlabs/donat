@@ -1,0 +1,38 @@
+# The cancellation module runs on the order the checkout module just created:
+# it voids the authorization at the provider and finalizes the cancellation.
+tests:
+  - name: a shopper cancels an authorized order and the process voids the payment
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/payment-authorizations/*/voids:
+            provider_event_id: evt_petshop_void_1
+            void_id: void_petshop_1
+            provider_reference: ref_petshop_1
+            status: voided
+            normalized_payload: { gateway: mock, voided: true }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440910") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - graphql: |
+          mutation {
+            request_authorized_order_cancellation(
+              order_id: "${order_id}", reason: "changed mind",
+              request_id: "550e8400-e29b-41d4-a716-446655440911"
+            ) { order_id }
+          }
+      # The cancellation process reports the order it cancelled.
+      - await:
+          terminal: authorized_order_cancellation
+          expect: { order_id: "${order_id}" }
+      - sql: SELECT count(*) FROM payment WHERE order_id = '${order_id}' AND status = 'voided'
+        expect: [{ count: 1 }]
+      - calls: { path: /v1/payment-authorizations/*/voids, count: 1 }

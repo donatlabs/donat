@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::json;
 
+use std::collections::BTreeMap;
+
 use super::*;
+use crate::model::substitute;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -308,4 +311,24 @@ fn subset_matchers_any_and_present() {
 fn subset_numbers_coerce_like_fixtures() {
     assert!(subset_matches(&json!(1), &json!(1.0)));
     assert!(!subset_matches(&json!("1"), &json!(1)));
+}
+
+// ---------------------------------------------------- substitute
+
+#[test]
+fn a_whole_string_reference_keeps_the_captured_type() {
+    let vars = BTreeMap::from([
+        ("amount".to_string(), json!(2659)),
+        ("id".to_string(), json!("abc")),
+    ]);
+    assert_eq!(
+        substitute(&json!({"amount_minor": "${amount}"}), &vars).unwrap(),
+        json!({"amount_minor": 2659})
+    );
+    assert_eq!(
+        substitute(&json!("order ${id} for ${amount}"), &vars).unwrap(),
+        json!("order abc for 2659")
+    );
+    assert!(substitute(&json!("${missing}"), &vars).is_err());
+    assert!(substitute(&json!("x ${missing}"), &vars).is_err());
 }
