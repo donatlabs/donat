@@ -34,6 +34,8 @@
 //! is worse than none: it tells a reviewer a bound was considered and declined
 //! on a permission where one is in fact present.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::{BoolExp, Metadata, PermissionEntry, QualifiedTable};
@@ -263,24 +265,45 @@ fn table_name(table: &QualifiedTable) -> String {
 /// its write permissions say — which is what makes an unbounded `check: {}`
 /// there reachable only through a command step.
 ///
-/// Inheritance is read in the widening direction and nowhere else: a role that
-/// inherits from one holding a select permission is exposed too. Read this way
-/// the answer can be wrong only by claiming a root exists where none does,
-/// which refuses a declaration that would have been fine rather than accepting
-/// one that would not.
+/// Inheritance is walked the whole way, with a visited set, because that is what
+/// the runtime does: `Planner::role_select_perms_from` recurses through each
+/// parent's own parents, so `A -> B -> C` gives `A` the table when only `C`
+/// declares the select. Stopping at one hop answered "no root" for a role that
+/// has one — and that is the one direction this analysis must never be wrong
+/// in, because it *accepts* a false `unbounded: command` instead of refusing a
+/// true one.
 fn generic_roots_reach(metadata: &Metadata, table: &crate::types::TableEntry, role: &str) -> bool {
-    let has_select = |role: &str| {
-        table
+    fn walk(
+        metadata: &Metadata,
+        table: &crate::types::TableEntry,
+        role: &str,
+        visiting: &mut BTreeSet<String>,
+    ) -> bool {
+        if table
             .select_permissions
             .iter()
             .any(|entry| entry.role == role)
-    };
-    has_select(role)
-        || metadata
+        {
+            return true;
+        }
+        // A cycle in the declaration is somebody else's error to report; here
+        // it just must not loop.
+        if !visiting.insert(role.to_owned()) {
+            return false;
+        }
+        metadata
             .inherited_roles
             .iter()
             .find(|inherited| inherited.role_name == role)
-            .is_some_and(|inherited| inherited.role_set.iter().any(|parent| has_select(parent)))
+            .is_some_and(|inherited| {
+                inherited
+                    .role_set
+                    .iter()
+                    .any(|parent| walk(metadata, table, parent, visiting))
+            })
+    }
+
+    walk(metadata, table, role, &mut BTreeSet::new())
 }
 
 /// Every bounds rule that can be decided from metadata alone.

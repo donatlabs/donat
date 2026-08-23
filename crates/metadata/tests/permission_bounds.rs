@@ -334,3 +334,69 @@ sources:
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("generic roots reach"), "{found:?}");
 }
+
+#[test]
+fn an_inherited_select_counts_however_many_hops_away_it_is() {
+    // The runtime walks the whole chain, so `A -> B -> C` gives `A` the table
+    // when only `C` declares the select — and with it an insert root. A check
+    // that stopped at one hop answered "no generic root" for a role that has
+    // one, and accepted a `command` claim nothing in a command bounds.
+    let yaml = r#"
+version: 3
+permissions:
+  unbounded_permissions: declared
+inherited_roles:
+  - role_name: vip_customer
+    role_set: [member]
+  - role_name: member
+    role_set: [customer]
+sources:
+  - name: default
+    kind: postgres
+    configuration:
+      connection_info:
+        database_url:
+          from_env: DONAT_GRAPHQL_DATABASE_URL
+    tables:
+      - table: {schema: public, name: booking_event}
+        select_permissions:
+          - role: customer
+            permission: {columns: "*", filter: {}, unbounded: catalogue}
+        insert_permissions:
+          - role: vip_customer
+            permission: {columns: "*", check: {}, unbounded: command}
+"#;
+    let found = errors(yaml);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("generic roots reach"), "{found:?}");
+    assert!(found[0].contains("vip_customer"), "{found:?}");
+}
+
+#[test]
+fn a_cycle_in_inherited_roles_does_not_hang_the_check() {
+    let yaml = r#"
+version: 3
+permissions:
+  unbounded_permissions: declared
+inherited_roles:
+  - role_name: a
+    role_set: [b]
+  - role_name: b
+    role_set: [a]
+sources:
+  - name: default
+    kind: postgres
+    configuration:
+      connection_info:
+        database_url:
+          from_env: DONAT_GRAPHQL_DATABASE_URL
+    tables:
+      - table: {schema: public, name: booking_event}
+        insert_permissions:
+          - role: a
+            permission: {columns: "*", check: {}, unbounded: command}
+"#;
+    // Nobody declares the select, so no generic root reaches it and the claim
+    // stands; the point of the case is that the walk terminates.
+    assert!(errors(yaml).is_empty());
+}
