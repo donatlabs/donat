@@ -1,0 +1,101 @@
+# The whole return module: the shopper requests a return of a delivered line,
+# support approves it, the carrier issues a return label, the warehouse
+# receives and inspects it, and the provider refunds exactly the inspected
+# amount. Three verified human signals drive one durable process.
+tests:
+  - name: a returned line is approved, received, inspected and refunded
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/returns/*/labels:
+            provider_event_id: evt_petshop_return_label_1
+            return_id: $request:/return_key
+            tracking_number: RETURN-TRACK-1
+            label_url: https://carrier.example/returns/petshop-1.pdf
+            status: created
+            normalized_payload: { carrier: mock, label: true }
+          /v1/payment-authorizations/*/refunds:
+            provider_event_id: evt_petshop_refund_1
+            refund_id: refund_petshop_1
+            provider_reference: ref_petshop_1
+            status: refunded
+            normalized_payload: { gateway: mock, refunded: true }
+      # Carry one seeded cart all the way to a captured payment: checkout,
+      # then the fulfilment module.
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440960") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440961"
+            ) { order_id }
+          }
+      - await: { terminal: partial_fulfilment }
+      - sql: SELECT id, line_subtotal_minor::bigint FROM order_line WHERE order_id = '${order_id}'
+        capture: { order_line_id: id, refund_amount_minor: line_subtotal_minor }
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_return(
+              order_id: "${order_id}",
+              lines: [{ order_line_id: "${order_line_id}", requested_quantity: 1 }],
+              reason: "wrong size", replacement_requested: false,
+              request_id: "550e8400-e29b-41d4-a716-446655440970"
+            ) { order_id }
+          }
+      - await: { receptive: return_refund, state: await_support_decision }
+      # The process opened one return request with one item.
+      - sql: |
+          SELECT return_request.id AS return_id, return_item.id AS return_item_id
+          FROM return_request
+          JOIN return_item ON return_item.return_request_id = return_request.id
+        expect: [{ return_id: "@present", return_item_id: "@present" }]
+        capture: { return_id: return_id, return_item_id: return_item_id }
+      - as: { role: support, user: support-1 }
+      - graphql: |
+          mutation {
+            approve_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", approved_quantity: 1 }],
+              decision_id: "550e8400-e29b-41d4-a716-446655440971", note: "approved"
+            ) { return_id status }
+          }
+      - await: { receptive: return_refund, state: await_warehouse_receipt }
+      - as: { role: fulfilment, user: warehouse-1 }
+      - graphql: |
+          mutation {
+            receive_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", received_quantity: 1 }],
+              receipt_id: "550e8400-e29b-41d4-a716-446655440972", received_at: "2030-01-02T00:00:00Z"
+            ) { return_id status }
+          }
+      - await: { receptive: return_refund, state: await_inspection }
+      - graphql: |
+          mutation {
+            record_return_inspection(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", inspected_quantity: 1 }],
+              inspection: accepted, refund_amount_minor: ${refund_amount_minor},
+              inspection_id: "550e8400-e29b-41d4-a716-446655440973", note: "as described"
+            ) { return_id status }
+          }
+      # The refund is exactly the inspected amount, never the order total, and
+      # the carrier return label is published to the shopper.
+      - await:
+          terminal: return_refund
+          expect:
+            status: refunded
+            refund_amount_minor: ${refund_amount_minor}
+            tracking_number: RETURN-TRACK-1

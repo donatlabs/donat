@@ -1,0 +1,41 @@
+# A prescription line is held until a veterinary reviewer decides; the
+# reviewer's verified decision releases it.
+tests:
+  - name: a reviewer approves a prescription and the process releases the line
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440930") { cart_id }
+          }
+      - await: { terminal: checkout_payment }
+      - sql: SELECT id FROM order_line LIMIT 1
+        capture: { order_line_id: id }
+      - graphql: |
+          mutation {
+            start_prescription_review(
+              order_line_id: "${order_line_id}", review_deadline: "2030-01-01T00:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440931"
+            ) { order_line_id }
+          }
+      # The prescription process submits its review before anyone can decide.
+      - await:
+          row: prescription_request
+          capture: { prescription_id: id }
+      - await: { receptive: prescription_review, state: await_veterinary_decision }
+      - as: { role: veterinary_reviewer, user: veterinarian-1 }
+      - graphql: |
+          mutation {
+            approve_prescription(
+              prescription_id: "${prescription_id}", decision_id: "550e8400-e29b-41d4-a716-446655440932",
+              review_note: "ok"
+            ) { prescription_id }
+          }
+      # The reviewer's decision released the line.
+      - await:
+          terminal: prescription_review
+          expect: { status: approved }

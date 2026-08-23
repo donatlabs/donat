@@ -41,7 +41,17 @@ pub struct TestCase {
 }
 
 /// The kinds of step, each named by the key that identifies it.
-const STEP_KEYS: &[&str] = &["url", "sql", "as", "graphql", "providers", "await", "calls"];
+const STEP_KEYS: &[&str] = &[
+    "url",
+    "sql",
+    "as",
+    "graphql",
+    "providers",
+    "hold",
+    "release",
+    "await",
+    "calls",
+];
 
 #[derive(Debug)]
 pub enum Step {
@@ -68,6 +78,11 @@ pub enum Step {
     Await(AwaitStep),
     /// What the provider stub recorded for a path.
     Calls(CallsStep),
+    /// Hold every request to a provider path unanswered until `release`, so
+    /// a test can act while the engine is mid-call.
+    Hold(String),
+    /// Answer the requests held on a path, with whatever `providers` now says.
+    Release(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +197,13 @@ pub enum Await {
         #[serde(default)]
         capture: BTreeMap<String, String>,
     },
+    /// A process's wait becoming receptive to a signal. Signals are never
+    /// buffered: one sent before the wait's timer event exists is audited as
+    /// unexpected rather than matched late, so a test that sends one waits
+    /// for the timer, not merely for the state name.
+    Receptive { receptive: String, state: String },
+    /// The engine's request to a held provider path arriving.
+    Held { held: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +264,20 @@ impl Step {
             }
             let w: Wrapper = serde_json::from_value(raw)?;
             return Ok(Step::Providers(w.providers));
+        }
+        if has("hold") || has("release") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Wrapper {
+                hold: Option<String>,
+                release: Option<String>,
+            }
+            let w: Wrapper = serde_json::from_value(raw)?;
+            return match (w.hold, w.release) {
+                (Some(path), None) => Ok(Step::Hold(path)),
+                (None, Some(path)) => Ok(Step::Release(path)),
+                _ => Err(anyhow!("a step is either `hold` or `release`")),
+            };
         }
         if has("await") {
             return Ok(Step::Await(serde_json::from_value(raw)?));

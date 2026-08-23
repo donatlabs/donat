@@ -258,7 +258,27 @@ impl CaseContext {
                     capture,
                 } => self.await_terminal(terminal, expect.as_ref(), capture),
                 Await::Row { row, capture } => self.await_row(row, capture),
+                Await::Receptive { receptive, state } => self.await_receptive(receptive, state),
+                Await::Held { held } => {
+                    if self.stand.providers().await_held(held, AWAIT_DEADLINE) {
+                        Ok(())
+                    } else {
+                        let mut client = self.stand.pg()?;
+                        Err(anyhow!(
+                            "no request to {held} was held: {}",
+                            process_diagnostics(&mut client, &self.source)
+                        ))
+                    }
+                }
             },
+            Step::Hold(path) => {
+                self.stand.providers().hold(&path);
+                Ok(())
+            }
+            Step::Release(path) => {
+                self.stand.providers().release(&path);
+                Ok(())
+            }
             Step::Calls(step) => self.calls(&step.calls),
         }
     }
@@ -454,6 +474,42 @@ impl CaseContext {
             .map(|(name, column)| (name.clone(), format!("/{column}")))
             .collect();
         self.capture(&pointers, &row, &format!("the first {table} row"))
+    }
+
+    fn await_receptive(&mut self, process: &str, state: &str) -> Result<()> {
+        let mut client = self.stand.pg()?;
+        let deadline = Instant::now() + AWAIT_DEADLINE;
+        loop {
+            let receptive: bool = client
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1
+                         FROM donat.process_events event
+                         JOIN donat.process_instances instance
+                           ON instance.source_name = event.source_name
+                          AND instance.id = event.instance_id
+                         WHERE event.source_name = $1
+                           AND event.kind = 'timer'
+                           AND event.status = 'pending'
+                           AND event.payload_json ->> 'wait_state' = $3
+                           AND instance.process_name = $2
+                           AND instance.current_state = $3
+                     )",
+                    &[&self.source, &process, &state],
+                )
+                .context("polling donat.process_events")?
+                .get(0);
+            if receptive {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "process '{process}' never became receptive in '{state}': {}",
+                    process_diagnostics(&mut client, &self.source)
+                ));
+            }
+            std::thread::sleep(AWAIT_POLL);
+        }
     }
 
     fn await_terminal(

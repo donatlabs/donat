@@ -1,0 +1,60 @@
+# A shopper cancels while the checkout process is mid-authorization. The
+# cancellation claim commits first; the authorization attempt then fails the
+# only way it still can, and the cancellation process proves through the
+# provider's lookup that no authorization ever existed — so nothing is voided
+# and the reserved stock is released.
+tests:
+  - name: a shopper cancels a pending checkout and the process proves no authorization
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          # The provider proving it never carried out the mutation it was asked
+          # about. The lookup contract is non-null throughout, so an absence
+          # still answers every declared field.
+          /v1/payment-operation-lookups:
+            found: false
+            terminal_absence_proven: true
+            provider_event_id: evt_petshop_lookup_absent
+            provider_mutation_id: ""
+            provider_reference: ""
+            outcome: failed
+            amount_minor: 0
+            currency: USD
+            normalized_payload: { gateway: mock, found: false }
+      - hold: /v1/payment-authorizations
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440940") { cart_id }
+          }
+      # The checkout process reaches its authorization request and waits there.
+      - await: { held: /v1/payment-authorizations }
+      - sql: SELECT id FROM orders WHERE order_status = 'checkout_started'
+        capture: { order_id: id }
+      - graphql: |
+          mutation {
+            cancel_order(order_id: "${order_id}", request_id: "550e8400-e29b-41d4-a716-446655440941") {
+              order_id order_status
+            }
+          }
+      # The claim is committed. Let the authorization attempt finish the only
+      # way it now can: the provider is unavailable, the retries exhaust, and
+      # the checkout process falls through to its own reconciliation.
+      - providers:
+          /v1/payment-authorizations:
+            - { status: 503 }
+            - { status: 503 }
+            - { status: 503 }
+      - release: /v1/payment-authorizations
+      # The cancellation process cancelled the order without a void.
+      - await:
+          terminal: checkout_cancellation
+          expect: { status: cancelled }
+      # Proving the authorization absent releases the reserved stock.
+      - sql: SELECT count(*) > 0 AS released FROM inventory_reservation WHERE order_id = '${order_id}' AND status = 'released'
+        expect: [{ released: true }]
+      # An authorization that never committed is never voided.
+      - calls: { path: /v1/payment-authorizations/*/voids, count: 0 }

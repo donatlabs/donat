@@ -1,0 +1,42 @@
+# A B2B quote above the automatic-credit ceiling: the decision table routes it
+# to approver review, the process opens that review and parks, and the
+# approver's verified decision consumes the organization's credit.
+tests:
+  - name: a large quote is routed to an approver who consumes the credit
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO organization (currency, available_credit_minor)
+          VALUES ('USD', 100000) RETURNING id
+        capture: { organization_id: id }
+      - sql: |
+          INSERT INTO organization_membership (organization_id, user_id)
+          VALUES ('${organization_id}', 'customer-1');
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          -- Five units clear the automatic-credit ceiling, so the quote must
+          -- be routed to a human approver rather than consuming credit on its own.
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
+      - as: { role: b2b_buyer, user: customer-1 }
+      # The quote command answers with its approval.
+      - graphql: |
+          mutation {
+            submit_quote(
+              organization_id: "${organization_id}", cart_id: 1,
+              request_id: "550e8400-e29b-41d4-a716-446655440980"
+            ) { quote_id approval_id total_minor }
+          }
+        capture: { approval_id: /data/submit_quote/approval_id }
+      - await: { receptive: b2b_order_approval, state: await_approver }
+      - as: { role: b2b_approver, user: approver-1 }
+      - graphql: |
+          mutation {
+            approve_purchase(approval_id: "${approval_id}", request_id: "550e8400-e29b-41d4-a716-446655440981") {
+              approval_id approval_status
+            }
+          }
+      - await:
+          terminal: b2b_order_approval
+          expect: { approval_status: approved }
+      # Approving the quote moves exactly its total out of available credit.
+      - sql: SELECT available_credit_minor, consumed_credit_minor FROM organization WHERE id = '${organization_id}'
+        expect: [{ available_credit_minor: 87505, consumed_credit_minor: 12495 }]
