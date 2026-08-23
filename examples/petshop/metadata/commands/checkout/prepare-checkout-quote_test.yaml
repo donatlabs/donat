@@ -1,0 +1,17 @@
+# A quote's discount never exceeds its subtotal. The command computes the
+# discount, but the bound is the schema's, so no later writer can break it.
+tests:
+  - name: the schema refuses a discount above the subtotal
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - sql: |
+          INSERT INTO checkout_quote (
+            cart_id, customer_id, price_list_code, discount_bps,
+            shipping_service_code, subtotal_minor, discount_minor,
+            shipping_minor, taxable_minor, currency,
+            destination_country_code, status
+          ) VALUES (
+            1, 'customer-1', 'retail', 5000, 'ground',
+            1000, 1001, 0, 0, 'USD', 'US', 'awaiting_tax'
+          )
+        error: check_violation

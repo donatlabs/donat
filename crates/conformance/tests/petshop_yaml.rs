@@ -74,7 +74,15 @@ macro_rules! yaml_files {
 }
 
 yaml_files! {
+    tables => "databases/default/tables/tables_test.yaml",
     public_cart => "databases/default/tables/public_cart_test.yaml",
+    public_cart_line => "databases/default/tables/public_cart_line_test.yaml",
+    public_inventory_stock => "databases/default/tables/public_inventory_stock_test.yaml",
+    public_order_line => "databases/default/tables/public_order_line_test.yaml",
+    public_orders => "databases/default/tables/public_orders_test.yaml",
+    public_product => "databases/default/tables/public_product_test.yaml",
+    public_product_variant => "databases/default/tables/public_product_variant_test.yaml",
+    prepare_checkout_quote => "commands/checkout/prepare-checkout-quote_test.yaml",
 }
 
 #[test]

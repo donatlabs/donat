@@ -9,7 +9,7 @@ use serde_json::Value as Json;
 
 use crate::config::AppTestConfig;
 use crate::fixture::load_fixture;
-use crate::matching::{response_matches, strip_mcp_content};
+use crate::matching::{response_matches, strip_mcp_content, subset_matches};
 use crate::model::{SqlStep, Step, TestCase, TestFile};
 use crate::stand::{Stand, StandConfig};
 
@@ -202,9 +202,58 @@ impl CaseContext {
 
     fn sql(&mut self, step: &SqlStep) -> Result<()> {
         let mut client = self.stand.pg()?;
-        client
-            .batch_execute(&step.sql)
-            .with_context(|| format!("executing:\n{}", step.sql))?;
+        if step.expect.is_some() && step.error.is_some() {
+            return Err(anyhow!(
+                "a sql step has either `expect` or `error`, not both"
+            ));
+        }
+        if let Some(class) = step.error {
+            return match client.batch_execute(&step.sql) {
+                Ok(()) => Err(anyhow!(
+                    "expected {class:?}, but the statement succeeded:\n{}",
+                    step.sql
+                )),
+                Err(error) => {
+                    let got = error.code().map(|c| c.code().to_string());
+                    if got.as_deref() == Some(class.sqlstate()) {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "expected {class:?} (SQLSTATE {}), got {}: {error}",
+                            class.sqlstate(),
+                            got.as_deref().unwrap_or("no SQLSTATE")
+                        ))
+                    }
+                }
+            };
+        }
+        let Some(expected) = &step.expect else {
+            client
+                .batch_execute(&step.sql)
+                .with_context(|| format!("executing:\n{}", step.sql))?;
+            return Ok(());
+        };
+        // Postgres renders each row as JSON, so a test compares values the
+        // way the API would show them rather than through a type mapping here.
+        let wrapped = format!(
+            "select to_jsonb(donat_test_row) from ({}) donat_test_row",
+            step.sql.trim().trim_end_matches(';')
+        );
+        let rows = client
+            .query(&wrapped, &[])
+            .with_context(|| format!("executing:\n{}", step.sql))?
+            .into_iter()
+            .map(|row| row.get::<_, Json>(0))
+            .collect::<Vec<_>>();
+        let actual = Json::Array(rows);
+        if !subset_matches(&Json::Array(expected.clone()), &actual) {
+            return Err(anyhow!(
+                "rows mismatch for:\n{}\nexpected:\n{}\nactual:\n{}",
+                step.sql,
+                pretty(&Json::Array(expected.clone())),
+                pretty(&actual)
+            ));
+        }
         Ok(())
     }
 

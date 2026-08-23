@@ -1,0 +1,8 @@
+# A cart line's quantity is bounded by the schema, not by a role: every
+# writer is held to it.
+tests:
+  - name: the schema refuses a non-positive quantity
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - sql: INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 1, -1)
+        error: check_violation

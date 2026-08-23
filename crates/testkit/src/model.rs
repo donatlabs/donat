@@ -41,8 +41,8 @@ pub enum Step {
     /// `status` (200), `headers`, `query` | `body`, `response` |
     /// `allowed_responses`. The response is compared exactly, as a fixture is.
     Http(Json),
-    /// SQL on the stand database. Without `expect` it is a seed that must
-    /// succeed.
+    /// SQL on the stand database. Without `expect` or `error` it is a seed
+    /// that must succeed.
     Sql(SqlStep),
 }
 
@@ -50,6 +50,36 @@ pub enum Step {
 #[serde(deny_unknown_fields)]
 pub struct SqlStep {
     pub sql: String,
+    /// The rows the statement returns, as JSON objects keyed by column,
+    /// compared with `subset_matches`: list the columns that matter, and
+    /// exactly as many rows as there are.
+    #[serde(default)]
+    pub expect: Option<Vec<Json>>,
+    /// The statement must fail with this error class.
+    #[serde(default)]
+    pub error: Option<SqlError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlError {
+    CheckViolation,
+    UniqueViolation,
+    ForeignKeyViolation,
+    NotNullViolation,
+    RaiseException,
+}
+
+impl SqlError {
+    pub fn sqlstate(self) -> &'static str {
+        match self {
+            SqlError::CheckViolation => "23514",
+            SqlError::UniqueViolation => "23505",
+            SqlError::ForeignKeyViolation => "23503",
+            SqlError::NotNullViolation => "23502",
+            SqlError::RaiseException => "P0001",
+        }
+    }
 }
 
 impl Step {

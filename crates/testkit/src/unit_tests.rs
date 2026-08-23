@@ -269,3 +269,43 @@ fn sel_tree_covers_operations_and_marks_leaves() {
     // Leaf fields carry no sub-tree.
     assert!(child.get("affected_rows").unwrap().is_none());
 }
+
+// ---------------------------------------------------- subset_matches
+
+#[test]
+fn subset_ignores_keys_the_expectation_does_not_mention() {
+    assert!(subset_matches(&json!({"a": 1}), &json!({"a": 1, "b": 2})));
+    assert!(!subset_matches(&json!({"a": 1, "b": 2}), &json!({"a": 1})));
+    assert!(!subset_matches(&json!({"a": 1}), &json!({"a": 2})));
+}
+
+#[test]
+fn subset_arrays_are_a_claim_about_length() {
+    assert!(subset_matches(
+        &json!([{"a": 1}]),
+        &json!([{"a": 1, "b": 2}])
+    ));
+    assert!(!subset_matches(&json!([]), &json!([1])));
+    assert!(!subset_matches(&json!([1]), &json!([1, 1])));
+}
+
+#[test]
+fn subset_matchers_any_and_present() {
+    assert!(subset_matches(&json!({"id": "@any"}), &json!({"id": null})));
+    assert!(!subset_matches(
+        &json!({"id": "@present"}),
+        &json!({"id": null})
+    ));
+    assert!(subset_matches(
+        &json!({"id": "@present"}),
+        &json!({"id": 7})
+    ));
+    assert!(!subset_matches(&json!({"id": "@present"}), &json!({})));
+    assert!(!subset_matches(&json!({"id": "@any"}), &json!({})));
+}
+
+#[test]
+fn subset_numbers_coerce_like_fixtures() {
+    assert!(subset_matches(&json!(1), &json!(1.0)));
+    assert!(!subset_matches(&json!("1"), &json!(1)));
+}

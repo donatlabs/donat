@@ -1,0 +1,7 @@
+# Reservations never exceed what is on hand; the constraint holds under
+# concurrency where a command's read-then-write would not.
+tests:
+  - name: the schema refuses a reservation above on-hand stock
+    steps:
+      - sql: UPDATE inventory_stock SET reserved = on_hand + 1 WHERE variant_id = 1
+        error: check_violation

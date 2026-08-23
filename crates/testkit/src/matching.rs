@@ -143,3 +143,34 @@ pub fn strip_mcp_content(v: &Json) -> Json {
     }
     out
 }
+
+/// The comparison an application test's `expect` uses: the expected value
+/// lists what must hold, and says nothing about the rest.
+///
+/// - an object matches when every expected key is present and matches;
+///   keys the expectation does not mention are free;
+/// - an array matches element-wise and must have the same length — a list
+///   of one row is a claim about how many rows there are;
+/// - the string `"@any"` matches any value, null included;
+/// - the string `"@present"` matches any value except null;
+/// - numbers compare by value (`1 == 1.0`); everything else by equality.
+///
+/// Conformance fixtures keep the exact [`response_matches`]: they pin a
+/// contract byte for byte. An application test asserts a behaviour, and a
+/// column added tomorrow should not fail it.
+pub fn subset_matches(exp: &Json, act: &Json) -> bool {
+    match (exp, act) {
+        (Json::String(s), _) if s == "@any" => true,
+        (Json::String(s), _) if s == "@present" => !act.is_null(),
+        (Json::Object(e), Json::Object(a)) => e
+            .iter()
+            .all(|(k, ve)| a.get(k).is_some_and(|va| subset_matches(ve, va))),
+        (Json::Array(e), Json::Array(a)) => {
+            e.len() == a.len() && e.iter().zip(a).all(|(x, y)| subset_matches(x, y))
+        }
+        (Json::Number(e), Json::Number(a)) => {
+            e == a || (e.as_f64().zip(a.as_f64()).is_some_and(|(x, y)| x == y))
+        }
+        _ => exp == act,
+    }
+}

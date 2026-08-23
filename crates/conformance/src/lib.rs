@@ -3445,7 +3445,6 @@ mod tests {
             "mcp_tools",
             "migrate",
             "oidc_login",
-            "petshop",
             "petshop_process",
             "petshop_yaml",
             "process_activity",

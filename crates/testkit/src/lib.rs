@@ -26,7 +26,7 @@ pub mod stand;
 pub use config::AppTestConfig;
 pub use fixture::load_fixture;
 pub use matching::{
-    SelMap, json_matches, response_matches, sel_tree_from_query, strip_mcp_content,
+    SelMap, json_matches, response_matches, sel_tree_from_query, strip_mcp_content, subset_matches,
 };
 pub use migrations::apply_sql_migration_dir;
 pub use runner::{Report, RunConfig};
