@@ -156,6 +156,58 @@ enum Command {
     /// Deploy-time connector credential lifecycle (OAuth2).
     #[command(subcommand)]
     Connector(ConnectorCommand),
+    /// Derive the schema `tenancy.yaml` implies, instead of writing it.
+    #[command(subcommand)]
+    Tenancy(TenancyCommand),
+}
+
+/// The tenancy migration, derived.
+///
+/// `tenancy.yaml` is short and the migration under it is not, and every line
+/// of it follows from the declaration plus the catalogue. Deriving it removes
+/// the class of mistake a hand-written one carries: a column scoped to a store
+/// while something keyed by it is still scoped to the deployment.
+///
+/// This writes a file; it does not apply one. The serving binary runs no DDL,
+/// and a schema change nobody read is the opposite of a deploy gate.
+#[derive(clap::Subcommand, Debug)]
+enum TenancyCommand {
+    /// Write the migration the declaration implies.
+    Plan(TenancyPlanArgs),
+    /// Report what differs, write nothing, exit non-zero if anything does.
+    Check(TenancyCheckArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct TenancyPlanArgs {
+    /// Metadata directory (defaults to --metadata-dir).
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    /// Metadata source (defaults to the only one).
+    #[arg(long)]
+    source: Option<String>,
+    /// Where to write the migration.
+    #[arg(long, default_value = "migrations")]
+    out: PathBuf,
+    /// The version stamp for the file name. Defaults to the current time.
+    #[arg(long)]
+    stamp: Option<String>,
+    /// The tenant every row already in the database belongs to. Required where
+    /// a tracked table is not empty, because the key cannot be `NOT NULL`
+    /// without one — which is what turning a single-tenant deployment into a
+    /// tenanted one always needs.
+    #[arg(long)]
+    backfill: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct TenancyCheckArgs {
+    /// Metadata directory (defaults to --metadata-dir).
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    /// Metadata source (defaults to the only one).
+    #[arg(long)]
+    source: Option<String>,
 }
 
 /// The OAuth2 credential lifecycle, and the reason it is a CLI.
@@ -684,6 +736,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Connector(command)) => {
             return run_connector_command(&args, command).await;
         }
+        Some(Command::Tenancy(command)) => {
+            return run_tenancy_command(&args, command).await;
+        }
         _ => {}
     }
 
@@ -1154,6 +1209,56 @@ async fn main() -> anyhow::Result<()> {
 /// directory that declares the instance, and the database of the source that
 /// holds its credentials. Both are resolved exactly as `validate` resolves
 /// them, so a deployment names its source once and every command agrees.
+/// Derive the tenancy migration, or report the difference.
+///
+/// Both need the same two things `validate` needs — a metadata directory and a
+/// database — and they are resolved the same way, so a deployment that can run
+/// `validate` can run these without learning new arguments.
+async fn run_tenancy_command(args: &Args, command: &TenancyCommand) -> anyhow::Result<()> {
+    let (metadata_dir, source, out, stamp, backfill) = match command {
+        TenancyCommand::Plan(plan) => (
+            plan.metadata_dir.clone(),
+            plan.source.clone(),
+            Some(plan.out.clone()),
+            plan.stamp.clone(),
+            plan.backfill.clone(),
+        ),
+        TenancyCommand::Check(check) => (
+            check.metadata_dir.clone(),
+            check.source.clone(),
+            None,
+            None,
+            None,
+        ),
+    };
+    let selected = resolve_validate_selection(
+        args,
+        &ValidateArgs {
+            metadata_dir,
+            source,
+        },
+        |name| std::env::var(name),
+    )?;
+
+    match out {
+        None => {
+            donat_server::tenancy_cli::check(&selected.metadata_dir, &selected.database_url).await
+        }
+        Some(out) => {
+            let stamp =
+                stamp.unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d%H%M%S").to_string());
+            donat_server::tenancy_cli::plan(
+                &selected.metadata_dir,
+                &selected.database_url,
+                &out,
+                &stamp,
+                backfill.as_deref(),
+            )
+            .await
+        }
+    }
+}
+
 async fn run_connector_command(args: &Args, command: &ConnectorCommand) -> anyhow::Result<()> {
     use donat_server::credentials::cli::{self, ConnectorTarget};
 

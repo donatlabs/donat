@@ -33,6 +33,7 @@ pub mod remote;
 pub mod rest;
 pub mod shutdown;
 pub mod state;
+pub mod tenancy_cli;
 pub mod transform;
 pub mod upstream;
 pub mod validate;
