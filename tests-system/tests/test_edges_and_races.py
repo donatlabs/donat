@@ -135,3 +135,37 @@ def test_an_order_waiting_on_a_provider_does_not_hold_up_another_shopper(
     assert d.payments_of(support, served["id"])[-1]["status"] == "authorized", (
         "the served order's money moved while another order was waiting"
     )
+
+
+# -- a race for the last checkout (from test_checkout_payment.py) --------------
+
+
+def test_two_racing_checkouts_of_one_cart_produce_one_order(
+    shopper, providers, well_stocked, settle_timeout
+):
+    """Two tabs, two distinct requests, one basket."""
+
+    cart_id = d.cart_with_one_line(shopper)
+    before = {order["id"] for order in d.orders_of(shopper)}
+    answers: list = []
+
+    def press_pay():
+        answers.append(d.start_checkout(shopper, cart_id))
+
+    racers = [threading.Thread(target=press_pay) for _ in range(2)]
+    for racer in racers:
+        racer.start()
+    for racer in racers:
+        racer.join()
+
+    accepted = [answer for answer in answers if not answer.errors]
+    assert accepted, f"at least one checkout is accepted: {answers}"
+
+    order = d.await_new_order(shopper, known=before, timeout=settle_timeout)
+    d.await_order_status(shopper, order["id"], {"authorized"}, timeout=settle_timeout)
+
+    fresh = [o for o in d.orders_of(shopper) if o["id"] not in before]
+    assert len(fresh) == 1, f"one cart, one order — got {fresh}"
+    assert len(providers.calls_about(P.AUTHORIZE, order_id=order["id"])) == 1, (
+        "and the card is charged once"
+    )
