@@ -1,0 +1,53 @@
+# The checkout module end to end: a shopper calls the entry-point command,
+# and the durable process carries the order the rest of the way — quote, tax,
+# checkout, provider authorization. The durable outcome is domain state, not
+# a process row: the order exists and its payment is authorized.
+tests:
+  - name: a shopper checks out and the process authorizes the order
+    steps:
+      - providers:
+          # The tax provider echoes the quote it was asked about: the process
+          # asserts the answer belongs to the checkout quote it sent.
+          /v1/tax-quotes:
+            tax_quote_id: tax_quote_petshop_1
+            checkout_quote_id: $request:/checkout_quote_id
+            tax_minor: 160
+            tax_code: US-STANDARD
+            currency: USD
+          /v1/payment-authorizations:
+            provider_event_id: evt_petshop_authorize_1
+            authorization_id: auth_petshop_1
+            provider_reference: ref_petshop_1
+            status: authorized
+            normalized_payload: { gateway: mock, captured: false }
+      # One open cart holding a single in-stock variant.
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      # The entry-point command answers its own admitted request.
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440900") {
+              cart_id
+              owner_user_id
+            }
+          }
+        expect:
+          data: { start_checkout: { cart_id: 1, owner_user_id: customer-1 } }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      - sql: |
+          SELECT count(*) FROM orders
+          JOIN payment ON payment.order_id = orders.id
+          WHERE orders.customer_id = 'customer-1' AND payment.status = 'authorized'
+        expect: [{ count: 1 }]
+      # Both providers were reached exactly once, with the compiled inputs,
+      # and the fixed-origin request carries its resolved credential.
+      - calls: { path: /v1/tax-quotes, count: 1 }
+      - calls:
+          path: /v1/payment-authorizations
+          count: 1
+          body: { currency: USD, amount_minor: "@present" }
+          headers: { authorization: petshop-test-payment }

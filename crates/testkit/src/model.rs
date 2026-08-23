@@ -2,19 +2,23 @@
 //!
 //! ```yaml
 //! tests:
-//!   - name: a customer creates a cart
+//!   - name: a shopper checks out and the process authorizes the order
 //!     steps:
-//!       - sql: insert into customer (id) values ('customer-1')
-//!       - url: /v1/graphql
-//!         headers: { X-Donat-Role: customer, X-Donat-User-Id: customer-1 }
-//!         query: { query: "mutation { insert_cart(objects: [{}]) { affected_rows } }" }
-//!         response: { data: { insert_cart: { affected_rows: 1 } } }
+//!       - providers:
+//!           /v1/payment-authorizations: { status: authorized, authorization_id: auth_1 }
+//!       - sql: insert into cart (customer_id) values ('customer-1')
+//!       - as: { role: customer, user: customer-1 }
+//!       - graphql: 'mutation { start_checkout(cart_id: 1, request_id: "…") { cart_id } }'
+//!         expect: { data: { start_checkout: { cart_id: 1 } } }
+//!       - await: { terminal: checkout_payment, expect: { payment_status: authorized } }
+//!       - calls: { path: /v1/payment-authorizations, count: 1 }
 //! ```
 //!
 //! A step is a mapping, and the key that names its kind is the one a reader
-//! would look for first: `url` is a request in the conformance fixture shape,
-//! `sql` is a statement on the stand database. The file is loaded through the
-//! fixture loader, so `!include` works here as it does in a fixture.
+//! would look for first. Steps are parsed one at a time, after `${name}`
+//! references to values captured by earlier steps are substituted, so the
+//! file is loaded through the fixture loader (`!include` works) and each
+//! step's shape is checked when it runs.
 
 use std::collections::BTreeMap;
 
@@ -32,8 +36,12 @@ pub struct TestFile {
 #[serde(deny_unknown_fields)]
 pub struct TestCase {
     pub name: String,
-    pub steps: Vec<Step>,
+    /// Raw steps; see [`Step::parse`].
+    pub steps: Vec<Json>,
 }
+
+/// The kinds of step, each named by the key that identifies it.
+const STEP_KEYS: &[&str] = &["url", "sql", "as", "graphql", "providers", "await", "calls"];
 
 #[derive(Debug)]
 pub enum Step {
@@ -44,6 +52,21 @@ pub enum Step {
     /// SQL on the stand database. Without `expect` or `error` it is a seed
     /// that must succeed.
     Sql(SqlStep),
+    /// The actor every later `graphql` step runs as.
+    As(AsStep),
+    /// A GraphQL operation as the current actor. `expect` is a subset match
+    /// over the whole response body; without it the response must carry no
+    /// `errors`.
+    Graphql(GraphqlStep),
+    /// Answers for the provider stub, by request path (`*` matches one
+    /// segment). A mapping is the default answer, `200` with that body; a
+    /// list is a queue of `{status, body}` answers consumed in order before
+    /// the default applies. Allowed at any point in a test.
+    Providers(BTreeMap<String, ProviderAnswer>),
+    /// Wait for durable state: a process reaching a terminal status.
+    Await(AwaitStep),
+    /// What the provider stub recorded for a path.
+    Calls(CallsStep),
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +81,9 @@ pub struct SqlStep {
     /// The statement must fail with this error class.
     #[serde(default)]
     pub error: Option<SqlError>,
+    /// Name → column of the first row, for `${name}` in later steps.
+    #[serde(default)]
+    pub capture: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -82,35 +108,188 @@ impl SqlError {
     }
 }
 
-impl Step {
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Step::Http(_) => "request",
-            Step::Sql(_) => "sql",
-        }
-    }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsStep {
+    #[serde(rename = "as")]
+    pub actor: Actor,
 }
 
-impl<'de> Deserialize<'de> for Step {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = BTreeMap::<String, Json>::deserialize(deserializer)?;
-        Step::from_map(raw).map_err(serde::de::Error::custom)
-    }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Actor {
+    pub role: String,
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphqlStep {
+    pub graphql: String,
+    #[serde(default)]
+    pub variables: Option<Json>,
+    #[serde(default)]
+    pub expect: Option<Json>,
+    /// Name → JSON pointer into the response body.
+    #[serde(default)]
+    pub capture: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ProviderAnswer {
+    Queue(Vec<ScriptedAnswer>),
+    Default(Json),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptedAnswer {
+    #[serde(default = "ok")]
+    pub status: u16,
+    #[serde(default)]
+    pub body: Json,
+}
+
+fn ok() -> u16 {
+    200
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwaitStep {
+    #[serde(rename = "await")]
+    pub what: Await,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Await {
+    /// A process (by name) whose instance reaches the `terminal` status;
+    /// `expect` and `capture` then apply to its terminal output.
+    pub terminal: String,
+    #[serde(default)]
+    pub expect: Option<Json>,
+    #[serde(default)]
+    pub capture: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallsStep {
+    pub calls: Calls,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Calls {
+    pub path: String,
+    /// How many calls the stub recorded for the path.
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// Which recorded call `body` and `headers` describe.
+    #[serde(default)]
+    pub index: usize,
+    /// Subset match over the call's JSON body.
+    #[serde(default)]
+    pub body: Option<Json>,
+    /// Header name (case-insensitive) → exact value.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 impl Step {
-    fn from_map(raw: BTreeMap<String, Json>) -> Result<Self> {
-        let keys = raw.keys().cloned().collect::<Vec<_>>();
-        let to_json = |raw: BTreeMap<String, Json>| Json::Object(raw.into_iter().collect());
-        if raw.contains_key("url") {
-            return Ok(Step::Http(to_json(raw)));
+    /// The key that names a step's kind, for a failure message.
+    pub fn kind_of(raw: &Json) -> &'static str {
+        raw.as_object()
+            .and_then(|m| STEP_KEYS.iter().find(|k| m.contains_key(**k)))
+            .copied()
+            .unwrap_or("step")
+    }
+
+    pub fn parse(raw: Json) -> Result<Self> {
+        let Some(map) = raw.as_object() else {
+            return Err(anyhow!("a step is a mapping"));
+        };
+        let has = |k: &str| map.contains_key(k);
+        if has("url") {
+            return Ok(Step::Http(raw));
         }
-        if raw.contains_key("sql") {
-            return Ok(Step::Sql(serde_json::from_value(to_json(raw))?));
+        if has("sql") {
+            return Ok(Step::Sql(serde_json::from_value(raw)?));
+        }
+        if has("as") {
+            return Ok(Step::As(serde_json::from_value(raw)?));
+        }
+        if has("graphql") {
+            return Ok(Step::Graphql(serde_json::from_value(raw)?));
+        }
+        if has("providers") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Wrapper {
+                providers: BTreeMap<String, ProviderAnswer>,
+            }
+            let w: Wrapper = serde_json::from_value(raw)?;
+            return Ok(Step::Providers(w.providers));
+        }
+        if has("await") {
+            return Ok(Step::Await(serde_json::from_value(raw)?));
+        }
+        if has("calls") {
+            return Ok(Step::Calls(serde_json::from_value(raw)?));
         }
         Err(anyhow!(
-            "a step needs one of `url`, `sql`; this one has keys [{}]",
-            keys.join(", ")
+            "a step needs one of {}; this one has keys [{}]",
+            STEP_KEYS
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            map.keys().cloned().collect::<Vec<_>>().join(", ")
         ))
     }
+}
+
+/// Replace `${name}` in every string of `value` with the captured value.
+/// A captured string is spliced as is; anything else as its JSON text.
+pub fn substitute(value: &Json, vars: &BTreeMap<String, Json>) -> Result<Json> {
+    Ok(match value {
+        Json::String(s) if s.contains("${") => Json::String(substitute_str(s, vars)?),
+        Json::Array(xs) => Json::Array(
+            xs.iter()
+                .map(|x| substitute(x, vars))
+                .collect::<Result<_>>()?,
+        ),
+        Json::Object(m) => Json::Object(
+            m.iter()
+                .map(|(k, v)| substitute(v, vars).map(|v| (k.clone(), v)))
+                .collect::<Result<_>>()?,
+        ),
+        other => other.clone(),
+    })
+}
+
+fn substitute_str(s: &str, vars: &BTreeMap<String, Json>) -> Result<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| anyhow!("unterminated `${{` in {s:?}"))?;
+        let name = &after[..end];
+        let value = vars
+            .get(name)
+            .ok_or_else(|| anyhow!("`${{{name}}}` was never captured"))?;
+        match value {
+            Json::String(v) => out.push_str(v),
+            other => out.push_str(&other.to_string()),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }

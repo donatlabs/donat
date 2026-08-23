@@ -83,6 +83,7 @@ yaml_files! {
     public_product => "databases/default/tables/public_product_test.yaml",
     public_product_variant => "databases/default/tables/public_product_variant_test.yaml",
     prepare_checkout_quote => "commands/checkout/prepare-checkout-quote_test.yaml",
+    checkout_payment => "flows/checkout-payment_test.yaml",
 }
 
 #[test]

@@ -10,7 +10,12 @@ use serde_json::Value as Json;
 use crate::config::AppTestConfig;
 use crate::fixture::load_fixture;
 use crate::matching::{response_matches, strip_mcp_content, subset_matches};
-use crate::model::{SqlStep, Step, TestCase, TestFile};
+use std::collections::BTreeMap;
+
+use crate::model::{
+    Actor, Await, Calls, GraphqlStep, ProviderAnswer, SqlStep, Step, TestCase, TestFile, substitute,
+};
+use crate::provider_stub::ScriptedResponse;
 use crate::stand::{Stand, StandConfig};
 
 pub const TEST_FILE_SUFFIX: &str = "_test.yaml";
@@ -202,13 +207,18 @@ fn run_case(app: &AppTestConfig, run: &RunConfig, file: &Path, case: &TestCase) 
             .collect(),
     })
     .context("booting the stand")?;
-    let mut cx = CaseContext { stand };
-    for (index, step) in case.steps.iter().enumerate() {
-        cx.run_step(step).with_context(|| {
+    let mut cx = CaseContext {
+        stand,
+        source: app.source.clone(),
+        actor: None,
+        vars: BTreeMap::new(),
+    };
+    for (index, raw) in case.steps.iter().enumerate() {
+        let kind = Step::kind_of(raw);
+        cx.run_step(raw).with_context(|| {
             format!(
-                "step {} {}; engine log: {}",
+                "step {} {kind}; engine log: {}",
                 index + 1,
-                step.kind(),
                 cx.stand.log_path().display()
             )
         })?;
@@ -216,16 +226,52 @@ fn run_case(app: &AppTestConfig, run: &RunConfig, file: &Path, case: &TestCase) 
     Ok(())
 }
 
+const AWAIT_DEADLINE: Duration = Duration::from_secs(60);
+const AWAIT_POLL: Duration = Duration::from_millis(50);
+
 struct CaseContext {
     stand: Stand,
+    source: String,
+    actor: Option<Actor>,
+    vars: BTreeMap<String, Json>,
 }
 
 impl CaseContext {
-    fn run_step(&mut self, step: &Step) -> Result<()> {
+    fn run_step(&mut self, raw: &Json) -> Result<()> {
+        let step = Step::parse(substitute(raw, &self.vars)?)?;
         match step {
-            Step::Http(conf) => self.http(conf),
-            Step::Sql(sql) => self.sql(sql),
+            Step::Http(conf) => self.http(&conf),
+            Step::Sql(sql) => self.sql(&sql),
+            Step::As(step) => {
+                self.actor = Some(step.actor);
+                Ok(())
+            }
+            Step::Graphql(step) => self.graphql(&step),
+            Step::Providers(answers) => {
+                self.providers(answers);
+                Ok(())
+            }
+            Step::Await(step) => self.await_terminal(&step.what),
+            Step::Calls(step) => self.calls(&step.calls),
         }
+    }
+
+    fn capture(
+        &mut self,
+        names: &BTreeMap<String, String>,
+        value: &Json,
+        what: &str,
+    ) -> Result<()> {
+        for (name, pointer) in names {
+            let found = value.pointer(pointer).ok_or_else(|| {
+                anyhow!(
+                    "capture `{name}`: no value at {pointer} in {what}:\n{}",
+                    pretty(value)
+                )
+            })?;
+            self.vars.insert(name.clone(), found.clone());
+        }
+        Ok(())
     }
 
     fn sql(&mut self, step: &SqlStep) -> Result<()> {
@@ -256,12 +302,12 @@ impl CaseContext {
                 }
             };
         }
-        let Some(expected) = &step.expect else {
+        if step.expect.is_none() && step.capture.is_empty() {
             client
                 .batch_execute(&step.sql)
                 .with_context(|| format!("executing:\n{}", step.sql))?;
             return Ok(());
-        };
+        }
         // Postgres renders each row as JSON, so a test compares values the
         // way the API would show them rather than through a type mapping here.
         let wrapped = format!(
@@ -275,13 +321,194 @@ impl CaseContext {
             .map(|row| row.get::<_, Json>(0))
             .collect::<Vec<_>>();
         let actual = Json::Array(rows);
-        if !subset_matches(&Json::Array(expected.clone()), &actual) {
+        if let Some(expected) = &step.expect
+            && !subset_matches(&Json::Array(expected.clone()), &actual)
+        {
             return Err(anyhow!(
                 "rows mismatch for:\n{}\nexpected:\n{}\nactual:\n{}",
                 step.sql,
                 pretty(&Json::Array(expected.clone())),
                 pretty(&actual)
             ));
+        }
+        if !step.capture.is_empty() {
+            let first = actual
+                .get(0)
+                .ok_or_else(|| {
+                    anyhow!("capture from a query that returned no rows:\n{}", step.sql)
+                })?
+                .clone();
+            let pointers = step
+                .capture
+                .iter()
+                .map(|(name, column)| (name.clone(), format!("/{column}")))
+                .collect();
+            self.capture(&pointers, &first, "the first row")?;
+        }
+        Ok(())
+    }
+
+    fn actor_headers(&self) -> Vec<(String, String)> {
+        let mut headers = Vec::new();
+        if let Some(actor) = &self.actor {
+            headers.push(("X-Donat-Role".to_string(), actor.role.clone()));
+            if let Some(user) = &actor.user {
+                headers.push(("X-Donat-User-Id".to_string(), user.clone()));
+            }
+        }
+        headers
+    }
+
+    fn graphql(&mut self, step: &GraphqlStep) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        body.insert("query".into(), Json::String(step.graphql.clone()));
+        if let Some(variables) = &step.variables {
+            body.insert("variables".into(), variables.clone());
+        }
+        let body = Json::Object(body);
+        let (code, resp) =
+            self.stand
+                .request("POST", "/v1/graphql", &self.actor_headers(), Some(&body))?;
+        if code != 200 {
+            return Err(anyhow!(
+                "status {code} for:\n{}\nresponse:\n{}",
+                step.graphql,
+                pretty(&resp)
+            ));
+        }
+        match &step.expect {
+            Some(expect) => {
+                if !subset_matches(expect, &resp) {
+                    return Err(anyhow!(
+                        "response mismatch for:\n{}\nexpected:\n{}\nactual:\n{}",
+                        step.graphql,
+                        pretty(expect),
+                        pretty(&resp)
+                    ));
+                }
+            }
+            None => {
+                if resp.get("errors").is_some() {
+                    return Err(anyhow!(
+                        "errors for:\n{}\nresponse:\n{}",
+                        step.graphql,
+                        pretty(&resp)
+                    ));
+                }
+            }
+        }
+        self.capture(&step.capture, &resp, "the response")
+    }
+
+    fn providers(&mut self, answers: BTreeMap<String, ProviderAnswer>) {
+        let stub = self.stand.providers();
+        for (path, answer) in answers {
+            match answer {
+                ProviderAnswer::Default(body) => {
+                    stub.set_default(&path, ScriptedResponse::ok(body))
+                }
+                ProviderAnswer::Queue(queue) => stub.script(
+                    &path,
+                    queue
+                        .into_iter()
+                        .map(|a| ScriptedResponse {
+                            status: a.status,
+                            body: a.body,
+                        })
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    fn await_terminal(&mut self, what: &Await) -> Result<()> {
+        let mut client = self.stand.pg()?;
+        let deadline = Instant::now() + AWAIT_DEADLINE;
+        let process = &what.terminal;
+        let output = loop {
+            let row = client
+                .query_opt(
+                    "SELECT status, terminal_output_json
+                     FROM donat.process_instances
+                     WHERE source_name = $1 AND process_name = $2",
+                    &[&self.source, process],
+                )
+                .context("polling donat.process_instances")?;
+            if let Some(row) = row {
+                let status: String = row.get(0);
+                if status != "running" {
+                    if status != "terminal" {
+                        return Err(anyhow!(
+                            "process '{process}' ended with status {status}: {}",
+                            process_diagnostics(&mut client, &self.source)
+                        ));
+                    }
+                    break row.get::<_, Option<Json>>(1).unwrap_or(Json::Null);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "process '{process}' never reached a terminal state: {}",
+                    process_diagnostics(&mut client, &self.source)
+                ));
+            }
+            std::thread::sleep(AWAIT_POLL);
+        };
+        if let Some(expect) = &what.expect
+            && !subset_matches(expect, &output)
+        {
+            return Err(anyhow!(
+                "terminal output of '{process}' mismatch\nexpected:\n{}\nactual:\n{}",
+                pretty(expect),
+                pretty(&output)
+            ));
+        }
+        self.capture(&what.capture, &output, "the terminal output")
+    }
+
+    fn calls(&mut self, calls: &Calls) -> Result<()> {
+        let recorded = self.stand.providers().calls_for(&calls.path);
+        if let Some(count) = calls.count
+            && recorded.len() != count
+        {
+            return Err(anyhow!(
+                "{} call(s) to {}, expected {count}",
+                recorded.len(),
+                calls.path
+            ));
+        }
+        if calls.body.is_none() && calls.headers.is_empty() {
+            return Ok(());
+        }
+        let call = recorded.get(calls.index).ok_or_else(|| {
+            anyhow!(
+                "no call #{} to {} ({} recorded)",
+                calls.index,
+                calls.path,
+                recorded.len()
+            )
+        })?;
+        if let Some(body) = &calls.body
+            && !subset_matches(body, &call.body)
+        {
+            return Err(anyhow!(
+                "call #{} to {}: body mismatch\nexpected:\n{}\nactual:\n{}",
+                calls.index,
+                calls.path,
+                pretty(body),
+                pretty(&call.body)
+            ));
+        }
+        for (name, value) in &calls.headers {
+            let got = call.header(name);
+            if got != Some(value.as_str()) {
+                return Err(anyhow!(
+                    "call #{} to {}: header {name} is {:?}, expected {value:?}",
+                    calls.index,
+                    calls.path,
+                    got
+                ));
+            }
         }
         Ok(())
     }
@@ -394,6 +621,61 @@ fn conf_headers(conf: &Json) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Durable evidence for a process that did not finish the way a test
+/// expects: instances, activity jobs, signals, fan-out items, stuck events.
+fn process_diagnostics(client: &mut postgres::Client, source: &str) -> String {
+    let mut report = String::new();
+    let mut section = |label: &str, sql: &str| {
+        if let Ok(rows) = client.query(sql, &[&source]) {
+            for row in rows {
+                report.push_str(label);
+                for (i, column) in row.columns().iter().enumerate() {
+                    let value: Option<String> = row.try_get(i).ok().flatten();
+                    report.push_str(&format!(
+                        " {}={}",
+                        column.name(),
+                        value.unwrap_or_else(|| "null".into())
+                    ));
+                }
+                report.push_str("; ");
+            }
+        }
+    };
+    section(
+        "instance",
+        "SELECT process_name::text, status::text, current_state::text,
+                terminal_output_json::text AS output
+         FROM donat.process_instances WHERE source_name = $1 ORDER BY created_at",
+    );
+    section(
+        "job",
+        "SELECT status::text, attempts::text, last_error_json::text AS error
+         FROM donat.process_activity_jobs WHERE source_name = $1 ORDER BY id",
+    );
+    section(
+        "signal",
+        "SELECT process_name::text, signal_name::text, status::text,
+                correlation_json::text AS correlate
+         FROM donat.process_signal_requests WHERE source_name = $1 ORDER BY id",
+    );
+    section(
+        "fanout",
+        "SELECT state_name::text, ordinal::text, status::text, failure_json::text AS failure
+         FROM donat.process_fanout_items WHERE source_name = $1 ORDER BY state_name, ordinal",
+    );
+    section(
+        "event",
+        "SELECT kind::text, status::text, attempts::text,
+                left(payload_json::text, 400) AS payload
+         FROM donat.process_events WHERE source_name = $1 AND status <> 'consumed' ORDER BY id",
+    );
+    if report.is_empty() {
+        "no durable process state recorded".into()
+    } else {
+        report
+    }
 }
 
 /// `postgres::Error` displays as "db error"; the message is in the payload.
