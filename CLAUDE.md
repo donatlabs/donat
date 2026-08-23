@@ -37,6 +37,7 @@ conformance harness (`crates/conformance`).
 | Conformance suite | `make conformance` (or `cargo test -p donat-conformance [--test <module>]`) |
 | Review snapshot changes | `cargo insta review` |
 | Format and lint gates (CI blocks on both) | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
+| What the change gate will ask this branch to declare | `make gate` (`GATE_BASE=<target branch>`, `GATE_BODY=<file holding the PR description>`) |
 | Inspect one Process instance | `donat process inspect --source <name> --instance <uuid>` (read-only) |
 | Check one instance's history | `donat process verify-history --source <name> --instance <uuid>` (read-only, non-zero exit on inconsistency) |
 | Authorize an OAuth2 connector instance | `donat connector authorize --source <name> --instance <name>` (deploy-time only; needs `DONAT_CREDENTIAL_KEY`) |
@@ -86,8 +87,12 @@ serve the login itself (`DONAT_OIDC` → `/auth/login`, `/auth/callback`), which
 stores no users and issues no tokens: it carries a token from the provider that
 issued it to the cookie this engine verifies. Any diff that re-introduces an
 admin role, a shared secret, a permission bypass, or a header that grants a
-role must be rejected. Configuration is deploy-time: `migrate` (DDL) + YAML
-metadata at boot.
+role must be rejected. The change gate (`make gate`, CI job `change-gate`)
+rejects the retired names mechanically — `ADMIN_ROLE`,
+`DONAT_GRAPHQL_ADMIN_SECRET`, `X-Donat-Admin-Secret` in engine sources,
+`run_sql` in `crates/server/src` — so engine code does not spell them even in
+a comment. Configuration is deploy-time: `migrate` (DDL) + YAML metadata at
+boot.
 
 ## BLOCKING RULE: Knowledgebase First
 
@@ -105,6 +110,42 @@ test evidence and the required suite verification. Run one independent code
 review for the complete, cohesive feature range before it is merged, handed
 off, or declared ready. Address material findings with a regression test and
 fresh verification before completion.
+
+Every material finding lands on the lowest rung that can hold it, and the pull
+request says which: a test or fixture first; then a mechanical gate
+(`scripts/check_*.py`, clippy, CI); then a skill in `plugins/donat/skills`;
+then an ADR. A lesson that only becomes a sentence in a document is read by
+whoever reads it, and the mistake is made again. The model does not learn
+between sessions — the repository does, and only on the rungs that refuse.
+
+## When CI Is Red
+
+Classify before touching anything:
+
+- **Flake** — failed with no code change, or passes on rerun. Record the test;
+  change neither code nor timeout. Conformance tests that wait on time
+  (`sleep` in `event_triggers`, `file_attachments`, `petshop_process`) are the
+  usual source. A flake seen twice is a task about the *wait* — wait on the
+  event, not on the clock — never a bigger `sleep`.
+- **Regression** — fails deterministically after a change. The TDD loop.
+- **Infrastructure** — container, registry, runner. Rerun; nothing to fix here.
+
+Three attempts on one failure, then stop and write down what was tried and why
+it did not work. A fourth attempt that nobody asked for is how a wrong fix
+gets merged.
+
+Never a way to make CI green: `cargo insta accept` without reading every diff,
+editing an existing fixture to match the engine, raising a `sleep`,
+`#[ignore]`, deleting the test, excusing an advisory. Each is occasionally the
+right change, so the change gate does not forbid them — it asks for the reason
+in the pull request description, one line per kind, `gate:<kind> <reason>`.
+`make gate` prints the lines it is missing. A new fixture or snapshot is free;
+rewriting an existing one is what needs a reason.
+
+A change under `plugins/donat/skills/` names its paired `make evals-compare
+BEFORE=<arm> AFTER=<arm>` result (DonatBench, `evals/`), or says why the edit
+needs no measurement. A skill with a wrong rule in it makes every later agent worse and
+never cleans itself up.
 
 ## Essential Rules
 
