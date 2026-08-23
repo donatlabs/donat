@@ -16,6 +16,26 @@ create schema if not exists notification;
 
 create extension if not exists pgcrypto;
 
+-- The channels this deployment delivers on.
+--
+-- A table rather than a `check (channel in (…))`, because a channel is exactly
+-- the thing an adopting deployment adds. Telegram, SMS or a chat webhook is one
+-- insert in the application's own migration plus a send state; a CHECK would
+-- have made it an edit to this file, which is a fork of the module.
+--
+-- The two shipped rows are the two the module's delivery Process knows how to
+-- send on. A row on its own delivers nothing: it makes the channel nameable, so
+-- an opt-out, a delivery row and an address can refer to it.
+create table if not exists notification.channel (
+    name        text primary key,
+    description text not null default ''
+);
+
+insert into notification.channel (name, description) values
+    ('in_app', 'The recipient''s own feed, read through notification.inbox.'),
+    ('email',  'A message posted to the deployment''s mail relay.')
+on conflict (name) do nothing;
+
 -- One row per triggered notification: the workflow that fired, who it is for,
 -- and the data every channel renders from.
 create table if not exists notification.dispatch (
@@ -88,8 +108,7 @@ create table if not exists notification.delivery (
     claim_id            uuid,
     recorded_at         timestamptz not null default now(),
     unique (dispatch_id, channel),
-    constraint delivery_channel_is_known
-        check (channel in ('in_app', 'email')),
+    foreign key (channel) references notification.channel (name),
     constraint delivery_status_is_known
         check (status in ('sent', 'sending', 'suppressed', 'skipped',
                           'deferred', 'failed', 'unknown'))
@@ -110,40 +129,53 @@ create table if not exists notification.preference (
     enabled      boolean not null default true,
     updated_at   timestamptz not null default now(),
     primary key (recipient_id, workflow, channel),
-    constraint preference_channel_is_known
-        check (channel in ('in_app', 'email'))
+    foreign key (channel) references notification.channel (name)
 );
 
--- The recipient contract, and the one thing an adopting application must
--- supply. The module ships the *shape* and no rows; the application replaces
--- the body with a view over whatever table already holds its users:
+-- The recipient contract: who a person is, and where each channel reaches them.
+--
+-- Two views rather than one, and the split is what makes a channel addable. The
+-- person's own facts — language, timezone — are the same whatever the channel;
+-- an address is per channel, and a shape with `email` in it has nowhere to put
+-- a chat id. `create or replace view` refuses a replacement whose columns
+-- differ, so a single view would have frozen the set of channels into this file
+-- forever. An adopting deployment replaces both bodies:
 --
 --   create or replace view notification.recipient as
---   select u.id, u.email, u.email_verified, u.locale, u.timezone
---   from public.app_user u;
+--   select u.id::text, u.locale, u.timezone from public.app_user u;
 --
--- `create or replace view` is what makes this a contract rather than a
--- convention: Postgres refuses a replacement whose column names or types
--- differ, so a binding that does not fit is a failed migration rather than a
--- notification that goes nowhere. Until it is replaced this view has no rows,
--- and `notify` refuses every send with "recipient not found" — loudly, at the
--- first attempt, which is the failure a deployment can act on.
+--   create or replace view notification.recipient_address as
+--   select u.id::text, 'email'::text, u.email, u.email_verified
+--   from public.app_user u where u.email is not null;
+--
+-- Adding Telegram later is a `union all` branch in the second view and a row in
+-- `notification.channel` — no change to this module.
+--
+-- Until they are replaced neither has rows, and `notify` refuses every send
+-- with "recipient not found" — loudly, at the first attempt, which is the
+-- failure a deployment can act on.
 create or replace view notification.recipient as
 select
     null::text    as id,
-    null::text    as email,
-    null::boolean as email_verified,
     null::text    as locale,
     null::text    as timezone
+where false;
+
+create or replace view notification.recipient_address as
+select
+    null::text    as recipient_id,
+    null::text    as channel,
+    null::text    as address,
+    null::boolean as verified
 where false;
 
 -- Which recipients are owed a digest, and how much of it.
 --
 -- This is read by the *scheduler*, over the ordinary API under an ordinary
 -- permission, and not by the sweep: enumerating groups inside a Process would
--- mean a `for_each` over an unbounded read, and a fan-out declares a fixed
--- maximum whose overflow fails the whole instance rather than trimming. A
--- client loop is bounded by its own `limit`, so the sweep never has to be.
+-- mean a `for_each` over a read of every pending group, and a fan-out declares
+-- a fixed maximum whose overflow fails the whole instance rather than trimming.
+-- A client loop is bounded by its own `limit`, so the sweep never has to be.
 create or replace view notification.pending_digest as
 select
     recipient_id      as recipient_id,

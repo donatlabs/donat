@@ -81,8 +81,11 @@ fn bind_recipients(db_url: &str) {
                timezone       text not null default 'UTC'
              );
              create or replace view notification.recipient as
-             select u.id::text, u.email, u.email_verified, u.locale, u.timezone
-             from public.app_user u;",
+             select u.id::text, u.locale, u.timezone from public.app_user u;
+             create or replace view notification.recipient_address as
+             select u.id::text as recipient_id, 'email'::text as channel,
+                    u.email as address, u.email_verified as verified
+             from public.app_user u where u.email is not null;",
         )
         .expect("bind the recipient view to the application's users");
 }
@@ -1084,8 +1087,9 @@ fn a_digest_for_a_recipient_who_lost_their_address_is_recorded() {
     // The binding stops giving this recipient an address between the deferral
     // and the sweep.
     db.batch_execute(
-        "create or replace view notification.recipient as
-         select u.id::text, nullif(u.email, '') as email, u.email_verified, u.locale, u.timezone
+        "create or replace view notification.recipient_address as
+         select u.id::text as recipient_id, 'email'::text as channel,
+                nullif(u.email, '') as address, u.email_verified as verified
          from public.app_user u;
          update public.app_user set email = '' where id = '11111111-1111-4111-8111-111111111111';",
     )
@@ -1201,8 +1205,9 @@ fn a_recipient_with_no_address_is_recorded_rather_than_queued() {
     )
     .expect("add a user");
     db.batch_execute(
-        "create or replace view notification.recipient as
-         select u.id::text, nullif(u.email, '') as email, u.email_verified, u.locale, u.timezone
+        "create or replace view notification.recipient_address as
+         select u.id::text as recipient_id, 'email'::text as channel,
+                nullif(u.email, '') as address, u.email_verified as verified
          from public.app_user u;",
     )
     .expect("rebind with a nullable address");
@@ -1435,5 +1440,115 @@ fn the_relay_is_given_what_a_template_needs() {
         body["locale"],
         json!("en"),
         "and the recipient's language, from the deployment's own binding"
+    );
+}
+
+#[test]
+fn a_deployment_can_bring_its_own_sender() {
+    // The swap point for "send it with my provider" is one file: the connector
+    // instance the flow names. This proves the seam is real by replacing it
+    // with a differently shaped one — a different path, different field names,
+    // a different response pointer — and asserting the notification still
+    // arrives. Nothing in the module's flows or commands is touched, which is
+    // what makes it a swap rather than a fork.
+    let mail = provider_stub::spawn();
+    const OWN_PATH: &str = "/api/v3/messages/send";
+    mail.set_default(
+        OWN_PATH,
+        ScriptedResponse::ok(json!({ "Id": "own-relay-7", "Result": "queued" })),
+    );
+    let s = Suite::new("notifications_own_sender")
+        .with_migrations()
+        .env("NOTIFICATION_MAIL_BASE_URL", mail.base_url())
+        .env("NOTIFICATION_MAIL_TOKEN", "Bearer own-relay-token")
+        .start();
+    apply_sql_migration_dir(s.db_url(), &module_root().join("migrations"))
+        .expect("apply the module's migrations");
+    bind_recipients(s.db_url());
+    s.adopt_metadata_module(&module_root().join("metadata"));
+
+    // The deployment's own declaration, in place of the module's shipped one.
+    //
+    // Derived from the module's file the way an adopter derives theirs: keep
+    // the instance name and the operation names the flow relies on, and change
+    // what is theirs — the path and the shape on the wire.
+    s.tune_metadata(|md| {
+        let shipped = md
+            .connectors
+            .iter()
+            .find(|c| c.name == "notification_mail")
+            .expect("the module ships the instance this replaces");
+        let mut doc = serde_json::to_value(shipped).expect("the shipped instance serializes");
+        for op in doc["operations"].as_array_mut().expect("operations") {
+            if op["name"] == json!("send_email") {
+                op["path"] = json!(OWN_PATH);
+                // Every input the flow sends must be consumed here — an input
+                // the body never mentions is "an undeclared value" and the send
+                // is refused before it leaves. What they are *called* on the
+                // wire is this deployment's business.
+                op["body"] = json!({
+                    "To": { "input": "recipient" },
+                    "Subject": { "input": "subject" },
+                    "TextBody": { "input": "body" },
+                    "Tag": { "input": "workflow" },
+                    "Language": { "input": "locale" },
+                    "Data": { "input": "payload" },
+                    "IdempotencyKey": { "input": "message_key" }
+                });
+                op["response"] = json!({
+                    "provider_message_id": { "json_pointer": "/Id", "type": "string!", "max_bytes": 256 },
+                    "normalized_status": { "json_pointer": "/Result", "type": "string!", "max_bytes": 64 }
+                });
+                // Redaction names the operation's *inputs*, not the wire keys.
+                op["redaction"] = json!({
+                    "request_headers": ["Authorization"],
+                    "request_body": ["recipient", "subject", "body", "payload"],
+                    "response_body": ["provider_message_id"]
+                });
+            }
+        }
+        let own: donat_metadata::ConnectorInstance =
+            serde_json::from_value(doc).expect("the deployment's own declaration deserializes");
+        md.connectors.retain(|c| c.name != "notification_mail");
+        md.connectors.push(own);
+    });
+
+    let mut db = client(s.db_url());
+    add_user(&mut db, ALICE, "alice@example.test");
+    let sent = notify(&s, ALICE, "your order shipped", ALICE);
+    assert!(sent.get("errors").is_none(), "notify failed: {sent}");
+    let dispatch_id = sent["data"]["notify"]["dispatch_id"]
+        .as_str()
+        .expect("notify returns the dispatch it recorded")
+        .to_string();
+
+    assert_eq!(
+        await_delivery(&mut db, &dispatch_id, "email"),
+        "sent",
+        "the module records a send it made through someone else's provider"
+    );
+    let calls = wait_for("the deployment's own relay to be called", || {
+        let calls = mail.calls_for(OWN_PATH);
+        (!calls.is_empty()).then_some(calls)
+    });
+    assert_eq!(
+        calls[0].body["To"],
+        json!("alice@example.test"),
+        "the wire shape is the deployment's, not the module's: {:?}",
+        calls[0].body
+    );
+    assert_eq!(calls[0].body["TextBody"], json!("it shipped"));
+
+    let stored: String = db
+        .query_one(
+            "select provider_message_id from notification.delivery
+             where dispatch_id = $1::text::uuid and channel = 'email'",
+            &[&dispatch_id],
+        )
+        .expect("read the delivery row")
+        .get(0);
+    assert_eq!(
+        stored, "own-relay-7",
+        "and the id recorded is the one that provider returned"
     );
 }

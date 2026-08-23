@@ -1940,7 +1940,9 @@ fn command_result_types(name: &str) -> BTreeMap<String, String> {
             ("digest", "bool!"),
             // Nullable: both come from the application's own binding view, and
             // a view carries no `not null`.
-            ("email", "string"),
+            // Nullable: the address comes from the application's own binding
+            // view, and a recipient may have no row for this channel at all.
+            ("address", "string"),
             ("locale", "string"),
             ("payload", "NotificationPayload"),
             ("opted_out", "bigint!"),
@@ -1949,7 +1951,7 @@ fn command_result_types(name: &str) -> BTreeMap<String, String> {
         "notification_resolve_digest_group" => &[
             ("recipient_id", "string!"),
             ("workflow", "string!"),
-            ("email", "string"),
+            ("address", "string"),
             ("locale", "string"),
             ("pending", "bigint!"),
         ],
@@ -1957,7 +1959,7 @@ fn command_result_types(name: &str) -> BTreeMap<String, String> {
             ("recipient_id", "string!"),
             ("workflow", "string!"),
             ("claim_id", "uuid!"),
-            ("email", "string"),
+            ("address", "string"),
             ("pending", "bigint!"),
         ],
         "notification_deliver_in_app"

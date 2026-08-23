@@ -759,6 +759,7 @@
 
 # --- the notification module ------------------------------------------
 - "!include ../../../../../../modules/notifications/metadata/databases/default/tables/notification_recipient.yaml"
+- "!include ../../../../../../modules/notifications/metadata/databases/default/tables/notification_recipient_address.yaml"
 - "!include ../../../../../../modules/notifications/metadata/databases/default/tables/notification_dispatch.yaml"
 - "!include ../../../../../../modules/notifications/metadata/databases/default/tables/notification_inbox.yaml"
 - "!include ../../../../../../modules/notifications/metadata/databases/default/tables/notification_delivery.yaml"

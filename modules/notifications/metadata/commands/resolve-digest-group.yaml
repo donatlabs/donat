@@ -25,6 +25,14 @@ steps:
       order_by: [id]
       returning: [id]
       maximum_rows: 512
+  - name: address
+    select_one:
+      table: { schema: notification, name: recipient_address }
+      by:
+        recipient_id: { arg: recipient_id }
+        channel: { literal: email }
+      returning: [recipient_id, channel, address, verified]
+      require_found: false
   - name: counted
     aggregate:
       from: { step: deferred_rows }
@@ -37,11 +45,11 @@ steps:
       table: { schema: notification, name: recipient }
       by:
         id: { arg: recipient_id }
-      returning: [id, email, locale]
+      returning: [id, locale]
       require_found: true
 result:
   recipient_id: { arg: recipient_id }
   workflow: { arg: workflow }
-  email: { step: recipient, column: email }
+  address: { step: address, column: address }
   locale: { step: recipient, column: locale }
   pending: { step: counted, column: pending }

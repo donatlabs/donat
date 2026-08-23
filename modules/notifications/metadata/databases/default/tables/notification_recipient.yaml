@@ -17,5 +17,5 @@ command_select_permissions:
   # copy taken when the notification was triggered.
   - role: notification_worker
     permission:
-      columns: [id, email, email_verified, locale, timezone]
+      columns: [id, locale, timezone]
       filter: {}

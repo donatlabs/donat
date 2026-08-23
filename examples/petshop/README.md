@@ -290,10 +290,19 @@ shipped view with the store's own customers:
 
 ```sql
 create or replace view notification.recipient as
-select c.customer_id as id, c.email, true as email_verified,
-       'en'::text as locale, 'UTC'::text as timezone
+select c.customer_id as id, 'en'::text as locale, 'UTC'::text as timezone
+from public.customer c;
+
+-- One row per channel the store can reach a customer on.
+create or replace view notification.recipient_address as
+select c.customer_id as recipient_id, 'email'::text as channel,
+       c.email as address, true as verified
 from public.customer c;
 ```
+
+Two views because an address is per channel and a person's language is not.
+Adding Telegram to the store later is a `union all` branch in the second and a
+row in `notification.channel` — the module does not change.
 
 `id` is `customer_id` and not `customer.id`, because the module matches a
 recipient against `X-Donat-User-Id` and that is what this store puts there.

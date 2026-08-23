@@ -57,8 +57,16 @@ steps:
       table: { schema: notification, name: recipient }
       by:
         id: { arg: recipient_id }
-      returning: [id, email]
+      returning: [id]
       require_found: true
+  - name: address
+    select_one:
+      table: { schema: notification, name: recipient_address }
+      by:
+        recipient_id: { arg: recipient_id }
+        channel: { literal: email }
+      returning: [recipient_id, channel, address, verified]
+      require_found: false
   - name: counted
     aggregate:
       from: { step: claimed }
@@ -68,5 +76,5 @@ result:
   recipient_id: { arg: recipient_id }
   workflow: { arg: workflow }
   claim_id: { arg: claim_id }
-  email: { step: recipient, column: email }
+  address: { step: address, column: address }
   pending: { step: counted, column: pending }

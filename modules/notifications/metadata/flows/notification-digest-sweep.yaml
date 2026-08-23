@@ -66,7 +66,7 @@ states:
       cases:
         - rule: notification_has_address
           with:
-            email: { state: resolve, field: email }
+            address: { state: resolve, field: address }
           next: claim
       default: record_unreachable
 
@@ -101,7 +101,7 @@ states:
       operation: send_digest
       input:
         message_key: { input: sweep_id, as: string }
-        recipient: { state: resolve, field: email, require_non_null: true }
+        recipient: { state: resolve, field: address, require_non_null: true }
         workflow: { input: workflow }
         locale: { state: resolve, field: locale }
         pending: { state: claim, field: pending }

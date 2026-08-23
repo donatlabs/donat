@@ -19,7 +19,9 @@ connectors, and this directory is those things arranged.
 | `notification.delivery` | what happened per channel — `sent`, `suppressed`, `skipped`, `deferred`, `sending`, `failed` — including channels never tried |
 | `notification.preference` | opt-out per recipient, per workflow, per channel |
 | `notification.pending_digest` | a view: which recipients are owed a digest, for the scheduler to page through |
-| `notification.recipient` | **the application's own binding** — see below |
+| `notification.channel` | the channels this deployment delivers on; adding one is an insert, not an edit to the module |
+| `notification.recipient` | **the application's own binding** — who a person is |
+| `notification.recipient_address` | **the application's own binding** — where each channel reaches them |
 
 Four roles are declared, and a deployment reaches them through
 `inherited_roles` rather than by editing this module:
@@ -72,9 +74,21 @@ you replace the body with a view over whatever table already holds your users:
 
 ```sql
 create or replace view notification.recipient as
-select u.id, u.email, u.email_verified, u.locale, u.timezone
-from public.app_user u;
+select u.id::text, u.locale, u.timezone from public.app_user u;
+
+create or replace view notification.recipient_address as
+select u.id::text as recipient_id, 'email'::text as channel,
+       u.email as address, u.email_verified as verified
+from public.app_user u where u.email is not null;
 ```
+
+Two views, and the split is what lets a channel be added later. A person's own
+facts are the same whatever the channel; an address is per channel, and a shape
+with `email` in it has nowhere to put a chat id — `create or replace view`
+refuses a replacement whose columns differ, so one view would have frozen the
+set of channels into the module forever. Adding Telegram is a `union all` branch
+in the second view, a row in `notification.channel`, and a send state; none of
+it changes this module.
 
 This is the module's one unavoidable piece of deployment DDL, and it is worth
 knowing why. The platform *does* ship per-user identity — `idp_users` carries an
@@ -235,6 +249,63 @@ The key is what makes the send *provider-idempotent*: a retry after a timeout
 reaches the same key, the relay absorbs it, and the recipient gets one message.
 Point it at a small relay of your own, or at any provider that accepts this
 shape.
+
+### Plugging in your own sender
+
+The swap point is one file: `connectors/notification-mail.yaml`. Include your own
+instead of the module's and nothing else changes — no flow is edited, no command
+is touched, the module is not forked.
+
+What the flow relies on, and all it relies on:
+
+| It must be | Because |
+|---|---|
+| an instance named `notification_mail` | the two send states name it |
+| with operations `send_email` and `send_digest` | one per state; a sender that misses the second fails `validate` |
+| whose inputs are `message_key`, `recipient`, `subject`, `body`, `workflow`, `locale`, `payload` (and `pending` for the digest) | these are the names the states bind |
+| whose `body` **consumes every one of them** | an input the body never mentions is "an undeclared value" and the send is refused before it leaves |
+
+Everything else is yours: the URL, the method, the path, the auth headers, the
+timeouts, the retry set, the error map, the bounds — and the field names on the
+wire. Map ours to whatever your provider calls them:
+
+```yaml
+- name: notification_mail
+  module: http
+  config:
+    base_url: { value_from_env: NOTIFICATION_MAIL_BASE_URL }
+    headers:
+      - { name: Authorization, value_from_env: NOTIFICATION_MAIL_TOKEN }
+  operations:
+    - name: send_email
+      method: POST
+      path: /api/v3/messages/send        # yours
+      input_contract:
+        message_key: string!
+        recipient: string!
+        subject: string!
+        body: string!
+        workflow: string!
+        locale: string
+        payload: NotificationPayload
+      body:                              # your provider's spelling
+        To:             { input: recipient }
+        Subject:        { input: subject }
+        TextBody:       { input: body }
+        Tag:            { input: workflow }
+        Language:       { input: locale }
+        Data:           { input: payload }
+        IdempotencyKey: { input: message_key }
+      response:                          # and its answer
+        provider_message_id: { json_pointer: /Id, type: string!, max_bytes: 256 }
+        normalized_status:   { json_pointer: /Result, type: string!, max_bytes: 64 }
+      # …plus the effect, bounds, error_map, retry and redaction the shipped
+      # file shows; copy them and adjust.
+```
+
+`a_deployment_can_bring_its_own_sender` in the conformance suite is exactly this:
+a different path, different field names and a different response shape, asserting
+the notification still arrives and the provider's own id is what gets recorded.
 
 **Sending through SendGrid, SES or Twilio instead** means using the compiled
 connector for that provider — and those publish no idempotency key, so the send

@@ -101,7 +101,7 @@ states:
       cases:
         - rule: notification_has_address
           with:
-            email: { state: resolve_email, field: email }
+            address: { state: resolve_email, field: address }
           next: route_digest
       default: record_no_address
 
@@ -184,7 +184,7 @@ states:
       operation: send_email
       input:
         message_key: { input: dispatch_id, as: string }
-        recipient: { state: resolve_email, field: email, require_non_null: true }
+        recipient: { state: resolve_email, field: address, require_non_null: true }
         subject: { state: resolve_email, field: title, require_non_null: true }
         body: { state: resolve_email, field: body, require_non_null: true }
         workflow: { state: resolve_email, field: workflow, require_non_null: true }

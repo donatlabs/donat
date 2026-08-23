@@ -26,8 +26,19 @@ steps:
       table: { schema: notification, name: recipient }
       by:
         id: { step: dispatch, column: recipient_id }
-      returning: [id, email, email_verified, locale]
+      returning: [id, locale]
       require_found: true
+  # Per channel, and read by the channel's own name — which is the whole reason
+  # a deployment can add one. `require_found: false`: a recipient with no
+  # address on this channel is a fact the flow routes on, not a failure.
+  - name: address
+    select_one:
+      table: { schema: notification, name: recipient_address }
+      by:
+        recipient_id: { step: dispatch, column: recipient_id }
+        channel: { arg: channel }
+      returning: [recipient_id, channel, address, verified]
+      require_found: false
   # At most one row: (recipient, workflow, channel) is the preference key, and
   # only a row that says `enabled: false` is selected at all.
   - name: opt_out
@@ -55,5 +66,5 @@ result:
   payload: { step: dispatch, column: payload }
   locale: { step: recipient, column: locale }
   digest: { step: dispatch, column: digest }
-  email: { step: recipient, column: email }
+  address: { step: address, column: address }
   opted_out: { step: counted, column: opted_out }

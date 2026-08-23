@@ -17,8 +17,17 @@
 create or replace view notification.recipient as
 select
     c.customer_id  as id,
-    c.email        as email,
-    true           as email_verified,
     'en'::text     as locale,
     'UTC'::text    as timezone
+from public.customer c;
+
+-- One row per channel the store can reach a customer on. Today that is email;
+-- adding Telegram later is a `union all` branch here and a row in
+-- `notification.channel` — the module itself does not change.
+create or replace view notification.recipient_address as
+select
+    c.customer_id  as recipient_id,
+    'email'::text  as channel,
+    c.email        as address,
+    true           as verified
 from public.customer c;
