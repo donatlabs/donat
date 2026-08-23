@@ -4,6 +4,19 @@ A GraphQL engine over Postgres, compatible with the Donat v2 surface
 (metadata format, API shape), developed TDD-style against a native
 conformance harness with Donat-derived fixtures (`crates/conformance`).
 
+## Who This Is For
+
+**donat is a framework for people who do not write code.** An application —
+its schema, its rules, its permissions, its processes, its integrations, and
+its tests — is declared in SQL migrations and YAML, and nothing else. The
+measure of every engine feature is whether someone with no development
+experience can use it by declaring it; a feature that needs a script, a
+service, or a Rust file on the application side is not finished. Rust is the
+engine's language only: `crates/*` and their tests are about the engine,
+never a stand-in for what an application author should have been able to
+declare. `examples/petshop` is the proof — a whole store, tests included,
+with not one line of code.
+
 ## Tech Stack
 
 Rust workspace (axum, tokio, serde, insta), Postgres 16 (postgis), native
