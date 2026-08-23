@@ -1,7 +1,8 @@
 .PHONY: build test conformance db-up db-down db-logs conformance-backend \
 	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex \
 	petshop-up petshop-down petshop-system-tests wasm-core go-test \
-	lending-up lending-down lending-system-tests gate
+	lending-up lending-down lending-system-tests gate \
+	setup-loop-infrastructure loop loop-status loop-off
 
 build:
 	cargo build
@@ -56,6 +57,24 @@ GATE_BASE ?= main
 gate:
 	python3 scripts/check_change_gate.py --self-test
 	python3 scripts/check_change_gate.py --base $(GATE_BASE) $(if $(GATE_BODY),--body-file $(GATE_BODY))
+
+# The nightly loops: jobs that run unattended on this machine, each in a
+# worktree of its own, and leave nothing behind but a pull request. See
+# scripts/loop.sh and .claude/skills/<job>/SKILL.md; the job list is in
+# scripts/loop-nightly.sh. State lives in ~/.local/state/donat-loops.
+setup-loop-infrastructure:
+	scripts/loop-setup.sh install
+
+# Run one job now, the way the timer would: make loop JOB=fix-advisories
+loop:
+	@test -n "$(JOB)" || (echo 'usage: make loop JOB=<job>   (jobs: see scripts/loop-nightly.sh)'; exit 2)
+	scripts/loop.sh $(JOB)
+
+loop-status:
+	scripts/loop-setup.sh status
+
+loop-off:
+	scripts/loop-setup.sh remove
 
 # Native Postgres reference conformance suite. Spawns its own engine
 # instances, one database per suite.
