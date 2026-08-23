@@ -1,6 +1,8 @@
 # A permanent metadata collision, retried as if it were a cold database
 
-**Effort: S. Status: TODO — found while adopting `modules/notifications` into `examples/petshop`.**
+**Effort: S. Status: DONE — `validate` compiles the schema it would serve, and a
+metadata defect no longer retries as readiness. Regression test:
+`crates/server/tests/source_selection.rs::two_tracked_tables_that_share_a_graphql_name_are_refused_by_validate`.**
 
 ## What is wrong
 
