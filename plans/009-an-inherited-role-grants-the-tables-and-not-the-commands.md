@@ -1,6 +1,10 @@
 # An inherited role grants the tables and not the commands
 
-**Effort: S–M. Status: TODO — found while adopting `modules/notifications` into `examples/petshop`.**
+**Effort: S–M. Status: TODO — the fork below is unsettled; the behaviour itself
+is now pinned by
+`crates/conformance/tests/notifications.rs::an_inherited_role_carries_the_reads_and_not_the_commands`,
+so whichever way it is settled is a deliberate change rather than a silent
+one.**
 
 ## What is wrong
 

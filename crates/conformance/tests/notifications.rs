@@ -1315,3 +1315,70 @@ fn opting_out_twice_is_the_documented_mutation() {
         "one row, carrying the last answer"
     );
 }
+
+#[test]
+fn an_inherited_role_carries_the_reads_and_not_the_commands() {
+    // Pinned because it is surprising, and because getting it wrong is cheap
+    // and quiet: `inherited_roles` reads like set union and is not one. An
+    // adopting deployment that inherits a module's role gets its tables and
+    // none of its commands, and finds out when the call it expected returns
+    // "field not found". Three files in this branch claimed the opposite until
+    // the store's role matrix caught them (`plans/009-*`).
+    //
+    // This asserts today's semantics rather than the ones anyone prefers. If
+    // the fork in that plan is settled the other way, this test is what makes
+    // the change deliberate instead of silent.
+    let (s, _mail) = stand("notifications_inheritance");
+    s.tune_metadata(|md| {
+        md.inherited_roles.push(donat_metadata::InheritedRole {
+            role_name: "digest_reader".to_string(),
+            role_set: vec![
+                "digest_reader".to_string(),
+                "notification_scheduler".to_string(),
+            ],
+        });
+    });
+
+    let surface = |role: &str, root: &str| -> Vec<String> {
+        let body = graphql(
+            &s,
+            role,
+            ALICE,
+            &format!("query {{ __type(name: \"{root}\") {{ fields {{ name }} }} }}"),
+        );
+        body["data"]["__type"]["fields"]
+            .as_array()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // The role it inherits holds both halves.
+    assert!(
+        surface("notification_scheduler", "query_root")
+            .contains(&"notification_pending_digest".to_string()),
+        "the scheduler reads the pending list"
+    );
+    assert!(
+        surface("notification_scheduler", "mutation_root")
+            .contains(&"flush_notification_digests".to_string()),
+        "and calls the sweep"
+    );
+
+    // The inheriting role gets the table permission…
+    assert!(
+        surface("digest_reader", "query_root").contains(&"notification_pending_digest".to_string()),
+        "an inherited role carries the table it named"
+    );
+    // …and not the command permission.
+    assert!(
+        !surface("digest_reader", "mutation_root")
+            .contains(&"flush_notification_digests".to_string()),
+        "an inherited role does not carry the commands of the role it names; \
+         a caller that must run the sweep holds `notification_scheduler` itself"
+    );
+}

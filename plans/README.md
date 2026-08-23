@@ -16,7 +16,7 @@ capabilities that shipped.
 | [006](006-a-declared-row-bound-that-nothing-enforces.md) | Enforce `select_many`'s declared row bound, and decide whether a bound refuses or truncates | S–M | TODO — one design question | — |
 | [007](007-a-permanent-metadata-collision-retried-as-if-it-were-a-cold-database.md) | A tracked-table name collision hangs boot instead of failing `validate` | S | **DONE** | — |
 | [008](008-the-identity-we-ship-is-unreachable-from-a-declaration.md) | Publish the identity provider as a connector, so a Process can read a person's address | M | TODO | — |
-| [009](009-an-inherited-role-grants-the-tables-and-not-the-commands.md) | `inherited_roles` carries table permissions and drops command ones | S–M | TODO — one fork to settle | — |
+| [009](009-an-inherited-role-grants-the-tables-and-not-the-commands.md) | `inherited_roles` carries table permissions and drops command ones | S–M | TODO — one fork to settle; behaviour pinned by a test | — |
 
 ## Suggested order
 
