@@ -38,6 +38,92 @@ impl Session {
     }
 }
 
+/// Refuse a document whose fragments reach themselves.
+///
+/// `{ product { ...a } } fragment a on product { ...b } fragment b on product
+/// { ...a }` is accepted by the parser and has two braces of nesting, so the
+/// depth guard passes it. Everything that walks a selection set afterwards
+/// recurses forever on it. One traversal here, before any of them.
+fn refuse_fragment_cycles(fragments: &Fragments) -> Result<(), PlanError> {
+    fn reaches(
+        name: &str,
+        fragments: &Fragments,
+        path: &mut Vec<String>,
+        done: &mut HashSet<String>,
+    ) -> Option<String> {
+        if path.iter().any(|seen| seen == name) {
+            return Some(name.to_string());
+        }
+        if done.contains(name) {
+            return None;
+        }
+        let fragment = fragments.get(name)?;
+        path.push(name.to_string());
+        let found = spreads_of(&fragment.selection_set)
+            .into_iter()
+            .find_map(|spread| reaches(&spread, fragments, path, done));
+        path.pop();
+        done.insert(name.to_string());
+        found
+    }
+
+    let mut done = HashSet::new();
+    for name in fragments.keys() {
+        let mut path = Vec::new();
+        if let Some(cycle) = reaches(name, fragments, &mut path, &mut done) {
+            return Err(PlanError::new(
+                "$",
+                "validation-failed",
+                format!("fragment \"{cycle}\" spreads itself, directly or through another"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every fragment named by a spread anywhere in one selection set.
+fn spreads_of(selection_set: &SelectionSet<'static, String>) -> Vec<String> {
+    let mut found = Vec::new();
+    for selection in &selection_set.items {
+        match selection {
+            Selection::FragmentSpread(spread) => found.push(spread.fragment_name.clone()),
+            Selection::Field(field) => found.extend(spreads_of(&field.selection_set)),
+            Selection::InlineFragment(inline) => found.extend(spreads_of(&inline.selection_set)),
+        }
+    }
+    found
+}
+
+/// Fields in one selection set, following fragment spreads once each.
+fn count_nodes(
+    selection_set: &SelectionSet<'static, String>,
+    fragments: &Fragments,
+    seen: &mut HashSet<String>,
+) -> usize {
+    let mut total = 0;
+    for selection in &selection_set.items {
+        match selection {
+            Selection::Field(field) => {
+                total += 1;
+                total += count_nodes(&field.selection_set, fragments, seen);
+            }
+            Selection::InlineFragment(inline) => {
+                total += count_nodes(&inline.selection_set, fragments, seen);
+            }
+            Selection::FragmentSpread(spread) => {
+                if !seen.insert(spread.fragment_name.clone()) {
+                    continue;
+                }
+                if let Some(fragment) = fragments.get(&spread.fragment_name) {
+                    total += count_nodes(&fragment.selection_set, fragments, seen);
+                }
+                seen.remove(&spread.fragment_name);
+            }
+        }
+    }
+    total
+}
+
 pub(crate) fn is_session_var_name(name: &str) -> bool {
     name.get(..8)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-donat-"))
@@ -1211,7 +1297,49 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // Before anything walks them. A spread that reaches itself makes
+        // every later traversal — this planner's included — recurse until the
+        // stack ends, and `query_too_deep` cannot see it because a cycle needs
+        // no nesting to express. The GraphQL specification calls it a
+        // validation error; so does this.
+        refuse_fragment_cycles(&fragments)?;
+        self.refuse_if_too_many_nodes(selection_set, &fragments, session)?;
         self.plan_selected(op, selection_set, &fragments, &vars, session)
+    }
+
+    /// Refuse an operation that asks for more fields than the role may.
+    ///
+    /// Counted over the parsed document, before anything is planned, so the
+    /// refusal costs one traversal and never a statement. Depth is bounded
+    /// elsewhere and is the wrong measure: a hundred roots with a hundred
+    /// fields each is ten thousand nodes at depth two.
+    ///
+    /// A fragment is counted where it is spread, and a cycle among fragments
+    /// is counted once — the parser accepts one, and a limit that recursed on
+    /// it would hang rather than refuse.
+    fn refuse_if_too_many_nodes(
+        &self,
+        selection_set: &SelectionSet<'static, String>,
+        fragments: &Fragments,
+        session: &Session,
+    ) -> Result<(), PlanError> {
+        let Some(ceiling) = self.metadata.limits.nodes.for_role(&session.role) else {
+            return Ok(());
+        };
+        let mut seen = HashSet::new();
+        let counted = count_nodes(selection_set, fragments, &mut seen);
+        if counted > ceiling as usize {
+            return Err(PlanError::new(
+                "$",
+                "validation-failed",
+                format!(
+                    "this operation selects {counted} fields and the ceiling for role \"{}\" is \
+                     {ceiling}. Ask for fewer fields, or page the lists it walks.",
+                    session.role
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Plan an operation that the caller has already selected, using a

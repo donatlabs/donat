@@ -131,6 +131,13 @@ pub struct Metadata {
         skip_serializing_if = "crate::bounds::PermissionsMetadata::is_default"
     )]
     pub permissions: crate::bounds::PermissionsMetadata,
+
+    /// What one caller may ask for, from the optional `limits.yaml`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::limits::LimitsMetadata::is_empty"
+    )]
+    pub limits: crate::limits::LimitsMetadata,
 }
 
 /// One named deployment instance of a connector module compiled into the

@@ -233,6 +233,7 @@ fn load_one_metadata_dir(
         media: load_section(dir, "media.yaml")?,
         ingest_schemas: load_ingest_schemas(dir)?,
         recurrence: load_section(dir, "recurrence.yaml")?,
+        limits: load_section(dir, "limits.yaml")?,
         permissions: load_section(dir, "permissions.yaml")?,
         tenancy: load_section(dir, "tenancy.yaml")?,
         iam: load_section(dir, "iam.yaml")?,
@@ -1255,6 +1256,7 @@ fn written_columns(
 fn merge_metadata(base: Metadata, overlay: Metadata) -> Result<Metadata, String> {
     let Metadata {
         version: _,
+        limits,
         permissions,
         sources,
         inherited_roles,
@@ -1382,6 +1384,14 @@ fn merge_metadata(base: Metadata, overlay: Metadata) -> Result<Metadata, String>
     // than the pair being refused. An overlay adds, it never edits — and a
     // base that requires unbounded permissions to declare themselves must not
     // be quietly relaxed by composing something on top of it.
+    // A base that set a ceiling keeps it; an overlay may add one where the
+    // base had none, and two answers for the same role is a collision like any
+    // other rather than a silent choice.
+    if merged.limits.is_empty() {
+        merged.limits = limits;
+    } else if !limits.is_empty() && merged.limits != limits {
+        return Err("both directories declare limits".to_string());
+    }
     if permissions.unbounded_permissions == crate::bounds::UnboundedPolicy::Declared {
         merged.permissions.unbounded_permissions = crate::bounds::UnboundedPolicy::Declared;
     }

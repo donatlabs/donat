@@ -589,3 +589,116 @@ fn a_v1_upsert_cannot_take_another_tenants_row_on_conflict() {
         "the tenant was re-applied from EXCLUDED, which moves the row: {rendered}"
     );
 }
+
+// --- what one caller may ask for ------------------------------------------
+
+fn with_node_ceiling(md: &mut Metadata, global: Option<u32>, staff: Option<u32>) {
+    md.limits.nodes.global = global;
+    if let Some(staff) = staff {
+        md.limits.nodes.per_role.insert("staff".into(), staff);
+    }
+}
+
+fn plan_with_limits(
+    query: &str,
+    global: Option<u32>,
+    staff: Option<u32>,
+) -> Result<Plan, PlanError> {
+    let mut md = metadata(json!({}));
+    with_node_ceiling(&mut md, global, staff);
+    let cat = catalog();
+    let planner = Planner::new(&md, &cat);
+    let doc = graphql_parser::parse_query::<String>(query)
+        .expect("query parses")
+        .into_static();
+    planner.plan(&doc, None, &Default::default(), &staff_session())
+}
+
+fn staff_session() -> Session {
+    staff()
+}
+
+#[test]
+fn a_deployment_with_no_ceiling_is_never_counted() {
+    assert!(plan_with_limits("{ product { id name } }", None, None).is_ok());
+}
+
+#[test]
+fn an_operation_under_the_ceiling_plans() {
+    // product, id, name — three.
+    assert!(plan_with_limits("{ product { id name } }", Some(3), None).is_ok());
+}
+
+#[test]
+fn an_operation_over_the_ceiling_is_refused_and_says_by_how_much() {
+    let error = plan_with_limits("{ product { id name } }", Some(2), None)
+        .expect_err("the ceiling refuses");
+    assert_eq!(error.code, "validation-failed");
+    assert!(
+        error.message.contains("selects 3 fields"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("staff"), "{}", error.message);
+}
+
+#[test]
+fn a_role_ceiling_overrides_the_global_one() {
+    // Global would refuse; the role's own entry is what applies.
+    assert!(plan_with_limits("{ product { id name } }", Some(1), Some(9)).is_ok());
+    // And it binds in the other direction too.
+    assert!(plan_with_limits("{ product { id name } }", Some(99), Some(2)).is_err());
+}
+
+#[test]
+fn a_nested_selection_counts_every_level() {
+    // product, id, reviews, body — four. Depth is two; the count is what
+    // describes the ask.
+    assert!(plan_with_limits("{ product { id reviews { body } } }", Some(4), None).is_ok());
+    assert!(plan_with_limits("{ product { id reviews { body } } }", Some(3), None).is_err());
+}
+
+#[test]
+fn a_fragment_is_counted_where_it_is_spread() {
+    let query = "{ product { ...f } } fragment f on product { id name }";
+    // product, id, name — three, the same as writing them out.
+    assert!(plan_with_limits(query, Some(3), None).is_ok());
+    assert!(plan_with_limits(query, Some(2), None).is_err());
+}
+
+/// A fragment that reaches itself is refused, and was a crash.
+///
+/// The parser accepts it and `query_too_deep` passes it — a cycle needs no
+/// nesting — so every later traversal recursed until the stack ended. That is
+/// reachable by anybody who may send a query, which makes it an availability
+/// bug rather than a validation nicety. Found while building the node
+/// ceiling: the counter walks fragments too, and terminating correctly is what
+/// exposed that nothing else did.
+#[test]
+fn a_fragment_that_reaches_itself_is_refused_rather_than_overflowing() {
+    let query = "{ product { ...a } } fragment a on product { id ...b } \
+                 fragment b on product { name ...a }";
+    // With no ceiling at all: the refusal is the planner's, not the limit's.
+    let error = plan_with_limits(query, None, None).expect_err("the cycle is refused");
+    assert_eq!(error.code, "validation-failed");
+    assert!(
+        error.message.contains("spreads itself"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn a_fragment_that_spreads_itself_directly_is_refused_too() {
+    let query = "{ product { ...a } } fragment a on product { id ...a }";
+    let error = plan_with_limits(query, None, None).expect_err("the cycle is refused");
+    assert_eq!(error.code, "validation-failed");
+}
+
+#[test]
+fn an_ordinary_fragment_used_twice_is_not_a_cycle() {
+    // The guard must not mistake reuse for recursion.
+    let query = "{ product { ...f reviews { ...g } } } \
+                 fragment f on product { id name } fragment g on review { body }";
+    assert!(plan_with_limits(query, None, None).is_ok());
+}

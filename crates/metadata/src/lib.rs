@@ -7,6 +7,7 @@ pub mod bounds;
 pub mod documents;
 pub mod iam;
 pub mod ingest;
+pub mod limits;
 mod loader;
 pub mod local;
 pub mod media;
@@ -34,6 +35,7 @@ pub use ingest::{
     IngestRowErrorPolicy, IngestSchema, IngestSchemaError, IngestSchemaKind, IngestSheetSelector,
     schema_pin, validate_ingest_schemas,
 };
+pub use limits::{Ceiling, LimitsMetadata};
 pub use loader::{LoadError, load_metadata_dir};
 pub use local::{
     LOCAL_NAMESPACE, LocalCapabilityCatalog, LocalCapabilityError, is_local,
