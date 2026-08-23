@@ -1,4 +1,7 @@
-# The public catalogue: what an anonymous shopper may read.
+# The catalogue as each role sees it: what the public may read, what staff
+# see beyond it, how search / paging / filters / aggregates stay inside the
+# role's shelf, the shopper-side cart guards that protect the catalogue, and
+# the second doors (Relay, REST, MCP) serving the same rows and refusals.
 tests:
   - name: anonymous shoppers browse published products and active variants
     steps:
@@ -44,3 +47,685 @@ tests:
                     currency: USD
                     stock:
                       available_quantity: 3
+
+  - name: the public catalogue shows only published products
+    steps:
+      - as: { role: anonymous }
+      # The unfiltered catalogue read: every row is published, and the seeded
+      # draft (turtle-heat-lamp) is simply not in the list.
+      - graphql: |
+          query Catalogue {
+            product(order_by: {id: asc}) {
+              id
+              slug
+              title
+              status
+              variants(order_by: {id: asc}) { id sku price_minor currency active }
+            }
+          }
+        expect:
+          data:
+            product:
+              - id: 1
+                slug: dog-kibble
+                title: Dog Kibble
+                status: published
+                variants:
+                  - { id: 1, sku: DOG-CHICKEN-1KG, price_minor: 1999, currency: USD, active: true }
+                  - { id: 2, sku: DOG-SALMON-1KG, price_minor: 2499, currency: USD, active: true }
+              - id: 2
+                slug: cat-scratcher
+                title: Cat Scratcher
+                status: published
+                variants:
+                  - { id: 3, sku: CAT-SCRATCH-POST, price_minor: 1599, currency: USD, active: true }
+
+  - name: the public catalogue shows only sellable variants
+    steps:
+      - as: { role: anonymous }
+      # Every variant the public sees is active; the inactive draft variant
+      # (TURTLE-HEAT-50W) is not on any shelf.
+      - graphql: |
+          query {
+            product(order_by: {id: asc}) {
+              slug
+              variants(order_by: {id: asc}) { sku active }
+            }
+          }
+        expect:
+          data:
+            product:
+              - slug: dog-kibble
+                variants:
+                  - { sku: DOG-CHICKEN-1KG, active: true }
+                  - { sku: DOG-SALMON-1KG, active: true }
+              - slug: cat-scratcher
+                variants:
+                  - { sku: CAT-SCRATCH-POST, active: true }
+
+  - name: staff see the drafts the public cannot
+    steps:
+      - as: { role: staff }
+      # Staff see the whole catalogue, drafts included.
+      - graphql: |
+          query { product(order_by: {id: asc}) { id slug status } }
+        expect:
+          data:
+            product:
+              - { id: 1, slug: dog-kibble, status: published }
+              - { id: 2, slug: cat-scratcher, status: published }
+              - { id: 3, slug: turtle-heat-lamp, status: draft }
+      - as: { role: anonymous }
+      # The public list is a strict subset of the staff list.
+      - graphql: |
+          query { product(order_by: {id: asc}) { id slug status } }
+        expect:
+          data:
+            product:
+              - { id: 1, slug: dog-kibble, status: published }
+              - { id: 2, slug: cat-scratcher, status: published }
+
+  - name: a shopper cannot change the catalogue
+    steps:
+      - as: { role: customer, user: customer-1 }
+      # No insert permission on product for customers: the field does not even
+      # exist in their schema.
+      - graphql: |
+          mutation {
+            insert_product_one(
+              object: {category_id: 1, slug: "shopper-made-this", title: "Nope", status: "published"}
+            ) { id }
+          }
+        expect:
+          errors:
+            - extensions:
+                code: validation-failed
+              message: "field 'insert_product_one' not found in type: 'mutation_root'"
+
+  - name: a draft product cannot be added to a cart
+    steps:
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { insert_cart_one(object: {}) { id } }'
+        expect: { data: { insert_cart_one: { id: 1 } } }
+      # Variant 4 is inactive and belongs to the draft product.
+      - graphql: |
+          mutation {
+            insert_cart_line_one(object: {cart_id: 1, variant_id: 4, quantity: 1}) { id }
+          }
+        expect:
+          errors:
+            - extensions:
+                code: permission-error
+
+  - name: a cart line is capped at twenty units for shoppers
+    steps:
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { insert_cart_one(object: {}) { id } }'
+        expect: { data: { insert_cart_one: { id: 1 } } }
+      - graphql: |
+          mutation {
+            insert_cart_line_one(object: {cart_id: 1, variant_id: 2, quantity: 21}) { id }
+          }
+        expect:
+          errors:
+            - extensions:
+                code: validation-failed
+              message: a cart line is limited to 20 units
+      # The cap is the shopper's, and it binds before anything is written.
+      - graphql: |
+          query { cart(where: {id: {_eq: 1}}) { id lines { id } } }
+        expect:
+          data:
+            cart:
+              - { id: 1, lines: [] }
+
+  - name: twenty units are still allowed
+    steps:
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { insert_cart_one(object: {}) { id } }'
+        expect: { data: { insert_cart_one: { id: 1 } } }
+      - graphql: |
+          mutation {
+            insert_cart_line_one(object: {cart_id: 1, variant_id: 2, quantity: 20}) {
+              cart_id variant_id quantity
+            }
+          }
+        expect:
+          data:
+            insert_cart_line_one: { cart_id: 1, variant_id: 2, quantity: 20 }
+      - graphql: |
+          query { cart(where: {id: {_eq: 1}}) { id lines { quantity } } }
+        expect:
+          data:
+            cart:
+              - id: 1
+                lines:
+                  - { quantity: 20 }
+
+  - name: a search finds the product by part of its name
+    steps:
+      - as: { role: anonymous }
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%Kibble%" }
+        expect:
+          data:
+            product:
+              - { slug: dog-kibble, title: Dog Kibble }
+
+  - name: a search does not care about case
+    steps:
+      - as: { role: anonymous }
+      # `_ilike` is the difference between a search box and a riddle.
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%kibble%" }
+        expect:
+          data:
+            product:
+              - { slug: dog-kibble, title: Dog Kibble }
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%KIBBLE%" }
+        expect:
+          data:
+            product:
+              - { slug: dog-kibble, title: Dog Kibble }
+      # And the case-sensitive operator really is the other one, so the choice
+      # above is a choice and not an accident.
+      - graphql: |
+          query C($p: String) { product(where: {title: {_like: $p}}) { slug } }
+        variables: { p: "%kibble%" }
+        expect:
+          data:
+            product: []
+
+  - name: a search looks in the description too
+    steps:
+      - as: { role: anonymous }
+      # Nobody types the title exactly: `scratch` reaches the description.
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%scratch%" }
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher, title: Cat Scratcher }
+
+  - name: a search that matches nothing says so
+    steps:
+      - as: { role: anonymous }
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%aquarium filter%" }
+        expect:
+          data:
+            product: []
+
+  - name: a search never reaches the drafts
+    steps:
+      # Staff, who may see drafts, do find the seeded draft by its own words —
+      # otherwise the public step below proves nothing.
+      - as: { role: staff }
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%Turtle%" }
+        expect:
+          data:
+            product:
+              - { slug: turtle-heat-lamp, title: Turtle Heat Lamp }
+      # A search that ignored the read permission would be the widest leak in
+      # the store: a shopper could recover a draft catalogue a letter at a time.
+      - as: { role: anonymous }
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%Turtle%" }
+        expect:
+          data:
+            product: []
+
+  - name: an injection typed into the search box stays a search term
+    steps:
+      - as: { role: anonymous }
+      # What reaches SQL is a value, never syntax. Each pattern is something a
+      # shopper could type; the answer is an ordinary empty result — not an
+      # error, not the whole shop, and not a shop that stopped working after.
+      - for:
+          - { pattern: "%'%", why: a quote would end the string literal if it were not escaped }
+          - { pattern: "%' OR '1'='1%", why: the textbook injection }
+          - { pattern: '%\%', why: a backslash escapes the escape }
+          - { pattern: "%%' OR title LIKE '%%", why: an injection wearing a wildcard }
+          - { pattern: '%"; DROP TABLE product; --%', why: a statement terminator inside a term }
+        do:
+          - graphql: |
+              query Search($pattern: String) {
+                product(
+                  where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+                  order_by: {slug: asc}
+                ) { slug title }
+              }
+            variables: { pattern: "${item.pattern}" }
+            expect:
+              data:
+                product: []
+          - graphql: 'query { product(order_by: {slug: asc}) { slug } }'
+            expect:
+              data:
+                product:
+                  - { slug: cat-scratcher }
+                  - { slug: dog-kibble }
+
+  - name: pattern syntax is pattern syntax and still cannot cross a permission
+    steps:
+      # `%` and `_` are the operator's own language, not letters to search
+      # for. The widest pattern expressible still returns only what the role
+      # may see: the public wildcard is the public catalogue, the staff
+      # wildcard is the larger one.
+      - as: { role: anonymous }
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%" }
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher, title: Cat Scratcher }
+              - { slug: dog-kibble, title: Dog Kibble }
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%_%" }
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher, title: Cat Scratcher }
+              - { slug: dog-kibble, title: Dog Kibble }
+      - as: { role: staff }
+      - graphql: |
+          query Search($pattern: String) {
+            product(
+              where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+              order_by: {slug: asc}
+            ) { slug title }
+          }
+        variables: { pattern: "%" }
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher, title: Cat Scratcher }
+              - { slug: dog-kibble, title: Dog Kibble }
+              - { slug: turtle-heat-lamp, title: Turtle Heat Lamp }
+
+  - name: the store answers a search rather than failing on it
+    steps:
+      - as: { role: anonymous }
+      # Whatever is typed, the shop stays a shop: a 200 with no errors, for
+      # every one of these. A step with no expect asserts exactly that.
+      - for:
+          - { pattern: "%%" }
+          - { pattern: "%%%%%%" }
+          - { pattern: "%''''''''''''''''''''%" }
+          - { pattern: '%\%_%' }
+          - { pattern: "%ünïcödé%" }
+          - { pattern: "%🐈%" }
+        do:
+          - graphql: |
+              query Search($pattern: String) {
+                product(
+                  where: {_or: [{title: {_ilike: $pattern}}, {description: {_ilike: $pattern}}]}
+                  order_by: {slug: asc}
+                ) { slug title }
+              }
+            variables: { pattern: "${item.pattern}" }
+      # Still serving afterwards.
+      - graphql: 'query { product(order_by: {slug: asc}) { slug } }'
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher }
+              - { slug: dog-kibble }
+
+  - name: paging the catalogue repeats nothing and drops nothing
+    steps:
+      - as: { role: anonymous }
+      # The whole visible list (the inactive draft variant is not in it) …
+      - graphql: |
+          query { product_variant(order_by: {id: asc}) { id sku } }
+        expect:
+          data:
+            product_variant:
+              - { id: 1, sku: DOG-CHICKEN-1KG }
+              - { id: 2, sku: DOG-SALMON-1KG }
+              - { id: 3, sku: CAT-SCRATCH-POST }
+      # … then the same list cut in two: a page of two and the rest.
+      - graphql: |
+          query { product_variant(order_by: {id: asc}, limit: 2) { id sku } }
+        expect:
+          data:
+            product_variant:
+              - { id: 1, sku: DOG-CHICKEN-1KG }
+              - { id: 2, sku: DOG-SALMON-1KG }
+      - graphql: |
+          query { product_variant(order_by: {id: asc}, limit: 2, offset: 2) { id sku } }
+        expect:
+          data:
+            product_variant:
+              - { id: 3, sku: CAT-SCRATCH-POST }
+
+  - name: the catalogue sorts the way it was asked to
+    steps:
+      - as: { role: anonymous }
+      - graphql: 'query { product(order_by: {slug: asc}) { slug } }'
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher }
+              - { slug: dog-kibble }
+      # desc is asc read backwards.
+      - graphql: 'query { product(order_by: {slug: desc}) { slug } }'
+        expect:
+          data:
+            product:
+              - { slug: dog-kibble }
+              - { slug: cat-scratcher }
+
+  - name: a filter selects exactly what it names
+    steps:
+      - as: { role: anonymous }
+      - graphql: |
+          query Pick($slugs: [String!]) { product(where: {slug: {_in: $slugs}}) { slug } }
+        variables: { slugs: [cat-scratcher] }
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher }
+      # What a filter excludes is exactly the rest of what the shopper may see.
+      - graphql: |
+          query Drop($slugs: [String!]) { product(where: {slug: {_nin: $slugs}}) { slug } }
+        variables: { slugs: [cat-scratcher] }
+        expect:
+          data:
+            product:
+              - { slug: dog-kibble }
+
+  - name: a filter cannot reach past what the role may see
+    steps:
+      # The seeded draft is really there for staff …
+      - as: { role: staff }
+      - graphql: |
+          query Pick($slug: String) { product(where: {slug: {_eq: $slug}}) { slug status } }
+        variables: { slug: turtle-heat-lamp }
+        expect:
+          data:
+            product:
+              - { slug: turtle-heat-lamp, status: draft }
+      # … and naming it by hand does not produce it for the public: a
+      # permission is not a default the caller can argue with.
+      - as: { role: anonymous }
+      - graphql: |
+          query Pick($slug: String) { product(where: {slug: {_eq: $slug}}) { slug status } }
+        variables: { slug: turtle-heat-lamp }
+        expect:
+          data:
+            product: []
+
+  - name: the count counts only what the shopper may see
+    steps:
+      - as: { role: anonymous }
+      # An aggregate is a read, and it obeys the same walls as the rows: the
+      # public count agrees with the public rows.
+      - graphql: |
+          query { product_aggregate { aggregate { count } } product(order_by: {id: asc}) { id } }
+        expect:
+          data:
+            product_aggregate: { aggregate: { count: 2 } }
+            product:
+              - { id: 1 }
+              - { id: 2 }
+      # Staff see the drafts, so their count is the larger one.
+      - as: { role: staff }
+      - graphql: 'query { product_aggregate { aggregate { count } } }'
+        expect:
+          data:
+            product_aggregate: { aggregate: { count: 3 } }
+
+  - name: one row by key is the same row the list shows
+    steps:
+      - as: { role: anonymous }
+      - graphql: 'query { product(order_by: {id: asc}, limit: 1) { id slug } }'
+        expect:
+          data:
+            product:
+              - { id: 1, slug: dog-kibble }
+      - graphql: |
+          query One($id: Int!) { product_by_pk(id: $id) { id slug } }
+        variables: { id: 1 }
+        expect:
+          data:
+            product_by_pk: { id: 1, slug: dog-kibble }
+
+  - name: a draft is not reachable by its key either
+    steps:
+      # The draft's key, read by the role that may see it …
+      - as: { role: staff }
+      - graphql: |
+          query { product(where: {slug: {_eq: "turtle-heat-lamp"}}) { id slug status } }
+        expect:
+          data:
+            product:
+              - { id: 3, slug: turtle-heat-lamp, status: draft }
+      # … answers nothing through the by-key door for the public: that door is
+      # not wider than the list.
+      - as: { role: anonymous }
+      - graphql: |
+          query One($id: Int!) { product_by_pk(id: $id) { id slug } }
+        variables: { id: 3 }
+        expect:
+          data:
+            product_by_pk: null
+
+  - name: relay serves the same catalogue as graphql
+    steps:
+      - as: { role: anonymous }
+      - graphql: 'query { product(order_by: {id: asc}) { id slug } }'
+        expect:
+          data:
+            product:
+              - { id: 1, slug: dog-kibble }
+              - { id: 2, slug: cat-scratcher }
+      # The Relay door serves node ids, not table keys, so the parity is
+      # pinned on the slugs — the same comparison the store's shoppers make.
+      - description: The Relay endpoint serves the same rows to the same role.
+        url: /v1/relay
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        query:
+          query: |
+            query { product(order_by: {id: asc}) { slug } }
+        response:
+          data:
+            product:
+              - { slug: dog-kibble }
+              - { slug: cat-scratcher }
+
+  - name: relay applies the same permissions
+    steps:
+      - description: The second door is not a way around the first one's walls.
+        url: /v1/relay
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        query:
+          query: |
+            query { orders { id } }
+        response:
+          errors:
+            - extensions:
+                path: $.selectionSet.orders
+                code: validation-failed
+              message: "field 'orders' not found in type: 'query_root'"
+
+  - name: an enum argument is an enum not a fragment of sql
+    steps:
+      - as: { role: anonymous }
+      - graphql: |
+          { product(order_by: {slug: "asc; DROP TABLE product"}) { id } }
+        expect:
+          errors:
+            - extensions:
+                code: validation-failed
+      # The catalogue is still there.
+      - graphql: 'query { product(order_by: {slug: asc}) { slug } }'
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher }
+              - { slug: dog-kibble }
+
+  - name: rest and graphql publish the same catalogue
+    steps:
+      - as: { role: anonymous }
+      - graphql: 'query { product(order_by: {slug: asc}) { slug } }'
+        expect:
+          data:
+            product:
+              - { slug: cat-scratcher }
+              - { slug: dog-kibble }
+      - description: The RESTified catalogue endpoint answers with the same products.
+        url: /api/rest/products
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: cat-scratcher
+              title: Cat Scratcher
+              variants:
+                - sku: CAT-SCRATCH-POST
+                  price_minor: 1599
+                  currency: USD
+                  stock:
+                    available_quantity: 5
+            - slug: dog-kibble
+              title: Dog Kibble
+              variants:
+                - sku: DOG-CHICKEN-1KG
+                  price_minor: 1999
+                  currency: USD
+                  stock:
+                    available_quantity: 1
+                - sku: DOG-SALMON-1KG
+                  price_minor: 2499
+                  currency: USD
+                  stock:
+                    available_quantity: 3
+
+  - name: mcp and graphql publish the same catalogue
+    steps:
+      - as: { role: anonymous }
+      - graphql: 'query { product(order_by: {id: asc}) { id slug } }'
+        expect:
+          data:
+            product:
+              - { id: 1, slug: dog-kibble }
+              - { id: 2, slug: cat-scratcher }
+      - description: The generic MCP query tool answers the same rows under the same role.
+        url: /mcp
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: tools/call
+          params:
+            name: query
+            arguments:
+              table: product
+              columns:
+                - id
+                - slug
+              order_by:
+                id: asc
+        response:
+          jsonrpc: "2.0"
+          id: 1
+          result:
+            isError: false
+            structuredContent:
+              rows:
+                - { id: 1, slug: dog-kibble }
+                - { id: 2, slug: cat-scratcher }
+
+  - name: one product reads the same by slug
+    steps:
+      - description: One published product, read through the REST door by its slug.
+        url: /api/rest/products/dog-kibble
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: dog-kibble
+              title: Dog Kibble
+              description: Balanced chicken and salmon recipes.
+              variants:
+                - sku: DOG-CHICKEN-1KG
+                  price_minor: 1999
+                  currency: USD
+                  stock:
+                    available_quantity: 1
+                - sku: DOG-SALMON-1KG
+                  price_minor: 2499
+                  currency: USD
+                  stock:
+                    available_quantity: 3

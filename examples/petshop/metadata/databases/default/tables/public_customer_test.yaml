@@ -1,0 +1,23 @@
+# The customer table's wall between shoppers: an update with no filter means
+# "every row I am allowed to touch", and for a customer that is exactly one
+# row — their own. Another shopper's row is not renamed by a request that
+# never named them.
+tests:
+  - name: an unfiltered update still only reaches your own row
+    steps:
+      # The migrations seed two customers; the attack needs a second one to
+      # fail to touch, so pin both rows before anything moves.
+      - sql: SELECT customer_id, name FROM customer ORDER BY customer_id
+        expect:
+          - { customer_id: customer-1, name: Alice Buyer }
+          - { customer_id: customer-2, name: Bob Buyer }
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { update_customer(where: {}, _set: {name: "Renamed By Test"}) { affected_rows } }'
+        expect:
+          data: { update_customer: { affected_rows: 1 } }
+      # The one row it reached is the caller's own.
+      - sql: SELECT name FROM customer WHERE customer_id = 'customer-1'
+        expect: [{ name: Renamed By Test }]
+      # And the other shopper's row is untouched.
+      - sql: SELECT name FROM customer WHERE customer_id = 'customer-2'
+        expect: [{ name: Bob Buyer }]

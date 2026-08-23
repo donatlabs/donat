@@ -12,23 +12,6 @@ tests:
           INSERT INTO cart (customer_id) VALUES ('customer-1');
           INSERT INTO orders (id, customer_id)
             VALUES ('00000000-0000-0000-0000-000000000001', 'customer-1');
-      - description: Anonymous visitors cannot query customer data.
-        url: /v1/graphql
-        status: 200
-        headers:
-          X-Donat-Role: anonymous
-        query:
-          query: |
-            query {
-              customer { customer_id }
-            }
-        response:
-          errors:
-            - extensions:
-                path: $.selectionSet.customer
-                code: validation-failed
-              message: "field 'customer' not found in type: 'query_root'"
-
       - description: A customer cannot read another customer's carts or orders.
         url: /v1/graphql
         status: 200
@@ -116,3 +99,72 @@ tests:
           id: 1
           result:
             isError: true
+
+  # The four tables a visitor with no account cannot even name: the schema
+  # for the anonymous role has no such fields, so the refusal does not
+  # confirm the data exists.
+  - name: a visitor with no account cannot reach customer data
+    steps:
+      - for:
+          - { field: cart }
+          - { field: orders }
+          - { field: customer }
+          - { field: payment }
+        do:
+          - url: /v1/graphql
+            status: 200
+            headers:
+              X-Donat-Role: anonymous
+            query:
+              query: "query { ${item.field} { id } }"
+            response:
+              errors:
+                - extensions:
+                    path: $.selectionSet.${item.field}
+                    code: validation-failed
+                  message: "field '${item.field}' not found in type: 'query_root'"
+
+  # Support's view of a shopper's orders and the shopper's own view agree:
+  # there is no order the desk can see that its owner cannot.
+  - name: every order belongs to a customer who can see it
+    steps:
+      - sql: |
+          INSERT INTO orders (id, customer_id, order_status, total_minor)
+            VALUES ('${order}', 'customer-1', 'authorized', 2499);
+      - as: { role: support }
+      - graphql: 'query { orders(where: {customer_id: {_eq: "customer-1"}}) { id customer_id order_status total_minor } }'
+        expect:
+          data:
+            orders:
+              - { id: "${order}", customer_id: customer-1, order_status: authorized, total_minor: 2499 }
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { orders { id customer_id order_status total_minor } }'
+        expect:
+          data:
+            orders:
+              - { id: "${order}", customer_id: customer-1, order_status: authorized, total_minor: 2499 }
+
+  # A freshly authorized order always carries a payment in a live state
+  # covering exactly what it charged: 2499 (one DOG-SALMON-1KG) + 799
+  # standard shipping + 160 quoted tax.
+  - name: an authorized order has money behind it
+    steps:
+      - providers: !include ../../../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655441101") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      - sql: |
+          SELECT orders.order_status, orders.total_minor,
+                 payment.status, payment.amount_minor, payment.currency
+          FROM orders JOIN payment ON payment.order_id = orders.id
+        expect:
+          - { order_status: authorized, total_minor: 3458,
+              status: authorized, amount_minor: 3458, currency: USD }
