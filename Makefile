@@ -1,7 +1,7 @@
 .PHONY: build test conformance db-up db-down db-logs conformance-backend \
 	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex \
 	petshop-up petshop-down petshop-system-tests wasm-core go-test \
-	lending-up lending-down lending-system-tests
+	lending-up lending-down lending-system-tests gate
 
 build:
 	cargo build
@@ -48,6 +48,14 @@ lending-system-tests:
 	@test -d tests-system-lending/.venv || python3 -m venv tests-system-lending/.venv
 	@tests-system-lending/.venv/bin/pip install -q -r tests-system-lending/requirements.txt
 	@cd tests-system-lending && eval "$$(./stack.sh env)" && .venv/bin/python -m pytest
+
+# What CI's change gate will ask this branch to declare, before it asks.
+# GATE_BASE is the branch the pull request targets; GATE_BODY is a file with
+# the description you intend to write, so the markers can be checked locally.
+GATE_BASE ?= main
+gate:
+	python3 scripts/check_change_gate.py --self-test
+	python3 scripts/check_change_gate.py --base $(GATE_BASE) $(if $(GATE_BODY),--body-file $(GATE_BODY))
 
 # Native Postgres reference conformance suite. Spawns its own engine
 # instances, one database per suite.
