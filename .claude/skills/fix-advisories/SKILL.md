@@ -45,7 +45,10 @@ The last line you print is read by a machine. It must be one of:
    cargo audit --deny warnings
    python3 scripts/check_audit_excuses.py --no-fetch
    ```
-   Both exit 0 → print `NOTHING TO DO` and stop. Do not open anything.
+   Both exit 0 → print `NOTHING TO DO` and stop. Do not open anything. (The
+   loop's `precheck.sh` runs the same two commands and only wakes you when one
+   of them reports something, so in practice you are here because there is
+   work — but confirm it rather than trust it.)
 
 2. For each advisory `cargo audit` raised: `cargo tree -i <crate>` shows who
    pulls it in. Try, in order, the smallest change that resolves it:

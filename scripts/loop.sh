@@ -58,12 +58,37 @@ echo "loop: $job on $branch ($base) — log $log"
 
 started=$(date +%s)
 status=0
-(
-  cd "$worktree"
-  export CARGO_TARGET_DIR="$state/target"
-  timeout --signal=TERM --kill-after=60 "$timeout_s" \
-    claude -p "/$job" --max-turns "$max_turns" --output-format json
-) >"$result" 2>"$log" || status=$?
+run_agent=1
+
+# A job may carry a cheap precheck that decides whether the model is worth
+# waking. `.claude/skills/<job>/precheck.sh` runs in the worktree with the same
+# PATH and target directory the agent would have; its exit code is the whole
+# contract: 0 means "nothing to do, do not spend a model on it", 10 means
+# "there is work, run the agent", anything else is an error the run stops on.
+# For fix-advisories this is `cargo audit` (free, seconds) instead of a
+# half-dollar of model to be told the tree is clean. A job with no precheck
+# always runs the agent — the earlier, simpler behaviour.
+precheck="$repo/.claude/skills/$job/precheck.sh"
+if [ -f "$precheck" ]; then
+  echo "loop: $job precheck…"
+  pc=0
+  ( cd "$worktree"; export CARGO_TARGET_DIR="$state/target"; bash "$precheck" ) >>"$log" 2>&1 || pc=$?
+  case "$pc" in
+    0)  run_agent=0; printf '{"result":"NOTHING TO DO (precheck)","num_turns":0,"total_cost_usd":0}' >"$result" ;;
+    10) : ;;  # work exists — fall through to the agent
+    *)  run_agent=0; status=$pc
+        printf '{"result":"NEEDS HUMAN: precheck exit %s (see log)","num_turns":0,"total_cost_usd":0}' "$pc" >"$result" ;;
+  esac
+fi
+
+if [ "$run_agent" -eq 1 ]; then
+  (
+    cd "$worktree"
+    export CARGO_TARGET_DIR="$state/target"
+    timeout --signal=TERM --kill-after=60 "$timeout_s" \
+      claude -p "/$job" --max-turns "$max_turns" --output-format json
+  ) >"$result" 2>"$log" || status=$?
+fi
 seconds=$(( $(date +%s) - started ))
 
 # The job's verdict is its last line; cost and turns come from the JSON
