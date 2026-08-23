@@ -21,3 +21,116 @@ tests:
       # And the other shopper's row is untouched.
       - sql: SELECT name FROM customer WHERE customer_id = 'customer-2'
         expect: [{ name: Bob Buyer }]
+
+  # -- file attachments: the avatar column (no byte ever passes the engine) --
+
+  - name: the engine never carries the bytes
+    steps:
+      - as: { role: customer, user: customer-1 }
+      # The upload target is the object store's own absolute URL — never the
+      # engine — and the completion call is a signed path the engine answers.
+      - graphql: 'mutation { donat_request_file_upload(attachment: "public_customer_avatar", file_name: "avatar.png", media_type: "image/png", size: 66) { id url method complete_url expires_at } }'
+        expect:
+          data:
+            donat_request_file_upload:
+              id: "@uuid"
+              url: "@regex ^http://minio:9000/petshop-media/"
+              complete_url: "@regex ^/v1/files/complete/.+sig="
+              expires_at: "@present"
+
+  - name: a media type the column does not declare is refused
+    steps:
+      - as: { role: customer, user: customer-1 }
+      # The column declares image/png and image/jpeg only.
+      - graphql: 'mutation { donat_request_file_upload(attachment: "public_customer_avatar", file_name: "invoice.pdf", media_type: "application/pdf", size: 66) { id } }'
+        expect:
+          errors:
+            - extensions:
+                path: $.selectionSet.donat_request_file_upload
+                code: validation-failed
+              message: "media type 'application/pdf' is not accepted by 'public.customer.avatar'"
+
+  - name: a file larger than the column allows is refused
+    steps:
+      - as: { role: customer, user: customer-1 }
+      # The column declares a 2 MiB ceiling; 8 MiB is refused at request time.
+      - graphql: 'mutation { donat_request_file_upload(attachment: "public_customer_avatar", file_name: "avatar.png", media_type: "image/png", size: 8388608) { id } }'
+        expect:
+          errors:
+            - extensions:
+                path: $.selectionSet.donat_request_file_upload
+                code: validation-failed
+              message: "size 8388608 is outside the accepted range for 'public.customer.avatar' (1..=2097152)"
+
+  - name: the public cannot ask for an upload
+    steps:
+      - as: { role: anonymous }
+      # An upload URL is a grant, not a public resource: the anonymous role has
+      # no writable attachment (and no mutation at all), so the field is absent.
+      - graphql: 'mutation { donat_request_file_upload(attachment: "public_customer_avatar", file_name: "avatar.png", media_type: "image/png", size: 66) { id } }'
+        expect:
+          errors:
+            - extensions:
+                path: $
+                code: validation-failed
+              message: no mutations exist
+
+  - name: an upload nobody finished cannot be claimed
+    steps:
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { donat_request_file_upload(attachment: "public_customer_avatar", file_name: "avatar.png", media_type: "image/png", size: 66) { id } }'
+        capture: { upload_id: /data/donat_request_file_upload/id }
+      # The bytes were never delivered, so the id is not claimable yet — and the
+      # refusal never says which of the possible causes applied.
+      - graphql: 'mutation { update_customer(where: {}, _set: {avatar: "${upload_id}"}) { affected_rows } }'
+        expect:
+          errors:
+            - extensions:
+                path: $
+                code: validation-failed
+              message: "file upload is not available: it is unknown, already used, expired, not uploaded, or was requested for another column or session"
+
+  - name: an invented file id is refused
+    steps:
+      - as: { role: customer, user: customer-1 }
+      # A file id nobody issued claims nothing, with the same refusal as every
+      # other unusable upload.
+      - graphql: 'mutation { update_customer(where: {}, _set: {avatar: "d5b0dcbf-0f2e-4b7c-9a67-3e1c6f2a9d41"}) { affected_rows } }'
+        expect:
+          errors:
+            - extensions:
+                path: $
+                code: validation-failed
+              message: "file upload is not available: it is unknown, already used, expired, not uploaded, or was requested for another column or session"
+
+  - name: a session may not hoard unclaimed uploads
+    steps:
+      - as: { role: customer, user: customer-2 }
+      # Ten pending uploads is the declared ceiling for one shopper
+      # (storage.yaml, pending_uploads_per_session). Each request below mints a
+      # new unclaimed upload...
+      - for:
+          - { n: 1 }
+          - { n: 2 }
+          - { n: 3 }
+          - { n: 4 }
+          - { n: 5 }
+          - { n: 6 }
+          - { n: 7 }
+          - { n: 8 }
+          - { n: 9 }
+          - { n: 10 }
+        do:
+          - graphql: 'mutation { donat_request_file_upload(attachment: "public_customer_avatar", file_name: "hoard-${item.n}.png", media_type: "image/png", size: 66) { id } }'
+            expect:
+              data:
+                donat_request_file_upload: { id: "@uuid" }
+      # ...and the eleventh is refused by the store itself, which a reverse
+      # proxy could never see: the ceiling is counted against rows the engine owns.
+      - graphql: 'mutation { donat_request_file_upload(attachment: "public_customer_avatar", file_name: "hoard-11.png", media_type: "image/png", size: 66) { id } }'
+        expect:
+          errors:
+            - extensions:
+                path: $.selectionSet.donat_request_file_upload
+                code: validation-failed
+              message: "too many upload requests: this session already holds the maximum number of unclaimed uploads, or has asked for too many in the last minute"
