@@ -165,6 +165,26 @@ insert_cart_line(
 migration. Name unique constraints deliberately — they become part of the API
 the moment a client upserts through them, and renaming one is a breaking change.
 
+## Where `tenancy.yaml` exists, a constraint is a tenancy decision
+
+Two things change in a migration once the deployment is tenanted, and both are
+easy to write correctly for one store and wrongly for two.
+
+**A new table needs the tenant key**, or a declared exemption. Forgetting stops
+the boot, which is the point — but it stops it after you have written the
+table, so decide while writing it.
+
+**A `UNIQUE` over a value somebody chose** — a slug, a code, an external id —
+almost always wants `(tenant_id, …)`. Global uniqueness means the first store
+to use a name takes it from every other, and the refusal names the constraint,
+so it also reports that somebody else holds it. A `UNIQUE` over a value the
+database issued is already unique across stores and stays as it is.
+
+The trap is the second order: once a column is unique only per tenant, every
+unique index *elsewhere* over that column has to carry the tenant too. `donat
+validate` cannot see this — it reads columns, not the reach of an index. See
+`donat-multitenancy` for the query that finds them.
+
 ## Deploy order
 
 ```sh

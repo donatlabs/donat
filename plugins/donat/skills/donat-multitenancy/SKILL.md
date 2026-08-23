@@ -179,6 +179,93 @@ catalogue belongs to every shopper and to no seller. So it stays in the
 permission's own `filter`, and what makes it reviewable is
 `unbounded_permissions: declared` — see `donat-tables-and-permissions`.
 
+## Making an existing schema multitenant
+
+The declaration is short. The migration under it is not: Petshop's is 498 lines
+for 16 lines of `tenancy.yaml`. Every one of those lines follows mechanically
+from the declaration plus the catalog, which is why a generator is specified
+(`specs/010-tenancy-migration-generator.md`) — **it does not exist yet**, so
+until it does this section is the procedure, and you are the generator.
+
+Derive five things, in this order. Do not write them from memory of the domain;
+ask the database each time.
+
+**1. The key column, on every tracked table.** Every table in the tenanted
+source either carries it, or is named under `keys:` because its key is spelled
+differently, or under `exempt:` because it belongs to nobody. `donat validate`
+names any table that says none of the three — run it and let it drive the list
+rather than reading the schema yourself.
+
+```sql
+ALTER TABLE public.<t> ADD COLUMN tenant_id text NOT NULL;
+CREATE INDEX <t>_tenant_id_idx ON public.<t> (tenant_id);
+```
+
+**2. Views.** A view is a table to the engine: tracked, therefore scoped,
+therefore it must expose the key. Append the driving table's `tenant_id` to the
+select list, and to `GROUP BY` where the view groups.
+
+**3. Natural keys.** Anything unique that a person or an application *chose* —
+a slug, a sku, an email, a customer id — becomes `(tenant_id, …)`. Anything
+unique that the database or a provider *issued* — a `bigserial`, a `uuid`
+default, a provider's payment id — stays as it is, because it is already unique
+across stores.
+
+**4. Everything keyed by what step 3 rescoped.** This is the step that gets
+missed, and it is the one that turns isolation back into coupling.
+
+Once `customer.customer_id` is unique only *within* a store, two stores
+legitimately hold a customer with the same id — and a unique index over that
+column anywhere else silently becomes a cross-store constraint. Petshop had
+exactly one: `cart_one_open_per_customer ON cart(customer_id)`. One shopper,
+two stores, and opening a cart in the first refused the cart in the second,
+naming the constraint in the error.
+
+Ask the database rather than reading the migration. `donat validate` cannot
+help here: it reads columns, not the reach of an index, and the catalog drops
+partial unique indexes on purpose.
+
+```sql
+-- every unique index on a tenanted table that does not carry the tenant
+SELECT t.relname, i.relname, array_agg(a.attname ORDER BY k.ord)
+  FROM pg_index x
+  JOIN pg_class i ON i.oid = x.indexrelid
+  JOIN pg_class t ON t.oid = x.indrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+  JOIN LATERAL unnest(x.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+  LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+ WHERE x.indisunique AND n.nspname = 'public'
+   AND EXISTS (SELECT 1 FROM pg_attribute ta
+                WHERE ta.attrelid = t.oid AND ta.attname = 'tenant_id'
+                  AND ta.attnum > 0 AND NOT ta.attisdropped)
+ GROUP BY i.relname, t.relname
+HAVING NOT ('tenant_id' = ANY(array_agg(a.attname)))
+ ORDER BY t.relname;
+```
+
+Read the result with step 3 in hand: an index keyed on a surrogate id is fine,
+an index keyed on a value you just made tenant-unique is not.
+
+**5. References.** A foreign key into a table whose identity became
+`(tenant_id, …)` becomes composite, so a row pointing across the boundary is
+impossible in the database and not only in the predicate.
+
+### When to stop and ask
+
+Three shapes are not yours to decide:
+
+- a **view you cannot re-derive** — anything past one driving table plus joins
+  you can attribute. Say which view and what you could not follow;
+- a **table that already has rows**, because `tenant_id NOT NULL` needs a value
+  for them and only the owner knows which;
+- a **unique constraint you cannot classify** as chosen or issued. Provider
+  identifiers are the live example: global today because one deployment holds
+  one provider account, and per-tenant connector credentials would change that.
+
+A half-scoped migration reads as a finished one. Stopping with a named object
+is the right outcome, and it is the same rule the engine follows when a tracked
+table carries neither key nor exemption.
+
 ## Checklist
 
 1. `tenancy.yaml` written; `donat validate` green — it names any table that
@@ -186,6 +273,8 @@ permission's own `filter`, and what makes it reviewable is
 2. The tenant claim reaches the token, and a request without one is refused.
 3. Cross-tenant foreign keys made composite in a migration.
 4. Natural keys scoped per tenant — a slug unique in a store, not globally.
+   Then every unique index over one of those columns, which is the step that
+   gets missed and the one no validator catches.
 5. Views redefined to carry the driving table's tenant key; a view is a table
    to the engine, therefore tracked, therefore scoped.
 6. Two tenants, the same query, disjoint rows — and a write naming the other

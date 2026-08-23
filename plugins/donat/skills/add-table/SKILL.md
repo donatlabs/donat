@@ -15,7 +15,10 @@ Load `donat-tables-and-permissions`, `donat-schema-and-migrations` and
    how relationships are declared, how session variables are spelled, whether
    column masks are explicit or `"*"`.
 
-2. **Migration** `V{YYYYMMDDHHMMSS}__create_<table>.sql`. Decide nullability
+2. **Migration** `V{YYYYMMDDHHMMSS}__create_<table>.sql`. If the deployment
+   has a `tenancy.yaml`, the table needs its tenant key and an index on it, or
+   a declared exemption — and any `UNIQUE` over a value somebody chose needs
+   `(tenant_id, …)`. See `donat-multitenancy`. Decide nullability
    deliberately: a nullable column forces every validator touching it to
    declare presence. Add the unique constraints and indexes the row filters
    will need — a filter traversing a relationship that has no index is a
