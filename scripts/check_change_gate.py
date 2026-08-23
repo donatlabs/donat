@@ -82,7 +82,7 @@ KINDS = {
     "timing": "why the test has to wait on time rather than on an event, and what bounds the wait",
     "ignored-test": "why the test cannot run by default and what runs it",
     "removed-test": "which tests went and what covers their property now",
-    "skills": "the paired `make evals-compare BEFORE=<arm> AFTER=<arm>` result, or why the edit needs no measurement",
+    "skills": "a measurement that the edit helps a skill (a paired benchmark arm, where one exists), or why the edit needs none",
 }
 
 

@@ -357,6 +357,52 @@ reviewable, and refused at deploy time when they do not hold together. If your
 logic wants a general-purpose language, keep it in a service and reach it
 through a connector.
 
+## Agentic contribution
+
+Much of the work here is done by coding agents, and the repository is built so
+that an agent writing code is answerable to the same things a person is — not
+to a reviewer's attention, which does not scale, but to gates that refuse. The
+premise is stated in
+[`knowledgebase/engineering`](knowledgebase/engineering/_index.md): a model
+does not learn between sessions; the repository does, and only on the rungs
+that refuse. So every lesson is pushed down to the lowest rung that can hold
+it — a test or a fixture before a lint, a lint before a CI gate, a gate before
+a sentence in a document.
+
+**The rules an agent reads.** [`CLAUDE.md`](CLAUDE.md) and
+[`AGENTS.md`](AGENTS.md) carry the same content for Claude Code and Codex: how
+work is done (a failing conformance case first, then the code), what is never
+negotiable (no admin role, fixtures are ground truth, snapshots are read not
+accepted), and how a red build is classified before it is touched.
+
+**The gate that reads the diff.** `make gate`
+([`scripts/check_change_gate.py`](scripts/check_change_gate.py), and the
+`Change gate` workflow on every pull request) is the mechanical twin of the
+rules that can be checked from a diff. A retired admin-role name in engine
+sources, or a committed `.snap.new`, fails outright. A change that is sometimes
+right and always worth a sentence — an existing fixture or snapshot rewritten,
+the toolchain bumped, an advisory excused, a `sleep` added to a conformance
+test, a test ignored, a skill edited — is admitted only when the pull request
+says why, one line per kind: `gate:<kind> <reason>`. A new fixture or snapshot
+is free; rewriting an existing one is what needs a reason. The gate checks that
+the change was named; a person reads whether the reason is good.
+
+**Measured, not asserted.** A change to a plugin skill names a measurement that
+the edit helps an agent build a better service — where a corpus to run one
+exists — or says why it needs none. The gate makes an unmeasured skill edit say
+so rather than pass in silence.
+
+**Unattended work still arrives as a pull request.** A nightly loop
+(`make setup-loop-infrastructure`; `scripts/loop.sh` and
+[`.claude/skills/fix-advisories`](.claude/skills/fix-advisories/SKILL.md)) runs
+jobs in a worktree of its own and opens a pull request — never a push to
+`main`, never a self-approved merge. The advisory check that feeds it runs
+[nightly in CI](.github/workflows/advisories.yml) as well. Whatever an agent
+did overnight is read, and merged, by a person.
+
+The shape of it: an agent can do the work, and the repository decides what it
+is allowed to have done quietly. Nothing here writes to `main` on its own.
+
 ## Get involved
 
 Star or watch the [repository](https://github.com/donatlabs/donat), report an
