@@ -1,0 +1,41 @@
+name: Change gate
+
+# The mechanical twin of the rules CLAUDE.md states in prose: an existing
+# fixture or snapshot rewritten, a test ignored or removed, a `sleep` added to
+# a conformance test, an advisory excused, a skill edited — each has to be
+# named in the pull request description (`gate:<kind> <reason>`), and the
+# retired admin-role names may not reappear in engine sources at all.
+# `make gate` runs the same check locally, before the request exists.
+#
+# Its own workflow rather than a job in ci.yml, for one reason: `edited`.
+# The usual way to satisfy the gate is to add a line to the description, and
+# this has to re-run when that happens — which ci.yml, forty-five minutes of
+# conformance, must not. The description is read live rather than from the
+# event payload, so a manual re-run also sees the current text.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  change-gate:
+    name: Change gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate diffs against the merge base with the target branch.
+          fetch-depth: 0
+      - name: Gate self-test
+        run: python3 scripts/check_change_gate.py --self-test
+      - name: Read the description as it is now
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr view "${{ github.event.pull_request.number }}" --json body --jq .body > pr-body.md
+      - name: Gate the diff
+        run: python3 scripts/check_change_gate.py --base "origin/${{ github.base_ref }}" --body-file pr-body.md
