@@ -116,11 +116,39 @@ pub fn load_test_file(path: &Path) -> Result<TestFile> {
     serde_json::from_value(json).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Run every test file under the application's metadata directory.
+/// Run every test file under the application's metadata directory. Files
+/// run in parallel, as many at a time as there are cores, the way cargo runs
+/// test binaries; the report keeps the files in discovery order.
 pub fn run_all(app: &AppTestConfig, run: &RunConfig) -> Result<Report> {
+    let files = discover(&app.metadata)?;
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(files.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(file) = files.get(index) else { break };
+                    let result = run_file(app, run, file);
+                    results
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((index, result));
+                }
+            });
+        }
+    });
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    results.sort_by_key(|(index, _)| *index);
     let mut report = Report::default();
-    for file in discover(&app.metadata)? {
-        report.cases.extend(run_file(app, run, &file)?.cases);
+    for (_, result) in results {
+        report.cases.extend(result?.cases);
     }
     Ok(report)
 }
@@ -219,9 +247,10 @@ impl CaseContext {
                         Ok(())
                     } else {
                         Err(anyhow!(
-                            "expected {class:?} (SQLSTATE {}), got {}: {error}",
+                            "expected {class:?} (SQLSTATE {}), got {}: {}",
                             class.sqlstate(),
-                            got.as_deref().unwrap_or("no SQLSTATE")
+                            got.as_deref().unwrap_or("no SQLSTATE"),
+                            describe_pg_error(&error)
                         ))
                     }
                 }
@@ -365,6 +394,17 @@ fn conf_headers(conf: &Json) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `postgres::Error` displays as "db error"; the message is in the payload.
+fn describe_pg_error(error: &postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(db) => match db.detail() {
+            Some(detail) => format!("{} ({detail})", db.message()),
+            None => db.message().to_string(),
+        },
+        None => error.to_string(),
+    }
 }
 
 fn pretty(v: &Json) -> String {

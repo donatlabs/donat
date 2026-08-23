@@ -1232,6 +1232,7 @@ dependencies = [
  "donat-schema",
  "donat-sqlgen",
  "donat-storage",
+ "donat-testkit",
  "futures-util",
  "graphql-parser",
  "hmac 0.12.1",
