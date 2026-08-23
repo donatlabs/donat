@@ -1,0 +1,19 @@
+# How long the email waits behind the bell. The shipped answer is "not at all",
+# because a module that delayed every message by default would be deciding
+# something the deployment did not ask for. A deployment that wants the
+# escalation — mail only if they did not look within five minutes — changes the
+# one row below, and the `test_cases` are what stop that edit from being silent.
+name: notification_email_delay
+inputs: { workflow: string! }
+output: { delay_seconds: int! }
+hit_policy: first
+rows:
+  - id: immediate
+    when: { workflow: "true" }
+    output: { delay_seconds: 0 }
+test_cases:
+  - name: the shipped default sends immediately
+    input: { workflow: order_shipped }
+    expect:
+      output: { delay_seconds: 0 }
+      matched_row_id: immediate

@@ -8,6 +8,19 @@ use std::path::Path;
 
 use donat_conformance::{Suite, Transport, apply_sql_migration_dir};
 
+/// The two versioned sets the store rests on, in the order its compose file
+/// applies them: the notification module's — whose `notification` schema the
+/// store's binding migration replaces a view in — and then the store's own.
+fn apply_store_migrations(database_url: &str, root: &std::path::Path) {
+    apply_sql_migration_dir(
+        database_url,
+        &root.join("../../modules/notifications/migrations"),
+    )
+    .expect("the notification module's migrations apply");
+    apply_sql_migration_dir(database_url, &root.join("migrations"))
+        .expect("the store's own migrations apply");
+}
+
 fn petshop_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/petshop")
 }
@@ -31,6 +44,10 @@ fn petshop_suite(name: &str) -> donat_conformance::Running {
         )
         .env("PETSHOP_PAYOUT_BASE_URL", "http://127.0.0.1:9")
         .env("PETSHOP_PAYOUT_API_TOKEN", "petshop-test-payout")
+        // The store adopts `modules/notifications`; its relay is resolved before
+        // the listener binds, like every other credential here.
+        .env("NOTIFICATION_MAIL_BASE_URL", "http://127.0.0.1:9")
+        .env("NOTIFICATION_MAIL_TOKEN", "petshop-test-mail")
         // The customer avatar is stored in an object store, and the engine
         // still signs the call reporting an upload finished.
         .env("PETSHOP_FILE_SIGNING_SECRET", "petshop-test-file-signing")
@@ -38,8 +55,12 @@ fn petshop_suite(name: &str) -> donat_conformance::Running {
         // but the registry resolves every credential before the listener binds.
         .env("PETSHOP_S3_KEY", "petshop-test-key")
         .env("PETSHOP_S3_SECRET", "petshop-test-secret")
+        // The store adopts `modules/notifications`; its relay is resolved before
+        // the listener binds, like every other credential here.
+        .env("NOTIFICATION_MAIL_BASE_URL", "http://127.0.0.1:9")
+        .env("NOTIFICATION_MAIL_TOKEN", "petshop-test-mail")
         .start();
-    apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
+    apply_store_migrations(running.db_url(), &root);
     running
 }
 
@@ -59,8 +80,12 @@ fn petshop_domain_suite(name: &str) -> donat_conformance::Running {
         // but the registry resolves every credential before the listener binds.
         .env("PETSHOP_S3_KEY", "petshop-test-key")
         .env("PETSHOP_S3_SECRET", "petshop-test-secret")
+        // The store adopts `modules/notifications`; its relay is resolved before
+        // the listener binds, like every other credential here.
+        .env("NOTIFICATION_MAIL_BASE_URL", "http://127.0.0.1:9")
+        .env("NOTIFICATION_MAIL_TOKEN", "petshop-test-mail")
         .start();
-    apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
+    apply_store_migrations(running.db_url(), &root);
     running
 }
 
@@ -83,7 +108,7 @@ const COMMAND_RELATIONS: &[&str] = &[
     "inventory_level",
     "inventory_reservation",
     "inventory_stock",
-    "notification_delivery",
+    "provider_notification_receipt",
     "order_adjustment",
     "order_current_authorization",
     "order_inventory_allocation_candidate",
@@ -136,7 +161,7 @@ const COMMAND_RELATIONS: &[&str] = &[
 fn command_relations_exist_in_the_petshop_catalog() {
     let root = petshop_root();
     let running = Suite::new("petshop_command_relations").start();
-    apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
+    apply_store_migrations(running.db_url(), &root);
     let mut client = postgres::Client::connect(running.db_url(), postgres::NoTls)
         .expect("connect to the Petshop command-relation database");
 
@@ -195,7 +220,7 @@ fn command_relations_are_tracked_in_petshop_metadata() {
 fn command_view_outputs_preserve_declared_non_nullability() {
     let root = petshop_root();
     let running = Suite::new("petshop_command_view_nullability").start();
-    apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
+    apply_store_migrations(running.db_url(), &root);
     let mut client = postgres::Client::connect(running.db_url(), postgres::NoTls)
         .expect("connect to the Petshop command-view catalog database");
 
@@ -292,7 +317,7 @@ fn permission_validators() {
 fn store_constraints() {
     let root = petshop_root();
     let running = Suite::new("petshop_constraints").start();
-    apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
+    apply_store_migrations(running.db_url(), &root);
     let mut client = postgres::Client::connect(running.db_url(), postgres::NoTls)
         .expect("connect to the Petshop suite database");
 
@@ -336,7 +361,7 @@ fn store_constraints() {
 fn checkout_quotes_reject_discounts_above_the_subtotal() {
     let root = petshop_root();
     let running = Suite::new("petshop_checkout_quote_constraints").start();
-    apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
+    apply_store_migrations(running.db_url(), &root);
     let mut client = postgres::Client::connect(running.db_url(), postgres::NoTls)
         .expect("connect to the Petshop checkout-quote constraint database");
     client
@@ -364,7 +389,7 @@ fn checkout_quotes_reject_discounts_above_the_subtotal() {
 fn order_lines_accept_checkout_and_subscription_snapshots() {
     let root = petshop_root();
     let running = Suite::new("petshop_order_line_snapshots").start();
-    apply_sql_migration_dir(running.db_url(), &root.join("migrations")).unwrap();
+    apply_store_migrations(running.db_url(), &root);
     let mut client = postgres::Client::connect(running.db_url(), postgres::NoTls)
         .expect("connect to the Petshop order-line snapshot database");
     client

@@ -1,0 +1,56 @@
+# The in-app feed. Every permission here is filtered by the session variable
+# that names the recipient — there is no role that sees another person's inbox,
+# and none that can be granted one without editing this file.
+table:
+  schema: notification
+  name: inbox
+select_permissions:
+  - role: notification_user
+    permission:
+      columns:
+        - id
+        - dispatch_id
+        - title
+        - body
+        - url
+        - created_at
+        - seen_at
+        - seen
+        - read_at
+        - archived_at
+      filter:
+        recipient_id:
+          _eq: X-Donat-User-Id
+      # The unread count is an aggregate, and it is the one read every client
+      # makes on every page. Without this it would be a full feed fetch.
+      allow_aggregations: true
+update_permissions:
+  # Marking a notification seen, read or archived is the only thing a recipient
+  # may change about it. The title and body are the sender's.
+  - role: notification_user
+    permission:
+      columns:
+        - seen_at
+        - read_at
+        - archived_at
+      filter:
+        recipient_id:
+          _eq: X-Donat-User-Id
+      check:
+        recipient_id:
+          _eq: X-Donat-User-Id
+command_insert_permissions:
+  # The delivery Process writes the feed row on the recipient's behalf. It is a
+  # command permission, so `notification_worker` gains no API surface here.
+  - role: notification_worker
+    permission:
+      columns: [dispatch_id, recipient_id, title, body, url]
+      check: {}
+command_select_permissions:
+  # `insert ... returning` reads the row back, so the role that writes the feed
+  # row must also be able to read the one it just wrote — and nothing else,
+  # since this is a command permission and grants no API surface.
+  - role: notification_worker
+    permission:
+      columns: [id, dispatch_id, recipient_id, title, body, url, created_at, seen_at, seen, read_at, archived_at]
+      filter: {}

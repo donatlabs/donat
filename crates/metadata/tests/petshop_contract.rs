@@ -92,15 +92,17 @@ fn petshop_contract_loads_complete_active_grammar() {
     let metadata =
         load_metadata_dir(&petshop_metadata_dir()).expect("real Petshop metadata must load");
 
-    assert_eq!(metadata.commands.len(), 74);
-    assert_eq!(metadata.connectors.len(), 5);
+    // The store's own declarations plus the notification module it adopts:
+    // 74 + 14 commands, 5 + 1 connectors, 11 + 2 processes.
+    assert_eq!(metadata.commands.len(), 88);
+    assert_eq!(metadata.connectors.len(), 6);
 
     let serialized =
         serde_yaml::to_value(&metadata).expect("loaded Petshop metadata must serialize");
     let processes = serialized["processes"]
         .as_sequence()
         .expect("flows.yaml must load into the processes collection");
-    assert_eq!(processes.len(), 11);
+    assert_eq!(processes.len(), 13);
 
     let command_operations = serialized["commands"]
         .as_sequence()
@@ -161,13 +163,18 @@ fn petshop_contract_loads_complete_active_grammar() {
             ("b2b_order_approval", 17),
             ("checkout_cancellation", 14),
             ("checkout_payment", 15),
-            ("grooming_booking", 8),
+            // One state more than the store wrote: `tell_the_customer`, which
+            // is where a confirmed booking calls the notification module.
+            ("grooming_booking", 9),
             ("partial_fulfilment", 14),
             ("payment_reconciliation", 9),
             ("prescription_review", 8),
             ("return_refund", 31),
             ("subscription_renewal", 39),
             ("vendor_payout", 6),
+            // The notification module's own two, adopted whole.
+            ("notification_delivery", 19),
+            ("notification_digest_sweep", 9),
         ]),
         "every reviewed Petshop process must remain present in full"
     );
@@ -196,19 +203,20 @@ fn petshop_contract_loads_complete_active_grammar() {
             });
     assert_eq!(
         process_states.len(),
-        171,
+        // 171 the store's own, plus the notification module's 29.
+        200,
         "the complete Petshop state inventory must not shrink silently"
     );
     assert_eq!(
         process_operation_counts,
         BTreeMap::from([
-            ("command", 60),
+            ("command", 77),
             ("fail", 13),
             ("for_each", 15),
-            ("output", 32),
-            ("request", 18),
-            ("wait", 10),
-            ("when", 23),
+            ("output", 34),
+            ("request", 20),
+            ("wait", 11),
+            ("when", 30),
         ]),
         "every declarative execution form must retain its reviewed coverage"
     );

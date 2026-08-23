@@ -1254,6 +1254,7 @@ impl Suite {
             _database: database,
             metadata: RefCell::new(metadata),
             engine: RefCell::new(None),
+            module_files: RefCell::new(Vec::new()),
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1302,6 +1303,11 @@ pub struct Running {
     metadata: RefCell<Metadata>,
     /// The spawned engine, started on first request (`ensure_engine`).
     engine: RefCell<Option<EngineProc>>,
+    /// Files an adopted module owns that are not YAML — a document template's
+    /// source, and whatever it includes. They are copied into the written
+    /// metadata directory because `source` is resolved against the metadata
+    /// root and refused if it escapes.
+    module_files: RefCell<Vec<(String, PathBuf)>>,
     http: reqwest::blocking::Client,
 }
 
@@ -2282,10 +2288,16 @@ impl Running {
     /// Serialize the accumulated metadata to a temp `version: 3` directory.
     fn write_metadata_dir(&self) -> PathBuf {
         let md = self.metadata.borrow();
-        Self::write_metadata_snapshot(&self.name, &md)
+        Self::write_metadata_snapshot(&self.name, &md, &self.module_files.borrow())
     }
 
-    fn write_metadata_snapshot(name: &str, md: &Metadata) -> PathBuf {
+    /// Write a metadata directory, plus any non-YAML files an adopted module
+    /// owns (a document template's source, and whatever it includes).
+    fn write_metadata_snapshot(
+        name: &str,
+        md: &Metadata,
+        module_files: &[(String, PathBuf)],
+    ) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("dist_conf_md_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("databases")).unwrap();
@@ -2365,6 +2377,23 @@ impl Running {
                 serde_yaml::to_string(&md.connectors).expect("serialize connectors"),
             )
             .unwrap();
+        }
+        if !md.templates.is_empty() {
+            std::fs::write(
+                dir.join("documents.yaml"),
+                serde_yaml::to_string(&json!({ "templates": md.templates }))
+                    .expect("serialize document templates"),
+            )
+            .unwrap();
+            for (relative, source) in module_files {
+                let destination = dir.join(relative);
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent).expect("create a template directory");
+                }
+                std::fs::copy(source, &destination).unwrap_or_else(|error| {
+                    panic!("copy template file {}: {error}", source.display())
+                });
+            }
         }
         if !md.storage.is_empty() {
             std::fs::write(
@@ -2636,6 +2665,91 @@ impl Running {
             "add_cron_trigger must be called before the engine spawns"
         );
         self.metadata.borrow_mut().cron_triggers.push(trigger);
+    }
+
+    /// Adopt a metadata module — a directory that loads on its own and whose
+    /// declarations an application merges into its own deployment.
+    ///
+    /// This is the harness's equivalent of the `!include` an adopting
+    /// application writes, and it is deliberately the *shipped files* that are
+    /// read: a module whose YAML stops parsing, or whose permissions stop
+    /// meaning what they said, fails here rather than in whichever project
+    /// adopted it. The module's own source configuration is discarded — the
+    /// suite already has a database, and a module never names one.
+    pub fn adopt_metadata_module(&self, dir: &std::path::Path) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "a module must be adopted before the engine spawns"
+        );
+        let mut module = donat_metadata::load_metadata_dir(dir)
+            .unwrap_or_else(|error| panic!("load metadata module {}: {error}", dir.display()));
+
+        // Two fields the loader derives are written back out and then refused
+        // on the way in: the `template_pin` stamped onto a `local.document`
+        // activity, and a template's `content_hash`. Neither belongs in the
+        // source YAML an application writes, which is what this directory is
+        // standing in for, so both are dropped here and re-derived on the load
+        // that matters.
+        for process in &mut module.processes {
+            for state in &mut process.states {
+                if let donat_metadata::ProcessStateOperation::Request { request } =
+                    &mut state.operation
+                {
+                    request.template_pin = None;
+                }
+            }
+        }
+        for template in &mut module.templates {
+            template.content_hash.clear();
+        }
+        // A template's source file is not YAML and cannot travel with the rest;
+        // carry it across so the written directory is complete.
+        {
+            let mut files = self.module_files.borrow_mut();
+            for template in &module.templates {
+                for relative in std::iter::once(&template.source).chain(template.includes.iter()) {
+                    files.push((relative.clone(), dir.join(relative)));
+                }
+            }
+        }
+
+        let mut metadata = self.metadata.borrow_mut();
+        let target = metadata
+            .sources
+            .first_mut()
+            .expect("the suite has a source to merge into");
+        for source in module.sources {
+            target.tables.extend(source.tables);
+            target.functions.extend(source.functions);
+        }
+        metadata.inherited_roles.extend(module.inherited_roles);
+        metadata.commands.extend(module.commands);
+        metadata.processes.extend(module.processes);
+        metadata.rules.types.extend(module.rules.types);
+        metadata.rules.rules.extend(module.rules.rules);
+        metadata
+            .rules
+            .decision_tables
+            .extend(module.rules.decision_tables);
+        metadata.connectors.extend(module.connectors);
+        metadata.templates.extend(module.templates);
+        metadata.query_collections.extend(module.query_collections);
+        metadata.rest_endpoints.extend(module.rest_endpoints);
+        metadata.cron_triggers.extend(module.cron_triggers);
+    }
+
+    /// Change the accumulated metadata before the engine starts.
+    ///
+    /// This is how a test plays the part of the deployment rather than the
+    /// module: a module ships a decision table's default, and the deployment
+    /// is the one that edits the row. Nothing here may invent a permission a
+    /// module did not declare — that would test the test.
+    pub fn tune_metadata(&self, tune: impl FnOnce(&mut Metadata)) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "metadata is read at boot, so it must be tuned before the engine spawns"
+        );
+        tune(&mut self.metadata.borrow_mut());
     }
 
     /// Configure the deployment's storage backends before the engine starts.
@@ -3712,6 +3826,7 @@ mod tests {
             "jwt_claims_map",
             "mcp_tools",
             "migrate",
+            "notifications",
             "oidc_login",
             "petshop",
             "petshop_process",
@@ -3793,7 +3908,7 @@ mod tests {
             }]
         }))
         .expect("rule metadata deserializes");
-        let with_rules_dir = Running::write_metadata_snapshot("rules_wrapper", &with_rules);
+        let with_rules_dir = Running::write_metadata_snapshot("rules_wrapper", &with_rules, &[]);
         let rules = std::fs::read_to_string(with_rules_dir.join("rules.yaml"))
             .expect("nonempty wrapper is serialized");
         assert!(rules.contains("is_ready"));
@@ -3808,7 +3923,7 @@ mod tests {
         }))
         .expect("types-only rule metadata deserializes");
         let with_types_only_dir =
-            Running::write_metadata_snapshot("rules_types_only_wrapper", &with_types_only);
+            Running::write_metadata_snapshot("rules_types_only_wrapper", &with_types_only, &[]);
         let types_only = std::fs::read_to_string(with_types_only_dir.join("rules.yaml"))
             .expect("a types-only wrapper is serialized");
         assert!(types_only.contains("OrderStatus"));
@@ -3816,7 +3931,7 @@ mod tests {
         assert!(!types_only.contains("decision_tables:"));
 
         let without_rules_dir =
-            Running::write_metadata_snapshot("empty_rules_wrapper", &empty_metadata());
+            Running::write_metadata_snapshot("empty_rules_wrapper", &empty_metadata(), &[]);
         assert!(
             !without_rules_dir.join("rules.yaml").exists(),
             "an empty wrapper must not create rules.yaml"
@@ -3853,7 +3968,7 @@ mod tests {
         }]))
         .expect("command metadata deserializes");
 
-        let dir = Running::write_metadata_snapshot("commands_section", &metadata);
+        let dir = Running::write_metadata_snapshot("commands_section", &metadata, &[]);
         let commands = std::fs::read_to_string(dir.join("commands.yaml"))
             .expect("nonempty commands section is serialized");
         assert!(commands.contains("create_order"));
@@ -3887,7 +4002,7 @@ mod tests {
         .expect("connector metadata deserializes");
 
         let with_connectors_dir =
-            Running::write_metadata_snapshot("connectors_section", &with_connectors);
+            Running::write_metadata_snapshot("connectors_section", &with_connectors, &[]);
         let connectors = std::fs::read_to_string(with_connectors_dir.join("connectors.yaml"))
             .expect("nonempty connectors section is serialized");
         assert!(connectors.contains("logistics_api"));
@@ -3900,7 +4015,7 @@ mod tests {
         );
 
         let without_connectors_dir =
-            Running::write_metadata_snapshot("empty_connectors_section", &empty_metadata());
+            Running::write_metadata_snapshot("empty_connectors_section", &empty_metadata(), &[]);
         assert!(
             !without_connectors_dir.join("connectors.yaml").exists(),
             "an empty connector list must not create connectors.yaml"
@@ -3932,7 +4047,7 @@ mod tests {
         .expect("process metadata deserializes");
 
         let with_processes_dir =
-            Running::write_metadata_snapshot("processes_section", &with_processes);
+            Running::write_metadata_snapshot("processes_section", &with_processes, &[]);
         let flows = std::fs::read_to_string(with_processes_dir.join("flows.yaml"))
             .expect("nonempty process section is serialized");
         assert!(flows.contains("checkout"));
@@ -3945,7 +4060,7 @@ mod tests {
         );
 
         let without_processes_dir =
-            Running::write_metadata_snapshot("empty_processes_section", &empty_metadata());
+            Running::write_metadata_snapshot("empty_processes_section", &empty_metadata(), &[]);
         assert!(
             !without_processes_dir.join("flows.yaml").exists(),
             "an empty process list must not create flows.yaml"

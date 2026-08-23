@@ -45,6 +45,7 @@ steps:
       returning: [id, booking_id, event_type, request_id]
 result:
   booking_id: { step: booking, column: id }
+  customer_id: { step: booking, column: customer_id }
   slot_key: { step: booking, column: slot_key }
   hold_expires_at: { step: booking, column: hold_expires_at }
   status: { step: booking, column: status }

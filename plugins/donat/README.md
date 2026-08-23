@@ -129,6 +129,7 @@ keep an expensive technique from firing on cheap problems.
 | `donat-file-attachments` | File columns, the object store, the request/upload/complete flow |
 | `donat-authentication` | Login, users and SSO: donat verifies tokens and never issues them — provider choice, claim mapping, and the default-role trap |
 | `donat-automation` | Cron triggers, event triggers, verified inbound webhooks and actions — and which of them need no receiver at all |
+| `donat-notifications` | Telling someone something: the shipped inbox/email/digest module, and the four things it asks of a deployment |
 | `donat-embedded-go` | The engine inside a Go program (wasm core, no cgo): in-process action functions, event handlers, `ExecuteTx`, and what the embedded host refuses |
 | `donat-platform-ui` | The platform — the screens its users and operators work in — as TypeScript resource configs derived from the metadata; forms, nav and routes generated, never hand-written |
 | `donat-deploy-and-verify` | migrate/validate/serve, environment, health probes and drain, what to test |

@@ -22,6 +22,7 @@ conformance harness (`crates/conformance`).
 | `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
 | `apps/ui` | Platform UI (`@refinest/*` + React) over the engine's GraphQL. Its own npm project, outside the Cargo workspace and `make test`. Not an admin surface — an ordinary role rendered; see `knowledgebase/platform/decisions/001-*` |
+| `modules/notifications` | Shipped domain module: an inbox, opt-out, email delivery and a digest, as migrations plus ordinary metadata. No engine code — see its README and `knowledgebase/declarative-saas/decisions/097-*` |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
 

@@ -82,6 +82,7 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/082-an-instance-a-deployment-operates-is-a-whole-origin-it-names]]
 - [[decisions/090-a-put-against-a-fixed-identity-is-the-method-half-and-a-version-pin-belongs-to-the-operation]]
 - [[decisions/095-a-credential-adjacent-value-is-not-a-credential-and-the-fingerprint-is-where-the-difference-shows]]
+- [[decisions/097-notifications-are-a-module-a-deployment-adopts-not-a-surface-the-engine-grows]]
 
 ## Reference governance
 

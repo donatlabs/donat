@@ -1,0 +1,62 @@
+# The same trigger, batched. The bell still rings immediately; only the email
+# waits for the sweep, which is the difference between a digest and a delay.
+#
+# It is a separate command rather than a flag on `notify` because a caller
+# choosing per call whether a channel batches is a policy decision, and a
+# policy decision that arrives as an argument is one nobody can review.
+name: notify_digested
+source: default
+permissions:
+  - role: notification_sender
+arguments:
+  - name: workflow
+    type: string!
+  - name: recipient_id
+    type: string!
+  - name: title
+    type: string!
+  - name: body
+    type: string!
+  # Where the notification points. Nullable, because plenty of notifications
+  # are not about a page; the feed row carries it through so a client can make
+  # the message clickable.
+  - name: url
+    type: string
+  - name: request_id
+    type: uuid!
+steps:
+  - name: recipient
+    select_one:
+      table: { schema: notification, name: recipient }
+      by:
+        id: { arg: recipient_id }
+      returning: [id]
+      require_found: true
+  - name: dispatch
+    insert:
+      table: { schema: notification, name: dispatch }
+      object:
+        workflow: { arg: workflow }
+        recipient_id: { arg: recipient_id }
+        title: { arg: title }
+        body: { arg: body }
+        url: { arg: url }
+        digest: { literal: true }
+      returning: [id, workflow, recipient_id]
+result:
+  dispatch_id: { step: dispatch, column: id }
+  workflow: { step: dispatch, column: workflow }
+  recipient_id: { step: dispatch, column: recipient_id }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: recipient_id }
+    - { argument: workflow }
+  retention: 7d
+effects:
+  - start_process:
+      process: notification_delivery
+      input:
+        dispatch_id: { step: dispatch, column: id }
+      process_key: { step: dispatch, column: id }
+      idempotency_key: { argument: request_id }

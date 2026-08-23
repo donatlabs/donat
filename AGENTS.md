@@ -20,6 +20,7 @@ conformance harness (`crates/conformance`).
 | `crates/sqlgen` | IR → one Postgres SQL statement (insta snapshot tests) |
 | `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
+| `modules/notifications` | Shipped domain module: an inbox, opt-out, email delivery and a digest, as migrations plus ordinary metadata. No engine code — see its README and `knowledgebase/declarative-saas/decisions/097-*` |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
 

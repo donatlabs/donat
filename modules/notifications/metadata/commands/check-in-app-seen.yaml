@@ -1,0 +1,27 @@
+# Did the recipient already see this in the app? Asked after the delay and
+# before the email, so that an escalation does not arrive for something the
+# recipient has already dealt with.
+name: notification_check_in_app_seen
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: dispatch_id
+    type: uuid!
+steps:
+  - name: seen_messages
+    select_many:
+      table: { schema: notification, name: inbox }
+      by:
+        dispatch_id: { arg: dispatch_id }
+        seen: { literal: true }
+      order_by: [id]
+      returning: [id]
+      maximum_rows: 1
+  - name: counted
+    aggregate:
+      from: { step: seen_messages }
+      values:
+        seen: { count: {} }
+result:
+  seen: { step: counted, column: seen }

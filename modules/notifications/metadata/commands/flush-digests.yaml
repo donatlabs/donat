@@ -1,0 +1,53 @@
+# One recipient's digest, started.
+#
+# The group is an argument rather than something the sweep discovers, and that
+# is the whole reason this module's digest cannot wedge. Discovering them inside
+# the Process would mean a `for_each` over `read_digest_queue`, and a
+# `select_many` cannot be bounded — its `maximum_rows` is accepted and then
+# ignored (`plans/006-*`) — while a fan-out that overflows fails the entire
+# Process rather than trimming. So enumeration happens where a bound is real: a
+# scheduler reads `notification_pending_digest` under a permission that carries
+# `limit`, and calls this once per row.
+#
+# Calling it for a group with nothing pending sends nothing: the claim finds no
+# deferred rows and rejects, so the instance fails having done nothing rather
+# than mailing a digest of zero.
+name: flush_notification_digests
+source: default
+permissions:
+  # Deliberately not `notification_worker`. This command is published over REST
+  # so a scheduler can call it, and whatever holds the role that reaches it can
+  # call every other command that role permits. `notification_worker` permits
+  # the ones that take a recipient id as a plain argument — reading anyone's
+  # address, or retiring anyone's digest without sending it. The scheduler gets
+  # a role that reaches this and the pending list, and nothing else.
+  - role: notification_scheduler
+arguments:
+  - name: request_id
+    type: uuid!
+  - name: recipient_id
+    type: string!
+  - name: workflow
+    type: string!
+steps: []
+idempotency:
+  # A sweep of one group is identified by its caller's own request id: a
+  # scheduler that fires twice, or a retry of the same tick, sweeps once.
+  key: { argument: request_id }
+  scope:
+    - { argument: recipient_id }
+    - { argument: workflow }
+  retention: 1d
+result:
+  sweep_id: { arg: request_id }
+  recipient_id: { arg: recipient_id }
+  workflow: { arg: workflow }
+effects:
+  - start_process:
+      process: notification_digest_sweep
+      input:
+        sweep_id: { arg: request_id }
+        recipient_id: { arg: recipient_id }
+        workflow: { arg: workflow }
+      process_key: { arg: request_id }
+      idempotency_key: { argument: request_id }

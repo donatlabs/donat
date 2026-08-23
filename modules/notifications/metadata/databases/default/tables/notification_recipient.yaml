@@ -1,0 +1,21 @@
+# The application's binding, tracked so that a deployment which never replaced
+# the shipped view is refused by `donat validate` rather than discovered at the
+# first send. It is read only inside a command — there is no role that can query
+# the recipient list over the API.
+table:
+  schema: notification
+  name: recipient
+command_select_permissions:
+  # `notify` and `notify_digested` check that the recipient exists and read
+  # nothing else. Granting the address here would be latent breadth on the
+  # module's most sensitive column for no caller that uses it.
+  - role: notification_sender
+    permission:
+      columns: [id]
+      filter: {}
+  # The delivery Process reads the address at send time rather than trusting a
+  # copy taken when the notification was triggered.
+  - role: notification_worker
+    permission:
+      columns: [id, email, email_verified, locale, timezone]
+      filter: {}

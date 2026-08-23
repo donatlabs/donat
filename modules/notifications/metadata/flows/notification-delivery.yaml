@@ -1,0 +1,243 @@
+# One notification, delivered on every channel it is allowed on.
+#
+# Both channels are in one Process rather than one each, because "what happened
+# to this notification" should be one instance and one journal. The channels are
+# sequential rather than parallel for the same reason a feed row is written
+# before an email is sent: the in-app copy is free and immediate, and an email
+# that follows it is the escalation.
+#
+# Every outcome ends at `done`. The Process output is only the dispatch id,
+# because the answer to "what happened" is `notification.delivery` — one row per
+# channel, written by the state that learned it, under a unique constraint that
+# makes a second write a refusal rather than a double count.
+name: notification_delivery
+kind: process
+version: 1
+source: default
+# The permission names who may *start* this Process — the sender, since `notify`
+# is its entry point. Every state runs as `notification_worker` instead, which
+# is a fixed role with no ambient session and no API surface of its own.
+permissions:
+  - role: notification_sender
+input:
+  - { name: dispatch_id, type: uuid! }
+output:
+  - { name: dispatch_id, type: uuid! }
+# The pinned entry point. `notify_digested` starts this Process too, through the
+# same effect contract — the pin names the command whose result shape this
+# mapping is type-checked against, not the only command allowed to start it.
+start:
+  command: notify
+  input:
+    dispatch_id: { command_result: dispatch_id }
+  idempotency_key: { command_argument: request_id }
+  process_key: { command_result: dispatch_id }
+start_at: resolve_in_app
+states:
+  # --- the in-app channel -------------------------------------------------
+  - id: resolve_in_app
+    command:
+      name: notification_resolve_channel
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        channel: { literal: in_app }
+      next: route_in_app
+
+  - id: route_in_app
+    when:
+      cases:
+        - rule: notification_channel_is_enabled
+          with:
+            opted_out: { state: resolve_in_app, field: opted_out }
+          next: write_inbox
+      default: suppress_in_app
+
+  - id: write_inbox
+    command:
+      name: notification_deliver_in_app
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+      next: resolve_email
+
+  - id: suppress_in_app
+    command:
+      name: notification_record_delivery
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        channel: { literal: in_app }
+        status: { literal: suppressed }
+      next: resolve_email
+
+  # --- the email channel --------------------------------------------------
+  # Resolved a second time because the opt-out is per channel: a recipient who
+  # keeps the bell and silences the mail is the common case, not an edge one.
+  - id: resolve_email
+    command:
+      name: notification_resolve_channel
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        channel: { literal: email }
+      next: route_email
+
+  - id: route_email
+    when:
+      cases:
+        - rule: notification_channel_is_enabled
+          with:
+            opted_out: { state: resolve_email, field: opted_out }
+          next: route_address
+      default: suppress_email
+
+  # An address the deployment's binding never supplied is a fact about the
+  # binding, not a send that failed. It is decided once, here, so that neither
+  # the immediate path nor the digest queue ever carries a recipient nobody can
+  # reach.
+  - id: route_address
+    when:
+      cases:
+        - rule: notification_has_address
+          with:
+            email: { state: resolve_email, field: email }
+          next: route_digest
+      default: record_no_address
+
+  - id: record_no_address
+    command:
+      name: notification_record_email_failed
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        error_code: { literal: mail_no_address }
+      next: done
+
+  - id: route_digest
+    when:
+      cases:
+        - rule: notification_is_digested
+          with:
+            digest: { state: resolve_email, field: digest }
+          next: defer_email
+      default: wait_before_email
+
+  # Not sent, not suppressed, not failed: waiting for the sweep, which finds it
+  # by exactly this row's status.
+  - id: defer_email
+    command:
+      name: notification_record_delivery
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        channel: { literal: email }
+        status: { literal: deferred }
+      next: done
+
+  # The delay the deployment declared, read from a decision table so that
+  # changing it is an edit to data with its own test cases rather than a new
+  # shape of flow. Zero seconds is a timer that is already due.
+  - id: wait_before_email
+    wait:
+      timer:
+        decision_table: notification_email_delay
+        with:
+          workflow: { state: resolve_email, field: workflow }
+        output: delay_seconds
+      next: check_seen
+
+  - id: check_seen
+    command:
+      name: notification_check_in_app_seen
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+      next: route_seen
+
+  - id: route_seen
+    when:
+      cases:
+        - rule: notification_was_not_seen
+          with:
+            seen: { state: check_seen, field: seen }
+          next: send_email
+      default: skip_email
+
+  # Not a failure and not an opt-out: the recipient dealt with it in the app, so
+  # the escalation had nothing left to do.
+  - id: skip_email
+    command:
+      name: notification_record_delivery
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        channel: { literal: email }
+        status: { literal: skipped }
+      next: done
+
+  # The address is required here and nowhere earlier: a recipient with no email
+  # is a fact about the binding, and this is the state that has to have one.
+  - id: send_email
+    request:
+      connector: notification_mail
+      operation: send_email
+      input:
+        message_key: { input: dispatch_id, as: string }
+        recipient: { state: resolve_email, field: email, require_non_null: true }
+        subject: { state: resolve_email, field: title, require_non_null: true }
+        body: { state: resolve_email, field: body, require_non_null: true }
+      # Stable across retries and takeovers, which is what the relay's
+      # `Idempotency-Key` is derived from.
+      idempotency_key:
+        stable: { run: id, state: send_email }
+      timeout:
+        schedule_to_start: 10s
+        # Not wider than the operation's own `timeout: 5s`; a window that
+        # claimed more would be a number the connector never honours.
+        start_to_close: 5s
+      retry:
+        retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
+      next: notification_record_email_sent
+      on_error:
+        routes:
+          - kinds: [authentication, validation, permanent, invariant, timeout, retry_exhausted, transport, http_429, http_5xx]
+            next: record_email_failure
+        fallback: { next: record_email_failure }
+
+  - id: notification_record_email_sent
+    command:
+      name: notification_record_email_sent
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        provider_message_id: { state: send_email, field: provider_message_id }
+      next: done
+
+  - id: record_email_failure
+    command:
+      name: notification_record_email_failed
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        error_code: { literal: mail_send_failed }
+      next: done
+
+  - id: suppress_email
+    command:
+      name: notification_record_delivery
+      run_as: notification_worker
+      arguments:
+        dispatch_id: { input: dispatch_id }
+        channel: { literal: email }
+        status: { literal: suppressed }
+      next: done
+
+  - id: done
+    output:
+      values:
+        dispatch_id: { input: dispatch_id }

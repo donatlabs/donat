@@ -1,5 +1,6 @@
 import type { ResourceMapping } from '../data/donat-data-provider';
 import { IDENTITY_GROUP, identityGroup, identityResources } from './identity';
+import { notificationResources, notificationsGroup } from './notifications';
 import { usersResource, type Stand, type StandUsers } from './types';
 
 /**
@@ -32,6 +33,18 @@ export interface StandConfig {
    * a deployment whose people are rows in its own database says so here.
    */
   users?: Partial<StandUsers> & { mapping?: Partial<ResourceMapping> };
+  /**
+   * Whether this stand's role can read its own notification inbox — that is,
+   * whether the deployment adopted `modules/notifications` and made this role
+   * inherit `notification_user`.
+   *
+   * Opt-in rather than probed, and for the same reason the resources duplicate
+   * their permissions: asking the engine what a role may see is the admin API
+   * this engine deleted. A stand that turns this on without the module gets two
+   * screens whose queries the engine refuses — loudly, which is the honest
+   * failure.
+   */
+  notifications?: boolean;
 }
 
 /**
@@ -175,10 +188,18 @@ export function standFromConfig(config: StandConfig, defaults: Required<Pick<Sta
     // One that declares none is the platform's, and gets all of them.
     // The section exists only where its screens do: a group with no members
     // is an empty heading in the sidebar.
-    groups: config.users ? undefined : [identityGroup()],
-    resources: config.users
-      ? [usersResource(usersFrom(config.users))]
-      : [usersResource(usersFrom(undefined), IDENTITY_GROUP), ...identityResources()],
+    // A section exists only where its screens do: a group with no members is
+    // an empty heading in the sidebar.
+    groups: [
+      ...(config.users ? [] : [identityGroup()]),
+      ...(config.notifications ? [notificationsGroup()] : []),
+    ],
+    resources: [
+      ...(config.users
+        ? [usersResource(usersFrom(config.users))]
+        : [usersResource(usersFrom(undefined), IDENTITY_GROUP), ...identityResources()]),
+      ...(config.notifications ? notificationResources() : []),
+    ],
   };
 }
 

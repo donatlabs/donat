@@ -1,0 +1,7 @@
+# The escalation rule: an email that follows an in-app notification is only
+# worth sending if the in-app one was not seen. Zero seen messages is what
+# "they have not looked" reduces to.
+name: notification_was_not_seen
+parameters: { seen: bigint! }
+result: bool!
+expression: "seen == 0"

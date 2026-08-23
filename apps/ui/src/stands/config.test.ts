@@ -135,4 +135,35 @@ describe('stands from configuration', () => {
     const stands = standsFromEnv(JSON.stringify({ role: 'support' }), DEFAULTS);
     expect(stands.map((s) => s.role)).toEqual(['support']);
   });
+
+  it('leaves the notification screens out until a stand says it has them', () => {
+    const stand = standFromConfig({ users: { table: 'customer' } }, DEFAULTS);
+    expect(stand.resources.map((r) => r.name)).not.toContain('notification_inbox');
+    expect(stand.groups ?? []).toHaveLength(0);
+  });
+
+  it('adds the inbox and its preferences to a stand that adopted the module', () => {
+    const stand = standFromConfig(
+      { users: { table: 'customer' }, notifications: true },
+      DEFAULTS,
+    );
+    expect(stand.resources.map((r) => r.name)).toEqual([
+      'users',
+      'notification_inbox',
+      'notification_preference',
+    ]);
+    const inbox = stand.resources.find((r) => r.name === 'notification_inbox')!;
+    // The unread count is a permission fact: the module grants
+    // `allow_aggregations` on the feed and not on the preferences.
+    expect(inbox.mapping.aggregate).toBe('notification_inbox_aggregate');
+    // `seen` is generated in the database, so it is readable and never
+    // writable — sending it would fail GraphQL validation, not permissions.
+    expect(inbox.mapping.selectFields).toContain('seen');
+    expect(inbox.mapping.updatableFields).toEqual(['seen_at', 'read_at', 'archived_at']);
+    const preferences = stand.resources.find((r) => r.name === 'notification_preference')!;
+    expect(preferences.mapping.aggregate).toBe(false);
+    // `recipient_id` is an insert preset in the module, so it is not a field a
+    // form may offer.
+    expect(preferences.mapping.updatableFields).toEqual(['enabled']);
+  });
 });

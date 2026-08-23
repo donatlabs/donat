@@ -24,6 +24,7 @@ const LABEL_PATH: &str = "/v1/shipments/*/labels";
 const RETURN_LABEL_PATH: &str = "/v1/returns/*/labels";
 const REFUND_PATH: &str = "/v1/payment-authorizations/*/refunds";
 const CAPTURE_PATH: &str = "/v1/payment-authorizations/*/captures";
+const MAIL_PATH: &str = "/v1/email/messages";
 
 fn petshop_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/petshop")
@@ -50,6 +51,8 @@ fn start_store(stub: &ProviderStub, name: &str) -> donat_conformance::Running {
         )
         .env("PETSHOP_PAYOUT_BASE_URL", stub.base_url())
         .env("PETSHOP_PAYOUT_API_TOKEN", "petshop-test-payout")
+        .env("NOTIFICATION_MAIL_BASE_URL", stub.base_url())
+        .env("NOTIFICATION_MAIL_TOKEN", "petshop-test-mail")
         // The customer avatar is stored in an object store, and the engine
         // still signs the call reporting an upload finished.
         .env("PETSHOP_FILE_SIGNING_SECRET", "petshop-test-file-signing")
@@ -58,6 +61,15 @@ fn start_store(stub: &ProviderStub, name: &str) -> donat_conformance::Running {
         .env("PETSHOP_S3_KEY", "petshop-test-key")
         .env("PETSHOP_S3_SECRET", "petshop-test-secret")
         .start();
+    // Three versioned sets, in the order the example's compose file applies
+    // them: the engine's (the Suite's own `with_migrations`), then the
+    // notification module's, then the store's — whose binding migration
+    // replaces a view the module's set created.
+    apply_sql_migration_dir(
+        running.db_url(),
+        &root.join("../../modules/notifications/migrations"),
+    )
+    .expect("the notification module's migrations apply");
     apply_sql_migration_dir(running.db_url(), &root.join("migrations"))
         .expect("the example's own migrations apply");
     running
@@ -459,6 +471,7 @@ fn a_shopper_cancels_an_authorized_order_and_the_process_voids_the_payment() {
 fn a_shopper_confirms_a_grooming_hold_and_the_process_completes() {
     let stub = provider_stub::spawn();
     script_providers(&stub);
+    script_mail_relay(&stub);
     let suite = start_store(&stub, "petshop_grooming_booking");
 
     let (status, body) = suite.post(
@@ -503,6 +516,84 @@ fn a_shopper_confirms_a_grooming_hold_and_the_process_completes() {
         output.pointer("/booking_id").and_then(Json::as_str),
         Some(booking_id.as_str()),
         "the booking Process reports the hold it confirmed: {output}"
+    );
+
+    // The business notification. The booking flow calls `notify`, which hands
+    // the sending to the notification module's own durable Process: the bell
+    // rings first, the mail follows.
+    let (status, feed) = suite.post(
+        "/v1/graphql",
+        &json!({
+            "query": "query { notification_inbox { title body url } }"
+        }),
+        &[
+            ("X-Donat-Role".to_owned(), "customer".to_owned()),
+            ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+        ],
+    );
+    assert_eq!(status, 200, "reading the shopper's own feed: {feed}");
+    let inbox = wait_for_feed(&suite);
+    assert_eq!(
+        inbox.pointer("/0/title").and_then(Json::as_str),
+        Some("Your grooming appointment is confirmed"),
+        "the shopper is told about their own booking: {inbox}"
+    );
+    assert_eq!(
+        inbox.pointer("/0/url").and_then(Json::as_str),
+        Some("/bookings"),
+        "and the notification links where the booking is: {inbox}"
+    );
+
+    let mailed = wait_for(|| {
+        let calls = stub.calls_for(MAIL_PATH);
+        (!calls.is_empty()).then_some(calls)
+    });
+    assert_eq!(
+        mailed[0].body["recipient"],
+        json!("alice@example.com"),
+        "the address comes from the store's own customer row"
+    );
+    assert_eq!(
+        mailed[0].body["subject"],
+        json!("Your grooming appointment is confirmed")
+    );
+}
+
+/// The shopper's own feed, once the notification Process has written it.
+fn wait_for_feed(suite: &donat_conformance::Running) -> Json {
+    wait_for(|| {
+        let (_, body) = suite.post(
+            "/v1/graphql",
+            &json!({ "query": "query { notification_inbox { title body url } }" }),
+            &[
+                ("X-Donat-Role".to_owned(), "customer".to_owned()),
+                ("X-Donat-User-Id".to_owned(), CUSTOMER.to_owned()),
+            ],
+        );
+        let rows = body.pointer("/data/notification_inbox").cloned()?;
+        (rows.as_array().is_some_and(|r| !r.is_empty())).then_some(rows)
+    })
+}
+
+/// Durable work is waited for, never slept through.
+fn wait_for<T>(mut poll: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(value) = poll() {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the notification"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn script_mail_relay(stub: &ProviderStub) {
+    stub.set_default(
+        MAIL_PATH,
+        ScriptedResponse::ok(json!({ "message_id": "mail-1", "status": "accepted" })),
     );
 }
 

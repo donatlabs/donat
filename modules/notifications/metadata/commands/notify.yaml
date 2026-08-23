@@ -1,0 +1,72 @@
+# The one entry point. It records what is being sent and to whom, and hands the
+# sending itself to a durable Process — because a send crosses a transaction
+# boundary and a command may not.
+#
+# The idempotency key is the dedupe window: the same `request_id` for the same
+# recipient and workflow inside the retention returns the first result and
+# writes nothing further. A caller that wants "at most one order_shipped per
+# order per day" passes a key derived from the order and lets this refuse the
+# rest.
+name: notify
+source: default
+permissions:
+  - role: notification_sender
+arguments:
+  - name: workflow
+    type: string!
+  - name: recipient_id
+    type: string!
+  - name: title
+    type: string!
+  - name: body
+    type: string!
+  # Where the notification points. Nullable, because plenty of notifications
+  # are not about a page; the feed row carries it through so a client can make
+  # the message clickable.
+  - name: url
+    type: string
+  - name: request_id
+    type: uuid!
+steps:
+  # The recipient must exist before anything is written. This is the step that
+  # turns a deployment which never replaced the `notification.recipient` view
+  # into a named refusal at the first send. It is a check and not a source: the
+  # id written below is the caller's own argument, because a view's column is
+  # nullable by construction and a nullable uuid does not fit a `not null`
+  # column.
+  - name: recipient
+    select_one:
+      table: { schema: notification, name: recipient }
+      by:
+        id: { arg: recipient_id }
+      returning: [id]
+      require_found: true
+  - name: dispatch
+    insert:
+      table: { schema: notification, name: dispatch }
+      object:
+        workflow: { arg: workflow }
+        recipient_id: { arg: recipient_id }
+        title: { arg: title }
+        body: { arg: body }
+        url: { arg: url }
+      returning: [id, workflow, recipient_id]
+result:
+  dispatch_id: { step: dispatch, column: id }
+  workflow: { step: dispatch, column: workflow }
+  recipient_id: { step: dispatch, column: recipient_id }
+idempotency:
+  key: { argument: request_id }
+  scope:
+    - { argument: recipient_id }
+    - { argument: workflow }
+  retention: 7d
+effects:
+  - start_process:
+      process: notification_delivery
+      input:
+        dispatch_id: { step: dispatch, column: id }
+      # The dispatch is the Process's business identity, which is what makes
+      # `donat process inspect` answerable from a notification id alone.
+      process_key: { step: dispatch, column: id }
+      idempotency_key: { argument: request_id }

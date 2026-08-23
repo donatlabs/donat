@@ -1,0 +1,7 @@
+# Whether the deployment's binding gave this recipient an address at all. A
+# view's column is nullable by construction, so this is where "has one" is
+# decided — once, before anything is deferred or sent.
+name: notification_has_address
+parameters: { email: string }
+result: bool!
+expression: "!is_null(email)"

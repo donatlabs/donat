@@ -61,7 +61,7 @@ states:
           with:
             actual: { state: await_customer_confirmation, field: outcome }
             expected: { literal: confirmed }
-          next: confirmed
+          next: tell_the_customer
         - rule: booking_outcome_is
           with:
             actual: { state: await_customer_confirmation, field: outcome }
@@ -77,6 +77,30 @@ states:
         booking_id: { state: reserve_slot, field: booking_id }
         deadline_id: { activity_key: expire_hold, as: uuid }
       next: expired
+
+  # The business notification. A confirmed booking is the first thing a
+  # customer wants to hear about, and saying so is a command call rather than a
+  # service: `notify` records it and hands the sending to the module's own
+  # durable Process, which rings the bell now and mails afterwards.
+  #
+  # `run_as: notification_sender` is the module's trigger role, named directly
+  # because a fixed `run_as` needs no ambient session — the recipient comes from
+  # the booking that was reserved, not from whoever signalled the confirmation.
+  #
+  # The request id is the booking, so a confirmation replayed by a retry or a
+  # duplicate signal notifies once: `notify` deduplicates on it for seven days.
+  - id: tell_the_customer
+    command:
+      name: notify
+      run_as: notification_sender
+      arguments:
+        workflow: { literal: grooming_booking_confirmed }
+        recipient_id: { state: reserve_slot, field: customer_id }
+        title: { literal: "Your grooming appointment is confirmed" }
+        body: { literal: "We will see you at your booked time. Reply to this message if you need to move it." }
+        url: { literal: /bookings }
+        request_id: { state: reserve_slot, field: booking_id }
+      next: confirmed
 
   - id: confirmed
     output:

@@ -1,0 +1,173 @@
+# The outbound contract the module ships.
+#
+# The message is sent as a subject and a body, and the relay composes it. That
+# is not the shape this module wanted: the engine carries an MJML renderer
+# (`local.document`, `email.render`) whose whole purpose is to turn a declared
+# template and typed data into an inline `html`/`text` pair. It is unreachable
+# — a `local.*` instance publishes no operation contract, so a Process that
+# names one is refused at `validate`. See `plans/004-*`; when that is closed,
+# a render state goes in front of this send and `html`/`text` join the body.
+#
+# The request is a plain JSON POST carrying an `Idempotency-Key`, which is what
+# makes the send *provider-idempotent*: a retry after a timeout reaches the same
+# key and the relay absorbs it, so the Process may retry and the recipient still
+# gets one message.
+#
+# A deployment that sends through SendGrid, SES or Twilio instead uses the
+# compiled connector for that provider — and those publish no idempotency key,
+# so the send becomes `at_most_once` and the state changes shape. The README
+# carries that variant; it is a different bargain and it should look like one.
+name: notification_mail
+module: http
+config:
+  endpoint_identity: donat_notification_mail_v1
+  credential_identity: donat_notification_mail
+  base_url: { value_from_env: NOTIFICATION_MAIL_BASE_URL }
+  headers:
+    - name: Authorization
+      value_from_env: NOTIFICATION_MAIL_TOKEN
+operations:
+  - name: send_email
+    version: v1
+    method: POST
+    path: /v1/email/messages
+    input_contract:
+      message_key: string!
+      recipient: string!
+      subject: string!
+      body: string!
+    body:
+      message_key: { input: message_key }
+      recipient: { input: recipient }
+      subject: { input: subject }
+      body: { input: body }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_message_id: { json_pointer: /message_id, type: string!, max_bytes: 256 }
+      normalized_status: { json_pointer: /status, type: string!, max_bytes: 64 }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: donat-notification-mail-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.donat.notification-mail-contract.v1
+              fact_ids:
+                - fact.notification-mail.fixed-idempotency-header
+                - fact.notification-mail.retention-604800000
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 65536
+      maximum_aggregate_response_bytes: 8192
+      maximum_output_canonical_bytes: 8192
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: mail_authentication }
+        - { statuses: [408], class: timeout, code: mail_timeout }
+        - { statuses: [429], class: http_429, code: mail_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: mail_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: mail_rejected }
+      fallback: { class: permanent, code: mail_provider_error }
+    # The connector's own ceiling. The activity that calls it narrows both —
+    # `start_to_close: 5s` and `max_attempts: 3` — and the narrower of the two
+    # is what runs; these are the widest this operation may ever be given.
+    timeout: 5s
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 60, per: 1m, burst: 16 }
+      serialize_by: { input: message_key }
+    idempotency: { header: Idempotency-Key }
+    # The recipient's address and the message itself never reach a log.
+    redaction:
+      request_headers: [Authorization]
+      request_body: [recipient, subject, body]
+      response_body: [provider_message_id]
+
+  # The digest's own send. It carries a count rather than a composed
+  # sentence, for the same reason the single message carries a body rather
+  # than rendered HTML: the engine cannot render one yet (`plans/004-*`).
+  - name: send_digest
+    version: v1
+    method: POST
+    path: /v1/email/digests
+    # `recipient` is nullable here and nowhere else. It reaches this send as
+    # a fan-out item, and a `for_each` item has no `require_non_null` the way
+    # an input or a state reference does — so the guarantee that it is present
+    # lives in the flow (`route_address` refuses to defer a recipient with no
+    # address) rather than in the type. See `plans/005-*`.
+    input_contract:
+      message_key: string!
+      recipient: string
+      workflow: string!
+      pending: bigint!
+    body:
+      message_key: { input: message_key }
+      recipient: { input: recipient }
+      workflow: { input: workflow }
+      pending: { input: pending }
+    success_statuses: [200, 201, 202]
+    response:
+      provider_message_id: { json_pointer: /message_id, type: string!, max_bytes: 256 }
+      normalized_status: { json_pointer: /status, type: string!, max_bytes: 64 }
+    effect:
+      provider_idempotent:
+        side_effect_steps:
+          - step: request
+            fixed_binding: { header: Idempotency-Key }
+            scope: donat-notification-digest-v1
+            minimum_retention_ms: 604800000
+            clock_safety_margin_ms: 300000
+            evidence:
+              source_record_id: source.donat.notification-mail-contract.v1
+              fact_ids:
+                - fact.notification-mail.fixed-idempotency-header
+                - fact.notification-mail.retention-604800000
+    bounds:
+      deadline_ms: 5000
+      maximum_calls: 1
+      maximum_pages: 1
+      maximum_items: 1
+      maximum_aggregate_request_bytes: 16384
+      maximum_aggregate_response_bytes: 8192
+      maximum_output_canonical_bytes: 8192
+      maximum_redirects: 0
+      maximum_json_depth: 8
+      maximum_json_nodes: 128
+    error_map:
+      rules:
+        - { statuses: [401, 403], class: authentication, code: mail_authentication }
+        - { statuses: [408], class: timeout, code: mail_timeout }
+        - { statuses: [429], class: http_429, code: mail_rate_limited }
+        - { statuses: [500, 502, 503, 504], class: http_5xx, code: mail_unavailable }
+        - { statuses: [400, 404, 409, 422], class: validation, code: mail_rejected }
+      fallback: { class: permanent, code: mail_provider_error }
+    # The connector's own ceiling. The activity that calls it narrows both —
+    # `start_to_close: 5s` and `max_attempts: 3` — and the narrower of the two
+    # is what runs; these are the widest this operation may ever be given.
+    timeout: 5s
+    retry:
+      maximum_attempts: 4
+      backoff: 250ms
+      retry_on: [transport, timeout, http_429, http_5xx]
+    capacity:
+      max_in_flight: 16
+      rate_limit: { permits: 60, per: 1m, burst: 16 }
+      serialize_by: { input: message_key }
+    idempotency: { header: Idempotency-Key }
+    redaction:
+      request_headers: [Authorization]
+      request_body: [recipient]
+      response_body: [provider_message_id]

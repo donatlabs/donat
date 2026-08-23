@@ -16,7 +16,7 @@ arguments:
 steps:
   - name: delivery
     insert:
-      table: public.notification_delivery
+      table: public.provider_notification_receipt
       object:
         notification_id: { arg: notification_id }
         provider_message_id: { arg: provider_message_id }

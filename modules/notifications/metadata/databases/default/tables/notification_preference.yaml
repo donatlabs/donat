@@ -1,0 +1,38 @@
+# Opt-out. A recipient owns their own preferences and nobody else's; the
+# insert preset is what makes that true even for a caller who supplies a
+# different `recipient_id`, because a preset is not an argument.
+table:
+  schema: notification
+  name: preference
+select_permissions:
+  - role: notification_user
+    permission:
+      columns: [recipient_id, workflow, channel, enabled, updated_at]
+      filter:
+        recipient_id:
+          _eq: X-Donat-User-Id
+insert_permissions:
+  - role: notification_user
+    permission:
+      columns: [workflow, channel, enabled]
+      check:
+        recipient_id:
+          _eq: X-Donat-User-Id
+      set:
+        recipient_id: X-Donat-User-Id
+update_permissions:
+  - role: notification_user
+    permission:
+      columns: [enabled]
+      filter:
+        recipient_id:
+          _eq: X-Donat-User-Id
+      check:
+        recipient_id:
+          _eq: X-Donat-User-Id
+command_select_permissions:
+  # Reading the opt-out is the delivery Process's only interest in this table.
+  - role: notification_worker
+    permission:
+      columns: [recipient_id, workflow, channel, enabled]
+      filter: {}

@@ -1,0 +1,57 @@
+# What the Process needs to know before it delivers on a channel: what is being
+# sent, where it would go, and whether this recipient has opted out of that
+# channel for that workflow. It writes nothing.
+name: notification_resolve_channel
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: dispatch_id
+    type: uuid!
+  - name: channel
+    type: string!
+steps:
+  - name: dispatch
+    select_one:
+      table: { schema: notification, name: dispatch }
+      by:
+        id: { arg: dispatch_id }
+      returning: [id, workflow, recipient_id, title, body, url, digest]
+      require_found: true
+  # The address comes from the application's own binding, read at send time
+  # rather than copied at trigger time — an address that changed between the
+  # two is the current one.
+  - name: recipient
+    select_one:
+      table: { schema: notification, name: recipient }
+      by:
+        id: { step: dispatch, column: recipient_id }
+      returning: [id, email, email_verified, locale]
+      require_found: true
+  # At most one row: (recipient, workflow, channel) is the preference key, and
+  # only a row that says `enabled: false` is selected at all.
+  - name: opt_out
+    select_many:
+      table: { schema: notification, name: preference }
+      by:
+        recipient_id: { step: dispatch, column: recipient_id }
+        workflow: { step: dispatch, column: workflow }
+        channel: { arg: channel }
+        enabled: { literal: false }
+      order_by: [recipient_id]
+      returning: [enabled]
+      maximum_rows: 1
+  - name: counted
+    aggregate:
+      from: { step: opt_out }
+      values:
+        opted_out: { count: {} }
+result:
+  dispatch_id: { step: dispatch, column: id }
+  workflow: { step: dispatch, column: workflow }
+  recipient_id: { step: dispatch, column: recipient_id }
+  title: { step: dispatch, column: title }
+  body: { step: dispatch, column: body }
+  digest: { step: dispatch, column: digest }
+  email: { step: recipient, column: email }
+  opted_out: { step: counted, column: opted_out }

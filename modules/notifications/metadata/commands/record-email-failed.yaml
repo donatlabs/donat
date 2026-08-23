@@ -1,0 +1,36 @@
+# The send did not happen, and the failure class the connector named is kept.
+# A failed notification is a row here rather than a retry loop: the Process has
+# already exhausted the retries its declaration allowed, and a further attempt
+# would be the module deciding something the deployment did not declare.
+name: notification_record_email_failed
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: dispatch_id
+    type: uuid!
+  - name: error_code
+    type: string!
+steps:
+  - name: dispatch
+    select_one:
+      table: { schema: notification, name: dispatch }
+      by:
+        id: { arg: dispatch_id }
+      returning: [id, recipient_id, workflow]
+      require_found: true
+  - name: logged
+    insert:
+      table: { schema: notification, name: delivery }
+      object:
+        dispatch_id: { step: dispatch, column: id }
+        recipient_id: { step: dispatch, column: recipient_id }
+        workflow: { step: dispatch, column: workflow }
+        channel: { literal: email }
+        status: { literal: failed }
+        error_code: { arg: error_code }
+      returning: [id, channel, status]
+result:
+  delivery_id: { step: logged, column: id }
+  channel: { step: logged, column: channel }
+  status: { step: logged, column: status }

@@ -1,0 +1,8 @@
+# The whole opt-out policy: a channel is enabled unless a preference row says
+# otherwise. The count is what makes that total — an absent preference is zero
+# rows, not a null to reason about, so "absent means enabled" is arithmetic
+# rather than a special case.
+name: notification_channel_is_enabled
+parameters: { opted_out: bigint! }
+result: bool!
+expression: "opted_out == 0"

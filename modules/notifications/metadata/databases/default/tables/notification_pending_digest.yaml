@@ -1,0 +1,15 @@
+# What the scheduler reads to know which digests are owed.
+#
+# An ordinary `select_permission` on an ordinary view, held by the one role
+# whose whole job is to drive the sweep. The `limit` is the point: enumeration
+# happens here, in a client's own paged loop, rather than inside a Process
+# where an unbounded read would meet a fan-out that fails on overflow.
+table:
+  schema: notification
+  name: pending_digest
+select_permissions:
+  - role: notification_scheduler
+    permission:
+      columns: [recipient_id, workflow, pending, oldest]
+      filter: {}
+      limit: 200

@@ -1,0 +1,47 @@
+# The sweep delivered, so the rows *it* claimed become sent.
+#
+# Scoped by `claim_id` and not by status alone: two sweeps can hold `sending`
+# rows for one recipient at once — the second claimed notifications that arrived
+# after the first's claim — and a record that matched every `sending` row would
+# stamp the other sweep's messages with this one's provider id, for a message
+# that never carried them.
+#
+# There is no matching failure command. A send that failed leaves its rows
+# `sending` with this sweep's `claim_id` still on them: visible, attributable,
+# and distinguishable from both `deferred` and `sent`. Returning them is one
+# update and the README says so.
+name: notification_record_digest_sent
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: claim_id
+    type: uuid!
+  - name: provider_message_id
+    type: string!
+steps:
+  - name: claimed_rows
+    select_many:
+      table: { schema: notification, name: delivery }
+      by:
+        claim_id: { arg: claim_id }
+        status: { literal: sending }
+      order_by: [id]
+      returning: [id]
+      maximum_rows: 512
+      require_non_empty: true
+  - name: delivered
+    update_many:
+      table: { schema: notification, name: delivery }
+      for_each: { step: claimed_rows }
+      by:
+        id: { item: id }
+        status: { literal: sending }
+      set:
+        status: { literal: sent }
+        provider_message_id: { arg: provider_message_id }
+      returning: [id, status]
+      require_each: true
+result:
+  claim_id: { arg: claim_id }
+  delivered: { step: delivered }

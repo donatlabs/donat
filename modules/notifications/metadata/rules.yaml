@@ -1,0 +1,14 @@
+# The module's rules, one file each.
+#
+# They are split rather than written inline because a deployment has exactly one
+# `rules.yaml`, and it is a mapping — so a second wrapper cannot be `!include`d
+# into it. An adopting application adds these same lines to the lists inside its
+# own file; see the module README.
+rules:
+  - "!include rules/channel-is-enabled.yaml"
+  - "!include rules/was-not-seen.yaml"
+  - "!include rules/digest-has-items.yaml"
+  - "!include rules/has-address.yaml"
+  - "!include rules/is-digested.yaml"
+decision_tables:
+  - "!include rules/email-delay.yaml"

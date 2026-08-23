@@ -1,0 +1,6 @@
+- "!include notification_recipient.yaml"
+- "!include notification_dispatch.yaml"
+- "!include notification_inbox.yaml"
+- "!include notification_delivery.yaml"
+- "!include notification_preference.yaml"
+- "!include notification_pending_digest.yaml"

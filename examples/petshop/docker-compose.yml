@@ -72,6 +72,7 @@ services:
     command:
       - >
         donat migrate --migrations-dir /usr/share/donat/migrations &&
+        donat migrate --migrations-dir /module-migrations &&
         donat migrate --migrations-dir /app-migrations
     depends_on:
       postgres:
@@ -80,6 +81,7 @@ services:
       DONAT_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
     volumes:
       - ./migrations:/app-migrations:ro
+      - ../../modules/notifications/migrations:/module-migrations:ro
     restart: "no"
 
   # One-shot: deploy the durable Process definitions for the `default` source.
@@ -115,6 +117,9 @@ services:
       DONAT_MOCK_CARRIER_TOKEN: petshop-carrier-token
       PETSHOP_NOTIFICATION_BASE_URL: http://mock-providers:8099
       PETSHOP_NOTIFICATION_API_TOKEN: petshop-notification-token
+      # `modules/notifications` mail relay, answered by the same mock.
+      NOTIFICATION_MAIL_BASE_URL: http://mock-providers:8099
+      NOTIFICATION_MAIL_TOKEN: petshop-notification-token
       PETSHOP_PAYOUT_BASE_URL: http://mock-providers:8099
       PETSHOP_PAYOUT_API_TOKEN: petshop-payout-token
       # `deploy` validates the WHOLE metadata directory, storage.yaml
