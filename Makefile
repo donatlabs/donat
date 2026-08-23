@@ -1,4 +1,4 @@
-.PHONY: build test conformance db-up db-down db-logs conformance-backend \
+.PHONY: build test conformance app-test db-up db-down db-logs conformance-backend \
 	backend-runtime conformance-matrix perf perf-matrix perf-mixed run claude codex \
 	petshop-up petshop-down petshop-system-tests wasm-core go-test \
 	lending-up lending-down lending-system-tests gate \
@@ -82,6 +82,16 @@ conformance:
 	cargo build -p donat-server --bin donat
 	@PG_URL="$${CONFORMANCE_PG_URL}" S3_URL="$(CONFORMANCE_S3_URL)" \
 		cargo test -p donat-conformance -- --test-threads=4
+
+# An application's own tests: every *_test.yaml beside its metadata, each on
+# a fresh database and engine. `APP_DIR` holds donat.test.yaml.
+APP_DIR ?= examples/petshop
+app-test:
+	cargo build -p donat-server --bin donat
+	@PG_URL="$${CONFORMANCE_PG_URL}" ./target/debug/donat test --app-dir $(APP_DIR) \
+		--engine-migrations-dir migrations
+	@python3 scripts/check_app_tests.py $(APP_DIR)/metadata \
+		$(if $(wildcard $(APP_DIR)/untested-tables.txt),--baseline $(APP_DIR)/untested-tables.txt,)
 
 CONFORMANCE_COMPOSE ?= docker compose -f docker-compose.conformance.yml
 CONFORMANCE_BACKENDS ?= postgres sqlite mysql clickhouse

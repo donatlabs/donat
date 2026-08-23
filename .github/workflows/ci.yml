@@ -58,6 +58,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Connector processor boundary policy
         run: python3 scripts/check_connector_processor_boundary.py
+      - name: Every permission-bearing petshop table has a test beside it
+        run: |
+          python3 scripts/check_app_tests.py --self-test
+          python3 scripts/check_app_tests.py examples/petshop/metadata \
+            --baseline examples/petshop/untested-tables.txt
       # The durable Process journals, the command claim ledger and catalog
       # introspection are all contracts against a real database, so their
       # tests need one. They live in the ordinary crates rather than in the

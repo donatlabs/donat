@@ -1,0 +1,13 @@
+# Tables that declare permissions and had no *_test.yaml beside them when
+# scripts/check_app_tests.py was introduced. A ratchet: remove a line once
+# its table gains a test; the gate fails while a tested table is still listed.
+databases/default/tables/public_cart_pricing.yaml
+databases/default/tables/public_category.yaml
+databases/default/tables/public_customer.yaml
+databases/default/tables/public_customer_address.yaml
+databases/default/tables/public_inventory_reservation.yaml
+databases/default/tables/public_order_operations.yaml
+databases/default/tables/public_payment.yaml
+databases/default/tables/public_payment_event.yaml
+databases/default/tables/public_refund.yaml
+databases/default/tables/public_shipment.yaml

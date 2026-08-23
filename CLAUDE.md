@@ -20,6 +20,7 @@ conformance harness (`crates/conformance`).
 | `crates/sqlgen` | IR → one Postgres SQL statement (insta snapshot tests) |
 | `crates/storage` | File attachments: the resolved S3-compatible store and the URL signing shared by planner and server |
 | `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
+| `crates/testkit` | Test stand + the `*_test.yaml` runner behind `donat test`; the stubs and matching `crates/conformance` shares |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
 | `apps/ui` | Platform UI (`@refinest/*` + React) over the engine's GraphQL. Its own npm project, outside the Cargo workspace and `make test`. Not an admin surface — an ordinary role rendered; see `knowledgebase/platform/decisions/001-*` |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
@@ -35,6 +36,7 @@ conformance harness (`crates/conformance`).
 | Apply schema migrations (DDL) | `donat migrate --migrations-dir migrations` (refinery) |
 | Validate metadata vs DB | `donat validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
 | Conformance suite | `make conformance` (or `cargo test -p donat-conformance [--test <module>]`) |
+| An application's own tests (`*_test.yaml` beside its metadata) | `make app-test` (`APP_DIR=examples/petshop`) or `donat test --app-dir <app>`; in cargo, `cargo test -p donat-conformance --test petshop_yaml` |
 | Review snapshot changes | `cargo insta review` |
 | Format and lint gates (CI blocks on both) | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
 | What the change gate will ask this branch to declare | `make gate` (`GATE_BASE=<target branch>`, `GATE_BODY=<file holding the PR description>`) |
@@ -124,7 +126,8 @@ Classify before touching anything:
 
 - **Flake** — failed with no code change, or passes on rerun. Record the test;
   change neither code nor timeout. Conformance tests that wait on time
-  (`sleep` in `event_triggers`, `file_attachments`, `petshop_process`) are the
+  (`sleep` in `event_triggers`, `file_attachments`; the `await` steps of
+  `*_test.yaml` files) are the
   usual source. A flake seen twice is a task about the *wait* — wait on the
   event, not on the clock — never a bigger `sleep`.
 - **Regression** — fails deterministically after a change. The TDD loop.
@@ -172,6 +175,12 @@ never cleans itself up.
 - **Every change needs tests**: unit/insta in the touched crate AND the
   conformance crate green (`make conformance`) after rebuilding the engine
   binary.
+- **An application's tests are declarations beside the thing they test.** A
+  `*_test.yaml` sits next to the metadata file it exercises
+  (`public_orders.yaml` → `public_orders_test.yaml`), never in Rust; `donat
+  test` runs them. A table that grants a role something has a test beside it
+  that proves the refusal (`scripts/check_app_tests.py`, CI). See
+  `knowledgebase/engineering/decisions/002-*`.
 - **The toolchain is pinned** in `rust-toolchain.toml`, because `cargo fmt
   --check` and `clippy -D warnings` are CI gates and both change meaning
   between releases. Bumping it is a deliberate commit that carries whatever
