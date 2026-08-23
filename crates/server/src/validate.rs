@@ -178,7 +178,43 @@ async fn check_consistency_inner(
     }
     problems.extend(planner.validator_problems(&validation_metadata.commands));
 
+    // Compile the schema the engine would serve.
+    //
+    // Everything above asks whether one declaration is well formed; this asks
+    // whether they can be served *together*. Two tracked tables whose GraphQL
+    // base names collide — `public.notification_delivery` and
+    // `notification.delivery` both render as `notification_delivery` — are each
+    // valid on their own and cannot share one schema. Without this the defect
+    // reaches the serving engine, where it is indistinguishable from a database
+    // that has not come up yet (`plans/007-*`).
+    if problems.is_empty() {
+        match crate::connectors::ConnectorRegistry::build(&validation_metadata) {
+            Ok(connectors) => {
+                let catalogs =
+                    HashMap::from([(selected_source_name(&validation_metadata), catalog.clone())]);
+                if let Err(error) = crate::state::compile_pure_engine_candidate(
+                    &validation_metadata,
+                    &catalogs,
+                    &connectors,
+                    false,
+                ) {
+                    push_plan_error(&mut problems, error);
+                }
+            }
+            Err(error) => problems.push(format!("connector configuration: {error}")),
+        }
+    }
+
     Ok(problems)
+}
+
+/// The one source `validate` introspected, which is the one its catalog is of.
+fn selected_source_name(metadata: &donat_metadata::Metadata) -> String {
+    metadata
+        .sources
+        .first()
+        .map(|source| source.name.clone())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 fn select_metadata(metadata: &Metadata, source_name: Option<&str>) -> Result<Metadata> {
