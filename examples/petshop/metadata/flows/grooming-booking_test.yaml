@@ -1,19 +1,25 @@
-# A grooming hold: the process reserves the slot, and the shopper's
-# confirmation completes it.
+# A grooming hold is a claim on something scarce — a groomer's morning. The
+# process reserves the slot, the shopper's confirmation completes it, a
+# conflicting hold is refused by the database and stays that shopper's
+# problem, and an idempotency key answers only the shopper who used it.
+vars:
+  resource: 550e8400-e29b-41d4-a716-446655440920
 tests:
-  - name: a shopper confirms a grooming hold and the process completes
+  - name: a shopper holds a slot and confirms it
     steps:
       - as: { role: customer, user: customer-1 }
       - graphql: |
           mutation {
             start_grooming_booking(
-              service_resource_id: "550e8400-e29b-41d4-a716-446655440920",
+              service_resource_id: "${resource}",
               slot_key: "2026-08-01T10:00",
               starts_at: "2030-01-02T10:00:00Z",
               hold_expires_at: "2030-01-01T10:00:00Z",
               request_id: "550e8400-e29b-41d4-a716-446655440921"
             ) { slot_key }
           }
+        expect:
+          data: { start_grooming_booking: { slot_key: "2026-08-01T10:00" } }
       # The booking process reserves its hold before anyone can confirm it.
       - await:
           row: grooming_booking
@@ -24,7 +30,202 @@ tests:
               booking_id
             }
           }
+        expect:
+          data: { confirm_booking: { booking_id: "${booking_id}" } }
       # The booking process reports the hold it confirmed.
       - await:
           terminal: grooming_booking
-          expect: { booking_id: "${booking_id}" }
+          expect: { booking_id: "${booking_id}", slot_key: "2026-08-01T10:00", status: confirmed }
+      # The shopper reads the confirmed booking back from the store.
+      - graphql: |
+          query {
+            grooming_booking(where: {slot_key: {_eq: "2026-08-01T10:00"}}) {
+              id slot_key status customer_id
+            }
+          }
+        expect:
+          data:
+            grooming_booking:
+              - id: "${booking_id}"
+                slot_key: "2026-08-01T10:00"
+                status: confirmed
+                customer_id: customer-1
+
+  - name: a double booking stays that shoppers problem
+    steps:
+      # One shopper's scheduling conflict does not stop anybody else. The
+      # second hold is accepted by the command and then refused by the
+      # database — one groomer cannot be in two places at ten. That refusal
+      # ends the losing process and nothing else: the slot keeps exactly one
+      # booking, and the store goes on taking orders while it happens.
+      - providers: !include ../testdata/providers.yaml
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_grooming_booking(
+              service_resource_id: "${resource}",
+              slot_key: "2030-03-04T10:00",
+              starts_at: "2030-01-02T10:00:00Z",
+              hold_expires_at: "2030-01-01T10:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440930"
+            ) { slot_key }
+          }
+      - await:
+          row: grooming_booking
+          capture: { booking_id: id }
+      # The conflicting hold from another shopper is admitted at the surface.
+      - as: { role: customer, user: customer-2 }
+      - graphql: |
+          mutation {
+            start_grooming_booking(
+              service_resource_id: "${resource}",
+              slot_key: "2030-03-04T10:00",
+              starts_at: "2030-01-02T10:00:00Z",
+              hold_expires_at: "2030-01-01T10:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440931"
+            ) { slot_key }
+          }
+        expect:
+          data: { start_grooming_booking: { slot_key: "2030-03-04T10:00" } }
+      # The store still takes orders while the losing process ends.
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440932") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      # The slot kept exactly one booking: the first shopper's.
+      - graphql: |
+          query {
+            grooming_booking(where: {slot_key: {_eq: "2030-03-04T10:00"}}) {
+              id customer_id status
+            }
+          }
+        expect:
+          data:
+            grooming_booking:
+              - { id: "${booking_id}", customer_id: customer-1 }
+      - sql: SELECT count(*) FROM grooming_booking WHERE slot_key = '2030-03-04T10:00'
+        expect: [{ count: 1 }]
+
+  - name: a shopper sees only their own bookings
+    steps:
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_grooming_booking(
+              service_resource_id: "${resource}",
+              slot_key: "2026-08-02T09:00",
+              starts_at: "2030-01-02T10:00:00Z",
+              hold_expires_at: "2030-01-01T10:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440940"
+            ) { slot_key }
+          }
+        expect:
+          data: { start_grooming_booking: { slot_key: "2026-08-02T09:00" } }
+      - await:
+          row: grooming_booking
+          capture: { booking_id: id }
+      # Another shopper asking about the same slot gets an empty list, not an error.
+      - as: { role: customer, user: customer-2 }
+      - graphql: |
+          query {
+            grooming_booking(where: {slot_key: {_eq: "2026-08-02T09:00"}}) { id }
+          }
+        expect:
+          data: { grooming_booking: [] }
+
+  - name: replaying another shoppers request id does not hand over their answer
+    steps:
+      # An idempotency key is scoped to who used it. If it were global,
+      # knowing somebody's request id would return their result — an order,
+      # a booking, a payment — to whoever asked second.
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_grooming_booking(
+              service_resource_id: "${resource}",
+              slot_key: "2031-03-04T09:00",
+              starts_at: "2031-03-04T09:00:00Z",
+              hold_expires_at: "2031-03-04T08:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440950"
+            ) { slot_key }
+          }
+        expect:
+          data: { start_grooming_booking: { slot_key: "2031-03-04T09:00" } }
+      - await:
+          row: grooming_booking
+          capture: { booking_id: id }
+      # The same mutation with the same request id from another shopper is
+      # their own attempt — which loses the taken slot — never the first
+      # shopper's stored answer.
+      - as: { role: customer, user: customer-2 }
+      - graphql: |
+          mutation {
+            start_grooming_booking(
+              service_resource_id: "${resource}",
+              slot_key: "2031-03-04T09:00",
+              starts_at: "2031-03-04T09:00:00Z",
+              hold_expires_at: "2031-03-04T08:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440950"
+            ) { slot_key }
+          }
+        expect:
+          data: { start_grooming_booking: { slot_key: "2031-03-04T09:00" } }
+      # A replayed key produced no second booking.
+      - sql: SELECT count(*) FROM grooming_booking WHERE slot_key = '2031-03-04T09:00'
+        expect: [{ count: 1 }]
+      # The other shopper was not handed the first one's booking.
+      - graphql: |
+          query {
+            grooming_booking(where: {slot_key: {_eq: "2031-03-04T09:00"}}) { id }
+          }
+        expect:
+          data: { grooming_booking: [] }
+
+  - name: a replayed booking request books once
+    steps:
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_grooming_booking(
+              service_resource_id: "${resource}",
+              slot_key: "2030-07-08T11:00",
+              starts_at: "2030-07-08T11:00:00Z",
+              hold_expires_at: "2030-07-08T10:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440960"
+            ) { slot_key }
+          }
+        expect:
+          data: { start_grooming_booking: { slot_key: "2030-07-08T11:00" } }
+      # A replay answers exactly what the first call did.
+      - graphql: |
+          mutation {
+            start_grooming_booking(
+              service_resource_id: "${resource}",
+              slot_key: "2030-07-08T11:00",
+              starts_at: "2030-07-08T11:00:00Z",
+              hold_expires_at: "2030-07-08T10:00:00Z",
+              request_id: "550e8400-e29b-41d4-a716-446655440960"
+            ) { slot_key }
+          }
+        expect:
+          data: { start_grooming_booking: { slot_key: "2030-07-08T11:00" } }
+      # The booking itself is the process's work, so it is waited for.
+      - await:
+          row: grooming_booking
+          capture: { booking_id: id }
+      # One request id, one booking.
+      - graphql: |
+          query {
+            grooming_booking(where: {slot_key: {_eq: "2030-07-08T11:00"}}) { id }
+          }
+        expect:
+          data: { grooming_booking: [{ id: "${booking_id}" }] }
+      - sql: SELECT count(*) FROM grooming_booking WHERE slot_key = '2030-07-08T11:00'
+        expect: [{ count: 1 }]

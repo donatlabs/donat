@@ -1,7 +1,9 @@
 # The whole return module: the shopper requests a return of a delivered line,
 # support approves it, the carrier issues a return label, the warehouse
 # receives and inspects it, and the provider refunds exactly the inspected
-# amount. Three verified human signals drive one durable process.
+# amount. Three verified human signals drive one durable process — and every
+# desk's mutation is refused for every other desk, so this file is as much an
+# authorization suite as a money suite.
 tests:
   - name: a returned line is approved, received, inspected and refunded
     steps:
@@ -99,3 +101,460 @@ tests:
             status: refunded
             refund_amount_minor: ${refund_amount_minor}
             tracking_number: RETURN-TRACK-1
+      # The provider was asked once, and asked for exactly the inspected
+      # amount; the store recorded the refund it answered with.
+      - calls:
+          path: /v1/payment-authorizations/*/refunds
+          count: 1
+          body: { amount_minor: "${refund_amount_minor}" }
+      - sql: SELECT amount_minor::bigint, status FROM refund WHERE return_request_id = '${return_id}'
+        expect: [{ amount_minor: "${refund_amount_minor}", status: refunded }]
+
+  - name: a receipt the warehouse records immediately is not lost
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/returns/*/labels:
+            provider_event_id: evt_petshop_return_label_1
+            return_id: $request:/return_key
+            tracking_number: RETURN-TRACK-1
+            label_url: https://carrier.example/returns/petshop-1.pdf
+            status: created
+            normalized_payload: { carrier: mock, label: true }
+          /v1/payment-authorizations/*/refunds:
+            provider_event_id: evt_petshop_refund_1
+            refund_id: refund_petshop_1
+            provider_reference: ref_petshop_1
+            status: refunded
+            normalized_payload: { gateway: mock, refunded: true }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440974") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440975"
+            ) { order_id }
+          }
+      - await: { terminal: partial_fulfilment }
+      - sql: SELECT id FROM order_line WHERE order_id = '${order_id}'
+        capture: { order_line_id: id }
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_return(
+              order_id: "${order_id}",
+              lines: [{ order_line_id: "${order_line_id}", requested_quantity: 1 }],
+              reason: "wrong size", replacement_requested: false,
+              request_id: "550e8400-e29b-41d4-a716-446655440976"
+            ) { order_id }
+          }
+      - await: { receptive: return_refund, state: await_support_decision }
+      - sql: |
+          SELECT return_request.id AS return_id, return_item.id AS return_item_id
+          FROM return_request
+          JOIN return_item ON return_item.return_request_id = return_request.id
+        capture: { return_id: return_id, return_item_id: return_item_id }
+      # Approval, receipt and inspection land back-to-back, with no pause for
+      # the process to reach the wait that expects each signal. The waits
+      # declare persist_before_match, so an early signal is held rather than
+      # dropped — the terminal await below is the whole assertion: a warehouse
+      # that works quickly is not a reason to strand a shopper's money.
+      - as: { role: support, user: support-1 }
+      - graphql: |
+          mutation {
+            approve_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", approved_quantity: 1 }],
+              decision_id: "550e8400-e29b-41d4-a716-446655440977", note: "approved"
+            ) { return_id }
+          }
+      - as: { role: fulfilment, user: warehouse-1 }
+      - graphql: |
+          mutation {
+            receive_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", received_quantity: 1 }],
+              receipt_id: "550e8400-e29b-41d4-a716-446655440978", received_at: "2030-01-02T00:00:00Z"
+            ) { return_id }
+          }
+      - graphql: |
+          mutation {
+            record_return_inspection(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", inspected_quantity: 1 }],
+              inspection: accepted, refund_amount_minor: 1000,
+              inspection_id: "550e8400-e29b-41d4-a716-446655440979", note: "as described"
+            ) { return_id }
+          }
+      - await:
+          terminal: return_refund
+          expect: { status: refunded, refund_amount_minor: 1000 }
+      - calls:
+          path: /v1/payment-authorizations/*/refunds
+          count: 1
+          body: { amount_minor: 1000 }
+
+  - name: a shopper cannot return someone else's order
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      # An order that belongs to the first customer. The ownership proof is
+      # start_return's own lookup by (order, caller), so an authorized order
+      # is enough — fulfilment would not change the refusal.
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440980") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - sql: SELECT id FROM order_line WHERE order_id = '${order_id}'
+        capture: { order_line_id: id }
+      # A different shopper asks for the return, and the order is not theirs.
+      - as: { role: customer, user: customer-2 }
+      - graphql: |
+          mutation {
+            start_return(
+              order_id: "${order_id}",
+              lines: [{ order_line_id: "${order_line_id}", requested_quantity: 1 }],
+              reason: "wrong size", replacement_requested: false,
+              request_id: "550e8400-e29b-41d4-a716-446655440981"
+            ) { order_id }
+          }
+        expect:
+          errors:
+            - extensions: { code: validation-failed }
+              message: "@present"
+
+  - name: the warehouse cannot approve its own returns
+    steps:
+      # Approval is support's decision; receiving is the warehouse's. The
+      # fulfilment role's schema has no approve_return field at all, so the
+      # refusal happens before any row is read — no return needs to exist.
+      - as: { role: fulfilment, user: warehouse-1 }
+      - graphql: |
+          mutation {
+            approve_return(
+              return_id: "00000000-0000-0000-0000-000000000001",
+              lines: [{ return_item_id: "00000000-0000-0000-0000-000000000002", approved_quantity: 1 }],
+              decision_id: "00000000-0000-0000-0000-000000000003", note: "self-approved"
+            ) { return_id }
+          }
+        expect:
+          errors:
+            - extensions:
+                path: $.selectionSet.approve_return
+                code: validation-failed
+              message: "field 'approve_return' not found in type: 'mutation_root'"
+
+  - name: nothing is refunded before the goods are inspected
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/returns/*/labels:
+            provider_event_id: evt_petshop_return_label_1
+            return_id: $request:/return_key
+            tracking_number: RETURN-TRACK-1
+            label_url: https://carrier.example/returns/petshop-1.pdf
+            status: created
+            normalized_payload: { carrier: mock, label: true }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440982") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440983"
+            ) { order_id }
+          }
+      - await: { terminal: partial_fulfilment }
+      - sql: SELECT id FROM order_line WHERE order_id = '${order_id}'
+        capture: { order_line_id: id }
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_return(
+              order_id: "${order_id}",
+              lines: [{ order_line_id: "${order_line_id}", requested_quantity: 1 }],
+              reason: "wrong size", replacement_requested: false,
+              request_id: "550e8400-e29b-41d4-a716-446655440984"
+            ) { order_id }
+          }
+      - await: { receptive: return_refund, state: await_support_decision }
+      - sql: |
+          SELECT return_request.id AS return_id, return_item.id AS return_item_id
+          FROM return_request
+          JOIN return_item ON return_item.return_request_id = return_request.id
+        capture: { return_id: return_id, return_item_id: return_item_id }
+      - as: { role: support, user: support-1 }
+      - graphql: |
+          mutation {
+            approve_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", approved_quantity: 1 }],
+              decision_id: "550e8400-e29b-41d4-a716-446655440985", note: "approved"
+            ) { return_id }
+          }
+      # The process has taken the approval, asked the carrier for a label, and
+      # is now waiting on the warehouse. An approved return is a promise to
+      # inspect, not a promise to pay: no provider refund, no refund row.
+      - await: { receptive: return_refund, state: await_warehouse_receipt }
+      - calls: { path: /v1/payment-authorizations/*/refunds, count: 0 }
+      - sql: SELECT id FROM refund WHERE return_request_id = '${return_id}'
+        expect: []
+
+  - name: a shopper who asked for a replacement gets an exchange
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/returns/*/labels:
+            provider_event_id: evt_petshop_return_label_1
+            return_id: $request:/return_key
+            tracking_number: RETURN-TRACK-1
+            label_url: https://carrier.example/returns/petshop-1.pdf
+            status: created
+            normalized_payload: { carrier: mock, label: true }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440986") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440987"
+            ) { order_id }
+          }
+      - await: { terminal: partial_fulfilment }
+      - sql: SELECT id FROM order_line WHERE order_id = '${order_id}'
+        capture: { order_line_id: id }
+      # Asking for a replacement is a request; the inspection agreeing to it
+      # is the warehouse's call.
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_return(
+              order_id: "${order_id}",
+              lines: [{ order_line_id: "${order_line_id}", requested_quantity: 1 }],
+              reason: "wrong size", replacement_requested: true,
+              request_id: "550e8400-e29b-41d4-a716-446655440988"
+            ) { order_id }
+          }
+      - await: { receptive: return_refund, state: await_support_decision }
+      - sql: |
+          SELECT return_request.id AS return_id, return_item.id AS return_item_id
+          FROM return_request
+          JOIN return_item ON return_item.return_request_id = return_request.id
+        capture: { return_id: return_id, return_item_id: return_item_id }
+      - as: { role: support, user: support-1 }
+      - graphql: |
+          mutation {
+            approve_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", approved_quantity: 1 }],
+              decision_id: "550e8400-e29b-41d4-a716-446655440989", note: "approved"
+            ) { return_id }
+          }
+      - await: { receptive: return_refund, state: await_warehouse_receipt }
+      - as: { role: fulfilment, user: warehouse-1 }
+      - graphql: |
+          mutation {
+            receive_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", received_quantity: 1 }],
+              receipt_id: "550e8400-e29b-41d4-a716-446655440990", received_at: "2030-01-02T00:00:00Z"
+            ) { return_id }
+          }
+      - await: { receptive: return_refund, state: await_inspection }
+      - graphql: |
+          mutation {
+            record_return_inspection(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", inspected_quantity: 1 }],
+              inspection: exchange, refund_amount_minor: 0,
+              inspection_id: "550e8400-e29b-41d4-a716-446655440991", note: "inspected"
+            ) { return_id }
+          }
+      # A replacement request is answered with goods, not money.
+      - await:
+          terminal: return_refund
+          expect: { status: exchanged, exchange_id: "@uuid" }
+      - sql: SELECT status FROM return_request WHERE id = '${return_id}'
+        expect: [{ status: exchanged }]
+      - calls: { path: /v1/payment-authorizations/*/refunds, count: 0 }
+
+  - name: goods the warehouse rejects are not refunded
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/returns/*/labels:
+            provider_event_id: evt_petshop_return_label_1
+            return_id: $request:/return_key
+            tracking_number: RETURN-TRACK-1
+            label_url: https://carrier.example/returns/petshop-1.pdf
+            status: created
+            normalized_payload: { carrier: mock, label: true }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440992") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440993"
+            ) { order_id }
+          }
+      - await: { terminal: partial_fulfilment }
+      - sql: SELECT id FROM order_line WHERE order_id = '${order_id}'
+        capture: { order_line_id: id }
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_return(
+              order_id: "${order_id}",
+              lines: [{ order_line_id: "${order_line_id}", requested_quantity: 1 }],
+              reason: "wrong size", replacement_requested: false,
+              request_id: "550e8400-e29b-41d4-a716-446655440994"
+            ) { order_id }
+          }
+      - await: { receptive: return_refund, state: await_support_decision }
+      - sql: |
+          SELECT return_request.id AS return_id, return_item.id AS return_item_id
+          FROM return_request
+          JOIN return_item ON return_item.return_request_id = return_request.id
+        capture: { return_id: return_id, return_item_id: return_item_id }
+      - as: { role: support, user: support-1 }
+      - graphql: |
+          mutation {
+            approve_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", approved_quantity: 1 }],
+              decision_id: "550e8400-e29b-41d4-a716-446655440995", note: "approved"
+            ) { return_id }
+          }
+      - await: { receptive: return_refund, state: await_warehouse_receipt }
+      - as: { role: fulfilment, user: warehouse-1 }
+      - graphql: |
+          mutation {
+            receive_return(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", received_quantity: 1 }],
+              receipt_id: "550e8400-e29b-41d4-a716-446655440996", received_at: "2030-01-02T00:00:00Z"
+            ) { return_id }
+          }
+      - await: { receptive: return_refund, state: await_inspection }
+      # What came back is not what was sold, so no money goes back.
+      - graphql: |
+          mutation {
+            record_return_inspection(
+              return_id: "${return_id}",
+              lines: [{ return_item_id: "${return_item_id}", inspected_quantity: 1 }],
+              inspection: rejected, refund_amount_minor: 0,
+              inspection_id: "550e8400-e29b-41d4-a716-446655440997", note: "inspected"
+            ) { return_id }
+          }
+      - await:
+          terminal: return_refund
+          expect: { status: rejected, public_reason_code: inspection_rejected }
+      - sql: SELECT status FROM return_request WHERE id = '${return_id}'
+        expect: [{ status: rejected }]
+      - calls: { path: /v1/payment-authorizations/*/refunds, count: 0 }
+
+  - name: support can refuse a return outright
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440998") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440999"
+            ) { order_id }
+          }
+      - await: { terminal: partial_fulfilment }
+      - sql: SELECT id FROM order_line WHERE order_id = '${order_id}'
+        capture: { order_line_id: id }
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_return(
+              order_id: "${order_id}",
+              lines: [{ order_line_id: "${order_line_id}", requested_quantity: 1 }],
+              reason: "wrong size", replacement_requested: false,
+              request_id: "550e8400-e29b-41d4-a716-446655441000"
+            ) { order_id }
+          }
+      - await: { receptive: return_refund, state: await_support_decision }
+      - sql: SELECT id AS return_id FROM return_request
+        capture: { return_id: return_id }
+      # The desk that approves returns can also say no, and then it ends
+      # there: no label, no warehouse, no provider.
+      - as: { role: support, user: support-1 }
+      - graphql: |
+          mutation {
+            reject_return(
+              return_id: "${return_id}", reason: "outside the window",
+              decision_id: "550e8400-e29b-41d4-a716-446655441001"
+            ) { return_id status }
+          }
+      - await:
+          terminal: return_refund
+          expect: { status: rejected, public_reason_code: return_rejected }
+      - sql: SELECT status FROM return_request WHERE id = '${return_id}'
+        expect: [{ status: rejected }]
+      - calls: { path: /v1/payment-authorizations/*/refunds, count: 0 }
+      # The request is kept on file rather than erased.
+      - sql: SELECT id FROM return_item WHERE return_request_id = '${return_id}'
+        expect: [{ id: "@present" }]

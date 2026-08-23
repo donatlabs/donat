@@ -81,34 +81,6 @@ def lookup_says_authorized(providers, amount_minor: int) -> None:
     )
 
 
-def test_cancelling_before_the_provider_answered_releases_the_shelf(
-    shopper, staff, support, providers, well_stocked, settle_timeout
-):
-    """Nothing was taken, so nothing is owed and the stock goes back."""
-
-    before = d.stock(staff, d.IN_STOCK_VARIANT)
-    order = order_in_checkout(shopper, providers, settle_timeout)
-
-    cancel(shopper, order["id"]).unwrap()
-
-    d.await_order_status(shopper, order["id"], {"cancelled"}, timeout=settle_timeout)
-    providers.await_call(P.LOOKUP)
-
-    payments = d.payments_of(support, order["id"])
-    assert all(payment["status"] not in {"authorized", "captured"} for payment in payments), (
-        f"a cancelled checkout holds no money: {payments}"
-    )
-    assert providers.count(P.CAPTURE) == 0
-
-    released = until(
-        lambda: d.stock(staff, d.IN_STOCK_VARIANT),
-        lambda level: level["reserved"] == before["reserved"],
-        timeout=settle_timeout,
-        description="the cancelled checkout to release its reservation",
-    )
-    assert released["on_hand"] == before["on_hand"], "a cancellation sells nothing"
-
-
 def test_an_authorization_the_provider_did_commit_is_voided(
     shopper, support, providers, well_stocked, settle_timeout
 ):
@@ -134,55 +106,6 @@ def test_an_authorization_the_provider_did_commit_is_voided(
         "an authorization the provider confirms is returned, not forgotten"
     )
     assert providers.count(P.CAPTURE) == 0, "nothing is ever captured on a cancelled order"
-
-
-def test_another_shopper_cannot_cancel_this_order(
-    shopper, other_shopper, providers, well_stocked, settle_timeout
-):
-    order = order_in_checkout(shopper, providers, settle_timeout)
-
-    refused = cancel(other_shopper, order["id"])
-
-    assert refused.errors, "another shopper cannot cancel this order"
-    assert refused.error_code() == "validation-failed"
-
-
-def test_support_cancels_only_on_a_named_shoppers_behalf(
-    store, shopper, support, providers, well_stocked, settle_timeout
-):
-    """`cancel_order` admits support, but the Process it starts is owned.
-
-    A support session with no `x-donat-user-id` passes the command's own
-    permission check and is then refused by the start effect, because the
-    cancellation Process captures its owner from that session variable. Acting
-    for a named shopper works; acting as nobody does not.
-    """
-
-    order = order_in_checkout(shopper, providers, settle_timeout)
-
-    anonymous_desk = cancel(support, order["id"])
-    assert anonymous_desk.error_code() == "not-found"
-    assert anonymous_desk.error_message() == 'missing session variable: "x-donat-user-id"'
-
-    on_behalf_of = store.as_role("support", d.CUSTOMER_ONE)
-    assert not cancel(on_behalf_of, order["id"]).errors
-    d.await_order_status(shopper, order["id"], {"cancelled"}, timeout=settle_timeout)
-
-
-def test_cancelling_twice_cancels_once(
-    shopper, support, providers, well_stocked, settle_timeout
-):
-    order = order_in_checkout(shopper, providers, settle_timeout)
-
-    first = cancel(shopper, order["id"])
-    second = cancel(shopper, order["id"])
-
-    assert not first.errors, first.text
-    # The second call finds no cancellable order — the first one already moved
-    # it — and it must not start a second cancellation Process.
-    d.await_order_status(shopper, order["id"], {"cancelled"}, timeout=settle_timeout)
-    assert providers.count(P.VOID) <= 1, "one cancellation, at most one void"
-    assert second.errors or second.value("data/cancel_order/order_id") == order["id"]
 
 
 def lookup_says_voided(providers) -> None:

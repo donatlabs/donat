@@ -1,6 +1,7 @@
 # Reconciliation compares the provider's answer against what the store
 # recorded. An answer that agrees on every compared fact is matched
-# automatically; anything else would park on a support decision instead.
+# automatically; a disagreement about money parks on a support decision, which
+# a support agent closes by hand — and no shopper can open a case at all.
 tests:
   - name: a reconciliation matches a payment the provider confirms
     steps:
@@ -44,3 +45,135 @@ tests:
       - await:
           terminal: payment_reconciliation
           expect: { reconciliation_status: matched, reconciliation_id: "@uuid" }
+      - sql: SELECT status FROM payment_reconciliation WHERE payment_id = '${payment_id}'
+        expect: [{ status: matched }]
+
+  - name: a provider that disagrees is escalated to support
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440a02") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { payment_id: /payment_id }
+      # The provider agrees on everything except the amount: one minor unit
+      # more than the store recorded.
+      - sql: SELECT amount_minor + 1 AS wrong, currency, provider_reference FROM payment WHERE id = '${payment_id}'
+        capture:
+          wrong_amount_minor: wrong
+          currency: currency
+          provider_reference: provider_reference
+      - providers:
+          /v1/payment-reconciliations:
+            provider_event_id: $request:/provider_event_id
+            reconciliation_id: recon_petshop_2
+            amount_minor: ${wrong_amount_minor}
+            currency: ${currency}
+            status: authorized
+            provider_reference: ${provider_reference}
+            normalized_payload: { gateway: mock, reconciled: false }
+      - as: { role: reconciliation_worker }
+      - graphql: |
+          mutation {
+            start_payment_reconciliation(
+              payment_id: "${payment_id}", provider_event_id: "evt_petshop_reconcile_2",
+              expected_status: authorized, request_id: "550e8400-e29b-41d4-a716-446655440a03"
+            ) { payment_id }
+          }
+      # A disagreement about money is a person's decision, not the engine's:
+      # the process parks receptive to support's resolution.
+      - await: { receptive: payment_reconciliation, state: await_support_resolution }
+      - sql: SELECT status FROM payment_reconciliation WHERE payment_id = '${payment_id}'
+        expect: [{ status: review_required }]
+
+  - name: support resolves a reconciliation by hand
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440a04") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { payment_id: /payment_id }
+      - sql: SELECT amount_minor + 7 AS wrong, currency, provider_reference FROM payment WHERE id = '${payment_id}'
+        capture:
+          wrong_amount_minor: wrong
+          currency: currency
+          provider_reference: provider_reference
+      - providers:
+          /v1/payment-reconciliations:
+            provider_event_id: $request:/provider_event_id
+            reconciliation_id: recon_petshop_3
+            amount_minor: ${wrong_amount_minor}
+            currency: ${currency}
+            status: authorized
+            provider_reference: ${provider_reference}
+            normalized_payload: { gateway: mock, reconciled: false }
+      - as: { role: reconciliation_worker }
+      - graphql: |
+          mutation {
+            start_payment_reconciliation(
+              payment_id: "${payment_id}", provider_event_id: "evt_petshop_reconcile_3",
+              expected_status: authorized, request_id: "550e8400-e29b-41d4-a716-446655440a05"
+            ) { payment_id }
+          }
+      - await: { receptive: payment_reconciliation, state: await_support_resolution }
+      - sql: SELECT status FROM payment_reconciliation WHERE payment_id = '${payment_id}'
+        expect: [{ status: review_required }]
+      # A decision about money is signed: the support session carries a user.
+      - as: { role: support, user: support-agent-1 }
+      - graphql: |
+          mutation {
+            resolve_payment_reconciliation(
+              payment_id: "${payment_id}", provider_event_id: "evt_petshop_reconcile_3",
+              resolution_id: "550e8400-e29b-41d4-a716-446655440a06",
+              note: "provider record accepted"
+            ) { payment_id }
+          }
+        expect:
+          data:
+            resolve_payment_reconciliation: { payment_id: "${payment_id}" }
+      # The person's decision closes the case and the process publishes it.
+      - await:
+          terminal: payment_reconciliation
+          expect: { payment_id: "${payment_id}", reconciliation_status: resolved }
+      - sql: SELECT status FROM payment_reconciliation WHERE payment_id = '${payment_id}'
+        expect: [{ status: resolved }]
+
+  - name: a shopper cannot reconcile their own payment
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440a07") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { payment_id: /payment_id }
+      # The reconciliation entry point does not exist in the shopper's schema.
+      - graphql: |
+          mutation {
+            start_payment_reconciliation(
+              payment_id: "${payment_id}", provider_event_id: "evt_self",
+              expected_status: authorized, request_id: "550e8400-e29b-41d4-a716-446655440a08"
+            ) { payment_id }
+          }
+        expect:
+          errors:
+            - extensions: { code: validation-failed }
+              message: "field 'start_payment_reconciliation' not found in type: 'mutation_root'"

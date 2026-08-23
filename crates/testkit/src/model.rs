@@ -211,6 +211,14 @@ pub enum Await {
         #[serde(default)]
         capture: BTreeMap<String, String>,
     },
+    /// A process (by name) whose instance ends in its declared fail
+    /// terminal; `expect` then applies to the journal's `failure_json`
+    /// (`{kind, code, message}`).
+    Failed {
+        failed: String,
+        #[serde(default)]
+        expect: Option<Json>,
+    },
     /// A process's wait becoming receptive to a signal. Signals are never
     /// buffered: one sent before the wait's timer event exists is audited as
     /// unexpected rather than matched late, so a test that sends one waits
@@ -239,7 +247,8 @@ pub struct Calls {
     /// Subset match over the call's JSON body.
     #[serde(default)]
     pub body: Option<Json>,
-    /// Header name (case-insensitive) → exact value.
+    /// Header name (case-insensitive) → expected value; matchers
+    /// (`@present`, `@regex …`) apply as in any `expect`.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
 }

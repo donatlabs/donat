@@ -1,6 +1,7 @@
-# A B2B quote above the automatic-credit ceiling: the decision table routes it
-# to approver review, the process opens that review and parks, and the
-# approver's verified decision consumes the organization's credit.
+# Buying on account: the decision table approves a quote inside the
+# organization's credit by itself, routes anything larger to a human approver,
+# and every decision desk is a role of its own — a shopper cannot approve, an
+# outsider cannot quote, and an approver may simply say no.
 tests:
   - name: a large quote is routed to an approver who consumes the credit
     steps:
@@ -28,15 +29,217 @@ tests:
         capture: { approval_id: /data/submit_quote/approval_id }
       - await: { receptive: b2b_order_approval, state: await_approver }
       - as: { role: b2b_approver, user: approver-1 }
+      # The decision comes back committed in the approver's own answer.
       - graphql: |
           mutation {
             approve_purchase(approval_id: "${approval_id}", request_id: "550e8400-e29b-41d4-a716-446655440981") {
               approval_id approval_status
             }
           }
+        expect:
+          data:
+            approve_purchase: { approval_id: "${approval_id}", approval_status: approved }
       - await:
           terminal: b2b_order_approval
           expect: { approval_status: approved }
+      # The approval row itself records the committed decision.
+      - sql: SELECT status FROM purchase_approval WHERE id = '${approval_id}'
+        expect: [{ status: approved }]
       # Approving the quote moves exactly its total out of available credit.
       - sql: SELECT available_credit_minor, consumed_credit_minor FROM organization WHERE id = '${organization_id}'
         expect: [{ available_credit_minor: 87505, consumed_credit_minor: 12495 }]
+
+  - name: a quote on account waits for an approver
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO organization (currency, available_credit_minor)
+          VALUES ('USD', 100000) RETURNING id
+        capture: { organization_id: id }
+      - sql: |
+          INSERT INTO organization_membership (organization_id, user_id)
+          VALUES ('${organization_id}', 'customer-1');
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
+      - as: { role: b2b_buyer, user: customer-1 }
+      - graphql: |
+          mutation {
+            submit_quote(
+              organization_id: "${organization_id}", cart_id: 1,
+              request_id: "550e8400-e29b-41d4-a716-446655440982"
+            ) { quote_id approval_id total_minor }
+          }
+        expect:
+          data:
+            submit_quote: { total_minor: "@gt 0" }
+        capture: { approval_id: /data/submit_quote/approval_id }
+      # The approval is recorded immediately; until the Process routes it, it
+      # is either freshly submitted or already at the approver's desk.
+      - sql: SELECT status FROM purchase_approval WHERE id = '${approval_id}'
+        expect: [{ status: "@regex ^(submitted|awaiting_approver)$" }]
+      - await: { receptive: b2b_order_approval, state: await_approver }
+      # Routed, and visible to the approver who has to act on it.
+      - as: { role: b2b_approver, user: approver-1 }
+      - graphql: |
+          query { purchase_approval(where: {id: {_eq: "${approval_id}"}}) { id status } }
+        expect:
+          data:
+            purchase_approval: [{ id: "${approval_id}", status: awaiting_approver }]
+
+  - name: a small purchase inside the credit needs nobody
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO organization (currency, available_credit_minor)
+          VALUES ('USD', 100000) RETURNING id
+        capture: { organization_id: id }
+      - sql: |
+          INSERT INTO organization_membership (organization_id, user_id)
+          VALUES ('${organization_id}', 'customer-1');
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          -- One unit at 2499 sits inside the 10000 automatic-credit ceiling.
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: b2b_buyer, user: customer-1 }
+      - graphql: |
+          mutation {
+            submit_quote(
+              organization_id: "${organization_id}", cart_id: 1,
+              request_id: "550e8400-e29b-41d4-a716-446655440983"
+            ) { quote_id approval_id total_minor }
+          }
+        expect:
+          data:
+            submit_quote: { total_minor: 2499 }
+        capture: { approval_id: /data/submit_quote/approval_id }
+      # A purchase inside the credit is approved without a person.
+      - await:
+          terminal: b2b_order_approval
+          expect: { approval_status: approved, credit_consumed: true }
+      - sql: SELECT status FROM purchase_approval WHERE id = '${approval_id}'
+        expect: [{ status: approved }]
+
+  - name: a large purchase waits for an approver
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO organization (currency, available_credit_minor)
+          VALUES ('USD', 100000) RETURNING id
+        capture: { organization_id: id }
+      - sql: |
+          INSERT INTO organization_membership (organization_id, user_id)
+          VALUES ('${organization_id}', 'customer-1');
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
+      - as: { role: b2b_buyer, user: customer-1 }
+      # Five units at 2499 clear the ceiling, so a person has to decide.
+      - graphql: |
+          mutation {
+            submit_quote(
+              organization_id: "${organization_id}", cart_id: 1,
+              request_id: "550e8400-e29b-41d4-a716-446655440984"
+            ) { quote_id approval_id total_minor }
+          }
+        expect:
+          data:
+            submit_quote: { total_minor: "@gt 10000" }
+        capture: { approval_id: /data/submit_quote/approval_id }
+      - await: { receptive: b2b_order_approval, state: await_approver }
+      - sql: SELECT status FROM purchase_approval WHERE id = '${approval_id}'
+        expect: [{ status: awaiting_approver }]
+
+  - name: an approver can simply say no
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO organization (currency, available_credit_minor)
+          VALUES ('USD', 100000) RETURNING id
+        capture: { organization_id: id }
+      - sql: |
+          INSERT INTO organization_membership (organization_id, user_id)
+          VALUES ('${organization_id}', 'customer-1');
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
+      - as: { role: b2b_buyer, user: customer-1 }
+      - graphql: |
+          mutation {
+            submit_quote(
+              organization_id: "${organization_id}", cart_id: 1,
+              request_id: "550e8400-e29b-41d4-a716-446655440985"
+            ) { quote_id approval_id total_minor }
+          }
+        capture: { approval_id: /data/submit_quote/approval_id }
+      - await: { receptive: b2b_order_approval, state: await_approver }
+      - as: { role: b2b_approver, user: approver-1 }
+      - graphql: |
+          mutation {
+            reject_purchase(
+              approval_id: "${approval_id}", reason: "not needed",
+              request_id: "550e8400-e29b-41d4-a716-446655440986"
+            ) { approval_id approval_status }
+          }
+        expect:
+          data:
+            reject_purchase: { approval_id: "${approval_id}", approval_status: rejected }
+      - await:
+          terminal: b2b_order_approval
+          expect: { approval_status: rejected, credit_consumed: false }
+      - sql: SELECT status FROM purchase_approval WHERE id = '${approval_id}'
+        expect: [{ status: rejected }]
+
+  - name: a shopper cannot approve a purchase
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO organization (currency, available_credit_minor)
+          VALUES ('USD', 100000) RETURNING id
+        capture: { organization_id: id }
+      - sql: |
+          INSERT INTO organization_membership (organization_id, user_id)
+          VALUES ('${organization_id}', 'customer-1');
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
+      - as: { role: b2b_buyer, user: customer-1 }
+      - graphql: |
+          mutation {
+            submit_quote(
+              organization_id: "${organization_id}", cart_id: 1,
+              request_id: "550e8400-e29b-41d4-a716-446655440987"
+            ) { quote_id approval_id total_minor }
+          }
+        capture: { approval_id: /data/submit_quote/approval_id }
+      # The mutation does not even exist for a shopper's role.
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            approve_purchase(approval_id: "${approval_id}", request_id: "550e8400-e29b-41d4-a716-446655440988") {
+              approval_id approval_status
+            }
+          }
+        expect:
+          errors:
+            - extensions: { code: validation-failed }
+              message: "field 'approve_purchase' not found in type: 'mutation_root'"
+
+  - name: a buyer cannot quote for an organization they do not belong to
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      # The organization exists, but the second customer is no member of it.
+      - sql: |
+          INSERT INTO organization (currency, available_credit_minor)
+          VALUES ('USD', 100000) RETURNING id
+        capture: { organization_id: id }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-2');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 2);
+      - as: { role: b2b_buyer, user: customer-2 }
+      # Membership is what makes a quote possible.
+      - graphql: |
+          mutation {
+            submit_quote(
+              organization_id: "${organization_id}", cart_id: 1,
+              request_id: "550e8400-e29b-41d4-a716-446655440989"
+            ) { quote_id approval_id total_minor }
+          }
+        expect:
+          errors:
+            - extensions: { code: validation-failed }

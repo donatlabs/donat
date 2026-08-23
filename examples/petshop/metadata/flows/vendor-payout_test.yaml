@@ -1,6 +1,7 @@
 # One marketplace payout cycle: the process selects the cycle's candidates,
 # pays each vendor through the provider, and records the outcome against the
-# payout row. The candidate view pins the cycle id.
+# payout row. The candidate view pins the cycle id, and only the marketplace
+# worker may move money to vendors at all.
 tests:
   - name: a payout cycle pays each accepted vendor order
     steps:
@@ -46,7 +47,36 @@ tests:
       - await:
           terminal: vendor_payout
           expect: { failures: [], payouts: ["@any"] }
+      # The provider was asked once, the call named the vendor being paid, and
+      # it carried the connector's configured payout credential.
+      - calls:
+          path: /v1/payouts
+          count: 1
+          body: { vendor_id: "@present" }
+          headers: { Authorization: petshop-test-payout }
       # The payout row records the provider outcome: the vendor is paid
       # gross (2499) minus its 10% commission (249).
       - sql: SELECT status, net_minor FROM vendor_payout WHERE payout_cycle_id = '00000000-0000-0000-0000-000000000001'
         expect: [{ status: paid, net_minor: 2250 }]
+
+  - name: only marketplace may start a payout
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      # Neither a shopper nor a support agent can move money to vendors: the
+      # mutation does not exist in their schemas.
+      - for:
+          - { role: customer, user: customer-1 }
+          - { role: support, user: support-1 }
+        do:
+          - as: { role: "${item.role}", user: "${item.user}" }
+          - graphql: |
+              mutation {
+                start_vendor_payout(
+                  payout_cycle_id: "00000000-0000-0000-0000-000000000099",
+                  request_id: "550e8400-e29b-41d4-a716-446655440992"
+                ) { payout_cycle_id }
+              }
+            expect:
+              errors:
+                - extensions: { code: validation-failed }
+                  message: "field 'start_vendor_payout' not found in type: 'mutation_root'"

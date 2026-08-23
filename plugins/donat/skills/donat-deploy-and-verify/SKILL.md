@@ -181,6 +181,7 @@ tests:
         expect: { data: { start_checkout: { cart_id: "${cart_id}" } } }   # subset; matchers below
       - await: { terminal: checkout_payment, expect: { payment_status: authorized } }
       - await: { receptive: return_refund, state: await_support_decision }  # before sending a signal
+      - await: { failed: checkout_payment, expect: { code: tax_quote_unavailable } }  # a declared fail terminal
       - await: { row: grooming_booking, capture: { booking_id: id } }
       - sql: select status from payment where order_id = '${order_id}'
         expect: [{ status: authorized }]                 # as many rows as listed
@@ -214,7 +215,10 @@ constraint, or, rarely, a Rust test in `crates/server/tests` that says why it
 could not be data.
 
 `await` polls the journal, never the clock; a failure prints the durable
-process state and names the engine log. A whole-string `${name}` keeps the
+process state and names the engine log. One wire detail: a connector
+percent-encodes every non-alphanumeric byte of a path slot, so a uuid's
+hyphens travel as `%2D` — a `calls` path built from a captured id needs
+`SELECT replace('${id}', '-', '%2D')` first. A whole-string `${name}` keeps the
 captured value's type, so a captured amount reaches a provider body as a
 number.
 

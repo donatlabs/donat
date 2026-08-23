@@ -13,7 +13,6 @@ import pytest
 
 from petshop_qa import domain as d
 from petshop_qa import providers as P
-from petshop_qa import until
 
 pytestmark = pytest.mark.providers
 
@@ -221,50 +220,6 @@ def test_two_shoppers_cannot_both_take_the_last_unit(
     assert after["reserved"] <= after["on_hand"], (
         f"the last unit was promised twice: {after}"
     )
-
-
-# -- asking twice ------------------------------------------------------------
-
-
-def test_a_replayed_booking_request_books_once(shopper, providers, settle_timeout):
-    import uuid
-
-    request_id = d.new_request_id()
-    slot = f"2030-07-08T11:{uuid.uuid4().hex[:2]}"
-    arguments = {
-        "resource": str(uuid.uuid4()),
-        "slot": slot,
-        "starts": "2030-07-08T11:00:00Z",
-        "expires": "2030-07-08T10:00:00Z",
-        "request": request_id,
-    }
-    mutation = """
-        mutation Hold(
-          $resource: uuid!, $slot: String!, $starts: timestamptz!,
-          $expires: timestamptz!, $request: uuid!
-        ) {
-          start_grooming_booking(
-            service_resource_id: $resource, slot_key: $slot, starts_at: $starts,
-            hold_expires_at: $expires, request_id: $request
-          ) { slot_key }
-        }
-    """
-
-    first = shopper.graphql(mutation, arguments)
-    second = shopper.graphql(mutation, arguments)
-
-    assert first.unwrap() == second.unwrap(), "a replay answers what the first call did"
-    # The booking itself is the Process's work, so it is waited for.
-    bookings = until(
-        lambda: shopper.query(
-            "query B($slot: String!) { grooming_booking(where: {slot_key: {_eq: $slot}}) { id } }",
-            {"slot": slot},
-        )["grooming_booking"],
-        lambda rows: bool(rows),
-        timeout=settle_timeout,
-        description="the held slot to exist",
-    )
-    assert len(bookings) == 1, f"one request id, one booking: {bookings}"
 
 
 # -- one shopper's trouble is not everybody's --------------------------------

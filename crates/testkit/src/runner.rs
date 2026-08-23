@@ -362,6 +362,7 @@ impl CaseContext {
                     capture,
                 } => self.await_terminal(terminal, expect.as_ref(), capture),
                 Await::Row { row, capture } => self.await_row(row, capture),
+                Await::Failed { failed, expect } => self.await_failed(failed, expect.as_ref()),
                 Await::Receptive { receptive, state } => self.await_receptive(receptive, state),
                 Await::Held { held } => {
                     if self.stand.providers().await_held(held, AWAIT_DEADLINE) {
@@ -580,6 +581,50 @@ impl CaseContext {
         self.capture(&pointers, &row, &format!("the first {table} row"))
     }
 
+    fn await_failed(&mut self, process: &str, expect: Option<&Json>) -> Result<()> {
+        let mut client = self.stand.pg()?;
+        let deadline = Instant::now() + AWAIT_DEADLINE;
+        let failure = loop {
+            let row = client
+                .query_opt(
+                    "SELECT status, failure_json
+                     FROM donat.process_instances
+                     WHERE source_name = $1 AND process_name = $2",
+                    &[&self.source, &process],
+                )
+                .context("polling donat.process_instances")?;
+            if let Some(row) = row {
+                let status: String = row.get(0);
+                if status == "failed" {
+                    break row.get::<_, Option<Json>>(1).unwrap_or(Json::Null);
+                }
+                if status != "running" {
+                    return Err(anyhow!(
+                        "process '{process}' ended with status {status}, expected failed: {}",
+                        process_diagnostics(&mut client, &self.source)
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "process '{process}' never failed: {}",
+                    process_diagnostics(&mut client, &self.source)
+                ));
+            }
+            std::thread::sleep(AWAIT_POLL);
+        };
+        if let Some(expect) = expect
+            && !subset_matches(expect, &failure)
+        {
+            return Err(anyhow!(
+                "failure of '{process}' mismatch\nexpected:\n{}\nactual:\n{}",
+                pretty(expect),
+                pretty(&failure)
+            ));
+        }
+        Ok(())
+    }
+
     fn await_receptive(&mut self, process: &str, state: &str) -> Result<()> {
         let mut client = self.stand.pg()?;
         let deadline = Instant::now() + AWAIT_DEADLINE;
@@ -699,13 +744,14 @@ impl CaseContext {
             ));
         }
         for (name, value) in &calls.headers {
-            let got = call.header(name);
-            if got != Some(value.as_str()) {
+            let got = call
+                .header(name)
+                .map_or(Json::Null, |v| Json::String(v.to_string()));
+            if !subset_matches(&Json::String(value.clone()), &got) {
                 return Err(anyhow!(
-                    "call #{} to {}: header {name} is {:?}, expected {value:?}",
+                    "call #{} to {}: header {name} is {got}, expected {value:?}",
                     calls.index,
-                    calls.path,
-                    got
+                    calls.path
                 ));
             }
         }
