@@ -1,0 +1,77 @@
+name: Advisories
+
+# The CI gate runs `cargo audit --deny warnings` on every push, which means a
+# new advisory is discovered at the next push and not when it is published.
+# Between the two, main is red and nobody knows. This is the same gate on a
+# clock, with one addition: `.cargo/audit.toml` excuses advisories on the
+# condition that an excuse which has become removable is removed, and nothing
+# else checks that condition.
+#
+# Report-only. It opens (or comments on) one issue and fixes nothing; the fix
+# is a dependency bump or an edit to the excuse list, and both are reviewed.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    name: Advisories against today's database
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Advisories the CI gate would fail on
+        id: gate
+        continue-on-error: true
+        run: cargo audit --deny warnings 2>&1 | tee gate.txt
+      - name: Excuses that no longer apply
+        id: excuses
+        continue-on-error: true
+        run: python3 scripts/check_audit_excuses.py --no-fetch 2>&1 | tee excuses.txt
+      - name: Open or update the issue
+        if: steps.gate.outcome == 'failure' || steps.excuses.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          EXCUSES_OUTCOME: ${{ steps.excuses.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly advisories: the CI gate would fail on main"
+          {
+            echo "Run: $RUN_URL"
+            echo
+            if [ "$GATE_OUTCOME" = "failure" ]; then
+              echo '## `cargo audit --deny warnings`'
+              echo
+              echo '```'
+              cat gate.txt
+              echo '```'
+              echo
+            fi
+            if [ "$EXCUSES_OUTCOME" = "failure" ]; then
+              echo '## Excuses in `.cargo/audit.toml` that no longer apply'
+              echo
+              echo '```'
+              cat excuses.txt
+              echo '```'
+              echo
+            fi
+            echo "Fix it with a dependency bump or an edit to the excuse list, through a pull request: the change gate asks \`gate:audit-ignore\` for a new excuse."
+          } > body.md
+          number="$(gh issue list --state open --search "\"$title\" in:title" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file body.md
+          else
+            gh issue create --title "$title" --body-file body.md
+          fi
+      - name: Fail the run when something was reported
+        if: steps.gate.outcome == 'failure' || steps.excuses.outcome == 'failure'
+        run: exit 1

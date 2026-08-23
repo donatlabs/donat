@@ -24,6 +24,13 @@ The engine as a process: what bounds a request, how it reaches its database,
 how it drains on `SIGTERM`, and what an operator may inspect without a
 permission bypass. 5 decisions. **Status: in progress (August 2026).**
 
+### [[engineering/_index|Engineering — how the engine is developed]]
+The process rather than the product: what the repository tells an agent before
+it acts and what it refuses afterwards. Why loop and graph engineering were
+read and not adopted, and the change gate, the nightly advisory check and the
+"lowest rung" rule that came out of it. 1 decision.
+**Status: started August 2026.**
+
 ### [[platform/research-what-a-platform-needs|Platform direction]]
 What separates an engine you deploy from a platform a business is built on,
 written after a week of the engine being used to build one. 1 research note,
