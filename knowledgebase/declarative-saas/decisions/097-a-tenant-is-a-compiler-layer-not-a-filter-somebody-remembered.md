@@ -211,3 +211,12 @@ billing (the only legitimate cross-tenant read, which needs an audited role
 rather than a hole in a filter), support impersonation, per-tenant connector
 credentials ([[010-static-community-connector-factory-and-runtime-boundaries]]
 left this open), tenant offboarding, and per-tenant cron fan-out.
+
+---
+
+*Checked against other platforms (2026-08-23):
+[[platform/research-multitenancy-elsewhere]]. The premise holds — Hasura
+documents the repetition this ADR rejects, in DDN as well as v2 — and the
+comparison names two things this decision does not cover: nothing here bounds
+what a tenant *consumes*, and the bound reaches only requests that go through
+the engine.*

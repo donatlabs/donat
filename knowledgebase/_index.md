@@ -31,6 +31,13 @@ written after a week of the engine being used to build one. 1 research note,
 engine rather than a surface the engine grows (`apps/ui`).
 **Status: draft, August 2026.**
 
+### [[platform/research-multitenancy-elsewhere|Multitenancy elsewhere]]
+What Hasura, Supabase/PostgREST and Nile do about tenants, written to check the
+premise of [[declarative-saas/decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]]
+rather than assert it. Two things worth taking: per-tenant resource limits,
+which nothing here bounds, and RLS as a second fence for the tenant alone.
+1 research note. **Status: draft, August 2026.**
+
 ## Cross-cutting
 
 - [[security-audit|Security & dependency audit]] — SQL-gen injection review, ranked findings (internal-microservice threat model), library assessment (2026-06-13)
