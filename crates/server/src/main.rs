@@ -691,6 +691,12 @@ async fn main() -> anyhow::Result<()> {
                 .join()
                 .map_err(|_| anyhow::anyhow!("the test runner panicked"))??;
             report.write(&mut std::io::stdout(), &metadata_dir)?;
+            if report.cases.is_empty() {
+                anyhow::bail!(
+                    "no test case ran under {} (no `*_test.yaml`, or --filter matched none)",
+                    metadata_dir.display()
+                );
+            }
             if report.failed() > 0 {
                 std::process::exit(1);
             }

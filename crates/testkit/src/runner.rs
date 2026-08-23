@@ -152,8 +152,18 @@ pub fn run_all(app: &AppTestConfig, run: &RunConfig) -> Result<Report> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     results.sort_by_key(|(index, _)| *index);
     let mut report = Report::default();
-    for (_, result) in results {
-        report.cases.extend(result?.cases);
+    for (index, result) in results {
+        match result {
+            Ok(file_report) => report.cases.extend(file_report.cases),
+            // A file that does not load fails as one case of its own; the
+            // other files' outcomes are still reported.
+            Err(error) => report.cases.push(CaseReport {
+                file: files[index].clone(),
+                name: "(file)".to_string(),
+                elapsed: Duration::ZERO,
+                outcome: Outcome::Failed(format!("{error:#}")),
+            }),
+        }
     }
     Ok(report)
 }

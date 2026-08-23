@@ -69,20 +69,28 @@ impl Stand {
     pub fn boot(cfg: &StandConfig) -> Result<Self> {
         let providers = provider_stub::spawn();
         let auth = auth_hook::spawn();
-        let mut env = cfg
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.replace("${providers}", providers.base_url())))
-            .collect::<Vec<_>>();
-        env.push(("DONAT_GRAPHQL_AUTH_HOOK".into(), auth.url().to_string()));
-        env.push(("DONAT_GRAPHQL_AUTH_HOOK_MODE".into(), "POST".into()));
-
         let db_name = database_name(&cfg.name);
         let database = DropDatabase::create(&cfg.admin_database_url, &db_name)?;
         let db_url = database.url.clone();
-        env.push(("DONAT_DATABASE_URL".into(), db_url.clone()));
-        env.push(("DONAT_GRAPHQL_DATABASE_URL".into(), db_url.clone()));
         create_postgis(&db_url)?;
+        let env = child_environment(
+            std::env::vars(),
+            cfg.env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.replace("${providers}", providers.base_url()))),
+            [
+                (
+                    "DONAT_GRAPHQL_AUTH_HOOK".to_string(),
+                    auth.url().to_string(),
+                ),
+                (
+                    "DONAT_GRAPHQL_AUTH_HOOK_MODE".to_string(),
+                    "POST".to_string(),
+                ),
+                ("DONAT_DATABASE_URL".to_string(), db_url.clone()),
+                ("DONAT_GRAPHQL_DATABASE_URL".to_string(), db_url.clone()),
+            ],
+        );
 
         // The production order: the engine's schema, then the application's,
         // then the Process revisions the metadata declares.
@@ -119,6 +127,7 @@ impl Stand {
             let log = std::fs::File::create(&log_path)
                 .with_context(|| format!("creating {}", log_path.display()))?;
             let mut cmd = Command::new(&cfg.engine_binary);
+            cmd.env_clear();
             cmd.arg("--port")
                 .arg(port.to_string())
                 .arg("--metadata-dir")
@@ -221,8 +230,41 @@ impl Stand {
     }
 }
 
+/// What the stand's children see. The parent's environment is not inherited:
+/// `donat test` runs inside the image, where `DONAT_METADATA_DIR`,
+/// `DONAT_GRAPHQL_JWT_SECRET` and the rest describe the deployment, and a
+/// child that inherited them would migrate the wrong metadata and verify
+/// tokens the test never issues. Only the variables that locate tools and
+/// certificates pass through; `donat.test.yaml` says everything else, and the
+/// stand's own connection and hook come last so nothing can override them.
+fn child_environment(
+    inherited: impl IntoIterator<Item = (String, String)>,
+    app: impl IntoIterator<Item = (String, String)>,
+    stand: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    const PASS_THROUGH: &[&str] = &[
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "RUST_LOG",
+        "RUST_BACKTRACE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ];
+    let mut env: Vec<(String, String)> = inherited
+        .into_iter()
+        .filter(|(k, _)| PASS_THROUGH.contains(&k.as_str()))
+        .collect();
+    for (k, v) in app.into_iter().chain(stand) {
+        env.retain(|(existing, _)| existing != &k);
+        env.push((k, v));
+    }
+    env
+}
+
 fn run_migrate(cfg: &StandConfig, env: &[(String, String)], extra: &[String]) -> Result<()> {
     let mut migrate = Command::new(&cfg.engine_binary);
+    migrate.env_clear();
     migrate
         .arg("migrate")
         .arg("--migrations-dir")
@@ -399,4 +441,46 @@ fn free_port() -> Result<u16> {
         }
     }
     Err(anyhow!("could not find a free port for the engine"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child_environment;
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_child_does_not_inherit_the_deployments_donat_variables() {
+        let env = child_environment(
+            pairs(&[
+                ("DONAT_METADATA_DIR", "/metadata"),
+                ("DONAT_GRAPHQL_JWT_SECRET", "{}"),
+                ("PATH", "/usr/bin"),
+                ("PGPASSWORD", "secret"),
+            ]),
+            pairs(&[("APP_TOKEN", "t")]),
+            pairs(&[("DONAT_DATABASE_URL", "postgresql://stand")]),
+        );
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["PATH", "APP_TOKEN", "DONAT_DATABASE_URL"],
+            "only tool-locating variables pass through: {env:?}"
+        );
+    }
+
+    #[test]
+    fn the_stands_own_variables_win_over_the_applications() {
+        let env = child_environment(
+            pairs(&[]),
+            pairs(&[("DONAT_DATABASE_URL", "postgresql://app")]),
+            pairs(&[("DONAT_DATABASE_URL", "postgresql://stand")]),
+        );
+        assert_eq!(env, pairs(&[("DONAT_DATABASE_URL", "postgresql://stand")]));
+    }
 }

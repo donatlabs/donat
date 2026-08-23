@@ -266,4 +266,4 @@ for them by design.
   retry and error routing, the ambiguity lookup
 - [`examples/petshop/metadata/flows/vendor-payout.yaml`](https://github.com/donatlabs/donat/blob/main/examples/petshop/metadata/flows/vendor-payout.yaml) — bounded fan-out with
   `collect` and a reconciliation pass
-- [`crates/conformance/tests/petshop_process.rs`](https://github.com/donatlabs/donat/blob/main/crates/conformance/tests/petshop_process.rs) — the flows driven end to end
+- [`examples/petshop/metadata/flows/*_test.yaml`](https://github.com/donatlabs/donat/tree/main/examples/petshop/metadata/flows) — the flows driven end to end, each test beside its process
