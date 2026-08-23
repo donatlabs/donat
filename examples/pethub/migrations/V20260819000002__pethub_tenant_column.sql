@@ -479,3 +479,20 @@ ALTER TABLE public."quote" ADD CONSTRAINT "quote_customer_id_fkey" FOREIGN KEY (
 ALTER TABLE public."return_request" ADD CONSTRAINT "return_request_customer_id_fkey" FOREIGN KEY (tenant_id, "customer_id") REFERENCES public.customer (tenant_id, customer_id);
 ALTER TABLE public."subscription" ADD CONSTRAINT "subscription_customer_id_fkey" FOREIGN KEY (tenant_id, "customer_id") REFERENCES public.customer (tenant_id, customer_id);
 ALTER TABLE public."vendor_membership" ADD CONSTRAINT "vendor_membership_user_id_fkey" FOREIGN KEY (tenant_id, "user_id") REFERENCES public.customer (tenant_id, customer_id);
+
+-- ------------------------------------- and so does everything keyed by them
+--
+-- A unique index over a column that is only unique *within* a store has to say
+-- so too, or the store boundary leaks back in through the constraint. This one
+-- is the whole reason the rule is worth stating: `customer_id` is now unique
+-- per store, so one person is legitimately a customer of two — and an index on
+-- `cart(customer_id)` alone means opening a cart in the first store stops them
+-- opening one in the second. The refusal even names the constraint, so it
+-- reports that somebody, somewhere, already holds that id.
+--
+-- Scoping a *column* is not finished until everything keyed by it is scoped as
+-- well. The engine cannot check this: `donat validate` reads columns, not the
+-- reach of an index.
+DROP INDEX IF EXISTS cart_one_open_per_customer;
+CREATE UNIQUE INDEX cart_one_open_per_customer
+  ON public.cart (tenant_id, customer_id) WHERE status = 'cart_open';

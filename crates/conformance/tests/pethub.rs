@@ -323,3 +323,33 @@ fn the_store_metadata_is_unchanged_and_still_stands_alone() {
         "pethub adds exactly its four platform tables"
     );
 }
+
+/// One person, two stores, one open cart each.
+///
+/// The store's `cart_one_open_per_customer` index is on `cart(customer_id)`
+/// alone, and Pethub made `customer.customer_id` unique only *within* a store
+/// — so the same shopper legitimately exists in both. Buying in one store then
+/// blocks buying in the other, and the refusal tells the second store that
+/// somebody somewhere already holds that id.
+#[test]
+fn a_shopper_can_hold_an_open_cart_in_each_store_they_shop_in() {
+    let s = pethub_suite("pethub_cart_collision");
+    let open_cart = json!({
+        "query": "mutation { insert_cart(objects: [{}]) { affected_rows } }"
+    });
+
+    let alpha = token_for("customer", Some(ALPHA), "shopper-1");
+    let (code, resp) = query(&s, &alpha, open_cart.clone());
+    assert_eq!(code, 200, "{resp}");
+    assert_eq!(resp["data"]["insert_cart"]["affected_rows"], 1, "{resp}");
+
+    // The same person, the other store. Nothing about this write touches the
+    // first store's row.
+    let beta = token_for("customer", Some(BETA), "shopper-1");
+    let (code, resp) = query(&s, &beta, open_cart);
+    assert_eq!(code, 200, "{resp}");
+    assert_eq!(
+        resp["data"]["insert_cart"]["affected_rows"], 1,
+        "a shopper's cart in one store blocked their cart in another: {resp}"
+    );
+}
