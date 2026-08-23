@@ -190,9 +190,10 @@ production, issue JWTs instead of passing roles by hand.
 
 All examples below `POST` to `http://localhost:8080/v1/graphql`.
 
-The catalogue and cart-line requests are taken verbatim from
-[`fixtures/petshop`](../../crates/conformance/fixtures/petshop), so their
-shapes are what CI asserts rather than what someone remembered. The others use
+The catalogue and cart-line requests are taken verbatim from the tests beside
+the tables ([`public_product_test.yaml`](metadata/databases/default/tables/public_product_test.yaml),
+[`public_cart_test.yaml`](metadata/databases/default/tables/public_cart_test.yaml)),
+so their shapes are what CI asserts rather than what someone remembered. The others use
 the same roles and permissions but are not themselves fixtures.
 
 ### Public catalogue (anonymous)
