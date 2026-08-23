@@ -49,7 +49,7 @@ SELECT n.nspname || '.' || c.relname AS name
    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'donat')
    AND (SELECT true FROM pg_catalog.pg_class WHERE false) IS NULL";
 
-async fn populated_tables(
+pub async fn populated_tables(
     client: &tokio_postgres::Client,
 ) -> Result<std::collections::BTreeSet<String>, tokio_postgres::Error> {
     let names: Vec<String> = client
@@ -77,7 +77,7 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-async fn unique_indexes(
+pub async fn unique_indexes(
     client: &tokio_postgres::Client,
 ) -> Result<Vec<UniqueIndex>, tokio_postgres::Error> {
     let rows = client.query(UNIQUE_INDEXES_SQL, &[]).await?;

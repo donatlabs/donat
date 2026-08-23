@@ -182,13 +182,25 @@ permission's own `filter`, and what makes it reviewable is
 ## Making an existing schema multitenant
 
 The declaration is short. The migration under it is not: Petshop's is 498 lines
-for 16 lines of `tenancy.yaml`. Every one of those lines follows mechanically
-from the declaration plus the catalog, which is why a generator is specified
-(`specs/010-tenancy-migration-generator.md`) — **it does not exist yet**, so
-until it does this section is the procedure, and you are the generator.
+for 16 lines of `tenancy.yaml`. Do not write them.
 
-Derive five things, in this order. Do not write them from memory of the domain;
-ask the database each time.
+```
+donat tenancy plan  --metadata-dir metadata [--backfill <tenant>] [--out migrations/]
+donat tenancy check --metadata-dir metadata
+```
+
+`plan` reads the declaration, introspects the database and writes the
+migration; you read it and commit it, as with any other. `check` writes
+nothing and exits non-zero when the database is not what the declaration
+implies, which makes it a CI gate for a schema that was written by hand.
+
+`plan` will not decide three things, and names each instead: a view whose body
+it cannot re-derive, a table that already holds rows and no `--backfill`, and a
+unique key it cannot classify as chosen or issued. Settle those and re-run —
+rescoping a natural key often reveals the next thing keyed by it, so two passes
+is the normal shape rather than a failure.
+
+What it derives, and what you are checking when you read its output:
 
 **1. The key column, on every tracked table.** Every table in the tenanted
 source either carries it, or is named under `keys:` because its key is spelled
@@ -221,9 +233,10 @@ exactly one: `cart_one_open_per_customer ON cart(customer_id)`. One shopper,
 two stores, and opening a cart in the first refused the cart in the second,
 naming the constraint in the error.
 
-Ask the database rather than reading the migration. `donat validate` cannot
-help here: it reads columns, not the reach of an index, and the catalog drops
-partial unique indexes on purpose.
+This is why the generator exists rather than a checklist: it asks the database.
+`donat validate` cannot help — it reads columns, not the reach of an index, and
+the catalogue drops partial unique indexes on purpose. If you are checking its
+work by hand, or working on a deployment that predates it, this is the query:
 
 ```sql
 -- every unique index on a tenanted table that does not carry the tenant
@@ -252,7 +265,8 @@ impossible in the database and not only in the predicate.
 
 ### When to stop and ask
 
-Three shapes are not yours to decide:
+`plan` refuses these by name; if you are writing the migration yourself, refuse
+them the same way. Three shapes are not yours to decide:
 
 - a **view you cannot re-derive** — anything past one driving table plus joins
   you can attribute. Say which view and what you could not follow;
