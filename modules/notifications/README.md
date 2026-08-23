@@ -109,14 +109,21 @@ module is a forked module. Point your own roles at them instead:
 inherited_roles:
   - role_name: customer
     role_set: [customer, notification_user]
-  - role_name: app_backend
-    role_set: [app_backend, notification_sender]
-  - role_name: scheduler
-    role_set: [scheduler, notification_scheduler]
 ```
 
-`notification_worker` appears in none of these on purpose: it is a `run_as` and
-not a caller.
+**Inheritance works for `notification_user` and for nothing else here, and the
+reason is worth knowing before you copy the pattern.** `inherited_roles` carries
+table permissions and *not* command permissions — verified, and written up in
+`plans/009-*`. `notification_user` is permissions on two tables, so a shopper
+inherits it and reads their feed. `notification_sender` and
+`notification_scheduler` own *commands*, so inheriting them grants nothing you
+can call: a token that must trigger a notification holds `notification_sender`
+itself, and a scheduler holds `notification_scheduler` itself. Both are machine
+roles issued to a credential, not hats a person wears, so that is the shape you
+want anyway.
+
+`notification_worker` appears nowhere on purpose: it is a `run_as` and never a
+grant.
 
 **5. Configure the relay.** `NOTIFICATION_MAIL_BASE_URL` and
 `NOTIFICATION_MAIL_TOKEN`. See *Sending* below.

@@ -319,8 +319,11 @@ query Feed {
 }
 ```
 
-Store staff inherit `notification_scheduler` instead — they can run a digest
-sweep and read the pending backlog, and they cannot read a customer's inbox.
+Store staff inherit `notification_scheduler` instead, which lets them read the
+pending backlog and not a customer's inbox. It does **not** let them run a
+sweep: `inherited_roles` carries table permissions and not command ones
+(`plans/009-*`), so the sweep is called by a credential holding
+`notification_scheduler` itself.
 
 **Two things the store had to move to adopt it**, both worth knowing before you
 adopt it yourself:
