@@ -46,7 +46,8 @@ inherited_roles:
 ```
 
 `inherited_roles` carries **table** permissions and **not command** permissions
-(`plans/009-*`, pinned by a test). `notification_user` is permissions on two
+(`plans/009-*`, pinned by
+`examples/petshop/metadata/inherited_roles_test.yaml`). `notification_user` is permissions on two
 tables, so a shopper inherits it and reads their feed. `notification_sender` and
 `notification_scheduler` own *commands*, so inheriting them grants nothing you
 can call — a token that triggers notifications holds `notification_sender`
@@ -153,6 +154,36 @@ the wire (`To`, `Subject`, `TextBody`, whatever your provider calls them).
   and `flush_notification_digests` are short, because those are the ones you
   call. A module must not squat generic names in your namespace — its
   `record_delivery` once collided with a store's own.
+
+## Proving it in your deployment
+
+Adopting is four declarations and a migration; whether they line up is one test
+beside the flow that notifies. The shape, from `examples/petshop`:
+
+```yaml
+- providers: !include ../testdata/providers.yaml   # the relay's answer
+- as: { role: customer, user: customer-1 }
+- graphql: 'mutation { ... }'                      # whatever triggers it
+- await: { row: notification.inbox }               # the bell, schema-qualified
+- await:                                           # then the log, both channels
+    sql: |
+      select channel, status from notification.delivery
+      where workflow = 'your_workflow' order by channel
+    expect:
+      - { channel: email, status: sent }
+      - { channel: in_app, status: sent }
+- calls: { path: /v1/email/messages, count: 1, body: { recipient: … } }
+```
+
+Two things bite here. **Wait on the delivery log, not on the relay**: the bell
+is written before the mail is sent, so a `calls` step that follows the inbox row
+finds nothing. And **`await.row` takes the real table name** —
+`notification.inbox`, not the GraphQL `notification_inbox`.
+
+The module's own tests are `*_test.yaml` beside its declarations
+(`make app-test APP_DIR=modules/notifications`), and
+`modules/notifications/examples/deployment` is a worked adoption you can copy:
+its own sender, and the escalation turned on.
 
 ## Extending it: a new channel
 

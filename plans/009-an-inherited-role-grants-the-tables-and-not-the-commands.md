@@ -2,7 +2,8 @@
 
 **Effort: S–M. Status: TODO — the fork below is unsettled; the behaviour itself
 is now pinned by
-`crates/conformance/tests/notifications.rs::an_inherited_role_carries_the_reads_and_not_the_commands`,
+`examples/petshop/metadata/inherited_roles_test.yaml::support inherits the digest
+backlog it can read and not the sweep it cannot run`,
 so whichever way it is settled is a deliberate change rather than a silent
 one.**
 
@@ -52,7 +53,8 @@ nothing says so:
 `notification_scheduler` to run a digest sweep by hand, could read the backlog,
 and could not sweep. The store's role matrix caught it
 (`tests-system/tests/test_role_matrix.py`), which is the only reason it is
-written down rather than shipped.
+written down rather than shipped; the behaviour is now pinned beside the
+declaration that causes it, in `inherited_roles_test.yaml`.
 
 ## What closing it needs
 

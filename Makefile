@@ -85,6 +85,11 @@ conformance:
 
 # An application's own tests: every *_test.yaml beside its metadata, each on
 # a fresh database and engine. `APP_DIR` holds donat.test.yaml.
+#
+# The applications in this repo: `examples/petshop`, `modules/notifications`
+# (the module is a metadata directory in its own right) and
+# `modules/notifications/examples/deployment` (a deployment that adopts it).
+# `make conformance` runs all three; this target is for one at a time.
 APP_DIR ?= examples/petshop
 app-test:
 	cargo build -p donat-server --bin donat

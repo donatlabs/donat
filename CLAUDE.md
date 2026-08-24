@@ -55,7 +55,7 @@ conformance harness (`crates/conformance`).
 | Apply schema migrations (DDL) | `donat migrate --migrations-dir migrations` (refinery) |
 | Validate metadata vs DB | `donat validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
 | Conformance suite | `make conformance` (or `cargo test -p donat-conformance [--test <module>]`) |
-| An application's own tests (`*_test.yaml` beside its metadata) | `make app-test` (`APP_DIR=examples/petshop`) or `donat test --app-dir <app>`; in cargo, `cargo test -p donat-conformance --test petshop_yaml` |
+| An application's own tests (`*_test.yaml` beside its metadata) | `make app-test` (`APP_DIR=examples/petshop`, `modules/notifications`, `modules/notifications/examples/deployment`) or `donat test --app-dir <app>`; in cargo, `cargo test -p donat-conformance --test petshop_yaml` / `--test notifications` |
 | Review snapshot changes | `cargo insta review` |
 | Format and lint gates (CI blocks on both) | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
 | What the change gate will ask this branch to declare | `make gate` (`GATE_BASE=<target branch>`, `GATE_BODY=<file holding the PR description>`) |
