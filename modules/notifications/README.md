@@ -303,9 +303,11 @@ wire. Map ours to whatever your provider calls them:
       # file shows; copy them and adjust.
 ```
 
-`a_deployment_can_bring_its_own_sender` in the conformance suite is exactly this:
-a different path, different field names and a different response shape, asserting
-the notification still arrives and the provider's own id is what gets recorded.
+`examples/deployment` is exactly this, as a stand you can run: a different path,
+different field names and a different response shape, asserting the notification
+still arrives and the provider's own id is what gets recorded. Its
+`connectors/own-mail.yaml` is derived from the shipped file the way yours will
+be — copy it rather than this excerpt.
 
 **Sending through SendGrid, SES or Twilio instead** means using the compiled
 connector for that provider — and those publish no idempotency key, so the send
