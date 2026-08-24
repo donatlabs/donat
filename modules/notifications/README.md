@@ -453,12 +453,38 @@ them would rebuild the admin API this engine deleted
 
 ## Tests
 
-`crates/conformance/tests/notifications.rs` stands this directory up against a
-real engine, a real database and a real HTTP relay — the files here are what it
-adopts, so a permission that stops naming the session variable, or a flow that
-stops compiling, fails there rather than in whichever project shipped it.
+The module's tests are declarations beside the thing they test — the same rule
+an application follows, because that is what this is. `donat.test.yaml` stands
+the module up on its own: its migrations, a recipient binding from
+`testdata/migrations` (the one thing a module cannot ship), its metadata, and a
+stub playing the mail relay. Then every `*_test.yaml` under `metadata/` runs
+against a fresh database and engine of its own.
 
 ```
-cargo build -p donat-server --bin donat
+make app-test APP_DIR=modules/notifications
+```
+
+`examples/deployment` is the second stand: a deployment that adopts this module
+by `!include`, brings its own sender and turns the email escalation on. Those
+are the two seams the module promises to whoever adopts it, so they are tested
+rather than described.
+
+```
+make app-test APP_DIR=modules/notifications/examples/deployment
+```
+
+Both run in CI as part of the conformance crate
+(`crates/conformance/tests/notifications.rs` is their cargo entry and asserts
+that no test file goes unrun), so a permission that stops naming the session
+variable, or a flow that stops compiling, fails here rather than in whichever
+project shipped it.
+
+```
 cargo test -p donat-conformance --test notifications
 ```
+
+What is *not* tested here is what an adopting deployment owes: its binding, its
+roles, its schedule. `examples/petshop` is that side of it — including the one
+thing the module cannot tell you itself, that `inherited_roles` carries its
+table permissions and not its command ones
+(`examples/petshop/metadata/inherited_roles_test.yaml`).

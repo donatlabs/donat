@@ -1,0 +1,46 @@
+# What the delay is for.
+#
+# With the escalation on, the bell rings first and the mail waits behind it. If
+# the recipient looks in the meantime there is nothing left to say, and the
+# module records that as `skipped` — which is neither a failure nor an opt-out,
+# and is the whole reason the delay exists.
+#
+# This is the one test in the repo that waits on a duration rather than on
+# durable state: the window it acts inside is the twenty seconds this deployment
+# declares for a reminder. It uses the longest row on purpose — the case has to
+# read the bell and mark it seen before the timer fires, and a window sized for
+# an idle machine is a test that fails on a busy one.
+vars:
+  alice: 11111111-1111-4111-8111-111111111111
+  request: 44444444-4444-4444-8444-444444444444
+
+tests:
+  - name: an email is skipped when the recipient already saw it in the app
+    steps:
+      - providers:
+          /api/v3/messages/send: { Id: own-relay-7, Result: queued }
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "invoice_ready", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            url: "/orders/1", request_id: "${request}") { dispatch_id } }
+        capture: { dispatch: /data/notify/dispatch_id }
+      # The bell rings immediately — that is what a digest and a delay both
+      # leave alone — and the recipient acts on it while the mail still waits.
+      - await:
+          row: notification.inbox
+          capture: { message: id }
+      - as: { role: notification_user, user: "${alice}" }
+      - graphql: |
+          mutation { update_notification_inbox(
+                       where: {id: {_eq: "${message}"}},
+                       _set: {seen_at: "2026-08-20T10:00:00+00:00"}) { affected_rows } }
+        expect: { data: { update_notification_inbox: { affected_rows: 1 } } }
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: skipped }]
+      # Nothing was sent, because there was nothing left to say.
+      - calls: { path: /api/v3/messages/send, count: 0 }

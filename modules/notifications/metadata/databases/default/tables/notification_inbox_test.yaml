@@ -1,0 +1,99 @@
+# The feed itself: who reads it, what the unread count counts, and what a
+# recipient may change about a message. Every case here is about the two row
+# filters on this table — a permission is only proven by the request it turns
+# away, and these turn away the only request that matters: someone else's.
+vars:
+  alice: 11111111-1111-4111-8111-111111111111
+  bob: 22222222-2222-4222-8222-222222222222
+
+tests:
+  - name: a recipient reads their own feed and nobody elses
+    steps:
+      - sql: |
+          insert into public.app_user (id, email) values
+            ('${alice}', 'alice@example.test'),
+            ('${bob}', 'bob@example.test')
+      # Seeded directly: these cases are about reading a feed, not about how a
+      # row got into it.
+      - sql: |
+          with d as (
+            insert into notification.dispatch (workflow, recipient_id, title, body)
+            values ('order_shipped', '${alice}', 'alice one', 'body'),
+                   ('order_shipped', '${alice}', 'alice two', 'body'),
+                   ('order_shipped', '${bob}', 'bob one', 'body')
+            returning id, recipient_id, title
+          )
+          insert into notification.inbox (dispatch_id, recipient_id, title, body)
+          select d.id, d.recipient_id, d.title, 'body' from d
+      - as: { role: notification_user, user: "${alice}" }
+      - graphql: 'query { notification_inbox(order_by: {title: asc}) { title } }'
+        expect:
+          data:
+            notification_inbox:
+              - { title: alice one }
+              - { title: alice two }
+      - as: { role: notification_user, user: "${bob}" }
+      - graphql: 'query { notification_inbox { title } }'
+        expect: { data: { notification_inbox: [{ title: bob one }] } }
+
+  - name: the unread count is an aggregate and marking read moves it
+    steps:
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - sql: |
+          insert into notification.dispatch (workflow, recipient_id, title, body)
+          values ('order_shipped', '${alice}', 'alice one', 'body')
+          returning id
+        capture: { dispatch: id }
+      - sql: |
+          insert into notification.inbox (dispatch_id, recipient_id, title, body)
+          values ('${dispatch}', '${alice}', 'alice one', 'body')
+          returning id
+        capture: { first: id }
+      - sql: |
+          with d as (
+            insert into notification.dispatch (workflow, recipient_id, title, body)
+            values ('order_shipped', '${alice}', 'alice two', 'body')
+            returning id
+          )
+          insert into notification.inbox (dispatch_id, recipient_id, title, body)
+          select d.id, '${alice}', 'alice two', 'body' from d
+      - as: { role: notification_user, user: "${alice}" }
+      # The bell: one aggregate, not a fetch of the feed.
+      - graphql: |
+          query { notification_inbox_aggregate(where: {read_at: {_is_null: true}})
+                  { aggregate { count } } }
+        expect: { data: { notification_inbox_aggregate: { aggregate: { count: 2 } } } }
+      - graphql: |
+          mutation { update_notification_inbox(
+                       where: {id: {_eq: "${first}"}},
+                       _set: {read_at: "2026-08-20T10:00:00+00:00"}) { affected_rows } }
+        expect: { data: { update_notification_inbox: { affected_rows: 1 } } }
+      - graphql: |
+          query { notification_inbox_aggregate(where: {read_at: {_is_null: true}})
+                  { aggregate { count } } }
+        expect: { data: { notification_inbox_aggregate: { aggregate: { count: 1 } } } }
+
+  - name: a recipient cannot mark someone elses notification read
+    steps:
+      - sql: insert into public.app_user (id, email) values ('${bob}', 'bob@example.test')
+      - sql: |
+          insert into notification.dispatch (workflow, recipient_id, title, body)
+          values ('order_shipped', '${bob}', 'bob one', 'body')
+          returning id
+        capture: { dispatch: id }
+      - sql: |
+          insert into notification.inbox (dispatch_id, recipient_id, title, body)
+          values ('${dispatch}', '${bob}', 'bob one', 'body')
+          returning id
+        capture: { bobs: id }
+      - as: { role: notification_user, user: "${alice}" }
+      # The row filter is what refuses this, so it is a no-op rather than an
+      # error — the same answer Alice would get for a row that does not exist,
+      # which is the answer she should get.
+      - graphql: |
+          mutation { update_notification_inbox(
+                       where: {id: {_eq: "${bobs}"}},
+                       _set: {read_at: "2026-08-20T10:00:00+00:00"}) { affected_rows } }
+        expect: { data: { update_notification_inbox: { affected_rows: 0 } } }
+      - sql: select read_at from notification.inbox where id = '${bobs}'
+        expect: [{ read_at: null }]

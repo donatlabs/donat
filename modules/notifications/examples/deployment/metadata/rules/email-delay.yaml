@@ -1,0 +1,36 @@
+# The escalation, turned on — per workflow, because "how long may this wait"
+# is not one answer for everything a store sends.
+#
+# The module ships one row saying `delay_seconds: 0` — "mail immediately" —
+# because a module that delayed every message by default would be deciding
+# something the deployment did not ask for. This deployment decides: the bell
+# rings now, and the mail follows only if the recipient did not look. The table
+# is `hit_policy: first`, so the rows read top to bottom.
+#
+# The numbers are a stand's timescale for what a real deployment writes in
+# minutes. The declaration is the same either way, and the number is the whole
+# of what changes.
+name: notification_email_delay
+inputs: { workflow: string! }
+output: { delay_seconds: int! }
+hit_policy: first
+rows:
+  # A reminder can wait to see whether the recipient deals with it themselves.
+  - id: reminder
+    when: { workflow: 'workflow == "invoice_ready"' }
+    output: { delay_seconds: 20 }
+  # Everything else escalates quickly.
+  - id: escalate
+    when: { workflow: "true" }
+    output: { delay_seconds: 5 }
+test_cases:
+  - name: a reminder waits behind the bell
+    input: { workflow: invoice_ready }
+    expect:
+      output: { delay_seconds: 20 }
+      matched_row_id: reminder
+  - name: everything else escalates quickly
+    input: { workflow: order_shipped }
+    expect:
+      output: { delay_seconds: 5 }
+      matched_row_id: escalate

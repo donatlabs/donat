@@ -1,0 +1,88 @@
+# The sweep's entry point: what a scheduler calls, once per row of the pending
+# list. Its own contract is that it is safe to call — for a group with nothing
+# owed, and twice for the same group — and that the token holding it can do
+# nothing else.
+vars:
+  alice: 11111111-1111-4111-8111-111111111111
+  request: dddddddd-4444-4444-8444-444444444444
+
+tests:
+  - name: sweeping a group with nothing pending is harmless
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - graphql: |
+          mutation { flush_notification_digests(request_id: "${request}",
+                       recipient_id: "${alice}", workflow: "order_shipped")
+                     { sweep_id } }
+      - await: { terminal: notification_digest_sweep }
+      - calls: { path: /v1/email/digests, count: 0 }
+
+  - name: the scheduler reaches the sweep and nothing else
+    steps:
+      # The scheduler's token is the one that lives in a cron runner's
+      # environment, so what it can reach matters. `notification_worker`
+      # commands take a recipient id as a plain argument — a token holding that
+      # role could read anyone's address and title through
+      # `notification_resolve_channel`.
+      - providers: !include ../testdata/providers.yaml
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - graphql: |
+          mutation { flush_notification_digests(request_id: "${request}",
+                       recipient_id: "${alice}", workflow: "order_shipped")
+                     { sweep_id } }
+      - for:
+          - 'notification_resolve_channel(dispatch_id: "${alice}", channel: "email") { email }'
+          - 'notification_claim_digest(recipient_id: "${alice}", workflow: "w", claim_id: "${alice}") { pending }'
+        do:
+          - graphql: 'mutation { ${item} }'
+            expect: { errors: "@present" }
+      # And the worker cannot reach the scheduler's entry point either: the two
+      # roles are not a ladder.
+      - as: { role: notification_worker, user: "${alice}" }
+      - graphql: |
+          mutation { flush_notification_digests(request_id: "${request}",
+                       recipient_id: "${alice}", workflow: "order_shipped")
+                     { sweep_id } }
+        expect: { errors: "@present" }
+
+  - name: the sweep is reachable over rest for whatever runs the schedule
+    steps:
+      # A cron runner posts JSON to a route; it does not write GraphQL. The
+      # module publishes the sweep as a RESTified saved operation for exactly
+      # that caller, and this is the request a schedule makes.
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify_digested(workflow: "order_shipped", recipient_id: "${alice}",
+                                     title: "your order shipped", body: "it shipped",
+                                     request_id: "44444444-4444-4444-8444-444444444444")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify_digested/dispatch_id }
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: deferred }]
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - url: /api/rest/notifications/digests/flush
+        headers:
+          X-Donat-Role: notification_scheduler
+          X-Donat-User-Id: "${alice}"
+        body:
+          request_id: "${request}"
+          recipient_id: "${alice}"
+          workflow: order_shipped
+        # A RESTified operation answers with the operation's own result, not
+        # with a GraphQL envelope around it.
+        response:
+          flush_notification_digests:
+            sweep_id: "${request}"
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: sent }]
+      - calls: { path: /v1/email/digests, count: 1 }
