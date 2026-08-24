@@ -445,7 +445,11 @@ fn a_config_takes_one_migrations_directory_or_several() {
     write(&root, "donat.test.yaml", "migrations: migrations\n");
     let one = crate::AppTestConfig::load(&root).expect("a single directory loads");
     assert_eq!(one.migrations, vec![root.join("migrations")]);
-    assert_eq!(one.metadata, root.join("metadata"), "metadata has a default");
+    assert_eq!(
+        one.metadata,
+        root.join("metadata"),
+        "metadata has a default"
+    );
 
     // And an application with no migrations of its own says nothing.
     write(&root, "donat.test.yaml", "metadata: metadata\n");
