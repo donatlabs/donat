@@ -28,7 +28,7 @@ primitive — or what is about the engine rather than the application:
 | `parallel` (two actors at once) | races in `test_checkout_payment`, `test_edges_and_races`, `test_performance` |
 | `ws` (subscriptions) | `test_live_updates` |
 | `upload` (moving real bytes through the store) | byte-moving cases of `test_file_attachments`, `test_file_attacks` |
-| `@contains` matcher (membership in a large list) | `test_role_matrix`, one search/parity introspection case each |
+| `@contains` matcher (membership in a large list) | `test_role_matrix` — including the notification module's commands, whose *refusals* are declared beside the module and whose exhaustive "and nobody else" is this matrix; one search/parity introspection case each |
 | engine-level, not application behaviour (JWT verification, generated hostile queries, latency) | token cases in `test_attacks`/`test_catalogue_and_roles`, `test_performance`, `test_store_integrity` whole-stand sweeps |
 
 A test ported to YAML is deleted here in the same change — one source of
