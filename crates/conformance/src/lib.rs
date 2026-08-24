@@ -12,7 +12,7 @@
 
 use std::io::Read;
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -22,268 +22,23 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value as Json, json};
 
 mod action_webhook;
-pub mod auth_hook;
 pub mod cron_webhook;
 pub mod idp_stub;
 pub mod object_store;
-pub mod provider_stub;
 mod remote_graphql;
+
+// The leaf helpers an application test needs as much as a conformance suite
+// does — stubs, fixture loading, response comparison, migrations — live in
+// `donat-testkit` and are re-exported here under their historical names.
+pub use donat_testkit::{
+    SelMap, apply_sql_migration_dir, auth_hook, json_matches, load_fixture, provider_stub,
+    response_matches, sel_tree_from_query, strip_mcp_content,
+};
 
 // ---------------------------------------------------------------- fixtures
 
 pub fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
-}
-
-/// Apply a checked-in directory of versioned SQL migrations to a suite
-/// database before its first engine request. Migration paths are selected by
-/// the test harness, never from an HTTP request.
-pub fn apply_sql_migration_dir(database_url: &str, dir: &Path) -> Result<()> {
-    let mut migrations = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading migration directory {}", dir.display()))?
-    {
-        let entry =
-            entry.with_context(|| format!("reading migration entry in {}", dir.display()))?;
-        let path = entry.path();
-        if !entry
-            .file_type()
-            .with_context(|| format!("reading migration file type {}", path.display()))?
-            .is_file()
-        {
-            return Err(anyhow!(
-                "migration entry {} is not a regular file",
-                path.display()
-            ));
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("migration file name {} is not UTF-8", path.display()))?;
-        let (version, description) = name
-            .strip_prefix('V')
-            .and_then(|name| name.split_once("__"))
-            .and_then(|(version, description)| {
-                description.strip_suffix(".sql").map(|d| (version, d))
-            })
-            .ok_or_else(|| anyhow!("invalid migration file name {name}"))?;
-        if version.is_empty()
-            || version.starts_with('0')
-            || !version.bytes().all(|byte| byte.is_ascii_digit())
-            || description.is_empty()
-            || !description
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        {
-            return Err(anyhow!("invalid migration file name {name}"));
-        }
-        let version = version
-            .parse::<u64>()
-            .with_context(|| format!("invalid migration version in {name}"))?;
-        migrations.push((version, path));
-    }
-
-    migrations.sort_by_key(|(version, _)| *version);
-    for pair in migrations.windows(2) {
-        if pair[0].0 == pair[1].0 {
-            return Err(anyhow!("duplicate version {}", pair[0].0));
-        }
-    }
-
-    let mut client = postgres::Client::connect(database_url, postgres::NoTls)
-        .with_context(|| format!("connecting to migration database {database_url}"))?;
-    for (_, path) in migrations {
-        let sql = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading migration {}", path.display()))?;
-        client
-            .batch_execute(&sql)
-            .with_context(|| format!("applying migration {}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Load a fixture YAML into JSON, resolving `!include <file>` (both the real
-/// YAML tag and the quoted-string spelling donat-cli produces) relative to
-/// the including file.
-pub fn load_fixture(path: &Path) -> Result<Json> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading fixture {}", path.display()))?;
-    let v: serde_yaml::Value = serde_yaml::from_str(&text)
-        .with_context(|| format!("parsing fixture {}", path.display()))?;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    yaml_to_json(&v, dir)
-}
-
-fn yaml_to_json(v: &serde_yaml::Value, dir: &Path) -> Result<Json> {
-    use serde_yaml::Value as Y;
-    Ok(match v {
-        Y::Null => Json::Null,
-        Y::Bool(b) => Json::Bool(*b),
-        Y::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                json!(i)
-            } else if let Some(u) = n.as_u64() {
-                json!(u)
-            } else {
-                json!(n.as_f64().unwrap())
-            }
-        }
-        Y::String(s) => {
-            if let Some(rest) = s.strip_prefix("!include ") {
-                load_fixture(&dir.join(rest.trim()))?
-            } else {
-                Json::String(s.clone())
-            }
-        }
-        Y::Sequence(xs) => Json::Array(
-            xs.iter()
-                .map(|x| yaml_to_json(x, dir))
-                .collect::<Result<_>>()?,
-        ),
-        Y::Mapping(m) => {
-            let mut out = Map::new();
-            for (k, val) in m {
-                let key = match k {
-                    Y::String(s) => s.clone(),
-                    other => serde_yaml::to_string(other)?.trim().to_string(),
-                };
-                out.insert(key, yaml_to_json(val, dir)?);
-            }
-            Json::Object(out)
-        }
-        Y::Tagged(t) => {
-            if t.tag.to_string().trim_start_matches('!') == "include" {
-                let f = t
-                    .value
-                    .as_str()
-                    .ok_or_else(|| anyhow!("!include expects a string"))?;
-                load_fixture(&dir.join(f))?
-            } else {
-                yaml_to_json(&t.value, dir)?
-            }
-        }
-    })
-}
-
-// -------------------------------------------------------------- comparison
-
-/// Selection tree extracted from the fixture's GraphQL query: response-alias
-/// -> nested selections (None for leaf fields). Used to replicate tests-py
-/// `collapse_order_not_selset`: key order is enforced only among keys that
-/// are part of the selection set; everything else (errors, jsonb column
-/// values, ...) compares order-insensitively.
-#[derive(Default)]
-pub struct SelMap(std::collections::HashMap<String, Option<SelMap>>);
-
-impl SelMap {
-    fn contains_key(&self, k: &str) -> bool {
-        self.0.contains_key(k)
-    }
-    fn get(&self, k: &str) -> Option<&Option<SelMap>> {
-        self.0.get(k)
-    }
-}
-
-pub fn sel_tree_from_query(query: &str) -> Option<SelMap> {
-    use graphql_parser::query::{Definition, OperationDefinition, Selection, SelectionSet};
-
-    let doc = graphql_parser::parse_query::<String>(query).ok()?;
-    let mut frags = std::collections::HashMap::new();
-    for def in &doc.definitions {
-        if let Definition::Fragment(f) = def {
-            frags.insert(f.name.clone(), &f.selection_set);
-        }
-    }
-    fn build<'a>(
-        ss: &SelectionSet<'a, String>,
-        frags: &std::collections::HashMap<String, &SelectionSet<'a, String>>,
-    ) -> SelMap {
-        let mut out = SelMap::default();
-        for item in &ss.items {
-            match item {
-                Selection::Field(f) => {
-                    let key = f.alias.clone().unwrap_or_else(|| f.name.clone());
-                    let child = if f.selection_set.items.is_empty() {
-                        None
-                    } else {
-                        Some(build(&f.selection_set, frags))
-                    };
-                    out.0.insert(key, child);
-                }
-                Selection::FragmentSpread(fs) => {
-                    if let Some(inner) = frags.get(&fs.fragment_name) {
-                        out.0.extend(build(inner, frags).0);
-                    }
-                }
-                Selection::InlineFragment(inf) => {
-                    out.0.extend(build(&inf.selection_set, frags).0);
-                }
-            }
-        }
-        out
-    }
-    for def in &doc.definitions {
-        let ss = match def {
-            Definition::Operation(OperationDefinition::Query(q)) => &q.selection_set,
-            Definition::Operation(OperationDefinition::Mutation(m)) => &m.selection_set,
-            Definition::Operation(OperationDefinition::Subscription(s)) => &s.selection_set,
-            Definition::Operation(OperationDefinition::SelectionSet(ss)) => ss,
-            Definition::Fragment(_) => continue,
-        };
-        return Some(build(ss, &frags));
-    }
-    None
-}
-
-/// Deep comparison. `sel` carries the selection tree for the current level;
-/// among keys present in the tree, the relative order in expected and actual
-/// must match, and their children recurse with their sub-tree. Keys outside
-/// the tree (and everything once `sel` is None) compare order-insensitively.
-/// Numbers compare by value (1 == 1.0), like Python.
-pub fn json_matches(exp: &Json, act: &Json, sel: Option<&SelMap>) -> bool {
-    match (exp, act) {
-        (Json::Object(e), Json::Object(a)) => {
-            if e.len() != a.len() || !e.keys().all(|k| a.contains_key(k)) {
-                return false;
-            }
-            if let Some(tree) = sel {
-                let eseq: Vec<&String> = e.keys().filter(|k| tree.contains_key(k)).collect();
-                let aseq: Vec<&String> = a.keys().filter(|k| tree.contains_key(k)).collect();
-                if eseq != aseq {
-                    return false;
-                }
-            }
-            e.iter().all(|(k, ve)| {
-                let child = sel.and_then(|t| t.get(k)).and_then(|c| c.as_ref());
-                json_matches(ve, &a[k], child)
-            })
-        }
-        (Json::Array(e), Json::Array(a)) => {
-            e.len() == a.len() && e.iter().zip(a.iter()).all(|(x, y)| json_matches(x, y, sel))
-        }
-        (Json::Number(e), Json::Number(a)) => {
-            e == a || (e.as_f64().zip(a.as_f64()).is_some_and(|(x, y)| x == y))
-        }
-        _ => exp == act,
-    }
-}
-
-/// Compare a full HTTP-level response: top-level object unordered, the
-/// `data` subtree governed by the query's selection tree.
-pub fn response_matches(exp: &Json, act: &Json, query_text: Option<&str>) -> bool {
-    let tree = query_text.and_then(sel_tree_from_query);
-    match (exp, act) {
-        (Json::Object(e), Json::Object(a)) => {
-            if e.len() != a.len() || !e.keys().all(|k| a.contains_key(k)) {
-                return false;
-            }
-            e.iter().all(|(k, ve)| {
-                let sel = if k == "data" { tree.as_ref() } else { None };
-                json_matches(ve, &a[k], sel)
-            })
-        }
-        _ => json_matches(exp, act, None),
-    }
 }
 
 // ------------------------------------------------------------------ engine
@@ -3166,39 +2921,16 @@ fn pretty(v: &Json) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
-/// Normalize a JSON-RPC `result` for MCP comparison by dropping fields that
-/// are not part of the conformance contract:
-///
-/// - `content` (always): a text duplicate of the structured data.
-/// - `structuredContent` *only when* `isError` is true: an error tool result's
-///   structured payload carries engine-dependent GraphQL error details, so the
-///   contract for a failure is just `isError: true`. On success,
-///   `structuredContent` (the real data) is kept and asserted.
-///
-/// Everything else (`isError`, `tools`, `protocolVersion`, `serverInfo`,
-/// `capabilities`, ...) is asserted as-is. GraphQL/REST comparison never calls
-/// this.
-fn strip_mcp_content(v: &Json) -> Json {
-    let mut out = v.clone();
-    if let Some(result) = out.get_mut("result").and_then(Json::as_object_mut) {
-        result.remove("content");
-        if result.get("isError") == Some(&Json::Bool(true)) {
-            result.remove("structuredContent");
-        }
-    }
-    out
-}
-
 // -------------------------------------------------------------------- tests
 
-/// Unit tests for the pure parts of the harness: fixture loading
-/// (`!include`) and the tests-py-faithful response comparison. They need
-/// neither Postgres nor a running engine, so they live in the lib target
-/// (the `tests/` binaries require a database).
+/// Unit tests for the pure parts of the harness (backend registry, engine
+/// start/retry, suite naming, metadata writer). They need neither Postgres
+/// nor a running engine, so they live in the lib target (the `tests/`
+/// binaries require a database). Fixture loading and response comparison
+/// are tested where they live now, in `donat-testkit`.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
 
     #[test]
@@ -3713,8 +3445,7 @@ mod tests {
             "mcp_tools",
             "migrate",
             "oidc_login",
-            "petshop",
-            "petshop_process",
+            "petshop_yaml",
             "process_activity",
             "process_inbound",
             "processes",
@@ -3766,10 +3497,6 @@ mod tests {
             POSTGRES_REFERENCE.len()
         );
     }
-
-    // ---------------------------------------------------- load_fixture
-
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     #[test]
     fn metadata_writer_emits_only_the_nonempty_rules_wrapper() {
@@ -3954,264 +3681,5 @@ mod tests {
         std::fs::remove_dir_all(with_processes_dir).expect("remove process metadata directory");
         std::fs::remove_dir_all(without_processes_dir)
             .expect("remove empty process metadata directory");
-    }
-
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "donat_conformance_fixture_{tag}_{}_{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn write(root: &Path, rel: &str, content: &str) {
-        let path = root.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, content).unwrap();
-    }
-
-    #[test]
-    fn duplicate_migration_versions_are_rejected() {
-        let dir = tempdir("duplicate_migration_versions");
-        write(&dir, "V2__first.sql", "SELECT 1;");
-        write(&dir, "V2__second.sql", "SELECT 2;");
-
-        let err = apply_sql_migration_dir("postgresql://unused", &dir)
-            .expect_err("duplicate migration versions must be rejected");
-        assert!(
-            format!("{err:#}").contains("duplicate version 2"),
-            "{err:#}"
-        );
-
-        std::fs::remove_dir_all(dir).expect("remove migration test directory");
-    }
-
-    #[test]
-    fn load_fixture_resolves_string_include_relative_to_file() {
-        // The quoted-string spelling, resolved against the *including*
-        // file's directory — including transitively from a subdirectory.
-        let dir = tempdir("string");
-        write(
-            &dir,
-            "suite/case.yaml",
-            "setup: \"!include sub/inner.yaml\"\nname: top\n",
-        );
-        write(
-            &dir,
-            "suite/sub/inner.yaml",
-            "deep: \"!include leaf.yaml\"\n",
-        );
-        write(&dir, "suite/sub/leaf.yaml", "- 1\n- two\n");
-
-        let v = load_fixture(&dir.join("suite/case.yaml")).unwrap();
-        assert_eq!(v["name"], json!("top"));
-        assert_eq!(v["setup"]["deep"], json!([1, "two"]));
-    }
-
-    #[test]
-    fn load_fixture_resolves_real_yaml_tag_include() {
-        let dir = tempdir("tag");
-        write(&dir, "case.yaml", "steps: !include steps.yaml\n");
-        write(&dir, "steps.yaml", "- url: /v1/graphql\n  status: 200\n");
-
-        let v = load_fixture(&dir.join("case.yaml")).unwrap();
-        assert_eq!(v["steps"][0]["url"], json!("/v1/graphql"));
-        assert_eq!(v["steps"][0]["status"], json!(200));
-    }
-
-    #[test]
-    fn load_fixture_missing_include_target_errors() {
-        let dir = tempdir("missing");
-        write(&dir, "case.yaml", "setup: \"!include nope.yaml\"\n");
-        let err = load_fixture(&dir.join("case.yaml")).unwrap_err();
-        assert!(format!("{err:#}").contains("nope.yaml"), "got: {err:#}");
-    }
-
-    #[test]
-    fn load_fixture_preserves_numbers_and_non_string_keys() {
-        let dir = tempdir("scalars");
-        write(
-            &dir,
-            "case.yaml",
-            "int: 5\nbig: 18446744073709551615\nfloat: 1.5\nmap:\n  1: one\n",
-        );
-        let v = load_fixture(&dir.join("case.yaml")).unwrap();
-        assert_eq!(v["int"], json!(5));
-        assert_eq!(v["big"], json!(18446744073709551615u64));
-        assert_eq!(v["float"], json!(1.5));
-        // Non-string YAML keys are stringified.
-        assert_eq!(v["map"]["1"], json!("one"));
-    }
-
-    // ----------------------------------------- json/response matching
-
-    #[test]
-    fn numbers_coerce_across_int_and_float() {
-        assert!(json_matches(&json!(1), &json!(1.0), None));
-        assert!(json_matches(&json!(1.0), &json!(1), None));
-        assert!(!json_matches(&json!(1), &json!(2.0), None));
-        assert!(json_matches(&json!({"n": 1}), &json!({"n": 1.0}), None));
-    }
-
-    #[test]
-    fn objects_without_selection_tree_compare_unordered() {
-        let exp = json!({"a": 1, "b": 2});
-        let act = json!({"b": 2, "a": 1});
-        assert!(json_matches(&exp, &act, None));
-    }
-
-    #[test]
-    fn object_key_set_mismatch_fails() {
-        // Missing, extra, and renamed keys all fail even order-insensitively.
-        assert!(!json_matches(
-            &json!({"a": 1}),
-            &json!({"a": 1, "b": 2}),
-            None
-        ));
-        assert!(!json_matches(
-            &json!({"a": 1, "b": 2}),
-            &json!({"a": 1}),
-            None
-        ));
-        assert!(!json_matches(&json!({"a": 1}), &json!({"b": 1}), None));
-    }
-
-    #[test]
-    fn arrays_require_equal_length_and_order() {
-        assert!(json_matches(&json!([1, 2]), &json!([1, 2]), None));
-        assert!(!json_matches(&json!([1, 2]), &json!([2, 1]), None));
-        assert!(!json_matches(&json!([1, 2]), &json!([1, 2, 3]), None));
-    }
-
-    #[test]
-    fn data_key_order_is_enforced_per_selection_tree() {
-        let query = "query { a b }";
-        let exp = json!({"data": {"a": 1, "b": 2}});
-        let in_order = json!({"data": {"a": 1, "b": 2}});
-        let reordered = json!({"data": {"b": 2, "a": 1}});
-        assert!(response_matches(&exp, &in_order, Some(query)));
-        assert!(!response_matches(&exp, &reordered, Some(query)));
-    }
-
-    #[test]
-    fn nested_selection_order_is_enforced_per_level() {
-        let query = "query { items { x y } }";
-        let exp = json!({"data": {"items": [{"x": 1, "y": 2}]}});
-        let good = json!({"data": {"items": [{"x": 1, "y": 2}]}});
-        let bad = json!({"data": {"items": [{"y": 2, "x": 1}]}});
-        assert!(response_matches(&exp, &good, Some(query)));
-        assert!(!response_matches(&exp, &bad, Some(query)));
-    }
-
-    #[test]
-    fn aliases_key_the_selection_tree() {
-        // The response key is the alias; ordering is enforced on aliases.
-        let query = "query { first: item { v } second: item { v } }";
-        let exp = json!({"data": {"first": {"v": 1}, "second": {"v": 2}}});
-        let good = json!({"data": {"first": {"v": 1}, "second": {"v": 2}}});
-        let swapped = json!({"data": {"second": {"v": 2}, "first": {"v": 1}}});
-        assert!(response_matches(&exp, &good, Some(query)));
-        assert!(!response_matches(&exp, &swapped, Some(query)));
-    }
-
-    #[test]
-    fn fragment_spread_fields_join_the_selection_tree() {
-        let query = "
-            query { item { ...F } }
-            fragment F on Item { p q }
-        ";
-        let exp = json!({"data": {"item": {"p": 1, "q": 2}}});
-        let good = json!({"data": {"item": {"p": 1, "q": 2}}});
-        let bad = json!({"data": {"item": {"q": 2, "p": 1}}});
-        assert!(response_matches(&exp, &good, Some(query)));
-        assert!(
-            !response_matches(&exp, &bad, Some(query)),
-            "fragment fields must take part in order enforcement"
-        );
-    }
-
-    #[test]
-    fn inline_fragment_fields_join_the_selection_tree() {
-        let query = "query { item { ... on Item { p q } } }";
-        let exp = json!({"data": {"item": {"p": 1, "q": 2}}});
-        let bad = json!({"data": {"item": {"q": 2, "p": 1}}});
-        assert!(!response_matches(&exp, &bad, Some(query)));
-    }
-
-    #[test]
-    fn jsonb_value_under_data_leaf_is_not_order_enforced() {
-        // `payload` is a leaf field (no sub-selection): its object value is
-        // a jsonb column, where Postgres does not guarantee key order.
-        let query = "query { item { payload } }";
-        let exp = json!({"data": {"item": {"payload": {"x": 1, "y": 2}}}});
-        let act = json!({"data": {"item": {"payload": {"y": 2, "x": 1}}}});
-        assert!(response_matches(&exp, &act, Some(query)));
-    }
-
-    #[test]
-    fn keys_outside_the_selection_tree_are_not_order_enforced() {
-        // Only keys present in the selection tree participate in the
-        // relative-order check (collapse_order_not_selset semantics).
-        let query = "query { a }";
-        let exp = json!({"data": {"extra": 0, "a": 1}});
-        let act = json!({"data": {"a": 1, "extra": 0}});
-        assert!(response_matches(&exp, &act, Some(query)));
-    }
-
-    #[test]
-    fn errors_compare_unordered() {
-        // `errors` is outside `data`: key order inside error objects is free.
-        let query = "query { a }";
-        let exp = json!({"errors": [{
-            "message": "boom",
-            "extensions": {"code": "x", "path": "$"}
-        }]});
-        let act = json!({"errors": [{
-            "extensions": {"path": "$", "code": "x"},
-            "message": "boom"
-        }]});
-        assert!(response_matches(&exp, &act, Some(query)));
-        // ...but error values still have to match.
-        let wrong = json!({"errors": [{
-            "message": "other",
-            "extensions": {"code": "x", "path": "$"}
-        }]});
-        assert!(!response_matches(&exp, &wrong, Some(query)));
-    }
-
-    #[test]
-    fn top_level_response_keys_compare_unordered() {
-        let query = "query { a }";
-        let exp = json!({"data": {"a": 1}, "errors": [{"message": "partial"}]});
-        let act = json!({"errors": [{"message": "partial"}], "data": {"a": 1}});
-        assert!(response_matches(&exp, &act, Some(query)));
-    }
-
-    #[test]
-    fn unparsable_query_disables_order_enforcement() {
-        assert!(sel_tree_from_query("not a graphql query {{{").is_none());
-        let exp = json!({"data": {"a": 1, "b": 2}});
-        let act = json!({"data": {"b": 2, "a": 1}});
-        assert!(response_matches(
-            &exp,
-            &act,
-            Some("not a graphql query {{{")
-        ));
-        assert!(response_matches(&exp, &act, None));
-    }
-
-    #[test]
-    fn sel_tree_covers_operations_and_marks_leaves() {
-        let tree = sel_tree_from_query("mutation { insert_x { affected_rows } }").unwrap();
-        assert!(tree.contains_key("insert_x"));
-        let child = tree.get("insert_x").unwrap().as_ref().unwrap();
-        assert!(child.contains_key("affected_rows"));
-        // Leaf fields carry no sub-tree.
-        assert!(child.get("affected_rows").unwrap().is_none());
     }
 }

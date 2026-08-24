@@ -109,9 +109,12 @@ def test_a_completion_cannot_be_signed_by_the_caller(shopper, store):
 @pytest.mark.parametrize(
     "path",
     [
+        # Only the raw traversal stays here: a URL library normalizes it away
+        # before the request is sent, so exercising the engine with it takes a
+        # client that transmits the path verbatim. The payloads that survive
+        # normalization (an encoded dot-segment, an unissued uuid) are ported
+        # to examples/petshop/metadata/storage_test.yaml.
         "/v1/files/complete/../../v1/graphql",
-        "/v1/files/complete/%2e%2e%2f%2e%2e",
-        "/v1/files/complete/00000000-0000-0000-0000-000000000000",
     ],
 )
 def test_a_completion_path_is_not_a_way_into_the_engine(store, shopper, path):

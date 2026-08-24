@@ -1,0 +1,303 @@
+# Tests for the cart: the GraphQL insert and upsert a customer uses, and the
+# REST operations that reuse them. The steps run in order — the upserts edit
+# the line the first step's cart receives.
+tests:
+  - name: a customer builds a cart over GraphQL and REST
+    steps:
+      - description: A customer creates their open cart through the regular GraphQL insert mutation.
+        url: /v1/graphql
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        query:
+          query: |
+            mutation CreateCart {
+              insert_cart(objects: [{}]) {
+                returning {
+                  id
+                  customer_id
+                  status
+                }
+              }
+            }
+        response:
+          data:
+            insert_cart:
+              returning:
+                - id: 1
+                  customer_id: customer-1
+                  status: cart_open
+
+      - description: REST exposes the same public product catalogue operation.
+        url: /api/rest/products
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: cat-scratcher
+              title: Cat Scratcher
+              variants:
+                - sku: CAT-SCRATCH-POST
+                  price_minor: 1599
+                  currency: USD
+                  stock:
+                    available_quantity: 5
+            - slug: dog-kibble
+              title: Dog Kibble
+              variants:
+                - sku: DOG-CHICKEN-1KG
+                  price_minor: 1999
+                  currency: USD
+                  stock:
+                    available_quantity: 1
+                - sku: DOG-SALMON-1KG
+                  price_minor: 2499
+                  currency: USD
+                  stock:
+                    available_quantity: 3
+
+      - description: REST binds a product slug path parameter into its saved operation.
+        url: /api/rest/products/dog-kibble
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: dog-kibble
+              title: Dog Kibble
+              description: Balanced chicken and salmon recipes.
+              variants:
+                - sku: DOG-CHICKEN-1KG
+                  price_minor: 1999
+                  currency: USD
+                  stock:
+                    available_quantity: 1
+                - sku: DOG-SALMON-1KG
+                  price_minor: 2499
+                  currency: USD
+                  stock:
+                    available_quantity: 3
+
+      - description: A customer adds an active catalogue variant to their own open cart.
+        url: /v1/graphql
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        query:
+          query: |
+            mutation AddCartLine {
+              insert_cart_line(
+                objects: [{cart_id: 1, variant_id: 1, quantity: 1}]
+                on_conflict: {
+                  constraint: cart_line_cart_id_variant_id_key
+                  update_columns: [quantity]
+                }
+              ) {
+                returning {
+                  cart_id
+                  variant_id
+                  quantity
+                }
+              }
+            }
+        response:
+          data:
+            insert_cart_line:
+              returning:
+                - cart_id: 1
+                  variant_id: 1
+                  quantity: 1
+
+      - description: The same upsert edits the existing line instead of creating a second line.
+        url: /v1/graphql
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        query:
+          query: |
+            mutation EditCartLine {
+              insert_cart_line(
+                objects: [{cart_id: 1, variant_id: 1, quantity: 2}]
+                on_conflict: {
+                  constraint: cart_line_cart_id_variant_id_key
+                  update_columns: [quantity]
+                }
+              ) {
+                returning {
+                  cart_id
+                  variant_id
+                  quantity
+                }
+              }
+            }
+        response:
+          data:
+            insert_cart_line:
+              returning:
+                - cart_id: 1
+                  variant_id: 1
+                  quantity: 2
+
+      - description: REST PUT reuses the same cart-line GraphQL upsert.
+        url: /api/rest/cart/lines
+        method: PUT
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          cart_id: 1
+          variant_id: 1
+          quantity: 3
+        response:
+          insert_cart_line:
+            returning:
+              - cart_id: 1
+                variant_id: 1
+                quantity: 3
+
+      - description: REST cart reads remain scoped to the calling customer.
+        url: /api/rest/cart
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          cart:
+            - id: 1
+              customer_id: customer-1
+              status: cart_open
+              lines:
+                - variant_id: 1
+                  quantity: 3
+
+      - description: REST orders returns only the caller's orders.
+        url: /api/rest/orders
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          orders: []
+
+      - description: REST binds an order UUID path parameter without bypassing row permissions.
+        url: /api/rest/orders/00000000-0000-0000-0000-000000000001
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          orders: []
+
+  # -- one shopper is not another: the cart, checkout and orders are scoped
+  # to the session's own customer, and a mutation the store reserves for
+  # itself does not exist in a shopper's schema at all.
+
+  - name: a shopper sees only their own cart
+    steps:
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { cart { id } }'
+        expect: { data: { cart: [{ id: 1 }] } }
+      # Another shopper's cart is not visible: an empty list, not an error.
+      - as: { role: customer, user: customer-2 }
+      - graphql: 'query { cart { id } }'
+        expect: { data: { cart: [] } }
+
+  - name: a shopper cannot fill another shopper's cart
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - as: { role: customer, user: customer-2 }
+      - graphql: |
+          mutation {
+            insert_cart_line_one(object: {cart_id: 1, variant_id: 2, quantity: 1}) {
+              id
+            }
+          }
+        expect:
+          errors:
+            - message: check constraint of an insert/update permission has failed
+              extensions: { code: permission-error }
+
+  - name: a shopper cannot check out another shopper's cart
+    steps:
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      # The entry-point command looks the cart up under the caller's own
+      # session; a cart the caller does not own is simply not found.
+      - as: { role: customer, user: customer-2 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655441000") {
+              cart_id
+            }
+          }
+        expect:
+          errors:
+            - message: command select_one step 'cart' did not find a row
+              extensions: { code: validation-failed }
+
+  - name: a shopper sees only their own orders
+    steps:
+      - sql: |
+          INSERT INTO orders (id, customer_id)
+            VALUES ('00000000-0000-0000-0000-000000000011', 'customer-1');
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { orders { id } }'
+        expect:
+          data:
+            orders:
+              - id: 00000000-0000-0000-0000-000000000011
+      - as: { role: customer, user: customer-2 }
+      - graphql: 'query { orders { id } }'
+        expect: { data: { orders: [] } }
+
+  - name: an unfiltered delete cannot empty the store
+    steps:
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1'), ('customer-2');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1), (2, 2, 1);
+      # `where: {}` means "everything I am allowed to touch", not "everything".
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { delete_cart_line(where: {}) { affected_rows } }'
+        expect: { data: { delete_cart_line: { affected_rows: 1 } } }
+      # The other shopper's basket was not emptied by a delete that never
+      # named it.
+      - as: { role: customer, user: customer-2 }
+      - graphql: 'query { cart(where: {id: {_eq: 2}}) { lines { variant_id quantity } } }'
+        expect:
+          data:
+            cart:
+              - lines:
+                  - { variant_id: 2, quantity: 1 }
+
+  - name: a shopper has no mutation for what the store decides
+    steps:
+      # Order and payment state are the process's to write, not a caller's.
+      # The mutation does not exist for the role: the refusal is "field not
+      # found", never a permission error that would confirm the field exists.
+      - as: { role: customer, user: customer-1 }
+      - for:
+          - { field: update_orders, call: 'update_orders(where: {}, _set: {order_status: "authorized"})' }
+          - { field: delete_orders, call: 'delete_orders(where: {})' }
+          - { field: delete_payment, call: 'delete_payment(where: {})' }
+        do:
+          - graphql: 'mutation { ${item.call} { affected_rows } }'
+            expect:
+              errors:
+                - extensions:
+                    path: $.selectionSet.${item.field}
+                    code: validation-failed
+                  message: "field '${item.field}' not found in type: 'mutation_root'"

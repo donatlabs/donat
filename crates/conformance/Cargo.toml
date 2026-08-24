@@ -9,6 +9,7 @@ description = "Native conformance harness: Donat-derived fixtures executed again
 anyhow = { workspace = true }
 donat-backend = { path = "../backend" }
 donat-metadata = { path = "../metadata" }
+donat-testkit = { path = "../testkit" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

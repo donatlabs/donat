@@ -134,7 +134,7 @@ update_permissions:
       # The list reads the updated row, so renaming an ungraded legacy variant
       # fails until the same statement grades it. That is a real consequence
       # of validating the written row rather than the submitted fields, and it
-      # is asserted in fixtures/petshop/validation.yaml rather than left to be
+      # is asserted in public_product_variant_test.yaml rather than left to be
       # discovered in production.
       validate:
         - not_null: quality_grade

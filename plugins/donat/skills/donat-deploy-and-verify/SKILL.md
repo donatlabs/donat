@@ -144,6 +144,84 @@ rolling deployment's readiness probe at `/readyz` and its liveness probe at
 
 ## Testing an application
 
+An application's tests are declarations too. A `*_test.yaml` sits beside the
+metadata file it exercises — `public_orders.yaml` → `public_orders_test.yaml`,
+`flows/checkout-payment.yaml` → `flows/checkout-payment_test.yaml` — the way Go
+keeps `_test.go` beside the source. The loader never boots a test file as
+metadata. `donat.test.yaml` at the application root says what the engine needs:
+
+```yaml
+metadata: metadata
+migrations: migrations
+engine_env:
+  PETSHOP_PAYMENT_BASE_URL: ${providers}      # the runner's provider stub
+  PETSHOP_PAYMENT_API_TOKEN: test-token
+```
+
+```sh
+donat test --app-dir . --database-url postgresql://postgres:postgres@127.0.0.1:5432/postgres
+donat test --filter checkout          # cases whose <file>::<name> contains it
+```
+
+Every test case gets a fresh database, both sets of migrations, the Process
+revisions, and the real binary serving the metadata; a role comes from the
+runner's authentication hook, which turns `X-Donat-Role` / `X-Donat-User-Id`
+into a session. Steps, in the order they run:
+
+```yaml
+vars: { customer: customer-1 }                           # constants, as ${customer}
+tests:
+  - name: a shopper checks out and the process authorizes the order
+    steps:
+      - providers: !include ../testdata/providers.yaml   # path → 200 body; a list is a queue of {status, body}
+      - sql: insert into cart (customer_id) values ('customer-1') returning id
+        capture: { cart_id: id }                         # ${cart_id} in every later step
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { start_checkout(cart_id: ${cart_id}, request_id: "…") { cart_id } }'
+        expect: { data: { start_checkout: { cart_id: "${cart_id}" } } }   # subset; matchers below
+      - await: { terminal: checkout_payment, expect: { payment_status: authorized } }
+      - await: { receptive: return_refund, state: await_support_decision }  # before sending a signal
+      - await: { failed: checkout_payment, expect: { code: tax_quote_unavailable } }  # a declared fail terminal
+      - await: { row: grooming_booking, capture: { booking_id: id } }
+      - sql: select status from payment where order_id = '${order_id}'
+        expect: [{ status: authorized }]                 # as many rows as listed
+      - sql: insert into cart_line (cart_id, variant_id, quantity) values (1, 1, -1)
+        error: check_violation
+      - calls: { path: /v1/payment-authorizations, count: 1, body: { currency: USD } }
+      - hold: /v1/payment-authorizations                 # act while the engine is mid-call …
+      - await: { held: /v1/payment-authorizations }
+      - release: /v1/payment-authorizations              # … then let it finish
+      - url: /v1/graphql                                 # the conformance fixture shape, compared exactly
+        headers: { X-Donat-Role: anonymous }
+        query: { query: "{ customer { id } }" }
+        response: { errors: [ … ] }
+      - for:                                             # a table: the same steps, one row per example
+          - { role: customer, field: update_orders }
+          - { role: staff, field: update_refund }
+        do:
+          - as: { role: "${item.role}" }
+          - graphql: "mutation { ${item.field}(where: {}, _set: {}) { affected_rows } }"
+            expect: { errors: [{ message: "field '${item.field}' not found in type: 'mutation_root'" }] }
+```
+
+Matchers in an `expect`: `@any`, `@present`, `@uuid`, `@number`, `@string`,
+`@bool`, `@gt N` / `@gte N` / `@lt N` / `@lte N`, `@regex R`, `@len N`.
+
+That `for` is the whole of what the format takes from a programming language.
+There is no `if`, no expression, no nested loop, no loop over a computed
+value — and there will not be. A test that seems to need one is a check that
+belongs elsewhere: a decision table's `test_cases`, a validator, a CHECK
+constraint, or, rarely, a Rust test in `crates/server/tests` that says why it
+could not be data.
+
+`await` polls the journal, never the clock; a failure prints the durable
+process state and names the engine log. One wire detail: a connector
+percent-encodes every non-alphanumeric byte of a path slot, so a uuid's
+hyphens travel as `%2D` — a `calls` path built from a captured id needs
+`SELECT replace('${id}', '-', '%2D')` first. A whole-string `${name}` keeps the
+captured value's type, so a captured amount reaches a provider body as a
+number.
+
 **Test the refusals, not just the successes.** A permission is only proven by
 the request it turns away. For every role and table, assert at least:
 
@@ -157,11 +235,12 @@ For commands and processes, assert:
 5. a replayed idempotency key returns the original result and writes nothing new,
 6. a guard that should fail rolls back **every** step, not just its own,
 7. a process reaches its terminal state, and its failure branches are reachable —
-   route a provider stub to an error and assert the `fail` code.
+   route a provider stub to an error (`providers` with a `[{status: 503}]`
+   queue) and assert the `fail` code.
 
-The petshop's black-box system tests are the model: they drive the real binary
-over HTTP with scripted provider stubs, and assert the journal in
-`donat.process_*` rather than trusting a response body.
+The petshop's tests under `examples/petshop/metadata/**/*_test.yaml` are the
+model; `scripts/check_app_tests.py` refuses a table that grants a role
+something without a test beside it.
 
 ## Inspecting a running process
 

@@ -2,21 +2,82 @@
 
 # donat
 
-## Declarative services on PostgreSQL.
+## A platform team for your SaaS, in a box.
 
-**Write the system you drew on the whiteboard. The boxes, the arrows, the
-retries, the "what if the payment provider times out" — as declarations, not
-as glue code.**
+**Vibe-code your SaaS. Ship it to production.** You describe what the
+business needs; your agent declares it — schema, permissions, payments,
+refunds, and the tests beside them; the engine **refuses anything wrong
+before it reaches production**. No hardening pass, because there is nothing
+to harden: there is no code.
 
 [![CI](https://github.com/donatlabs/donat/actions/workflows/ci.yml/badge.svg)](https://github.com/donatlabs/donat/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/donatlabs/donat?display_name=tag&label=release)](https://github.com/donatlabs/donat/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[Run the Petshop example](#get-started) · [See what you declare](#what-you-declare) · [Explore the architecture](#one-execution-path)
+[Why it is safe](#safe-to-vibe-code) · [Run the Petshop example](#get-started) · [See what you declare](#what-you-declare) · [Explore the architecture](#one-execution-path)
 
 </div>
 
 ---
+
+## Safe to vibe-code
+
+2026 taught everyone the same lesson: AI writes applications faster than
+anyone can review them, and the wreckage is documented — leaked keys by the
+million, endpoints nobody authenticated, production tables dropped by an
+agent that was told not to. The going advice is a "hardening pass" before
+AI-built software touches production data.
+
+Donat's answer is structural, not procedural. An application here is not
+code the agent wrote — it is **declarations the engine either accepts whole
+or refuses**, the way a platform team's golden path works: the paved road is
+the easy one, and the guardrails do not move.
+
+| What keeps happening to vibe-coded apps | Why it cannot happen here |
+|---|---|
+| Hardcoded secrets shipped in code | There is no code to ship them in. Credentials are deploy-time environment, named by the metadata, resolved before the engine will even bind its port. |
+| An endpoint someone forgot to authenticate | Access exists only as a declared per-role permission. No permission — no field in the schema at all. And there is **no admin role** to find: the bypass does not exist. |
+| SQL injection through a clever input | Nobody — including the agent — writes SQL into a request path. Inputs bind as typed values; the [injection attempts are tests now](examples/petshop/metadata/databases/default/tables/public_product_test.yaml), and they stay search terms. |
+| A wrong declaration discovered in production | `donat validate` is a compiler: a permission naming a missing column, a validator that cannot type-check, an unreachable process branch — each is a **deploy failure**, never a request failure. |
+| Untested behaviour nobody noticed | A test is a `*_test.yaml` file beside the declaration it proves, run by `donat test` on a fresh database each. A table that grants a role something **without a test beside it fails CI**. |
+| A migration or "quick fix" run by hand against prod | The runtime has no `run_sql`, no metadata API, no admin surface — deleted, not disabled. Change arrives as `migrate` + metadata, through review. |
+
+So the promise is not "the agent will not make mistakes". It is: **everything
+the agent gets wrong is refused before production — by the engine, not by a
+reviewer's attention.**
+
+## Built to be driven by an agent
+
+The intended user is not a developer with an editor — it is a founder,
+analyst or operator working with a coding agent. You say what the business
+needs; the agent reads this repository's skills and writes the declarations;
+you read the result and recognise your own requirement in it, because a
+declaration reads as a sentence, and so does its test:
+
+```yaml
+tests:
+  - name: a shopper cannot check out another shopper's cart
+    steps:
+      - as: { role: customer, user: customer-2 }
+      - graphql: 'mutation { start_checkout(cart_id: 1, request_id: "…") { cart_id } }'
+        expect:
+          errors:
+            - extensions: { code: validation-failed }
+```
+
+This repository is a [Claude Code plugin marketplace](plugins/donat):
+
+```
+/plugin marketplace add donatlabs/donat
+/plugin install donat@donat
+```
+
+It installs skills for the whole declarative surface — tables and
+permissions, validators, rules, commands, durable Processes, connectors,
+files, the REST and MCP surfaces, testing and deployment — each pointing at
+the worked example in this tree, plus the rules that are not negotiable. For
+OpenAI Codex, [`plugins/donat/codex`](plugins/donat/codex) ships the same
+material as an `AGENTS.md` section and prompts.
 
 ## The whiteboard is the source
 
@@ -93,9 +154,13 @@ with per-shipment capture, returns with three human approvals, subscription
 dunning, B2B credit approval, marketplace payouts, prescription review and
 payment reconciliation.
 
-Every one is exercised end to end over HTTP against the real binary in
-[`crates/conformance`](crates/conformance): a shopper calls the entry-point
-Command, and the durable Process carries the order the rest of the way.
+And it is tested the way it is built — declaratively. **142 test cases live
+beside the metadata they prove** (`*_test.yaml` next to each table, flow and
+endpoint), run by `donat test` against the real binary on a fresh database
+per case: declines, retries, idempotency replays, cross-shopper refusals,
+provider outages, human approvals. The whole store — payments, returns, B2B
+credit, subscriptions, marketplace payouts — with **zero lines of code,
+tests included**.
 
 ## Explicit access, no way around it
 
@@ -195,26 +260,6 @@ whose side effects are ordinary Go functions called in-process, and which
 serves GraphQL from the same binary with no cgo. Its
 [system tests](tests-system-lending) run every case against both the
 standalone engine and the embedded host, and fail if the two disagree.
-
-### Building with a coding agent
-
-The metadata format is the product surface, and an agent that does not know it
-will write a service where a declaration belongs. This repository is also a
-[Claude Code plugin marketplace](plugins/donat):
-
-```
-/plugin marketplace add donatlabs/donat
-/plugin install donat@donat
-```
-
-It installs skills for the whole declarative surface — permissions and
-validators, rules, commands, durable Processes, connectors, files, the REST and
-MCP surfaces, and the embedded Go host — each pointing at the worked example in
-this repository. It also carries the rules that are not negotiable: no admin
-role, and a requirement becomes a declaration or an escalation, never a script.
-
-For OpenAI Codex, [`plugins/donat/codex`](plugins/donat/codex) ships the same
-material as an `AGENTS.md` section plus prompts.
 
 ### From source
 
@@ -349,7 +394,10 @@ backend runs only the fixtures its declared capabilities support.
 
 Choose Donat when the flow between your services is the hard part — when the
 same data must serve app clients, REST consumers and AI tools, and when
-"charged but not recorded" is a bug you cannot ship.
+"charged but not recorded" is a bug you cannot ship. And choose it when the
+person who owns the requirements is not the person who would have written the
+code: an analyst with an agent gets the platform team's guardrails without
+hiring the platform team.
 
 Donat is not an ORM, a hosted platform, or a place for genuinely computational
 work. What it gives you is declarations with closed grammars: bounded,

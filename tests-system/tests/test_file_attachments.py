@@ -9,8 +9,6 @@ refused.
 
 from __future__ import annotations
 
-import uuid
-
 import pytest
 import requests
 
@@ -50,8 +48,8 @@ def request_upload(actor, *, file_name="avatar.png", media_type="image/png", siz
 def granted_upload(actor, **kwargs) -> dict:
     """An upload URL, or a skip that says how to get the allowance back.
 
-    A session holds at most ten unclaimed uploads and the refusal cases below
-    spend them; the collector reclaims abandoned ones a day later, so on a
+    A session holds at most ten unclaimed uploads and earlier runs may have
+    spent them; the collector reclaims abandoned ones a day later, so on a
     reused stand `stack.sh provision` is what clears them.
     """
 
@@ -132,42 +130,7 @@ def test_a_shopper_uploads_an_avatar_and_reads_it_back(shopper):
     assert fetched.content == PNG, "what comes back is what went up"
 
 
-def test_the_engine_never_carries_the_bytes(shopper):
-    """The upload URL points at the object store, not at the engine."""
-
-    upload = granted_upload(shopper)
-
-    assert upload["url"].startswith("http"), "the upload target is an absolute URL"
-    assert shopper._config.base_url not in upload["url"], (
-        f"the bytes would pass through the engine: {upload['url']}"
-    )
-    # The completion call, which carries no bytes, is the store's own signed
-    # path — no host, because the client is already talking to it.
-    assert upload["complete_url"].startswith("/v1/files/complete/")
-    assert "sig=" in upload["complete_url"], "the completion call proves itself"
-
-
 # -- what the store refuses --------------------------------------------------
-
-
-def test_a_media_type_the_column_does_not_declare_is_refused(shopper):
-    refused = request_upload(shopper, media_type="application/pdf", file_name="invoice.pdf")
-
-    assert refused.errors, "the column declares image/png and image/jpeg only"
-    assert refused.error_code() in {"validation-failed", "permission-error"}
-
-
-def test_a_file_larger_than_the_column_allows_is_refused(shopper):
-    refused = request_upload(shopper, size=8 * 1024 * 1024)
-
-    assert refused.errors, "the column declares a 2 MiB ceiling"
-    assert refused.error_code() in {"validation-failed", "permission-error"}
-
-
-def test_the_public_cannot_ask_for_an_upload(anonymous):
-    refused = request_upload(anonymous)
-
-    assert refused.errors, "an upload URL is a grant, not a public resource"
 
 
 def test_a_shopper_cannot_claim_an_upload_somebody_else_asked_for(shopper, other_shopper):
@@ -181,48 +144,3 @@ def test_a_shopper_cannot_claim_an_upload_somebody_else_asked_for(shopper, other
 
     assert stolen.errors, "another shopper cannot wear this picture"
     assert stolen.error_code() in {"validation-failed", "permission-error"}
-
-
-def test_an_upload_nobody_finished_cannot_be_claimed(shopper):
-    """The bytes were never delivered, so the id is not claimable yet."""
-
-    upload = granted_upload(shopper)
-
-    unfinished = claim(shopper, upload["id"])
-
-    assert unfinished.errors, "a pending upload is not a file"
-    assert unfinished.error_code() in {"validation-failed", "permission-error"}
-
-
-def test_an_invented_file_id_is_refused(shopper):
-    invented = claim(shopper, str(uuid.uuid4()))
-
-    assert invented.errors, "a file id nobody issued claims nothing"
-
-
-# -- how much one session may ask for ----------------------------------------
-
-
-def test_a_session_may_not_hoard_unclaimed_uploads(other_shopper):
-    """Ten pending uploads is the declared ceiling for one shopper.
-
-    An upload URL costs the store a row and a reserved object key, so a client
-    that asks and never finishes is throttled by the store itself — a reverse
-    proxy cannot see this, because it is counted against rows the engine owns.
-
-    Deliberately last in the file: it spends the whole allowance, and the
-    collector reclaims it a day later (`stack.sh provision` on a reused stand).
-    """
-
-    refusal = None
-    for _ in range(14):
-        answer = request_upload(other_shopper, file_name=f"{uuid.uuid4().hex[:8]}.png")
-        if answer.errors:
-            refusal = answer
-            break
-
-    assert refusal is not None, "the store hands out upload URLs without limit"
-    assert refusal.error_code() == "validation-failed"
-    assert "maximum number of unclaimed uploads" in (refusal.error_message() or ""), (
-        f"unexpected refusal: {refusal.error_message()}"
-    )

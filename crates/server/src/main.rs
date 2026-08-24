@@ -26,7 +26,9 @@ use donat_server::{
 };
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
 use std::sync::Arc;
 
 use axum::{
@@ -156,6 +158,95 @@ enum Command {
     /// Deploy-time connector credential lifecycle (OAuth2).
     #[command(subcommand)]
     Connector(ConnectorCommand),
+    /// Run an application's `*_test.yaml` files against a fresh stand each.
+    Test(TestArgs),
+}
+
+/// `donat test`: the application's tests are declarations too.
+///
+/// A `*_test.yaml` sits beside the metadata file it exercises; `donat.test.yaml`
+/// at the application root says what the engine needs to boot it. Every test
+/// case gets a fresh database, the engine's and the application's migrations,
+/// and this same binary serving the metadata — so what passes here is what
+/// deploys. Where Postgres is and where the engine's migrations live are the
+/// machine's business and come from flags or the environment.
+#[derive(clap::Args, Debug)]
+struct TestArgs {
+    /// Application root: the directory holding `donat.test.yaml`.
+    #[arg(long, default_value = ".")]
+    app_dir: PathBuf,
+    /// Admin Postgres connection; each test creates and drops a database on it.
+    #[arg(long, env = "DONAT_TEST_DATABASE_URL")]
+    database_url: Option<String>,
+    /// The engine's own migrations (`/usr/share/donat/migrations` in the image).
+    #[arg(long, env = "DONAT_ENGINE_MIGRATIONS_DIR")]
+    engine_migrations_dir: Option<PathBuf>,
+    /// Run only the cases whose `<file>::<name>` contains this text.
+    #[arg(long)]
+    filter: Option<String>,
+    /// Where engine logs go (one per test case).
+    #[arg(long, default_value = "target/app-test-logs")]
+    log_dir: PathBuf,
+    /// Also write a JUnit XML report here, for CI annotations.
+    #[arg(long)]
+    junit: Option<PathBuf>,
+    /// Test cases to run at once (each is its own database and engine);
+    /// default one per core.
+    #[arg(long, short = 'j', env = "DONAT_TEST_JOBS")]
+    jobs: Option<usize>,
+}
+
+impl TestArgs {
+    fn resolve(&self) -> anyhow::Result<(donat_testkit::AppTestConfig, donat_testkit::RunConfig)> {
+        let app_dir = self
+            .app_dir
+            .canonicalize()
+            .with_context(|| format!("application root {}", self.app_dir.display()))?;
+        let app = donat_testkit::AppTestConfig::load(&app_dir)?;
+        let admin_database_url = self
+            .database_url
+            .clone()
+            .or_else(|| std::env::var("PG_URL").ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no Postgres to test on: pass --database-url or set DONAT_TEST_DATABASE_URL"
+                )
+            })?;
+        let engine_binary = std::env::current_exe().context("locating this binary")?;
+        let engine_migrations_dir = match &self.engine_migrations_dir {
+            Some(dir) => dir.clone(),
+            None => default_engine_migrations_dir(&engine_binary).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot find the engine's migrations: pass --engine-migrations-dir or set \
+                     DONAT_ENGINE_MIGRATIONS_DIR"
+                )
+            })?,
+        };
+        Ok((
+            app,
+            donat_testkit::RunConfig {
+                engine_binary,
+                engine_migrations_dir,
+                admin_database_url,
+                log_dir: self.log_dir.clone(),
+                filter: self.filter.clone(),
+                jobs: self.jobs,
+            },
+        ))
+    }
+}
+
+/// The image ships the engine's migrations beside the binary; a development
+/// checkout has them at the workspace root, two levels above `target/debug`.
+fn default_engine_migrations_dir(engine_binary: &Path) -> Option<PathBuf> {
+    let shipped = PathBuf::from("/usr/share/donat/migrations");
+    if shipped.is_dir() {
+        return Some(shipped);
+    }
+    engine_binary
+        .ancestors()
+        .map(|dir| dir.join("migrations"))
+        .find(|dir| dir.is_dir())
 }
 
 /// The OAuth2 credential lifecycle, and the reason it is a CLI.
@@ -595,6 +686,32 @@ async fn main() -> anyhow::Result<()> {
                         "source metadata reconciled"
                     );
                 }
+            }
+            return Ok(());
+        }
+        // The runner drives blocking Postgres and HTTP clients, which refuse
+        // to run on a tokio worker thread; a plain thread has no runtime
+        // context and behaves as it does in a test binary.
+        Some(Command::Test(t)) => {
+            let (app, run) = t.resolve()?;
+            let metadata_dir = app.metadata.clone();
+            let report = std::thread::spawn(move || donat_testkit::runner::run_all(&app, &run))
+                .join()
+                .map_err(|_| anyhow::anyhow!("the test runner panicked"))??;
+            report.write(&mut std::io::stdout(), &metadata_dir)?;
+            if let Some(path) = &t.junit {
+                let mut file = std::fs::File::create(path)
+                    .with_context(|| format!("creating {}", path.display()))?;
+                report.write_junit(&mut file, &metadata_dir)?;
+            }
+            if report.cases.is_empty() {
+                anyhow::bail!(
+                    "no test case ran under {} (no `*_test.yaml`, or --filter matched none)",
+                    metadata_dir.display()
+                );
+            }
+            if report.failed() > 0 {
+                std::process::exit(1);
             }
             return Ok(());
         }

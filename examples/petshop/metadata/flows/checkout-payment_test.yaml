@@ -1,0 +1,323 @@
+# The checkout module end to end: a shopper calls the entry-point command,
+# and the durable process carries the order the rest of the way — quote, tax,
+# checkout, provider authorization. The durable outcome is domain state, not
+# a process row: the order exists and its payment is authorized. The failure
+# branches are proved the same way — a declined card, a broken provider and a
+# broken tax quote each leave the store exactly as the flow declares.
+tests:
+  - name: a shopper checks out and the process authorizes the order
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      # One open cart holding a single in-stock variant.
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      # The entry-point command answers its own admitted request.
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440900") {
+              cart_id
+              owner_user_id
+            }
+          }
+        expect:
+          data: { start_checkout: { cart_id: 1, owner_user_id: customer-1 } }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      - sql: |
+          SELECT count(*) FROM orders
+          JOIN payment ON payment.order_id = orders.id
+          WHERE orders.customer_id = 'customer-1' AND payment.status = 'authorized'
+        expect: [{ count: 1 }]
+      # The store asks the provider for exactly what it charged the shopper:
+      # 2499 (one DOG-SALMON-1KG) + 799 standard shipping + 160 quoted tax.
+      - sql: |
+          SELECT orders.total_minor, orders.currency,
+                 payment.amount_minor, payment.currency AS payment_currency
+          FROM orders JOIN payment ON payment.order_id = orders.id
+        expect:
+          - { total_minor: 3458, currency: USD, amount_minor: 3458, payment_currency: USD }
+      # Both providers were reached exactly once, with the compiled inputs,
+      # and the fixed-origin request carries its resolved credential.
+      - calls: { path: /v1/tax-quotes, count: 1 }
+      - calls:
+          path: /v1/payment-authorizations
+          count: 1
+          body: { currency: USD, amount_minor: "@gt 0" }
+          headers: { authorization: petshop-test-payment }
+
+  - name: the provider is asked once for the order total
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440901") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+          capture: { order_id: /order_id }
+      # One checkout, one tax quote, one authorization — for this order's
+      # exact total, in its currency, under the environment's credential.
+      - calls: { path: /v1/tax-quotes, count: 1 }
+      - calls:
+          path: /v1/payment-authorizations
+          count: 1
+          body: { order_id: "${order_id}", amount_minor: 3458, currency: USD }
+          headers: { authorization: petshop-test-payment }
+
+  - name: the checked out cart is closed behind the shopper
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440902") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      # The process owns the cart from here: it is no longer open. The cart
+      # keeps the checkout_started mark the begin_checkout command gave it.
+      - graphql: 'query { cart(where: { id: { _eq: 1 } }) { id status } }'
+        expect:
+          data: { cart: [{ id: 1, status: checkout_started }] }
+      # And it cannot be checked out a second time.
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440903") { cart_id }
+          }
+        expect:
+          errors:
+            - message: command select_one step 'cart' did not find a row
+              extensions: { code: validation-failed }
+
+  - name: a declined card cancels the order and charges nothing
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/payment-authorizations:
+            provider_event_id: evt_petshop_decline_1
+            authorization_id: auth_petshop_decline_1
+            provider_reference: ref_petshop_decline_1
+            status: declined
+            normalized_payload: { gateway: mock, captured: false }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440904") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: declined }
+          capture: { order_id: /order_id }
+      # The order is cancelled, the payment records the failure, and nothing
+      # is ever captured on a declined checkout.
+      - sql: SELECT order_status FROM orders WHERE id = '${order_id}'
+        expect: [{ order_status: cancelled }]
+      - sql: SELECT status FROM payment WHERE order_id = '${order_id}'
+        expect: [{ status: failed }]
+      - calls: { path: /v1/payment-authorizations/*/captures, count: 0 }
+
+  - name: a declined order puts the stock back
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/payment-authorizations:
+            provider_event_id: evt_petshop_decline_2
+            authorization_id: auth_petshop_decline_2
+            provider_reference: ref_petshop_decline_2
+            status: declined
+            normalized_payload: { gateway: mock, captured: false }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440905") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: declined }
+      # A refused checkout must not keep holding the shelf: the counters are
+      # exactly the migration's seed for variant 2 again.
+      - sql: SELECT on_hand, reserved FROM inventory_stock WHERE variant_id = 2
+        expect: [{ on_hand: 5, reserved: 2 }]
+
+  - name: a failing provider leaves the order for a human and takes no money
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      # Every authorization attempt gets a terminal 500; the lookup that
+      # follows can prove neither presence nor absence.
+      - providers:
+          /v1/payment-authorizations:
+            - { status: 500 }
+            - { status: 500 }
+            - { status: 500 }
+          /v1/payment-operation-lookups:
+            found: false
+            terminal_absence_proven: false
+            provider_event_id: evt_petshop_lookup_undetermined
+            provider_mutation_id: ""
+            provider_reference: ""
+            outcome: failed
+            amount_minor: 0
+            currency: USD
+            normalized_payload: { gateway: mock, found: false }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440906") { cart_id }
+          }
+      # An unprovable authorization ends the run in the declared fail
+      # terminal: the instance is failed, not terminal, and the journal
+      # carries the fail state's code.
+      - await:
+          failed: checkout_payment
+          expect:
+            kind: process_failed
+            code: payment_authorization_requires_reconciliation
+            message: The authorization outcome is ambiguous; inventory remains reserved pending reconciliation
+      # The lookup asked about this order's authorization, once.
+      - sql: SELECT id FROM orders
+        capture: { order_id: id }
+      - calls:
+          path: /v1/payment-operation-lookups
+          count: 1
+          body: { resource_kind: authorization, resource_id: "${order_id}" }
+      # Nothing became authorized and no money moved: the order waits for a
+      # person and the payment is still pending.
+      - sql: SELECT order_status FROM orders
+        expect: [{ order_status: checkout_started }]
+      - sql: SELECT status FROM payment WHERE order_id = '${order_id}'
+        expect: [{ status: pending }]
+      - calls: { path: /v1/payment-authorizations/*/captures, count: 0 }
+
+  - name: a transient provider failure is retried
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      # One 500, then the queue is exhausted and the shared 200 answers: the
+      # declared retry policy carries the order.
+      - providers:
+          /v1/payment-authorizations:
+            - { status: 500 }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440907") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      - calls: { path: /v1/payment-authorizations, count: 2 }
+
+  - name: the authorization carries its idempotency key
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440908") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      # The operation's provider-idempotent effect names the fixed header; a
+      # provider can only deduplicate a replay if it is given the key.
+      - calls:
+          path: /v1/payment-authorizations
+          count: 1
+          headers: { idempotency-key: "@regex ^.+$" }
+
+  - name: clicking pay twice creates one order and one authorization
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      # The same request id twice: the replay answers what the first call did.
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440909") {
+              cart_id
+              owner_user_id
+            }
+          }
+        expect:
+          data: { start_checkout: { cart_id: 1, owner_user_id: customer-1 } }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440909") {
+              cart_id
+              owner_user_id
+            }
+          }
+        expect:
+          data: { start_checkout: { cart_id: 1, owner_user_id: customer-1 } }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+          capture: { order_id: /order_id }
+      # One checkout, one order; the shopper is asked for money once.
+      - sql: SELECT count(*) FROM orders
+        expect: [{ count: 1 }]
+      - calls:
+          path: /v1/payment-authorizations
+          count: 1
+          body: { order_id: "${order_id}" }
+
+  - name: a checkout whose tax cannot be quoted commits nothing
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      # Every tax attempt gets a terminal 500: no tax, no total; no total, no
+      # order the shopper could be charged for.
+      - providers:
+          /v1/tax-quotes:
+            - { status: 500 }
+            - { status: 500 }
+            - { status: 500 }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440990") { cart_id }
+          }
+      # The run ends in the declared fail terminal before checkout committed.
+      - await:
+          failed: checkout_payment
+          expect:
+            kind: process_failed
+            code: tax_quote_unavailable
+            message: Tax could not be quoted before checkout committed
+      # No order, no authorization attempt, and the shelf was never held:
+      # variant 2 still shows the migration's seed counters.
+      - sql: SELECT count(*) FROM orders
+        expect: [{ count: 0 }]
+      - calls: { path: /v1/payment-authorizations, count: 0 }
+      - sql: SELECT on_hand, reserved FROM inventory_stock WHERE variant_id = 2
+        expect: [{ on_hand: 5, reserved: 2 }]

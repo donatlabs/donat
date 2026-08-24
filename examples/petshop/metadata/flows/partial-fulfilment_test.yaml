@@ -1,0 +1,146 @@
+# Fulfilment allocates the authorized order, packs it, ships it through the
+# carrier, and captures exactly the shipped value — the whole bounded fan-out
+# driven from one entry-point command.
+tests:
+  - name: fulfilment allocates, ships and captures the shipped value
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440950") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440951"
+            ) { order_id order_status }
+          }
+      # The fulfilment process publishes its bounded outcome: every
+      # allocation shipped, the carrier label recorded against the shipment.
+      - await:
+          terminal: partial_fulfilment
+          expect:
+            status: partial
+            unshipped_allocations: []
+            shipment_outcomes: [{ outcome: label_created }]
+      # Capture takes exactly the shipped value, never the order total.
+      - sql: |
+          SELECT
+            (SELECT coalesce(sum(shipped_value_minor), 0)::bigint FROM shipment WHERE status = 'shipped') AS shipped,
+            (SELECT coalesce(sum(amount_minor), 0)::bigint FROM payment_capture) AS captured
+        expect: [{ shipped: "@present", captured: "@present" }]
+        capture: { shipped: shipped }
+      - sql: |
+          SELECT ${shipped} > 0 AS shipped_something,
+                 (SELECT coalesce(sum(amount_minor), 0)::bigint FROM payment_capture) = ${shipped} AS captured_the_shipped_value
+        expect: [{ shipped_something: true, captured_the_shipped_value: true }]
+
+  - name: shipping an order captures the authorized money
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440952") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id, payment_id: /payment_id }
+      - sql: SELECT amount_minor::bigint AS authorized_minor FROM payment WHERE id = '${payment_id}'
+        capture: { authorized_minor: authorized_minor }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440953"
+            ) { order_id order_status }
+          }
+      - await:
+          terminal: partial_fulfilment
+          expect: { shipment_outcomes: [{ outcome: label_created }] }
+      # One shipment, one capture, in the order's currency.
+      - calls:
+          path: /v1/payment-authorizations/*/captures
+          count: 1
+          body: { currency: USD, amount_minor: "@gt 0" }
+      # A capture takes the value that actually shipped, which is at most
+      # what was authorized — never more.
+      - sql: |
+          SELECT (SELECT coalesce(sum(amount_minor), 0)::bigint FROM payment_capture)
+                 BETWEEN 1 AND ${authorized_minor} AS captured_within_authorization
+        expect: [{ captured_within_authorization: true }]
+
+  - name: a shipment carries the carriers tracking number
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440954") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      - as: { role: fulfilment }
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440955"
+            ) { order_id order_status }
+          }
+      - await:
+          terminal: partial_fulfilment
+          expect: { shipment_outcomes: [{ outcome: label_created }] }
+      # The shipped parcel stores the tracking number the carrier issued.
+      - sql: SELECT id, status, tracking_number FROM shipment WHERE order_id = '${order_id}'
+        expect: [{ status: shipped, tracking_number: TRACK-PETSHOP-1 }]
+        capture: { shipment_id: id }
+      # The label was bought for this shipment, not for some other parcel.
+      - calls:
+          path: /v1/shipments/*/labels
+          count: 1
+          body: { shipment_id: "${shipment_id}" }
+
+  - name: only fulfilment may start fulfilment
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440956") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      # The fulfilment entry point does not exist in the shopper's schema.
+      - graphql: |
+          mutation {
+            start_order_fulfilment(
+              order_id: "${order_id}", destination_region: "northeast",
+              allocation_request_id: "550e8400-e29b-41d4-a716-446655440957"
+            ) { order_id }
+          }
+        expect:
+          errors:
+            - extensions: { code: validation-failed }
+              message: "field 'start_order_fulfilment' not found in type: 'mutation_root'"
