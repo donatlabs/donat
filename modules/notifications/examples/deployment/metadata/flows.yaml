@@ -1,0 +1,3 @@
+# The module's flows, unchanged.
+- "!include ../../../metadata/flows/notification-delivery.yaml"
+- "!include ../../../metadata/flows/notification-digest-sweep.yaml"

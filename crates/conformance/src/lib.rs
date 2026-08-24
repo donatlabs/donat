@@ -2040,6 +2040,7 @@ impl Running {
         Self::write_metadata_snapshot(&self.name, &md)
     }
 
+    /// Write a metadata directory.
     fn write_metadata_snapshot(name: &str, md: &Metadata) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("dist_conf_md_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2118,6 +2119,14 @@ impl Running {
             std::fs::write(
                 dir.join("connectors.yaml"),
                 serde_yaml::to_string(&md.connectors).expect("serialize connectors"),
+            )
+            .unwrap();
+        }
+        if !md.templates.is_empty() {
+            std::fs::write(
+                dir.join("documents.yaml"),
+                serde_yaml::to_string(&json!({ "templates": md.templates }))
+                    .expect("serialize document templates"),
             )
             .unwrap();
         }
@@ -3444,6 +3453,7 @@ mod tests {
             "jwt_claims_map",
             "mcp_tools",
             "migrate",
+            "notifications",
             "oidc_login",
             "petshop_yaml",
             "process_activity",

@@ -188,6 +188,24 @@ def route(path, body, key):
             "normalized_payload": EVIDENCE,
         }
 
+    # -- mail relay ----------------------------------------------------------
+    # What `modules/notifications` posts to. Both answers carry a message id,
+    # which is what the module records so a later "did it go?" is answerable
+    # without asking the provider again. `issued` keys on the Idempotency-Key,
+    # so a retry after a timeout gets the same id back rather than a second
+    # message — which is the whole reason the module declares the send
+    # provider-idempotent.
+    if path == "/v1/email/messages":
+        return {
+            "message_id": issued("mail", key),
+            "status": "accepted",
+        }
+    if path == "/v1/email/digests":
+        return {
+            "message_id": issued("digest", key),
+            "status": "accepted",
+        }
+
     return None
 
 

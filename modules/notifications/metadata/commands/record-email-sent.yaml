@@ -1,0 +1,35 @@
+# The provider accepted the message, and said so with an id. Recording that id
+# is what makes a later support question ("did it go?") answerable without
+# asking the provider.
+name: notification_record_email_sent
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: dispatch_id
+    type: uuid!
+  - name: provider_message_id
+    type: string!
+steps:
+  - name: dispatch
+    select_one:
+      table: { schema: notification, name: dispatch }
+      by:
+        id: { arg: dispatch_id }
+      returning: [id, recipient_id, workflow]
+      require_found: true
+  - name: logged
+    insert:
+      table: { schema: notification, name: delivery }
+      object:
+        dispatch_id: { step: dispatch, column: id }
+        recipient_id: { step: dispatch, column: recipient_id }
+        workflow: { step: dispatch, column: workflow }
+        channel: { literal: email }
+        status: { literal: sent }
+        provider_message_id: { arg: provider_message_id }
+      returning: [id, channel, status]
+result:
+  delivery_id: { step: logged, column: id }
+  channel: { step: logged, column: channel }
+  status: { step: logged, column: status }

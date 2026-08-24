@@ -1,0 +1,14 @@
+# The module's rules join this deployment's lists — a deployment has exactly one
+# `rules.yaml` and it is a mapping, so this is where adoption actually happens.
+types:
+  - "!include ../../../metadata/rules/notification-payload.yaml"
+rules:
+  - "!include ../../../metadata/rules/channel-is-enabled.yaml"
+  - "!include ../../../metadata/rules/was-not-seen.yaml"
+  - "!include ../../../metadata/rules/digest-has-items.yaml"
+  - "!include ../../../metadata/rules/has-address.yaml"
+  - "!include ../../../metadata/rules/is-digested.yaml"
+decision_tables:
+  # Not the module's: this deployment wants the escalation, so it brings its own
+  # copy of the one table that decides it.
+  - "!include rules/email-delay.yaml"

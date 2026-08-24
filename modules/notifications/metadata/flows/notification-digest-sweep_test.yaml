@@ -1,0 +1,252 @@
+# One group — a recipient and a workflow — collapsed into one message.
+#
+# Enumeration is the scheduler's paged read of `notification_pending_digest`,
+# never a fan-out inside the Process, which is why a backlog has no ceiling
+# here. What the Process owns is the claim, the send and the record, and each of
+# those has a way to go wrong that these cases pin.
+vars:
+  alice: 11111111-1111-4111-8111-111111111111
+  bob: 22222222-2222-4222-8222-222222222222
+  sweep_request: dddddddd-4444-4444-8444-444444444444
+
+tests:
+  - name: a digested notification rings the bell now and defers the mail
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify_digested(workflow: "order_shipped", recipient_id: "${alice}",
+                                     title: "your order shipped", body: "it shipped",
+                                     request_id: "aaaaaaa1-1111-4111-8111-111111111111")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify_digested/dispatch_id }
+      - await:
+          sql: |
+            select channel, status from notification.delivery
+            where dispatch_id = '${dispatch}' order by channel
+          expect:
+            # The mail waits for the sweep; the bell is not what a digest delays.
+            - { channel: email, status: deferred }
+            - { channel: in_app, status: sent }
+      - calls: { path: /v1/email/digests, count: 0 }
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - graphql: 'query { notification_pending_digest { pending } }'
+        expect: { data: { notification_pending_digest: [{ pending: 1 }] } }
+
+  - name: a sweep collapses a recipients backlog into one message
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          insert into public.app_user (id, email) values
+            ('${alice}', 'alice@example.test'),
+            ('${bob}', 'bob@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      # Three for Alice, one for Bob: four deferred emails, two messages.
+      - for:
+          - { recipient: 11111111-1111-4111-8111-111111111111, request: aaaaaaa1-1111-4111-8111-111111111111 }
+          - { recipient: 11111111-1111-4111-8111-111111111111, request: aaaaaaa2-1111-4111-8111-111111111111 }
+          - { recipient: 11111111-1111-4111-8111-111111111111, request: aaaaaaa3-1111-4111-8111-111111111111 }
+          - { recipient: 22222222-2222-4222-8222-222222222222, request: bbbbbbb1-2222-4222-8222-222222222222 }
+        do:
+          - graphql: |
+              mutation { notify_digested(workflow: "order_shipped",
+                                         recipient_id: "${item.recipient}",
+                                         title: "your order shipped", body: "it shipped",
+                                         request_id: "${item.request}") { dispatch_id } }
+      - await:
+          sql: |
+            select count(*) as deferred from notification.delivery
+            where channel = 'email' and status = 'deferred'
+          expect: [{ deferred: 4 }]
+      # The scheduler's own loop: read what is owed, sweep each row of it.
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - graphql: |
+          query { notification_pending_digest(order_by: {recipient_id: asc})
+                  { recipient_id workflow pending } }
+        expect:
+          data:
+            notification_pending_digest:
+              - { recipient_id: "${alice}", workflow: order_shipped, pending: 3 }
+              - { recipient_id: "${bob}", workflow: order_shipped, pending: 1 }
+      # Alice first, and settled before Bob is swept — two sweeps in flight at
+      # once would reach the relay in either order, and this case is about what
+      # each message says rather than about which arrives first.
+      - graphql: |
+          mutation { flush_notification_digests(
+                       request_id: "cccccccc-3333-4333-8333-333333333301",
+                       recipient_id: "${alice}", workflow: "order_shipped") { sweep_id } }
+      - await:
+          sql: |
+            select count(*) as sent from notification.delivery
+            where recipient_id = '${alice}' and channel = 'email' and status = 'sent'
+          expect: [{ sent: 3 }]
+      - calls:
+          path: /v1/email/digests
+          count: 1
+          body:
+            recipient: alice@example.test
+            # One message stands for three, and says so.
+            pending: 3
+      - graphql: |
+          mutation { flush_notification_digests(
+                       request_id: "cccccccc-3333-4333-8333-333333333302",
+                       recipient_id: "${bob}", workflow: "order_shipped") { sweep_id } }
+      # All four notifications are recorded as delivered, and the id stamped on
+      # them is the one the relay returned for the message they were in.
+      - await:
+          sql: |
+            select count(*) as sent from notification.delivery
+            where channel = 'email' and status = 'sent' and provider_message_id = 'digest-1'
+          expect: [{ sent: 4 }]
+      - calls: { path: /v1/email/digests, count: 2 }
+      - calls:
+          path: /v1/email/digests
+          index: 1
+          body: { recipient: bob@example.test, pending: 1 }
+
+  - name: a backlog larger than one sweep still drains
+    steps:
+      # The shape this module was rebuilt around. Enumeration happens in the
+      # scheduler's paged read, not inside the Process, so no bound inside the
+      # Process can be exceeded — one sweep handles one group however large the
+      # backlog is. Seventy is more than any fan-out bound the module ever
+      # declared, and it is one message.
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      # Seeded through the Process's own entry point would be seventy stands'
+      # worth of waiting; the sweep's subject is the delivery log, so the log is
+      # what this case seeds.
+      - sql: |
+          insert into notification.dispatch (workflow, recipient_id, title, body, digest)
+          select 'order_shipped', '${alice}', 'your order shipped', 'it shipped', true
+          from generate_series(1, 70)
+      - sql: |
+          insert into notification.delivery
+            (dispatch_id, recipient_id, workflow, channel, status)
+          select id, recipient_id, workflow, 'email', 'deferred' from notification.dispatch
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - graphql: 'query { notification_pending_digest { pending } }'
+        expect: { data: { notification_pending_digest: [{ pending: 70 }] } }
+      - graphql: |
+          mutation { flush_notification_digests(request_id: "${sweep_request}",
+                       recipient_id: "${alice}", workflow: "order_shipped")
+                     { sweep_id } }
+      - await:
+          sql: |
+            select count(*) as in_flight from notification.delivery
+            where channel = 'email' and status in ('deferred', 'sending')
+          expect: [{ in_flight: 0 }]
+      - calls: { path: /v1/email/digests, count: 1 }
+      # Nothing is owed any more.
+      - graphql: 'query { notification_pending_digest { pending } }'
+        expect: { data: { notification_pending_digest: [] } }
+
+  - name: one recipient with two workflows gets two digests
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - for:
+          - { workflow: order_shipped, request: aaaaaaa1-1111-4111-8111-111111111111 }
+          - { workflow: invoice_ready, request: aaaaaaa2-1111-4111-8111-111111111111 }
+        do:
+          - graphql: |
+              mutation { notify_digested(workflow: "${item.workflow}",
+                                         recipient_id: "${alice}",
+                                         title: "t", body: "b",
+                                         request_id: "${item.request}") { dispatch_id } }
+      - await:
+          sql: |
+            select count(*) as deferred from notification.delivery
+            where channel = 'email' and status = 'deferred'
+          expect: [{ deferred: 2 }]
+      # A group is a recipient *and* a workflow: one recipient, two messages.
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - graphql: |
+          query { notification_pending_digest(order_by: {workflow: asc}) { workflow pending } }
+        expect:
+          data:
+            notification_pending_digest:
+              - { workflow: invoice_ready, pending: 1 }
+              - { workflow: order_shipped, pending: 1 }
+      - for:
+          - { workflow: order_shipped, request: cccccccc-3333-4333-8333-333333333401 }
+          - { workflow: invoice_ready, request: cccccccc-3333-4333-8333-333333333402 }
+        do:
+          - graphql: |
+              mutation { flush_notification_digests(request_id: "${item.request}",
+                           recipient_id: "${alice}", workflow: "${item.workflow}")
+                         { sweep_id } }
+      - await:
+          sql: |
+            select count(*) as sent from notification.delivery
+            where channel = 'email' and status = 'sent'
+          expect: [{ sent: 2 }]
+      - calls: { path: /v1/email/digests, count: 2 }
+
+  - name: a failed digest send gives its rows back
+    steps:
+      - providers:
+          /v1/email/digests:
+            - { status: 422, body: { message: no } }
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify_digested(workflow: "order_shipped", recipient_id: "${alice}",
+                                     title: "one", body: "it shipped",
+                                     request_id: "aaaaaaa1-1111-4111-8111-111111111111")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify_digested/dispatch_id }
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: deferred }]
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - graphql: |
+          mutation { flush_notification_digests(request_id: "${sweep_request}",
+                       recipient_id: "${alice}", workflow: "order_shipped")
+                     { sweep_id } }
+      # Back to `deferred`, so the next sweep retries it: a refused send must
+      # not strand mail in `sending`.
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: deferred }]
+      - graphql: 'query { notification_pending_digest { pending } }'
+        expect: { data: { notification_pending_digest: [{ pending: 1 }] } }
+
+  - name: a digest for a recipient who lost their address is recorded
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify_digested(workflow: "order_shipped", recipient_id: "${alice}",
+                                     title: "one", body: "it shipped",
+                                     request_id: "aaaaaaa1-1111-4111-8111-111111111111")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify_digested/dispatch_id }
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: deferred }]
+      # The binding stops giving this recipient an address between the deferral
+      # and the sweep — an address is a view over someone else's table, and it
+      # can change under a queued message.
+      - sql: update public.app_user set email = '' where id = '${alice}'
+      - as: { role: notification_scheduler, user: "${alice}" }
+      - graphql: |
+          mutation { flush_notification_digests(request_id: "${sweep_request}",
+                       recipient_id: "${alice}", workflow: "order_shipped")
+                     { sweep_id } }
+      - await:
+          sql: |
+            select status, error_code from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: failed, error_code: mail_no_address }]
+      # Nothing was posted with a null recipient.
+      - calls: { path: /v1/email/digests, count: 0 }

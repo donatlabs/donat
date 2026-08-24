@@ -1,0 +1,17 @@
+# The module's own stand: what `donat test --app-dir modules/notifications`
+# boots for every `*_test.yaml` beside the declarations below.
+#
+# The module is a metadata directory in its own right, so the thing under test
+# here is exactly what an application adopts — no wrapper, no copy. What the
+# stand adds is the one thing the module cannot ship: the recipient binding.
+# `testdata/migrations` is the application's side of it, played by the smallest
+# users table that satisfies the contract, and it is the only file here that an
+# adopting deployment writes for itself.
+metadata: metadata
+migrations:
+  - migrations
+  - testdata/migrations
+engine_env:
+  # The mail relay the shipped contract posts to, played by the runner's stub.
+  NOTIFICATION_MAIL_BASE_URL: ${providers}
+  NOTIFICATION_MAIL_TOKEN: Bearer module-test-mail

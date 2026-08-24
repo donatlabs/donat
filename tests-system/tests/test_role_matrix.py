@@ -54,6 +54,30 @@ OWNERS = {
     # operations
     "record_notification_delivery": {"notification_worker"},
     "resolve_fraud_review": {"support"},
+    # notifications — the adopted module's surface.
+    #
+    # `notify` is the trigger any part of the store may pull; the sweep is the
+    # scheduler's and nobody else's; everything else is the delivery Process's
+    # own work, reachable only by the role its states run as. That last set is
+    # the point of listing them here: `notification_worker` takes a recipient
+    # id as a plain argument, so a shopper or a clerk finding one of these in
+    # their schema is the failure this matrix exists to catch.
+    "notify": {"notification_sender"},
+    "notify_digested": {"notification_sender"},
+    # Not `support`, which inherits the role: `inherited_roles` carries table
+    # permissions and not command ones (`plans/009-*`).
+    "flush_notification_digests": {"notification_scheduler"},
+    "notification_resolve_channel": {"notification_worker"},
+    "notification_deliver_in_app": {"notification_worker"},
+    "notification_record_delivery": {"notification_worker"},
+    "notification_record_email_sent": {"notification_worker"},
+    "notification_record_email_failed": {"notification_worker"},
+    "notification_check_in_app_seen": {"notification_worker"},
+    "notification_resolve_digest_group": {"notification_worker"},
+    "notification_claim_digest": {"notification_worker"},
+    "notification_record_digest_sent": {"notification_worker"},
+    "notification_record_digest_unreachable": {"notification_worker"},
+    "notification_requeue_digest": {"notification_worker"},
 }
 
 ROLES = [
@@ -76,6 +100,11 @@ ROLES = [
     "booking_worker",
     "subscription_worker",
     "notification_worker",
+    "notification_sender",
+    "notification_scheduler",
+    # A shopper reads their own feed through this; it owns no command, and the
+    # matrix asserting that is worth as much as the ones that do.
+    "notification_user",
 ]
 
 MUTATION_FIELDS = 'query { __type(name: "mutation_root") { fields { name } } }'
@@ -121,10 +150,18 @@ def test_the_public_is_offered_no_mutation_at_all(callable_by_role):
     )
 
 
+#: Roles that only ever act. `notification_sender` exists to pull one trigger
+#: and holds command permissions alone, so it has no query surface by design —
+#: which is the point of it, not an oversight.
+WRITE_ONLY_ROLES = {"notification_sender"}
+
+
 def test_every_role_can_read_something(store):
     """A role that can see nothing is a deployment mistake, not a wall."""
 
     for role in ROLES:
+        if role in WRITE_ONLY_ROLES:
+            continue
         actor = store.anonymous() if role == "anonymous" else store.as_role(role, "matrix-user")
         data = actor.graphql('query { __type(name: "query_root") { fields { name } } }').data or {}
         fields = ((data.get("__type") or {}).get("fields")) or []

@@ -1,0 +1,41 @@
+# The group cannot be sent, because the binding no longer gives this recipient
+# an address. Its deferred rows become a recorded failure instead of waiting for
+# a sweep that will never succeed.
+name: notification_record_digest_unreachable
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: recipient_id
+    type: string!
+  - name: workflow
+    type: string!
+steps:
+  - name: deferred_rows
+    select_many:
+      table: { schema: notification, name: delivery }
+      by:
+        recipient_id: { arg: recipient_id }
+        workflow: { arg: workflow }
+        channel: { literal: email }
+        status: { literal: deferred }
+      order_by: [id]
+      returning: [id]
+      maximum_rows: 512
+      require_non_empty: true
+  - name: failed
+    update_many:
+      table: { schema: notification, name: delivery }
+      for_each: { step: deferred_rows }
+      by:
+        id: { item: id }
+        status: { literal: deferred }
+      set:
+        status: { literal: failed }
+        error_code: { literal: mail_no_address }
+      returning: [id, status]
+      require_each: true
+result:
+  recipient_id: { arg: recipient_id }
+  workflow: { arg: workflow }
+  failed: { step: failed }

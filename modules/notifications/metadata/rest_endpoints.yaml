@@ -1,0 +1,32 @@
+# The scheduler's two calls.
+#
+# `GET /api/rest/notifications/digests?limit=100` lists the groups owed a
+# digest; `POST /api/rest/notifications/digests/flush` sweeps one of them with
+# `{"request_id": "<uuid>", "recipient_id": …, "workflow": …}`.
+#
+# The caller supplies a fresh `request_id` per group per tick, and that is not a
+# detail: the sweep is idempotent on it, so a scheduler that sent a constant id
+# would sweep once and then do nothing for a day. A donat cron trigger's payload
+# is static, which is exactly why the module ships none — see the README.
+#
+# Both require the `notification_scheduler` role, which reaches these and
+# nothing else.
+- name: pending_notification_digests
+  url: notifications/digests
+  methods:
+    - GET
+  definition:
+    query:
+      collection_name: notifications
+      query_name: PendingDigests
+  comment: List the recipient/workflow groups owed a digest.
+
+- name: flush_notification_digests
+  url: notifications/digests/flush
+  methods:
+    - POST
+  definition:
+    query:
+      collection_name: notifications
+      query_name: FlushDigests
+  comment: Sweep one group. Requires the notification_scheduler role.

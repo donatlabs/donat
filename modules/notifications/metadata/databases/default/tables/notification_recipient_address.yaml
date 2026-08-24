@@ -1,0 +1,11 @@
+# Where each channel reaches a person — the application's binding, one row per
+# recipient per channel. It is read only inside a command; there is no role that
+# can query the address book over the API.
+table:
+  schema: notification
+  name: recipient_address
+command_select_permissions:
+  - role: notification_worker
+    permission:
+      columns: [recipient_id, channel, address, verified]
+      filter: {}

@@ -1,0 +1,14 @@
+# The module is a metadata directory in its own right: it loads and validates
+# on its own, so `donat validate --metadata-dir modules/notifications/metadata`
+# is a real check. An application adopting it does not point at this file — it
+# `!include`s the table files below into its own `databases.yaml`, and inherits
+# the module's roles rather than renaming them (see the README).
+- name: default
+  kind: postgres
+  configuration:
+    connection_info:
+      database_url:
+        from_env: DONAT_GRAPHQL_DATABASE_URL
+      isolation_level: read-committed
+      use_prepared_statements: false
+  tables: "!include default/tables/tables.yaml"

@@ -72,6 +72,14 @@ async fn drop_database(admin_url: &str, database_name: &str) {
 #[tokio::test]
 async fn real_petshop_catalog_compiles_one_closed_candidate() {
     let (admin_url, database_name, database_url) = create_database("petshop_candidate").await;
+    // The store rests on the notification module it adopts: its binding
+    // migration replaces a view in the `notification` schema that set creates.
+    run_migrate(
+        &database_url,
+        &petshop_root().join("../../modules/notifications/migrations"),
+    )
+    .await
+    .expect("the notification module's migrations apply");
     run_migrate(&database_url, &petshop_root().join("migrations"))
         .await
         .expect("all Petshop schema migrations apply");
@@ -104,8 +112,9 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
     )
     .expect("real Petshop Commands, Processes, effects, and schema compile together");
 
-    assert_eq!(metadata.commands.len(), 74);
-    assert_eq!(candidate.process_catalog.len(), 11);
+    // The store's own declarations plus the notification module it adopts.
+    assert_eq!(metadata.commands.len(), 88);
+    assert_eq!(candidate.process_catalog.len(), 13);
     assert_eq!(
         candidate
             .process_catalog
@@ -113,7 +122,7 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
             .flat_map(|(_, source)| source.iter())
             .map(|(_, process)| process.states.len())
             .sum::<usize>(),
-        171
+        200
     );
 
     let finalized_effects = candidate
@@ -123,7 +132,9 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
         .flat_map(|source| source.commands.values())
         .flat_map(|command| &command.effects)
         .collect::<Vec<_>>();
-    assert_eq!(finalized_effects.len(), 25);
+    // 25 the store's own, plus the three the module's triggers carry:
+    // `notify`, `notify_digested` and the digest sweep's entry point.
+    assert_eq!(finalized_effects.len(), 28);
     for effect in finalized_effects {
         let (source, process_name, revision) = match effect {
             FinalizedCommandEffect::Start(effect) => (
@@ -234,7 +245,6 @@ const COMMAND_RELATIONS: &[&str] = &[
     "inventory_level",
     "inventory_reservation",
     "inventory_stock",
-    "notification_delivery",
     "order_adjustment",
     "order_current_authorization",
     "order_inventory_allocation_candidate",
@@ -258,6 +268,7 @@ const COMMAND_RELATIONS: &[&str] = &[
     "prescription_event",
     "prescription_request",
     "prescription_review",
+    "provider_notification_receipt",
     "purchase_approval",
     "quote",
     "quote_line",
@@ -314,6 +325,15 @@ fn command_relations_are_tracked_in_petshop_metadata() {
 #[tokio::test]
 async fn tracked_petshop_domain_compiles_without_runtime_sections() {
     let (admin_url, database_name, database_url) = create_database("petshop_domain").await;
+    // Two sets, in the order the store deploys them: the notification module's
+    // schema, then the store's own — whose binding migration replaces a view
+    // the first one created.
+    run_migrate(
+        &database_url,
+        &petshop_root().join("../../modules/notifications/migrations"),
+    )
+    .await
+    .expect("the notification module's migrations apply");
     run_migrate(&database_url, &petshop_root().join("migrations"))
         .await
         .expect("all Petshop schema migrations apply");

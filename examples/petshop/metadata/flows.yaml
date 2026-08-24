@@ -9,3 +9,7 @@
 - "!include flows/grooming-booking.yaml"
 - "!include flows/prescription-review.yaml"
 - "!include flows/payment-reconciliation.yaml"
+
+# --- the notification module ------------------------------------------
+- "!include ../../../modules/notifications/metadata/flows/notification-delivery.yaml"
+- "!include ../../../modules/notifications/metadata/flows/notification-digest-sweep.yaml"

@@ -1,0 +1,45 @@
+# The in-app channel's whole delivery: the feed row the recipient reads, and the
+# delivery row that records it happened. Both in one command, so a notification
+# can never appear in a feed without being in the log or the other way round.
+name: notification_deliver_in_app
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: dispatch_id
+    type: uuid!
+steps:
+  - name: dispatch
+    select_one:
+      table: { schema: notification, name: dispatch }
+      by:
+        id: { arg: dispatch_id }
+      returning: [id, recipient_id, workflow, title, body, url]
+      require_found: true
+  # Denormalised on purpose: the recipient's feed is one table read under one
+  # permission, and the title they were sent does not change when the dispatch
+  # is retained differently.
+  - name: message
+    insert:
+      table: { schema: notification, name: inbox }
+      object:
+        dispatch_id: { step: dispatch, column: id }
+        recipient_id: { step: dispatch, column: recipient_id }
+        title: { step: dispatch, column: title }
+        body: { step: dispatch, column: body }
+        url: { step: dispatch, column: url }
+      returning: [id]
+  - name: logged
+    insert:
+      table: { schema: notification, name: delivery }
+      object:
+        dispatch_id: { step: dispatch, column: id }
+        recipient_id: { step: dispatch, column: recipient_id }
+        workflow: { step: dispatch, column: workflow }
+        channel: { literal: in_app }
+        status: { literal: sent }
+      returning: [id, channel, status]
+result:
+  inbox_id: { step: message, column: id }
+  channel: { step: logged, column: channel }
+  status: { step: logged, column: status }

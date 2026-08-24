@@ -1,0 +1,50 @@
+# The entry point. Two things are its own rather than the Process's: it refuses
+# a recipient the binding does not know, and it collapses a repeat.
+vars:
+  alice: 11111111-1111-4111-8111-111111111111
+  nobody: 33333333-3333-4333-8333-333333333333
+  request: 44444444-4444-4444-8444-444444444444
+
+tests:
+  - name: notifying an unknown recipient is refused before anything is written
+    steps:
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${nobody}",
+                            title: "into the void", body: "it shipped",
+                            request_id: "${request}") { dispatch_id } }
+        expect: { errors: "@present" }
+      # A refused send writes nothing: the recipient is asserted inside the one
+      # statement the command compiles to, so there is no half-written dispatch
+      # to clean up.
+      - sql: select count(*) as dispatches from notification.dispatch
+        expect: [{ dispatches: 0 }]
+
+  - name: the same request id notifies once
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            request_id: "${request}") { dispatch_id } }
+        capture: { dispatch: /data/notify/dispatch_id }
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'in_app'
+          expect: [{ status: sent }]
+      # The dedupe window is the command's idempotency retention: the same key
+      # for the same recipient and workflow is answered with the first result
+      # and writes nothing further. `request_id` is that key, which is why the
+      # README says to derive it from the thing that happened.
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            request_id: "${request}") { dispatch_id } }
+        expect: { data: { notify: { dispatch_id: "${dispatch}" } } }
+      - as: { role: notification_user, user: "${alice}" }
+      - graphql: 'query { notification_inbox { title } }'
+        expect: { data: { notification_inbox: [{ title: your order shipped }] } }

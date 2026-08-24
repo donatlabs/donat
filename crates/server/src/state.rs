@@ -721,6 +721,25 @@ impl PureEngineCandidate {
 
 /// Compile one all-or-nothing serving candidate in dependency order without
 /// touching a database or publishing mutable state.
+/// A metadata defect: the declarations cannot be served together, whatever the
+/// database does next.
+///
+/// It exists to be told apart from "the source is not reachable yet" at boot.
+/// Both arrive as an `anyhow::Error` from `sync_sources`, and only one of them
+/// is worth retrying — a schema whose two tracked tables collide will collide
+/// again in half a second, and reporting it as a database that has not come up
+/// sends the operator to look at the wrong thing (`plans/007-*`).
+#[derive(Debug)]
+pub struct MetadataDefect(pub PlanError);
+
+impl std::fmt::Display for MetadataDefect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.0.path, self.0.message)
+    }
+}
+
+impl std::error::Error for MetadataDefect {}
+
 pub fn compile_pure_engine_candidate(
     metadata: &Metadata,
     catalogs: &HashMap<String, Catalog>,
@@ -1821,12 +1840,14 @@ impl AppState {
                 });
             }
         }
+        // A compilation failure here is the metadata's, not the database's.
         let pure = compile_pure_engine_candidate(
             &metadata,
             &new_catalogs,
             self.connectors.as_ref(),
             self.infer_function_permissions,
-        )?;
+        )
+        .map_err(MetadataDefect)?;
         let deployed_process_catalog = crate::processes::validate_serving_catalogs(
             &new_runtimes,
             &metadata,

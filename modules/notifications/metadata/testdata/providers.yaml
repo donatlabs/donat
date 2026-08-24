@@ -1,0 +1,13 @@
+# The mail relay's answers, shared by every test that lets a send leave. Both
+# paths are the shipped contract's (`connectors/notification-mail.yaml`), and
+# both answer with an id, because the id the provider returns is what the
+# module records and what a later question is answered from.
+#
+# Nothing under testdata/ is metadata: the loader follows only known file names
+# and the `!include`s reached from them.
+/v1/email/messages:
+  message_id: relay-1
+  status: accepted
+/v1/email/digests:
+  message_id: digest-1
+  status: accepted

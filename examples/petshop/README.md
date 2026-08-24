@@ -253,6 +253,107 @@ curl -s localhost:8080/v1/graphql \
 > were unset, a trusted role-less request would instead be rejected with
 > `x-donat-role header is required`.)
 
+## Business notifications
+
+The store adopts [`modules/notifications`](../../modules/notifications) rather
+than building an inbox of its own. Nothing here is engine code and nothing is a
+service: the store gets an in-app feed, per-customer opt-out, email delivery
+through a durable Process and a delivery log, and pays for it with one migration
+and a handful of `!include` lines.
+
+**The trigger is a state in a flow the store already had.** A confirmed grooming
+booking tells the customer, and saying so is a command call:
+
+```yaml
+# metadata/flows/grooming-booking.yaml
+- id: tell_the_customer
+  command:
+    name: notify
+    run_as: notification_sender
+    arguments:
+      workflow: { literal: grooming_booking_confirmed }
+      recipient_id: { state: reserve_slot, field: customer_id }
+      title: { literal: "Your grooming appointment is confirmed" }
+      body: { literal: "We will see you at your booked time." }
+      url: { literal: /bookings }
+      request_id: { state: reserve_slot, field: booking_id }
+    next: confirmed
+```
+
+`notify` records the notification and hands the sending to the module's own
+Process: the bell rings immediately, the email follows. The request id is the
+booking, so a confirmation replayed by a retry or a duplicate signal notifies
+once.
+
+**The store supplies one thing the module cannot ship** — who its people are.
+`migrations/V20260823090000__notification_binding.sql` replaces the module's
+shipped view with the store's own customers:
+
+```sql
+create or replace view notification.recipient as
+select c.customer_id as id, 'en'::text as locale, 'UTC'::text as timezone
+from public.customer c;
+
+-- One row per channel the store can reach a customer on.
+create or replace view notification.recipient_address as
+select c.customer_id as recipient_id, 'email'::text as channel,
+       c.email as address, true as verified
+from public.customer c;
+```
+
+Two views because an address is per channel and a person's language is not.
+Adding Telegram to the store later is a `union all` branch in the second and a
+row in `notification.channel` — the module does not change.
+
+`id` is `customer_id` and not `customer.id`, because the module matches a
+recipient against `X-Donat-User-Id` and that is what this store puts there.
+`create or replace view` refuses a shape that does not match, so a wrong binding
+is a failed migration rather than mail that goes nowhere.
+
+**A shopper reads their own feed and nobody else's**, through
+`inherited_roles.yaml`:
+
+```yaml
+- role_name: customer
+  role_set: [customer, notification_user]
+```
+
+```graphql
+query Bell {                       # as customer, X-Donat-User-Id: customer-1
+  notification_inbox_aggregate(where: { read_at: { _is_null: true } }) {
+    aggregate { count }
+  }
+}
+query Feed {
+  notification_inbox(order_by: { created_at: desc }) { title body url }
+}
+```
+
+Store staff inherit `notification_scheduler` instead, which lets them read the
+pending backlog and not a customer's inbox. It does **not** let them run a
+sweep: `inherited_roles` carries table permissions and not command ones
+(`plans/009-*`), so the sweep is called by a credential holding
+`notification_scheduler` itself.
+
+**Two things the store had to move to adopt it**, both worth knowing before you
+adopt it yourself:
+
+- `public.notification_delivery` was renamed to
+  `public.provider_notification_receipt`. The module tracks
+  `notification.delivery`, whose GraphQL name is `notification_delivery`, and
+  two tracked tables cannot share one. A module owns the `<its schema>_*`
+  GraphQL namespace.
+- The module's internal commands are all `notification_*` for the same reason —
+  its `record_delivery` collided with fulfilment's.
+
+**Running it.** `docker compose up` applies three versioned migration sets — the
+engine's, the module's, then the store's — and points the module's mail relay at
+the same mock that answers the store's other providers
+(`NOTIFICATION_MAIL_BASE_URL`). The conformance case
+`a_shopper_confirms_a_grooming_hold_and_the_process_completes` in
+`crates/conformance/tests/petshop_process.rs` drives the whole path and asserts
+both the feed row and the message the relay received.
+
 ## Per-role value validators
 
 A permission answers two different questions, and they are written separately.

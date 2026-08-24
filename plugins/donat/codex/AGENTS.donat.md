@@ -109,6 +109,7 @@ Detailed patterns live in `~/.codex/donat/skills/*/SKILL.md` (installed by
 | which primitive a requirement becomes; how to escalate | `declaring-not-coding` |
 | login, users, SSO, mapping token claims to roles | `donat-authentication` |
 | schedules, row-change hooks, inbound webhooks, actions | `donat-automation` |
+| an inbox, an email, an opt-out, a digest | `donat-notifications` |
 | the engine embedded in a Go program; in-process functions | `donat-embedded-go` |
 | the platform's screens as resource configs, not components | `donat-platform-ui` |
 | layer model, directory layout, deploy pipeline | `donat-app-architecture` |

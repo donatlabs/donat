@@ -1,0 +1,80 @@
+# Take this group's deferred rows for this sweep, and nobody else's.
+#
+# Two declarations carry the whole of the correctness:
+#
+#   * `by` names `status: deferred` beside the primary key, so the update
+#     matches only a row still unclaimed. Under READ COMMITTED a second sweep
+#     blocks on the first's row locks, re-evaluates that predicate after it
+#     commits, and matches nothing.
+#   * `require_each` turns "matched nothing" into a rejected command rather
+#     than a silent no-op, and `require_non_empty` does the same for the sweep
+#     that read the group after another had already emptied it — without it, an
+#     empty claim would send a digest of zero.
+#
+# `claim_id` is stamped so that the record can name what *this* sweep took. A
+# notification deferred while this digest is in flight is not stamped, so it
+# stays `deferred` and the next sweep takes it.
+name: notification_claim_digest
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: recipient_id
+    type: string!
+  - name: workflow
+    type: string!
+  - name: claim_id
+    type: uuid!
+steps:
+  - name: deferred_rows
+    select_many:
+      table: { schema: notification, name: delivery }
+      by:
+        recipient_id: { arg: recipient_id }
+        workflow: { arg: workflow }
+        channel: { literal: email }
+        status: { literal: deferred }
+      order_by: [id]
+      returning: [id]
+      maximum_rows: 512
+      require_non_empty: true
+  - name: claimed
+    update_many:
+      table: { schema: notification, name: delivery }
+      for_each: { step: deferred_rows }
+      by:
+        id: { item: id }
+        status: { literal: deferred }
+      set:
+        status: { literal: sending }
+        claim_id: { arg: claim_id }
+      returning: [id, status]
+      require_each: true
+  # Read at send time rather than copied at defer time: an address that changed
+  # between the two is the current one.
+  - name: recipient
+    select_one:
+      table: { schema: notification, name: recipient }
+      by:
+        id: { arg: recipient_id }
+      returning: [id]
+      require_found: true
+  - name: address
+    select_one:
+      table: { schema: notification, name: recipient_address }
+      by:
+        recipient_id: { arg: recipient_id }
+        channel: { literal: email }
+      returning: [recipient_id, channel, address, verified]
+      require_found: false
+  - name: counted
+    aggregate:
+      from: { step: claimed }
+      values:
+        pending: { count: {} }
+result:
+  recipient_id: { arg: recipient_id }
+  workflow: { arg: workflow }
+  claim_id: { arg: claim_id }
+  address: { step: address, column: address }
+  pending: { step: counted, column: pending }

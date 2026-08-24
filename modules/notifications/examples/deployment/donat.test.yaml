@@ -1,0 +1,11 @@
+# The deployment's stand. Its metadata is its own; the schema and the recipient
+# binding are the module's, reused from where the module keeps them — a
+# deployment does not copy migrations either.
+metadata: metadata
+migrations:
+  - ../../migrations
+  - ../../testdata/migrations
+engine_env:
+  # This deployment's own relay, played by the runner's stub.
+  NOTIFICATION_MAIL_BASE_URL: ${providers}
+  NOTIFICATION_MAIL_TOKEN: Bearer own-relay-token

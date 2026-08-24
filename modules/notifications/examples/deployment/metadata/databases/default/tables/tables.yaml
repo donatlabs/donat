@@ -1,0 +1,9 @@
+# The module's tables, tracked by this deployment. Nothing is renamed: a
+# renamed module is a forked module.
+- "!include ../../../../../../metadata/databases/default/tables/notification_recipient.yaml"
+- "!include ../../../../../../metadata/databases/default/tables/notification_dispatch.yaml"
+- "!include ../../../../../../metadata/databases/default/tables/notification_inbox.yaml"
+- "!include ../../../../../../metadata/databases/default/tables/notification_delivery.yaml"
+- "!include ../../../../../../metadata/databases/default/tables/notification_preference.yaml"
+- "!include ../../../../../../metadata/databases/default/tables/notification_pending_digest.yaml"
+- "!include ../../../../../../metadata/databases/default/tables/notification_recipient_address.yaml"

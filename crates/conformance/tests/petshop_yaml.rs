@@ -77,6 +77,7 @@ macro_rules! yaml_files {
 }
 
 yaml_files! {
+    inherited_roles => "inherited_roles_test.yaml",
     rest_endpoints => "rest_endpoints_test.yaml",
     storage => "storage_test.yaml",
     tables => "databases/default/tables/tables_test.yaml",

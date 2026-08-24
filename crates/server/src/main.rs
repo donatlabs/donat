@@ -1007,15 +1007,26 @@ async fn main() -> anyhow::Result<()> {
             .to_string(),
     });
 
-    // The database may still be starting; retry the first sync.
+    // The database may still be starting; retry the first sync. A metadata
+    // defect is not a cold database and never becomes one, so it is reported
+    // once and immediately rather than fifteen seconds of "not ready".
     {
         let mut attempt = 0;
         loop {
             match state.sync_sources().await {
                 Ok(()) => break,
+                Err(e)
+                    if e.chain()
+                        .any(|cause| cause.is::<donat_server::state::MetadataDefect>()) =>
+                {
+                    anyhow::bail!(
+                        "this metadata cannot be served: {e}. \
+                         `donat validate --metadata-dir <dir>` reports it before a deploy."
+                    );
+                }
                 Err(e) if attempt < 30 => {
                     attempt += 1;
-                    tracing::warn!(attempt, error = %e, "database not ready, retrying");
+                    tracing::warn!(attempt, error = %e, "source not reachable yet, retrying");
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => anyhow::bail!("cannot initialize sources: {e}"),

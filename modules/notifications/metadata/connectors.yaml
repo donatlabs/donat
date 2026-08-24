@@ -1,0 +1,3 @@
+# The module's connectors, one file each, so an adopting application includes
+# the entry rather than this list — a list included as a list item nests.
+- "!include connectors/notification-mail.yaml"

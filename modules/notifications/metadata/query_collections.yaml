@@ -1,0 +1,27 @@
+# The two saved operations the module publishes over REST, so that whatever runs
+# the schedule needs an HTTP client and nothing else: read what is owed, then
+# sweep each group.
+- name: notifications
+  definition:
+    queries:
+      - name: PendingDigests
+        query: |
+          query PendingDigests($limit: Int!) {
+            notification_pending_digest(order_by: {oldest: asc}, limit: $limit) {
+              recipient_id
+              workflow
+              pending
+              oldest
+            }
+          }
+      - name: FlushDigests
+        query: |
+          mutation FlushDigests($request_id: uuid!, $recipient_id: uuid!, $workflow: String!) {
+            flush_notification_digests(
+              request_id: $request_id
+              recipient_id: $recipient_id
+              workflow: $workflow
+            ) {
+              sweep_id
+            }
+          }

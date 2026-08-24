@@ -21,10 +21,15 @@ pub struct AppTestConfig {
     /// Metadata directory, relative to the config file.
     #[serde(default = "default_metadata")]
     pub metadata: PathBuf,
-    /// Application migrations directory, relative to the config file; absent
-    /// means the application has none.
-    #[serde(default)]
-    pub migrations: Option<PathBuf>,
+    /// Application migration directories, relative to the config file, applied
+    /// in order; absent means the application has none.
+    ///
+    /// A list because a deployment applies more than one versioned set as soon
+    /// as it adopts a module: the module's schema, then the application's own,
+    /// whose binding migration replaces a view the first one created. One
+    /// string is still accepted and means a list of one.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub migrations: Vec<PathBuf>,
     /// The source whose Process revisions `migrate` deploys.
     #[serde(default = "default_source")]
     pub source: String,
@@ -32,6 +37,23 @@ pub struct AppTestConfig {
     /// the provider stub's base URL.
     #[serde(default)]
     pub engine_env: BTreeMap<String, String>,
+}
+
+/// Accept either `migrations: dir` or `migrations: [first, second]`.
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(PathBuf),
+        Many(Vec<PathBuf>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    })
 }
 
 fn default_metadata() -> PathBuf {
@@ -51,7 +73,7 @@ impl AppTestConfig {
         let mut cfg: Self =
             serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.metadata = app_dir.join(&cfg.metadata);
-        cfg.migrations = cfg.migrations.as_ref().map(|m| app_dir.join(m));
+        cfg.migrations = cfg.migrations.iter().map(|m| app_dir.join(m)).collect();
         Ok(cfg)
     }
 }

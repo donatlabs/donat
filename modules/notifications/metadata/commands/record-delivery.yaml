@@ -1,0 +1,41 @@
+# The log entry for an outcome that wrote nothing else — a channel the recipient
+# opted out of, an email deferred to the digest sweep, an escalation the
+# recipient pre-empted. One row per (dispatch, channel) is a database
+# constraint, so a Process that reaches this twice is refused rather than
+# double-counted.
+name: notification_record_delivery
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: dispatch_id
+    type: uuid!
+  - name: channel
+    type: string!
+  - name: status
+    type: string!
+steps:
+  # Read rather than passed in: who the notification is for is a fact about the
+  # dispatch, and a caller that could supply a different one would be able to
+  # file this row under someone else.
+  - name: dispatch
+    select_one:
+      table: { schema: notification, name: dispatch }
+      by:
+        id: { arg: dispatch_id }
+      returning: [id, recipient_id, workflow]
+      require_found: true
+  - name: logged
+    insert:
+      table: { schema: notification, name: delivery }
+      object:
+        dispatch_id: { step: dispatch, column: id }
+        recipient_id: { step: dispatch, column: recipient_id }
+        workflow: { step: dispatch, column: workflow }
+        channel: { arg: channel }
+        status: { arg: status }
+      returning: [id, channel, status]
+result:
+  delivery_id: { step: logged, column: id }
+  channel: { step: logged, column: channel }
+  status: { step: logged, column: status }

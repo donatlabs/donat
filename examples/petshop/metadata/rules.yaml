@@ -190,6 +190,9 @@ types:
       maximum_depth: 8
       maximum_nodes: 128
 
+  # --- the notification module -----------------------------------------
+  - "!include ../../../modules/notifications/metadata/rules/notification-payload.yaml"
+
 rules:
   - name: can_reserve_stock
     parameters: { on_hand: int!, reserved: int!, requested: int! }
@@ -436,6 +439,13 @@ rules:
     result: bool!
     expression: "(decision == ReconciliationDecision::matched && local_amount_minor == provider_amount_minor && local_currency == provider_currency && ((local_status == \"pending\" && provider_status == PaymentState::pending) || (local_status == \"cancellation_requested\" && provider_status == PaymentState::cancellation_requested) || (local_status == \"authorized\" && provider_status == PaymentState::authorized) || (local_status == \"void_in_progress\" && provider_status == PaymentState::void_in_progress) || (local_status == \"captured\" && provider_status == PaymentState::captured) || (local_status == \"voided\" && provider_status == PaymentState::voided) || (local_status == \"refunded\" && provider_status == PaymentState::refunded) || (local_status == \"failed\" && provider_status == PaymentState::failed) || (local_status == \"chargeback\" && provider_status == PaymentState::chargeback)) && !is_null(local_provider_reference)) || (decision == ReconciliationDecision::manual_review && (local_amount_minor != provider_amount_minor || local_currency != provider_currency || !((local_status == \"pending\" && provider_status == PaymentState::pending) || (local_status == \"cancellation_requested\" && provider_status == PaymentState::cancellation_requested) || (local_status == \"authorized\" && provider_status == PaymentState::authorized) || (local_status == \"void_in_progress\" && provider_status == PaymentState::void_in_progress) || (local_status == \"captured\" && provider_status == PaymentState::captured) || (local_status == \"voided\" && provider_status == PaymentState::voided) || (local_status == \"refunded\" && provider_status == PaymentState::refunded) || (local_status == \"failed\" && provider_status == PaymentState::failed) || (local_status == \"chargeback\" && provider_status == PaymentState::chargeback)) || is_null(local_provider_reference)))"
 
+  # --- the notification module -----------------------------------------
+  - "!include ../../../modules/notifications/metadata/rules/channel-is-enabled.yaml"
+  - "!include ../../../modules/notifications/metadata/rules/was-not-seen.yaml"
+  - "!include ../../../modules/notifications/metadata/rules/digest-has-items.yaml"
+  - "!include ../../../modules/notifications/metadata/rules/has-address.yaml"
+  - "!include ../../../modules/notifications/metadata/rules/is-digested.yaml"
+
 decision_tables:
   - name: price_list_route
     inputs: { customer_tier: string!, sales_channel: string! }
@@ -613,3 +623,6 @@ decision_tables:
         expect:
           output: { hold: true, route: manual_review }
           matched_row_id: high_score_review
+
+  # --- the notification module -----------------------------------------
+  - "!include ../../../modules/notifications/metadata/rules/email-delay.yaml"

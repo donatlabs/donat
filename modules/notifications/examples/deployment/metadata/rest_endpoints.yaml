@@ -1,0 +1,2 @@
+# The module's scheduler routes, unchanged.
+"!include ../../../metadata/rest_endpoints.yaml"

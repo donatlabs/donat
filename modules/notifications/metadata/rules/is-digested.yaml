@@ -1,0 +1,7 @@
+# Whether this notification's email is batched rather than sent on its own. A
+# digested notification still rings the bell immediately — only the mail waits,
+# which is the difference between a digest and a delay.
+name: notification_is_digested
+parameters: { digest: bool! }
+result: bool!
+expression: "digest"

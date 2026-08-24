@@ -1,0 +1,9 @@
+# Whether this group has anything to send at all. A scheduler reads the pending
+# list and then calls the sweep, and rows can be swept by an overlapping run in
+# between — so "there was something a moment ago" is not the same question as
+# "there is something now", and only the second one may decide whether a
+# message goes out.
+name: notification_digest_has_items
+parameters: { pending: bigint! }
+result: bool!
+expression: "pending > 0"

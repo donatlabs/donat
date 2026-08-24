@@ -35,3 +35,12 @@
   provider_reference: ref_petshop_1
   status: captured
   normalized_payload: { gateway: mock, captured: true }
+
+# `modules/notifications`' mail relay. The module records the id the provider
+# returns, so the answer carries one.
+/v1/email/messages:
+  message_id: mail_petshop_1
+  status: accepted
+/v1/email/digests:
+  message_id: digest_petshop_1
+  status: accepted

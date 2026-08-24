@@ -1,0 +1,23 @@
+# What was sent, to whom. Written by `notify` and read by the delivery Process;
+# no role reads it over the API, because everything a recipient is entitled to
+# see about their own notification is already in their inbox row.
+table:
+  schema: notification
+  name: dispatch
+command_insert_permissions:
+  - role: notification_sender
+    permission:
+      columns: [workflow, recipient_id, payload, title, body, url, digest]
+      check: {}
+command_select_permissions:
+  # `insert ... returning` reads the row back, so the sender reads the dispatch
+  # it just wrote — and only through a command.
+  # Exactly what `insert ... returning` hands back to the two trigger commands.
+  - role: notification_sender
+    permission:
+      columns: [id, workflow, recipient_id]
+      filter: {}
+  - role: notification_worker
+    permission:
+      columns: [id, workflow, recipient_id, payload, title, body, url, digest, created_at]
+      filter: {}

@@ -1,0 +1,48 @@
+# What the store's roles actually gained by inheriting the module's.
+#
+# Pinned because it is surprising, and because getting it wrong is cheap and
+# quiet: `inherited_roles` reads like set union and is not one. An adopting
+# deployment that inherits a module's role gets its tables and none of its
+# commands, and finds out when the call it expected returns "field not found".
+# Three files in this store claimed the opposite until its role matrix caught
+# them (`plans/009-*`).
+#
+# This asserts today's semantics rather than the ones anyone prefers. If the
+# fork in that plan is settled the other way, this test is what makes the change
+# deliberate instead of silent.
+vars:
+  request: dddddddd-4444-4444-8444-444444444444
+
+tests:
+  - name: support inherits the digest backlog it can read and not the sweep it cannot run
+    steps:
+      # The role it inherits holds both halves…
+      - as: { role: notification_scheduler, user: staff-1 }
+      - graphql: 'query { notification_pending_digest { recipient_id } }'
+        expect: { data: { notification_pending_digest: [] } }
+      - graphql: |
+          mutation { flush_notification_digests(request_id: "${request}",
+                       recipient_id: "customer-1", workflow: "order_shipped")
+                     { sweep_id } }
+        expect: { data: { flush_notification_digests: { sweep_id: "${request}" } } }
+      # …and the inheriting role gets the table permission…
+      - as: { role: support, user: staff-1 }
+      - graphql: 'query { notification_pending_digest { recipient_id } }'
+        expect: { data: { notification_pending_digest: [] } }
+      # …and not the command permission. A caller that must run the sweep holds
+      # `notification_scheduler` itself, which is what a scheduler has anyway.
+      - graphql: |
+          mutation { flush_notification_digests(request_id: "${request}",
+                       recipient_id: "customer-1", workflow: "order_shipped")
+                     { sweep_id } }
+        expect: { errors: "@present" }
+
+  - name: a shopper inherits their own feed and no staff surface
+    steps:
+      - as: { role: customer, user: customer-1 }
+      # The module's own filter, on the store's own session variable.
+      - graphql: 'query { notification_inbox { title } }'
+        expect: { data: { notification_inbox: [] } }
+      # And nothing that names another recipient: the backlog is staff's.
+      - graphql: 'query { notification_pending_digest { recipient_id } }'
+        expect: { errors: "@present" }

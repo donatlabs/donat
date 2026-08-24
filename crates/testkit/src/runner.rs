@@ -344,7 +344,7 @@ fn run_case(
         name: stem.to_string(),
         engine_binary: run.engine_binary.clone(),
         engine_migrations_dir: run.engine_migrations_dir.clone(),
-        app_migrations_dir: app.migrations.clone(),
+        app_migrations_dirs: app.migrations.clone(),
         metadata_dir: app.metadata.clone(),
         source: app.source.clone(),
         admin_database_url: run.admin_database_url.clone(),
@@ -428,6 +428,11 @@ impl CaseContext {
                     expect,
                     capture,
                 } => self.await_terminal(terminal, expect.as_ref(), capture),
+                Await::Rows {
+                    sql,
+                    expect,
+                    capture,
+                } => self.await_rows(sql, expect, capture),
                 Await::Row { row, capture } => self.await_row(row, capture),
                 Await::Failed { failed, expect } => self.await_failed(failed, expect.as_ref()),
                 Await::Receptive { receptive, state } => self.await_receptive(receptive, state),
@@ -646,6 +651,57 @@ impl CaseContext {
             .map(|(name, column)| (name.clone(), format!("/{column}")))
             .collect();
         self.capture(&pointers, &row, &format!("the first {table} row"))
+    }
+
+    /// Poll a query until its rows match `expect`. The wrapping and the
+    /// comparison are a `sql` step's, so a test that graduates from asserting
+    /// to waiting changes one word.
+    fn await_rows(
+        &mut self,
+        sql: &str,
+        expect: &[Json],
+        capture: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut client = self.stand.pg()?;
+        let wrapped = format!(
+            "WITH donat_test_row AS ({}) SELECT to_jsonb(donat_test_row) FROM donat_test_row",
+            sql.trim().trim_end_matches(';')
+        );
+        let expected = Json::Array(expect.to_vec());
+        let deadline = Instant::now() + AWAIT_DEADLINE;
+        let actual = loop {
+            let rows = client
+                .query(&wrapped, &[])
+                .with_context(|| format!("polling:\n{sql}"))?
+                .into_iter()
+                .map(|row| row.get::<_, Json>(0))
+                .collect::<Vec<_>>();
+            let actual = Json::Array(rows);
+            if subset_matches(&expected, &actual) {
+                break actual;
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "rows never matched for:\n{sql}\nexpected:\n{}\nlast seen:\n{}\n{}",
+                    pretty(&expected),
+                    pretty(&actual),
+                    process_diagnostics(&mut client, &self.source)
+                ));
+            }
+            std::thread::sleep(AWAIT_POLL);
+        };
+        if capture.is_empty() {
+            return Ok(());
+        }
+        let first = actual
+            .get(0)
+            .ok_or_else(|| anyhow!("capture from a query that returned no rows:\n{sql}"))?
+            .clone();
+        let pointers = capture
+            .iter()
+            .map(|(name, column)| (name.clone(), format!("/{column}")))
+            .collect();
+        self.capture(&pointers, &first, "the first awaited row")
     }
 
     fn await_failed(&mut self, process: &str, expect: Option<&Json>) -> Result<()> {

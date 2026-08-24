@@ -1525,7 +1525,8 @@ fn petshop_dependencies(metadata: &Metadata) -> Dependencies {
 #[test]
 fn all_petshop_processes_compile_and_publish_effect_contracts() {
     let metadata = petshop_metadata();
-    assert_eq!(metadata.processes.len(), 11);
+    // Eleven the store wrote, plus the notification module's two.
+    assert_eq!(metadata.processes.len(), 13);
     let mut counts = [0_usize; 7];
     for process in &metadata.processes {
         for state in &process.states {
@@ -1540,16 +1541,16 @@ fn all_petshop_processes_compile_and_publish_effect_contracts() {
             }
         }
     }
-    assert_eq!(counts, [60, 18, 23, 10, 15, 32, 13]);
-    assert_eq!(counts.iter().sum::<usize>(), 171);
+    assert_eq!(counts, [77, 20, 30, 11, 15, 34, 13]);
+    assert_eq!(counts.iter().sum::<usize>(), 200);
 
     let dependencies = petshop_dependencies(&metadata);
     let catalog =
         compile_process_catalog(&metadata, &dependencies).expect("all Petshop flows compile");
-    assert_eq!(catalog.len(), 11);
+    assert_eq!(catalog.len(), 13);
     let contracts =
         build_process_effect_contract_catalog(&catalog).expect("effect contracts publish");
-    assert_eq!(contracts.sources["default"].len(), 11);
+    assert_eq!(contracts.sources["default"].len(), 13);
     for (source_name, source) in catalog.sources() {
         for (process_name, process) in source.iter() {
             let contract = &contracts.sources[source_name][process_name];
@@ -1574,7 +1575,8 @@ fn all_petshop_processes_compile_and_publish_effect_contracts() {
             .iter()
             .map(|command| command.effects.len())
             .sum::<usize>(),
-        25,
+        // 25 the store's own, plus the module's three trigger effects.
+        28,
         "every Petshop start/signal effect has a compiled target contract"
     );
 }
@@ -1916,10 +1918,64 @@ fn command_result_types(name: &str) -> BTreeMap<String, String> {
             ("outcome", "PayoutState!"),
             ("requires_reconciliation", "bool!"),
         ],
+        // --- the notification module the store adopts ---------------------
+        // `email` is nullable because it comes from the application's own
+        // binding view, and a view carries no `not null`.
+        "notify" | "notify_digested" => &[
+            ("dispatch_id", "uuid!"),
+            ("workflow", "string!"),
+            ("recipient_id", "string!"),
+        ],
+        "flush_notification_digests" => &[
+            ("sweep_id", "uuid!"),
+            ("recipient_id", "string!"),
+            ("workflow", "string!"),
+        ],
+        "notification_resolve_channel" => &[
+            ("dispatch_id", "uuid!"),
+            ("workflow", "string!"),
+            ("recipient_id", "string!"),
+            ("title", "string!"),
+            ("body", "string!"),
+            ("digest", "bool!"),
+            // Nullable: both come from the application's own binding view, and
+            // a view carries no `not null`.
+            // Nullable: the address comes from the application's own binding
+            // view, and a recipient may have no row for this channel at all.
+            ("address", "string"),
+            ("locale", "string"),
+            ("payload", "NotificationPayload"),
+            ("opted_out", "bigint!"),
+        ],
+        "notification_check_in_app_seen" => &[("seen", "bigint!")],
+        "notification_resolve_digest_group" => &[
+            ("recipient_id", "string!"),
+            ("workflow", "string!"),
+            ("address", "string"),
+            ("locale", "string"),
+            ("pending", "bigint!"),
+        ],
+        "notification_claim_digest" => &[
+            ("recipient_id", "string!"),
+            ("workflow", "string!"),
+            ("claim_id", "uuid!"),
+            ("address", "string"),
+            ("pending", "bigint!"),
+        ],
+        "notification_deliver_in_app"
+        | "notification_record_delivery"
+        | "notification_record_email_sent"
+        | "notification_record_email_failed"
+        | "notification_record_digest_sent"
+        | "notification_record_digest_unreachable"
+        | "notification_requeue_digest" => &[("status", "string!")],
         "reserve_grooming_slot" => &[
             ("booking_id", "uuid!"),
             ("slot_key", "string!"),
             ("hold_expires_at", "timestamptz!"),
+            // Who the booking is for, which is what the confirmation
+            // notification is addressed to.
+            ("customer_id", "string!"),
         ],
         "expire_booking_hold" => &[
             ("booking_id", "uuid!"),

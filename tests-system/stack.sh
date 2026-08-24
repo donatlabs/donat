@@ -60,6 +60,9 @@ engine_env() {
   export PETSHOP_NOTIFICATION_API_TOKEN="petshop-notification-token"
   export PETSHOP_PAYOUT_BASE_URL="$PETSHOP_PROVIDERS_URL"
   export PETSHOP_PAYOUT_API_TOKEN="petshop-payout-token"
+  # The mail relay `modules/notifications` posts to, answered by the same mock.
+  export NOTIFICATION_MAIL_BASE_URL="$PETSHOP_PROVIDERS_URL"
+  export NOTIFICATION_MAIL_TOKEN="petshop-notification-token"
   # File attachments: the object store the engine presigns against, and the
   # secret those signatures are made with.
   export PETSHOP_S3_KEY="petshopminio"
@@ -133,6 +136,7 @@ cmd_up() {
   engine_env
   echo "==> applying DDL (engine schema, then the store's)"
   "$binary" migrate --migrations-dir "$repo/migrations"
+  "$binary" migrate --migrations-dir "$repo/modules/notifications/migrations"
   "$binary" migrate --migrations-dir "$example/migrations"
 
   echo "==> deploying the durable Process revisions"
@@ -247,6 +251,7 @@ cmd_up_fast() {
   PETSHOP_PROVIDERS_URL="$PETSHOP_FAST_PROVIDERS_URL" engine_env
   export DONAT_GRAPHQL_DATABASE_URL="$FAST_PG_URL"
   "$binary" migrate --migrations-dir "$repo/migrations"
+  "$binary" migrate --migrations-dir "$repo/modules/notifications/migrations"
   "$binary" migrate --migrations-dir "$example/migrations"
   "$binary" migrate --migrations-dir "$repo/migrations" \
     --metadata-dir "$FAST_METADATA" --source default

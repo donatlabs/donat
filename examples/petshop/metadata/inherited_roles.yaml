@@ -1,0 +1,23 @@
+# What adopting the notification module costs the store's own roles.
+#
+# The module declares `notification_user`, and a shopper reaches it by
+# inheriting it rather than by the module being edited to say `customer` — a
+# renamed module is a forked module, and the next version of it would not
+# merge. Everything a shopper can do with a notification is exactly the
+# module's own permissions, filtered by the same `X-Donat-User-Id` the rest of
+# this store filters by.
+- role_name: customer
+  role_set: [customer, notification_user]
+
+# Store staff answer "did they get it?", so they read the digest backlog. They
+# do not inherit `notification_user`: an operator reading a customer's inbox
+# would be reading their mail.
+#
+# Note what this does and does not give them. `inherited_roles` carries table
+# permissions and *not* command permissions — verified against this stand —
+# so support can read `notification_pending_digest` and cannot call
+# `flush_notification_digests`. Running a sweep is done by a credential that
+# holds `notification_scheduler` itself, which is what a scheduler has anyway.
+# See `plans/009-*`.
+- role_name: support
+  role_set: [support, notification_scheduler]

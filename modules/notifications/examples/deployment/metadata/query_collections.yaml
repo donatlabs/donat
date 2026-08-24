@@ -1,0 +1,3 @@
+# The module's saved operations, unchanged: a whole-document `!include`, because
+# a list included as a list *item* would nest.
+"!include ../../../metadata/query_collections.yaml"

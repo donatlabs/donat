@@ -39,6 +39,7 @@ conformance harness (`crates/conformance`).
 | `crates/server` | axum server: `/v1/graphql` (+ws), relay, `/api/rest` (RESTified endpoints), `/mcp` (MCP server), auth; `migrate`/`validate`. No runtime admin/`run_sql` API (deleted) |
 | `crates/testkit` | Test stand + the `*_test.yaml` runner behind `donat test`; the stubs and matching `crates/conformance` shares |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
+| `modules/notifications` | Shipped domain module: an inbox, opt-out, email delivery and a digest, as migrations plus ordinary metadata. No engine code — see its README and `knowledgebase/declarative-saas/decisions/097-*` |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
 
@@ -52,7 +53,7 @@ conformance harness (`crates/conformance`).
 | Apply schema migrations (DDL) | `donat migrate --migrations-dir migrations` (refinery) |
 | Validate metadata vs DB | `donat validate --metadata-dir <dir>` (non-zero exit on inconsistency) |
 | Conformance suite | `make conformance` (or `cargo test -p donat-conformance [--test <module>]`) |
-| An application's own tests (`*_test.yaml` beside its metadata) | `make app-test` (`APP_DIR=examples/petshop`) or `donat test --app-dir <app>`; in cargo, `cargo test -p donat-conformance --test petshop_yaml` |
+| An application's own tests (`*_test.yaml` beside its metadata) | `make app-test` (`APP_DIR=examples/petshop`, `modules/notifications`, `modules/notifications/examples/deployment`) or `donat test --app-dir <app>`; in cargo, `cargo test -p donat-conformance --test petshop_yaml` / `--test notifications` |
 | Review snapshot changes | `cargo insta review` |
 | Format and lint gates (CI blocks on both) | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
 | What the change gate will ask this branch to declare | `make gate` (`GATE_BASE=<target branch>`, `GATE_BODY=<file holding the PR description>`) |

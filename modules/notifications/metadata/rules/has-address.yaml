@@ -1,0 +1,8 @@
+# Whether the deployment's binding gave this recipient an address on this
+# channel at all. A view's column is nullable by construction, and a recipient
+# with no row for the channel is nullable too — so this is where "has one" is
+# decided, once, before anything is deferred or sent.
+name: notification_has_address
+parameters: { address: string }
+result: bool!
+expression: "!is_null(address)"

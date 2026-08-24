@@ -54,6 +54,16 @@ token.
 ```
 
 - `input_contract` is what the process must supply, typed against `rules.yaml`.
+- **Every input must be consumed** by `body`, `query`, `path` or a header. One
+  that nothing mentions is refused at execution as `connector operation input
+  contains an undeclared value`, `class: invariant` — *before the request
+  leaves*, so the provider sees nothing and the log says only that an activity
+  failed. Adding a field to a process's request and forgetting to map it is the
+  usual way to meet this, and the failure names neither the input nor the
+  operation.
+- The **keys of `body` are the wire's, not yours**: `To: { input: recipient }`
+  is fine. Rename freely to match what the provider publishes; only the input
+  *names* are fixed, because the process binds by them.
 - `path` may interpolate an input: `/v1/payment-authorizations/{input.payment_id}/captures`.
 - `response` maps JSON pointers to **typed** fields. `type: PaymentOutcome!`
   means the provider's string is validated into your enum at the boundary, so

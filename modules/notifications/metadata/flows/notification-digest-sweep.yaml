@@ -1,0 +1,155 @@
+# One recipient's digest, sent.
+#
+# There is no fan-out here and that is the design: the scheduler enumerates the
+# groups by reading `notification.pending_digest` under a permission that
+# carries a `limit`, and starts one of these per row. A Process that discovered
+# its own work would have to fan out over an unbounded read, and a fan-out that
+# overflows fails the whole instance rather than trimming — so enumeration
+# happens where a bound is a permission rather than a hope.
+#
+# What collapses many notifications into one message is the claim, not a
+# grouping step: `notification_claim_digest` moves every deferred row of this group to
+# `sending` under one `claim_id`, and everything after it names that id rather
+# than a predicate. A notification deferred while the relay was being called is
+# therefore not recorded as sent by a message it was never in.
+name: notification_digest_sweep
+kind: process
+version: 1
+source: default
+# The permission names who may *start* this Process — the scheduler, since
+# `flush_notification_digests` is its entry point. Every state runs as
+# `notification_worker`, which is never granted to a token at all.
+permissions:
+  - role: notification_scheduler
+input:
+  - { name: sweep_id, type: uuid! }
+  - { name: recipient_id, type: string! }
+  - { name: workflow, type: string! }
+output:
+  - { name: sweep_id, type: uuid! }
+start:
+  command: flush_notification_digests
+  input:
+    sweep_id: { command_result: sweep_id }
+    recipient_id: { command_result: recipient_id }
+    workflow: { command_result: workflow }
+  idempotency_key: { command_argument: request_id }
+  process_key: { command_result: sweep_id }
+start_at: resolve
+states:
+  # Both decisions in front of the claim are about rows that must still be
+  # `deferred` when they are made: whether there is anything to send, and
+  # whether there is anywhere to send it. Claiming first would move the rows out
+  # from under the second one.
+  - id: resolve
+    command:
+      name: notification_resolve_digest_group
+      run_as: notification_worker
+      arguments:
+        recipient_id: { input: recipient_id }
+        workflow: { input: workflow }
+      next: route_pending
+
+  # A scheduler reads the pending list and then calls this, and an overlapping
+  # sweep can empty the group in between. Nothing to send is not a failure.
+  - id: route_pending
+    when:
+      cases:
+        - rule: notification_digest_has_items
+          with:
+            pending: { state: resolve, field: pending }
+          next: route_address
+      default: done
+
+  - id: route_address
+    when:
+      cases:
+        - rule: notification_has_address
+          with:
+            address: { state: resolve, field: address }
+          next: claim
+      default: record_unreachable
+
+  # An address the binding no longer supplies is a fact about the binding, not a
+  # send that failed. It is recorded against the deferred rows, which is why it
+  # happens before the claim moves them.
+  - id: record_unreachable
+    command:
+      name: notification_record_digest_unreachable
+      run_as: notification_worker
+      arguments:
+        recipient_id: { input: recipient_id }
+        workflow: { input: workflow }
+      next: done
+
+  # The sweep's own id is the claim id: one sweep is one group, so it is unique
+  # by construction, and it is what ties the rows to the message they went out
+  # in.
+  - id: claim
+    command:
+      name: notification_claim_digest
+      run_as: notification_worker
+      arguments:
+        recipient_id: { input: recipient_id }
+        workflow: { input: workflow }
+        claim_id: { input: sweep_id }
+      next: send
+
+  - id: send
+    request:
+      connector: notification_mail
+      operation: send_digest
+      input:
+        message_key: { input: sweep_id, as: string }
+        recipient: { state: resolve, field: address, require_non_null: true }
+        workflow: { input: workflow }
+        locale: { state: resolve, field: locale }
+        pending: { state: claim, field: pending }
+      idempotency_key:
+        stable: { run: id, state: send }
+      timeout:
+        schedule_to_start: 10s
+        # Not wider than the operation's own `timeout: 5s`; a window that
+        # claimed more would be a number the connector never honours.
+        start_to_close: 5s
+      retry:
+        retry_on: [transport, timeout, http_429, http_5xx]
+        max_attempts: 3
+        initial_interval: 100ms
+        max_interval: 1s
+        jitter: deterministic_full
+      next: record
+      on_error:
+        routes:
+          - kinds: [authentication, validation, permanent, invariant, timeout, retry_exhausted, transport, http_429, http_5xx]
+            next: requeue
+        fallback: { next: requeue }
+
+  - id: record
+    command:
+      name: notification_record_digest_sent
+      run_as: notification_worker
+      arguments:
+        claim_id: { input: sweep_id }
+        provider_message_id: { state: send, field: provider_message_id }
+      next: done
+
+  # The other half of the send's outcome. A claimed group whose message did not
+  # go out is still `sending`, which nothing reads — so without this its
+  # notifications would never be tried again. Returning them to `deferred` is
+  # the whole retry policy, and it is why there is no failure branch here to get
+  # wrong: the next sweep finds them exactly as it found them the first time.
+  - id: requeue
+    command:
+      name: notification_requeue_digest
+      run_as: notification_worker
+      arguments:
+        claim_id: { input: sweep_id }
+      next: done
+
+  # The sweep's answer is its own identity; what it swept is in the delivery
+  # log, which is where the question is actually asked.
+  - id: done
+    output:
+      values:
+        sweep_id: { input: sweep_id }

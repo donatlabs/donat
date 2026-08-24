@@ -1,0 +1,4 @@
+# This deployment's own sender, in place of the module's shipped contract. The
+# instance name and the operation names are the ones the flows rely on; the rest
+# is this deployment's business.
+- "!include connectors/own-mail.yaml"

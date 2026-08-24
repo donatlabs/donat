@@ -1,0 +1,195 @@
+# One notification, delivered on every channel it is allowed on.
+#
+# The Process is the module: `notify` writes a row and starts this, and every
+# outcome a channel can have — delivered, opted out, refused, unreachable — is
+# a row in `notification.delivery` written by the state that learned it. So
+# these cases all have the same shape: trigger, wait for the log to say what
+# happened, and check what did or did not reach the relay.
+vars:
+  alice: 11111111-1111-4111-8111-111111111111
+  request: 44444444-4444-4444-8444-444444444444
+
+tests:
+  - name: notify reaches the feed through the delivery process
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            url: "/orders/1", request_id: "${request}")
+                     { dispatch_id workflow } }
+        capture: { dispatch: /data/notify/dispatch_id }
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'in_app'
+          expect: [{ status: sent }]
+      # The recipient reads what the sender wrote, link included: the feed
+      # advertises `url` so a client can make the message clickable.
+      - as: { role: notification_user, user: "${alice}" }
+      - graphql: 'query { notification_inbox { title body url } }'
+        expect:
+          data:
+            notification_inbox:
+              - { title: your order shipped, body: it shipped, url: /orders/1 }
+
+  - name: an opted out channel is logged and not delivered
+    steps:
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_user, user: "${alice}" }
+      - graphql: |
+          mutation { insert_notification_preference(objects: [
+                       {workflow: "order_shipped", channel: "in_app", enabled: false}])
+                     { affected_rows } }
+        expect: { data: { insert_notification_preference: { affected_rows: 1 } } }
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            url: "/orders/1", request_id: "${request}")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify/dispatch_id }
+      # An opt-out is a recorded outcome, not a silent drop.
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'in_app'
+          expect: [{ status: suppressed }]
+      - as: { role: notification_user, user: "${alice}" }
+      - graphql: 'query { notification_inbox { title } }'
+        expect: { data: { notification_inbox: [] } }
+
+  - name: a notification is sent to the mail relay
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            url: "/orders/1", request_id: "${request}")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify/dispatch_id }
+      # The provider's own id is what makes a later question answerable, so the
+      # log carries it and not merely a status.
+      - await:
+          sql: |
+            select status, provider_message_id from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: sent, provider_message_id: relay-1 }]
+      - calls:
+          path: /v1/email/messages
+          count: 1
+          body:
+            recipient: alice@example.test
+            subject: your order shipped
+            body: it shipped
+          # The key its contract binds: a retry after a timeout reaches the same
+          # key, and the relay absorbs it.
+          headers: { Idempotency-Key: "@present" }
+
+  - name: an opted out email is logged and never sent
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_user, user: "${alice}" }
+      - graphql: |
+          mutation { insert_notification_preference(objects: [
+                       {workflow: "order_shipped", channel: "email", enabled: false}])
+                     { affected_rows } }
+        expect: { data: { insert_notification_preference: { affected_rows: 1 } } }
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            url: "/orders/1", request_id: "${request}")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify/dispatch_id }
+      - await:
+          sql: |
+            select channel, status from notification.delivery
+            where dispatch_id = '${dispatch}' order by channel
+          expect:
+            # The in-app channel was not opted out of, so the bell still rang.
+            - { channel: email, status: suppressed }
+            - { channel: in_app, status: sent }
+      - calls: { path: /v1/email/messages, count: 0 }
+
+  - name: a refused send is recorded rather than retried forever
+    steps:
+      # 422 is mapped to `validation` by the module's error map, which is not in
+      # the operation's `retry_on` set — so it is a permanent outcome and the
+      # Process records it instead of hammering the relay.
+      - providers:
+          /v1/email/messages:
+            - { status: 422, body: { message: no } }
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            url: "/orders/1", request_id: "${request}")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify/dispatch_id }
+      - await:
+          sql: |
+            select status, error_code from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: failed, error_code: mail_send_failed }]
+      - calls: { path: /v1/email/messages, count: 1 }
+
+  - name: a recipient with no address is recorded rather than queued
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      # A user row whose email the binding reports as absent.
+      - sql: insert into public.app_user (id, email) values ('${alice}', '')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation { notify(workflow: "order_shipped", recipient_id: "${alice}",
+                            title: "your order shipped", body: "it shipped",
+                            url: "/orders/1", request_id: "${request}")
+                     { dispatch_id } }
+        capture: { dispatch: /data/notify/dispatch_id }
+      - await:
+          sql: |
+            select status, error_code from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: failed, error_code: mail_no_address }]
+      - calls: { path: /v1/email/messages, count: 0 }
+
+  - name: the relay is given what a template needs
+    steps:
+      # The module renders nothing — the engine's own renderer is unreachable
+      # from a Process (`plans/004-*`) — so what "templating" means here is that
+      # whatever does render is handed the three things it needs: which
+      # notification this is, the recipient's language, and the data. A relay
+      # that templates nothing ignores them and still works.
+      - providers: !include ../testdata/providers.yaml
+      - sql: insert into public.app_user (id, email) values ('${alice}', 'alice@example.test')
+      - as: { role: notification_sender, user: "${alice}" }
+      - graphql: |
+          mutation Notify($p: NotificationPayload) {
+            notify(workflow: "order_shipped", recipient_id: "${alice}",
+                   title: "Your order shipped", body: "It is on its way.",
+                   payload: $p, request_id: "${request}") { dispatch_id }
+          }
+        variables:
+          p: { order: A-1, tracking: TRK-9 }
+        capture: { dispatch: /data/notify/dispatch_id }
+      - await:
+          sql: |
+            select status from notification.delivery
+            where dispatch_id = '${dispatch}' and channel = 'email'
+          expect: [{ status: sent }]
+      - calls:
+          path: /v1/email/messages
+          count: 1
+          body:
+            # The data reaches the relay opaque and whole…
+            payload: { order: A-1, tracking: TRK-9 }
+            # …with which notification it is, so a template can be chosen…
+            workflow: order_shipped
+            # …and the recipient's language, from the deployment's own binding.
+            locale: en

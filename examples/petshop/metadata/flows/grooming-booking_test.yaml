@@ -7,6 +7,7 @@ vars:
 tests:
   - name: a shopper holds a slot and confirms it
     steps:
+      - providers: !include ../testdata/providers.yaml
       - as: { role: customer, user: customer-1 }
       - graphql: |
           mutation {
@@ -36,6 +37,36 @@ tests:
       - await:
           terminal: grooming_booking
           expect: { booking_id: "${booking_id}", slot_key: "2026-08-01T10:00", status: confirmed }
+      # The business notification: a confirmed booking tells the customer. The
+      # flow calls `notify`, which hands the sending to the notification
+      # module's own Process — the bell first, the mail after.
+      - await:
+          row: notification.inbox
+          capture: { inbox_id: id }
+      - graphql: |
+          query { notification_inbox { title body url } }
+        expect:
+          data:
+            notification_inbox:
+              - title: Your grooming appointment is confirmed
+                body: We will see you at your booked time. Reply to this message if you need to move it.
+                url: /bookings
+      # The bell rings first and the mail follows it, so the log is what says
+      # both channels are done before the relay is asked what it received.
+      - await:
+          sql: |
+            select channel, status from notification.delivery
+            where workflow = 'grooming_booking_confirmed' order by channel
+          expect:
+            - { channel: email, status: sent }
+            - { channel: in_app, status: sent }
+      - calls:
+          path: /v1/email/messages
+          count: 1
+          body:
+            recipient: alice@example.com
+            subject: Your grooming appointment is confirmed
+            workflow: grooming_booking_confirmed
       # The shopper reads the confirmed booking back from the store.
       - graphql: |
           query {

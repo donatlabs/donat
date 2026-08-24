@@ -70,6 +70,7 @@ Mode first, then architecture, then the domain skill.
    `donat-rules`, `donat-commands`, `donat-processes`, `donat-connectors`,
    `donat-schema-and-migrations`, `donat-api-surfaces`,
    `donat-file-attachments`, `donat-authentication`, `donat-automation`,
+   `donat-notifications`,
    `donat-embedded-go`, `donat-platform-ui`, `donat-deploy-and-verify`.
 
 Examples:

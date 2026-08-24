@@ -11,6 +11,12 @@ capabilities that shipped.
 | [001](001-subscription-multiplexing.md) | Multiplex live-query subscriptions | M or L, by fork | TODO — needs a decision | sqlgen parameterisation, if Fork B |
 | [002](002-json-schema-for-metadata.md) | Publish a JSON Schema for the metadata | M | TODO | — |
 | [003](003-the-journal-served-through-its-own-rules.md) | Serve the Process journal through the engine's own permissions | S–M | TODO — spike first | — |
+| [004](004-a-local-capability-no-process-can-name.md) | Publish local capability contracts so a Process can name one | M | TODO — one fork to settle | — |
+| [005](005-a-fan-out-item-cannot-assert-what-it-is.md) | `require_non_null` on a fan-out item, so a view and a `for_each` can be used together | S | TODO | — |
+| [006](006-a-declared-row-bound-that-nothing-enforces.md) | Enforce `select_many`'s declared row bound, and decide whether a bound refuses or truncates | S–M | TODO — one design question | — |
+| [007](007-a-permanent-metadata-collision-retried-as-if-it-were-a-cold-database.md) | A tracked-table name collision hangs boot instead of failing `validate` | S | **DONE** | — |
+| [008](008-the-identity-we-ship-is-unreachable-from-a-declaration.md) | Publish the identity provider as a connector, so a Process can read a person's address | M | TODO | — |
+| [009](009-an-inherited-role-grants-the-tables-and-not-the-commands.md) | `inherited_roles` carries table permissions and drops command ones | S–M | TODO — one fork to settle; behaviour pinned by a test | — |
 
 ## Suggested order
 

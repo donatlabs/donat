@@ -3,3 +3,6 @@
 - "!include connectors/mock-tax.yaml"
 - "!include connectors/mock-notification.yaml"
 - "!include connectors/mock-payout.yaml"
+
+# --- the notification module ------------------------------------------
+- "!include ../../../modules/notifications/metadata/connectors/notification-mail.yaml"

@@ -1,0 +1,25 @@
+# The per-channel outcome log. Written only by the delivery Process's commands.
+# `unique (dispatch_id, channel)` in the schema is what makes a Process that
+# reaches the same channel twice a refusal rather than a double count.
+table:
+  schema: notification
+  name: delivery
+command_insert_permissions:
+  - role: notification_worker
+    permission:
+      columns: [dispatch_id, recipient_id, workflow, channel, status, provider_message_id, error_code, claim_id]
+      check: {}
+command_select_permissions:
+  - role: notification_worker
+    permission:
+      columns: [id, dispatch_id, recipient_id, workflow, channel, status, provider_message_id, error_code, claim_id, recorded_at]
+      filter: {}
+command_update_permissions:
+  # The digest sweep turns a deferred row into a sent one. It may change the
+  # outcome and the provider's id, and nothing else — not who the row is about,
+  # and not which notification it belongs to.
+  - role: notification_worker
+    permission:
+      columns: [status, provider_message_id, error_code, claim_id]
+      filter: {}
+      check: {}

@@ -1,0 +1,40 @@
+# Give a failed digest back to the next sweep.
+#
+# The claim moves a group's rows to `sending` before the relay is called, so a
+# send that fails leaves them there — invisible to the sweep, which reads
+# `deferred`. Without this they would sit until an operator noticed, which is
+# the one place the module would have quietly lost mail.
+#
+# There is no `require_each` and no `require_non_empty` on purpose: this runs
+# after a failure, and a row something else has already moved on is not an
+# error worth failing a second time over.
+name: notification_requeue_digest
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: claim_id
+    type: uuid!
+steps:
+  - name: sending_rows
+    select_many:
+      table: { schema: notification, name: delivery }
+      by:
+        claim_id: { arg: claim_id }
+        status: { literal: sending }
+      order_by: [id]
+      returning: [id]
+      maximum_rows: 512
+  - name: requeued
+    update_many:
+      table: { schema: notification, name: delivery }
+      for_each: { step: sending_rows }
+      by:
+        id: { item: id }
+        status: { literal: sending }
+      set:
+        status: { literal: deferred }
+      returning: [id, status]
+result:
+  claim_id: { arg: claim_id }
+  requeued: { step: requeued }

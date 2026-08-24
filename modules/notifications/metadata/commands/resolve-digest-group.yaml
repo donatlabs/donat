@@ -1,0 +1,55 @@
+# What one group's digest would say, without claiming anything.
+#
+# It reads rather than writes because the two decisions in front of the claim —
+# is there anything to send, and is there anywhere to send it — are about rows
+# that must still be `deferred` when they are made. `notification_record_digest_unreachable`
+# works on deferred rows, so it cannot run after a claim has moved them.
+name: notification_resolve_digest_group
+source: default
+permissions:
+  - role: notification_worker
+arguments:
+  - name: recipient_id
+    type: string!
+  - name: workflow
+    type: string!
+steps:
+  - name: deferred_rows
+    select_many:
+      table: { schema: notification, name: delivery }
+      by:
+        recipient_id: { arg: recipient_id }
+        workflow: { arg: workflow }
+        channel: { literal: email }
+        status: { literal: deferred }
+      order_by: [id]
+      returning: [id]
+      maximum_rows: 512
+  - name: address
+    select_one:
+      table: { schema: notification, name: recipient_address }
+      by:
+        recipient_id: { arg: recipient_id }
+        channel: { literal: email }
+      returning: [recipient_id, channel, address, verified]
+      require_found: false
+  - name: counted
+    aggregate:
+      from: { step: deferred_rows }
+      values:
+        pending: { count: {} }
+  # Read at send time rather than copied at defer time: an address that changed
+  # between the two is the current one.
+  - name: recipient
+    select_one:
+      table: { schema: notification, name: recipient }
+      by:
+        id: { arg: recipient_id }
+      returning: [id, locale]
+      require_found: true
+result:
+  recipient_id: { arg: recipient_id }
+  workflow: { arg: workflow }
+  address: { step: address, column: address }
+  locale: { step: recipient, column: locale }
+  pending: { step: counted, column: pending }

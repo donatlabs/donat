@@ -2,6 +2,11 @@
 # reads or writes exists before the engine compiles metadata, and the views
 # commands read keep their non-null columns as NOT NULL domains, so the
 # command's declared output types are honest.
+#
+# `public` is the store's own schema and the list below is the store's own
+# relations. The notification module's live in `notification.*` and are its
+# migration's business — what this store owes them is a binding, which the
+# tests beside the flows that notify prove.
 tests:
   - name: every command relation exists in the catalog
     steps:
@@ -26,7 +31,6 @@ tests:
             'inventory_level',
             'inventory_reservation',
             'inventory_stock',
-            'notification_delivery',
             'order_adjustment',
             'order_current_authorization',
             'order_inventory_allocation_candidate',
@@ -50,6 +54,7 @@ tests:
             'prescription_event',
             'prescription_request',
             'prescription_review',
+            'provider_notification_receipt',
             'purchase_approval',
             'quote',
             'quote_line',
