@@ -390,3 +390,65 @@ fn a_for_step_does_not_nest() {
     let raw = json!({"for": [1], "do": [{"for": [2], "do": []}]});
     assert!(crate::model::Step::parse(raw).is_err());
 }
+
+#[test]
+fn an_await_on_a_query_parses_as_a_polled_sql_step() {
+    // `await: {sql: …}` and `await: {row: …}` are different shapes of the same
+    // step kind, and an untagged enum resolves them by which key is present.
+    let raw = json!({
+        "await": {
+            "sql": "select status from notification.delivery where channel = 'email'",
+            "expect": [{"status": "sent"}],
+            "capture": {"status": "status"},
+        }
+    });
+    let Ok(crate::model::Step::Await(step)) = crate::model::Step::parse(raw) else {
+        panic!("an await step with a sql query is an await step");
+    };
+    let crate::model::Await::Rows {
+        sql,
+        expect,
+        capture,
+    } = step.what
+    else {
+        panic!("a sql key selects the polled-query variant, not the first-row one");
+    };
+    assert!(sql.contains("notification.delivery"));
+    assert_eq!(expect, vec![json!({"status": "sent"})]);
+    assert_eq!(capture.get("status").map(String::as_str), Some("status"));
+
+    // No `expect` is not "wait for anything": a wait with nothing to wait for
+    // would spin until the deadline, so the shape refuses it.
+    assert!(crate::model::Step::parse(json!({"await": {"sql": "select 1"}})).is_err());
+}
+
+#[test]
+fn a_config_takes_one_migrations_directory_or_several() {
+    // A deployment applies more than one versioned set as soon as it adopts a
+    // module, and the order is the deployment's: the module's schema, then the
+    // application's, whose binding migration replaces a view the first created.
+    let root = tempdir("app_config");
+    write(
+        &root,
+        "donat.test.yaml",
+        "metadata: metadata\nmigrations:\n  - ../module/migrations\n  - migrations\n",
+    );
+    let many = crate::AppTestConfig::load(&root).expect("a list of directories loads");
+    assert_eq!(
+        many.migrations,
+        vec![root.join("../module/migrations"), root.join("migrations")],
+        "each entry resolves against the config file's directory, in order"
+    );
+
+    // One string still means a list of one — the shape every application that
+    // adopts nothing already writes.
+    write(&root, "donat.test.yaml", "migrations: migrations\n");
+    let one = crate::AppTestConfig::load(&root).expect("a single directory loads");
+    assert_eq!(one.migrations, vec![root.join("migrations")]);
+    assert_eq!(one.metadata, root.join("metadata"), "metadata has a default");
+
+    // And an application with no migrations of its own says nothing.
+    write(&root, "donat.test.yaml", "metadata: metadata\n");
+    let none = crate::AppTestConfig::load(&root).expect("no migrations loads");
+    assert!(none.migrations.is_empty());
+}

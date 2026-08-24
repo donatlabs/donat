@@ -205,6 +205,19 @@ pub enum Await {
         #[serde(default)]
         capture: BTreeMap<String, String>,
     },
+    /// A query whose rows match `expect`, polled until they do. The same
+    /// shape as a `sql` step, and the difference is the whole point: a `sql`
+    /// step asks what is true now, and this one waits for durable work to make
+    /// it true — a delivery reaching a status, a second row arriving, a claim
+    /// being taken. `row` is the special case of "any first row"; this is what
+    /// a test uses when several instances of one Process are in flight and the
+    /// row it is waiting for is named by a value, not by being first.
+    Rows {
+        sql: String,
+        expect: Vec<Json>,
+        #[serde(default)]
+        capture: BTreeMap<String, String>,
+    },
     /// A table receiving its first row; `capture` names its columns.
     Row {
         row: String,
@@ -321,7 +334,30 @@ impl Step {
             };
         }
         if has("await") {
-            return Ok(Step::Await(serde_json::from_value(raw)?));
+            // An untagged enum says only "data did not match any variant",
+            // naming neither the key nor the line. An await is the step most
+            // often written from memory, so the shapes are named here instead.
+            const AWAIT_KINDS: &[&str] = &["terminal", "row", "sql", "failed", "receptive", "held"];
+            let what = map.get("await").and_then(Json::as_object);
+            if let Some(what) = what
+                && !AWAIT_KINDS.iter().any(|k| what.contains_key(*k))
+            {
+                return Err(anyhow!(
+                    "an await names one of {}; this one names {}",
+                    AWAIT_KINDS.join(", "),
+                    what.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            return Ok(Step::Await(serde_json::from_value(raw).map_err(
+                |error| {
+                    anyhow!(
+                        "an await of this shape is not one the runner knows \
+                     (terminal/failed take `expect` and `capture`, row takes \
+                     `capture`, sql takes `expect` and `capture`, receptive \
+                     takes `state`): {error}"
+                    )
+                },
+            )?));
         }
         if has("calls") {
             return Ok(Step::Calls(serde_json::from_value(raw)?));

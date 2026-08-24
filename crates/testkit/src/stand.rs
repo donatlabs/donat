@@ -40,7 +40,7 @@ pub struct StandConfig {
     /// The engine's own `donat.*` schema (shipped at `/usr/share/donat/migrations`).
     pub engine_migrations_dir: PathBuf,
     /// The application's schema, applied after the engine's.
-    pub app_migrations_dir: Option<PathBuf>,
+    pub app_migrations_dirs: Vec<PathBuf>,
     /// The application's metadata directory.
     pub metadata_dir: PathBuf,
     /// The `default` source name whose Process revisions `migrate` deploys.
@@ -317,7 +317,7 @@ fn template_name(cfg: &StandConfig, providers_url: &str) -> Result<String> {
         Ok(())
     };
     feed_dir(&cfg.engine_migrations_dir)?;
-    if let Some(dir) = &cfg.app_migrations_dir {
+    for dir in &cfg.app_migrations_dirs {
         feed_dir(dir)?;
     }
     feed_dir(&cfg.metadata_dir)?;
@@ -336,17 +336,23 @@ fn template_name(cfg: &StandConfig, providers_url: &str) -> Result<String> {
         hasher.update(since.as_nanos().to_le_bytes());
     }
     let digest = hasher.finalize();
+    // Which application this is, separately from what is currently in it. A
+    // run can hold several — a module and a deployment that adopts it — and
+    // reclaiming a stale template must not reach another application's, so the
+    // name has to say whose it is.
+    let mut app = Sha256::new();
+    app.update(cfg.metadata_dir.to_string_lossy().as_bytes());
+    let app = app.finalize();
     // The resolved provider URL participates in the deployed revisions (ADR
     // declarative-saas/046), so the port is part of the template's identity —
     // as a suffix, not in the hash, so cleanup can tell "same content, another
     // worker's port" from "stale content".
     let port = providers_url.rsplit(':').next().unwrap_or("0");
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     Ok(format!(
-        "apptest_tpl_{}_p{port}",
-        digest[..6]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
+        "apptest_tpl_{}_{}_p{port}",
+        hex(&app[..4]),
+        hex(&digest[..6])
     ))
 }
 
@@ -376,12 +382,13 @@ fn ensure_template(
 ) -> Result<()> {
     let mut admin = postgres::Client::connect(admin_url, postgres::NoTls)
         .with_context(|| format!("connecting to {admin_url} (is postgres up?)"))?;
-    // One builder at a time, across processes.
-    let key = i64::from_le_bytes(
-        template.as_bytes()[template.len() - 8..]
-            .try_into()
-            .unwrap(),
-    );
+    // One builder of *this* template at a time, across processes. Keyed by the
+    // whole name: the tail of it is the port, which several templates share.
+    let key = {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(template.as_bytes());
+        i64::from_le_bytes(digest[..8].try_into().expect("eight bytes of a digest"))
+    };
     admin.execute("SELECT pg_advisory_lock($1)", &[&key])?;
     let build = (|| -> Result<()> {
         let exists: bool = admin
@@ -393,13 +400,23 @@ fn ensure_template(
         if exists {
             return Ok(());
         }
-        // Same content prefix, another port: a sibling worker's template.
-        // A different prefix is a stale build to reclaim.
-        let prefix = &template[..template.rfind("_p").unwrap_or(template.len())];
+        // What is stale is *this application's* template from a previous
+        // content hash. Same content prefix and another port is a sibling
+        // worker's; another application's — a module and the deployment that
+        // adopts it are two — is not this build's to reclaim, and a
+        // `_building` database belongs to whoever is filling it right now.
+        // `apptest_tpl_<app>_<content>_p<port>`: the first three segments name
+        // the application.
+        let app = template
+            .match_indices('_')
+            .nth(2)
+            .map_or(template, |(at, _)| &template[..at]);
+        let mine = &template[..template.rfind("_p").unwrap_or(template.len())];
         for stale in admin.query(
-            "SELECT datname FROM pg_database WHERE datname LIKE 'apptest_tpl_%' \
-             AND position($1 in datname) <> 1",
-            &[&prefix],
+            "SELECT datname FROM pg_database \
+             WHERE datname LIKE $1 || '_%' AND position($2 in datname) <> 1 \
+               AND datname NOT LIKE '%_building'",
+            &[&app, &mine],
         )? {
             let name: String = stale.get(0);
             let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
@@ -423,7 +440,7 @@ fn ensure_template(
             ],
         );
         run_migrate(cfg, &env, &[])?;
-        if let Some(dir) = &cfg.app_migrations_dir {
+        for dir in &cfg.app_migrations_dirs {
             apply_sql_migration_dir(&db_url, dir)?;
         }
         run_migrate(
