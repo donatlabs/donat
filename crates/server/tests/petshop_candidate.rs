@@ -245,7 +245,6 @@ const COMMAND_RELATIONS: &[&str] = &[
     "inventory_level",
     "inventory_reservation",
     "inventory_stock",
-    "notification_delivery",
     "order_adjustment",
     "order_current_authorization",
     "order_inventory_allocation_candidate",
@@ -269,6 +268,7 @@ const COMMAND_RELATIONS: &[&str] = &[
     "prescription_event",
     "prescription_request",
     "prescription_review",
+    "provider_notification_receipt",
     "purchase_approval",
     "quote",
     "quote_line",
@@ -325,6 +325,15 @@ fn command_relations_are_tracked_in_petshop_metadata() {
 #[tokio::test]
 async fn tracked_petshop_domain_compiles_without_runtime_sections() {
     let (admin_url, database_name, database_url) = create_database("petshop_domain").await;
+    // Two sets, in the order the store deploys them: the notification module's
+    // schema, then the store's own — whose binding migration replaces a view
+    // the first one created.
+    run_migrate(
+        &database_url,
+        &petshop_root().join("../../modules/notifications/migrations"),
+    )
+    .await
+    .expect("the notification module's migrations apply");
     run_migrate(&database_url, &petshop_root().join("migrations"))
         .await
         .expect("all Petshop schema migrations apply");

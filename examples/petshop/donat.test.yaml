@@ -2,7 +2,12 @@
 # `*_test.yaml` under `metadata/`. Where Postgres is and which binary runs are
 # the machine's business (`donat test --help`).
 metadata: metadata
-migrations: migrations
+# Two sets, in the order the compose file applies them: the notification
+# module's schema, then the store's own — whose binding migration replaces a
+# view the module's set created.
+migrations:
+  - ../../modules/notifications/migrations
+  - migrations
 engine_env:
   # Every provider the connectors name is played by the runner's stub.
   PETSHOP_PAYMENT_BASE_URL: ${providers}
@@ -13,6 +18,9 @@ engine_env:
   DONAT_MOCK_CARRIER_TOKEN: petshop-test-carrier
   PETSHOP_NOTIFICATION_BASE_URL: ${providers}
   PETSHOP_NOTIFICATION_API_TOKEN: petshop-test-notification
+  # `modules/notifications`' mail relay, played by the same stub.
+  NOTIFICATION_MAIL_BASE_URL: ${providers}
+  NOTIFICATION_MAIL_TOKEN: petshop-test-mail
   PETSHOP_PAYOUT_BASE_URL: ${providers}
   PETSHOP_PAYOUT_API_TOKEN: petshop-test-payout
   # The customer avatar names an object store; the registry resolves every
