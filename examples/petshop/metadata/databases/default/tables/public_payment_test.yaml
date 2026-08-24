@@ -1,0 +1,81 @@
+# A payment says whether money moved, and only the store may say it did.
+# A shopper has no ordinary write to payment at all — the mutation is not in
+# their schema — and reading one is scoped to the order's owner plus the
+# desks the metadata names.
+vars:
+  order: 00000000-0000-0000-0000-00000000a001
+  payment: 00000000-0000-0000-0000-00000000b001
+tests:
+  - name: a shopper cannot write their own payment paid
+    steps:
+      - providers: !include ../../../testdata/providers.yaml
+      # One open cart holding a single in-stock variant, checked out for real:
+      # the payment under attack is the one the store itself authorized.
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655441001") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      - sql: SELECT id::text AS id, status, amount_minor FROM payment
+        expect: [{ status: authorized, amount_minor: 3458 }]
+        capture: { payment_id: id }
+      # `captured` would be money the shopper never paid; `amount_minor` their
+      # own price. Neither write exists for the role: the field is not in the
+      # shopper's schema, so the refusal does not even confirm it exists.
+      - for:
+          - { column: status, value: '"captured"' }
+          - { column: amount_minor, value: "1" }
+        do:
+          - graphql: 'mutation { update_payment(where: {id: {_eq: "${payment_id}"}}, _set: {${item.column}: ${item.value}}) { affected_rows } }'
+            expect:
+              errors:
+                - extensions:
+                    path: $.selectionSet.update_payment
+                    code: validation-failed
+                  message: "field 'update_payment' not found in type: 'mutation_root'"
+      # The payment did not move: still authorized, still the checkout's total.
+      - sql: SELECT status, amount_minor FROM payment WHERE id = '${payment_id}'
+        expect: [{ status: authorized, amount_minor: 3458 }]
+
+  - name: only the owning shopper and the desks the metadata names may read a payment
+    steps:
+      - sql: |
+          INSERT INTO orders (id, customer_id, order_status, total_minor)
+            VALUES ('${order}', 'customer-1', 'authorized', 2499);
+          INSERT INTO payment (id, order_id, status, amount_minor, currency)
+            VALUES ('${payment}', '${order}', 'authorized', 2499, 'USD');
+      # The owner of the order sees the payment behind it.
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { payment { id status amount_minor currency } }'
+        expect:
+          data:
+            payment:
+              - { id: "${payment}", status: authorized, amount_minor: 2499, currency: USD }
+      # Another shopper's session sees an empty list, not an error.
+      - as: { role: customer, user: customer-2 }
+      - graphql: 'query { payment { id } }'
+        expect:
+          data: { payment: [] }
+      # Support reads every payment, unfiltered.
+      - as: { role: support }
+      - graphql: 'query { payment { id status amount_minor } }'
+        expect:
+          data:
+            payment:
+              - { id: "${payment}", status: authorized, amount_minor: 2499 }
+      # A role with no select permission cannot even name the table: the
+      # refusal is "field not found", never a hint that the table exists.
+      - as: { role: staff }
+      - graphql: 'query { payment { id } }'
+        expect:
+          errors:
+            - extensions:
+                path: $.selectionSet.payment
+                code: validation-failed
+              message: "field 'payment' not found in type: 'query_root'"

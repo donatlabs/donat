@@ -134,5 +134,5 @@ example is the specification; this skill is the map.
 > One stale note: [`examples/petshop/README.md`](https://github.com/donatlabs/donat/tree/main/examples/petshop/README.md) still says its declarative YAML
 > "is not currently runnable". That caveat predates the runtime — `commands`,
 > `rules`, `processes` and `connectors` each have conformance suites, and
-> [`crates/conformance/tests/petshop_process.rs`](https://github.com/donatlabs/donat/tree/main/crates/conformance/tests/petshop_process.rs) drives the petshop flows end to
-> end. Trust the tests.
+> the tests beside each flow ([`examples/petshop/metadata/flows/*_test.yaml`](https://github.com/donatlabs/donat/tree/main/examples/petshop/metadata/flows))
+> drive the petshop end to end. Trust the tests.

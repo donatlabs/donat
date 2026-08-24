@@ -1,0 +1,29 @@
+# Two commands snapshot a line in two shapes: checkout carries the tax
+# breakdown, a subscription renewal carries one total. The schema admits both.
+tests:
+  - name: checkout and subscription snapshots both satisfy the schema
+    steps:
+      - sql: |
+          INSERT INTO orders (id, customer_id) VALUES
+            ('00000000-0000-0000-0000-000000000001', 'customer-1'),
+            ('00000000-0000-0000-0000-000000000002', 'customer-1');
+      - sql: |
+          INSERT INTO order_line (
+            order_id, variant_id, quantity, unit_price_minor,
+            line_subtotal_minor, discount_minor, taxable_minor,
+            tax_code, tax_bps, currency
+          ) VALUES (
+            '00000000-0000-0000-0000-000000000001', 1, 2, 1999,
+            3998, 0, 3998, 'standard', 0, 'USD'
+          );
+      - sql: |
+          INSERT INTO order_line (
+            order_id, variant_id, quantity, unit_price_minor,
+            line_total_minor, currency
+          ) VALUES (
+            '00000000-0000-0000-0000-000000000002', 2, 1, 2499,
+            2499, 'USD'
+          );
+      - sql: SELECT count(*) FROM order_line
+        expect:
+          - count: 2

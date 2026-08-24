@@ -1,0 +1,689 @@
+# The RESTified door, endpoint by endpoint. The store publishes six named
+# endpoints, each a saved GraphQL operation behind a URL. Every declared
+# endpoint is exercised, its parameters are shown to bind, and the walls —
+# per-role permissions, validators, error shapes — are shown to be the same
+# walls as the GraphQL door's, because they are the same saved operation.
+# The catalogue bodies are pinned from the migration seed; an order comes
+# from the real checkout walk, not from a hand-written row.
+vars:
+  order_read_request: 550e8400-e29b-41d4-a716-446655441001
+  order_scope_request: 550e8400-e29b-41d4-a716-446655441002
+  parity_request: 550e8400-e29b-41d4-a716-446655441003
+tests:
+  - name: every declared endpoint answers
+    steps:
+      # An order for the order endpoints, made the way a shopper makes one.
+      - providers: !include testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "${order_read_request}") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+          capture: { order_id: /order_id }
+      # A second, open cart for the PUT endpoint.
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+
+      - description: GET /products answers the published catalogue.
+        url: /api/rest/products
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: cat-scratcher
+              title: Cat Scratcher
+              variants:
+                - sku: CAT-SCRATCH-POST
+                  price_minor: 1599
+                  currency: USD
+                  stock:
+                    available_quantity: 5
+            - slug: dog-kibble
+              title: Dog Kibble
+              variants:
+                - sku: DOG-CHICKEN-1KG
+                  price_minor: 1999
+                  currency: USD
+                  stock:
+                    available_quantity: 1
+                # One unit is reserved by the checkout this test just ran.
+                - sku: DOG-SALMON-1KG
+                  price_minor: 2499
+                  currency: USD
+                  stock:
+                    available_quantity: 2
+
+      - description: GET /products/:slug answers one product.
+        url: /api/rest/products/dog-kibble
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: dog-kibble
+              title: Dog Kibble
+              description: Balanced chicken and salmon recipes.
+              variants:
+                - sku: DOG-CHICKEN-1KG
+                  price_minor: 1999
+                  currency: USD
+                  stock:
+                    available_quantity: 1
+                - sku: DOG-SALMON-1KG
+                  price_minor: 2499
+                  currency: USD
+                  stock:
+                    available_quantity: 2
+
+      - description: GET /cart answers the caller's carts, the checked-out one included.
+        url: /api/rest/cart
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          cart:
+            - id: 1
+              customer_id: customer-1
+              status: checkout_started
+              lines:
+                - variant_id: 2
+                  quantity: 1
+            - id: 2
+              customer_id: customer-1
+              status: cart_open
+              lines: []
+
+      - description: GET /orders answers the caller's orders.
+        url: /api/rest/orders
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          orders:
+            - id: ${order_id}
+              order_status: authorized
+              total_minor: 3458
+              currency: USD
+
+      - description: GET /orders/:id answers one order with its lines.
+        url: /api/rest/orders/${order_id}
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          orders:
+            - id: ${order_id}
+              order_status: authorized
+              total_minor: 3458
+              currency: USD
+              lines:
+                - variant_id: 2
+                  quantity: 1
+                  unit_price_minor: 2499
+                  line_total_minor: null
+
+      - description: PUT /cart/lines writes through the saved upsert.
+        url: /api/rest/cart/lines
+        method: PUT
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          cart_id: 2
+          variant_id: 3
+          quantity: 1
+        response:
+          insert_cart_line:
+            returning:
+              - cart_id: 2
+                variant_id: 3
+                quantity: 1
+
+  # -- parameters -------------------------------------------------------------
+
+  - name: a path parameter selects the row it names
+    steps:
+      - description: The slug in the path picks cat-scratcher and nothing else.
+        url: /api/rest/products/cat-scratcher
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: cat-scratcher
+              title: Cat Scratcher
+              description: A sturdy scratch post for indoor cats.
+              variants:
+                - sku: CAT-SCRATCH-POST
+                  price_minor: 1599
+                  currency: USD
+                  stock:
+                    available_quantity: 5
+      - description: And dog-kibble answers dog-kibble alone.
+        url: /api/rest/products/dog-kibble
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: dog-kibble
+              title: Dog Kibble
+              description: Balanced chicken and salmon recipes.
+              variants:
+                - sku: DOG-CHICKEN-1KG
+                  price_minor: 1999
+                  currency: USD
+                  stock:
+                    available_quantity: 1
+                - sku: DOG-SALMON-1KG
+                  price_minor: 2499
+                  currency: USD
+                  stock:
+                    available_quantity: 3
+
+  - name: a path that names nothing is an empty answer not an error
+    steps:
+      - description: A slug nobody sells is a question with the answer "none".
+        url: /api/rest/products/no-such-product
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product: []
+
+  - name: a body binds to the operation's variables
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - description: PUT is an upsert; the first call creates the line.
+        url: /api/rest/cart/lines
+        method: PUT
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          cart_id: 1
+          variant_id: 2
+          quantity: 2
+        response:
+          insert_cart_line:
+            returning:
+              - cart_id: 1
+                variant_id: 2
+                quantity: 2
+      - description: The second call updates the same line, not a second one.
+        url: /api/rest/cart/lines
+        method: PUT
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          cart_id: 1
+          variant_id: 2
+          quantity: 5
+        response:
+          insert_cart_line:
+            returning:
+              - cart_id: 1
+                variant_id: 2
+                quantity: 5
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines(order_by: {id: asc}) { variant_id quantity } } }'
+        expect:
+          data:
+            cart:
+              - lines:
+                  - { variant_id: 2, quantity: 5 }
+
+  # -- the same walls as the other door ---------------------------------------
+
+  - name: an endpoint shows the caller only their own rows
+    steps:
+      - providers: !include testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "${order_scope_request}") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+          capture: { order_id: /order_id }
+      - description: The owner reads their order by id.
+        url: /api/rest/orders/${order_id}
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          orders:
+            - id: ${order_id}
+              order_status: authorized
+              total_minor: 3458
+              currency: USD
+              lines:
+                - variant_id: 2
+                  quantity: 1
+                  unit_price_minor: 2499
+                  line_total_minor: null
+      - description: Another shopper naming the same id reads nothing — an empty list, not an error.
+        url: /api/rest/orders/${order_id}
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-2
+        response:
+          orders: []
+
+  - name: the public gets no cart and no orders
+    steps:
+      - description: The saved Cart operation does not validate for the anonymous role.
+        url: /api/rest/cart
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          errors:
+            - extensions:
+                path: $.selectionSet.cart
+                code: validation-failed
+              message: "field 'cart' not found in type: 'query_root'"
+      - description: Neither does the saved Orders operation.
+        url: /api/rest/orders
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          errors:
+            - extensions:
+                path: $.selectionSet.orders
+                code: validation-failed
+              message: "field 'orders' not found in type: 'query_root'"
+
+  - name: a validator applies to the rest door too
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - description: The twenty-unit cap is a property of the store, not of GraphQL.
+        url: /api/rest/cart/lines
+        method: PUT
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          cart_id: 1
+          variant_id: 2
+          quantity: 21
+        response:
+          errors:
+            - extensions:
+                path: $.selectionSet.insert_cart_line.args.objects
+                code: validation-failed
+              message: a cart line is limited to 20 units
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { id } } }'
+        expect:
+          data:
+            cart:
+              - lines: []
+
+  - name: a shopper cannot write into another shopper's cart through rest
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-2')
+      - description: The refusal is the permission's, not something else.
+        url: /api/rest/cart/lines
+        method: PUT
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          cart_id: 1
+          variant_id: 2
+          quantity: 1
+        response:
+          errors:
+            - extensions:
+                path: $.selectionSet.insert_cart_line.args.objects
+                code: permission-error
+              message: check constraint of an insert/update permission has failed
+      - as: { role: customer, user: customer-2 }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { id } } }'
+        expect:
+          data:
+            cart:
+              - lines: []
+
+  # -- what a client can rely on ----------------------------------------------
+
+  - name: an endpoint answers only the method it declares
+    steps:
+      - for:
+          - { method: POST }
+          - { method: DELETE }
+          - { method: PATCH }
+          - { method: OPTIONS }
+          - { method: HEAD }
+        do:
+          # A HEAD response has no body, so only the status is asserted here;
+          # the 405 body itself is pinned in the wrong-method test below.
+          - url: /api/rest/products
+            method: ${item.method}
+            status: 405
+            headers:
+              X-Donat-Role: anonymous
+
+  - name: both doors refuse the same things the same way
+    steps:
+      - description: A value that is not a uuid, through the REST door.
+        url: /api/rest/orders/not-a-uuid
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          errors:
+            - extensions:
+                path: $
+                code: data-exception
+              message: 'invalid input syntax for type uuid: "not-a-uuid"'
+      - description: The same value through the GraphQL door earns the same code.
+        url: /v1/graphql
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        query:
+          query: 'query O($id: uuid!) { orders(where: {id: {_eq: $id}}) { id } }'
+          variables:
+            id: not-a-uuid
+        response:
+          errors:
+            - extensions:
+                path: $
+                code: data-exception
+              message: 'invalid input syntax for type uuid: "not-a-uuid"'
+      - description: A missing variable is refused before anything is executed.
+        url: /api/rest/cart/lines
+        method: PUT
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          cart_id: 1
+        response:
+          errors:
+            - extensions:
+                path: $.selectionSet.insert_cart_line
+                code: validation-failed
+              message: 'expecting a value for non-nullable variable: "quantity"'
+
+  - name: a rest error is a graphql error with an http 200
+    steps:
+      - description: >-
+          These endpoints are saved GraphQL operations, so a refusal is a
+          GraphQL error envelope under HTTP 200 — not a 4xx.
+        url: /api/rest/orders/not-a-uuid
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          errors:
+            - extensions:
+                path: $
+                code: data-exception
+              message: 'invalid input syntax for type uuid: "not-a-uuid"'
+      - description: Only the routing layer answers with a status code.
+        url: /api/rest/no-such-endpoint
+        method: GET
+        status: 404
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          code: not-found
+          error: endpoint not found
+
+  # -- the same order through three doors -------------------------------------
+
+  - name: a shopper reads the same order everywhere
+    steps:
+      - providers: !include testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "${parity_request}") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+          capture: { order_id: /order_id }
+      # The order over GraphQL.
+      - graphql: 'query { orders(order_by: {created_at: desc}) { id order_status total_minor currency } }'
+        expect:
+          data:
+            orders:
+              - id: ${order_id}
+                order_status: authorized
+                total_minor: 3458
+                currency: USD
+      - description: The order over REST.
+        url: /api/rest/orders/${order_id}
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        response:
+          orders:
+            - id: ${order_id}
+              order_status: authorized
+              total_minor: 3458
+              currency: USD
+              lines:
+                - variant_id: 2
+                  quantity: 1
+                  unit_price_minor: 2499
+                  line_total_minor: null
+      - description: The order over MCP.
+        url: /mcp
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: tools/call
+          params:
+            name: query
+            arguments:
+              table: orders
+              columns:
+                - id
+                - order_status
+              where:
+                id:
+                  _eq: ${order_id}
+        response:
+          jsonrpc: "2.0"
+          id: 1
+          result:
+            isError: false
+            structuredContent:
+              rows:
+                - id: ${order_id}
+                  order_status: authorized
+
+  - name: a shopper writes through rest and reads it over graphql
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - url: /api/rest/cart/lines
+        method: PUT
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          cart_id: 1
+          variant_id: 2
+          quantity: 2
+        response:
+          insert_cart_line:
+            returning:
+              - cart_id: 1
+                variant_id: 2
+                quantity: 2
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines(order_by: {id: asc}) { variant_id quantity } } }'
+        expect:
+          data:
+            cart:
+              - lines:
+                  - { variant_id: 2, quantity: 2 }
+
+  - name: the public cannot read orders on any surface
+    steps:
+      - description: The GraphQL door refuses the anonymous role.
+        url: /v1/graphql
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        query:
+          query: 'query { orders { id } }'
+        response:
+          errors:
+            - extensions:
+                path: $.selectionSet.orders
+                code: validation-failed
+              message: "field 'orders' not found in type: 'query_root'"
+      - description: The REST route runs the same permission check.
+        url: /api/rest/orders
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          errors:
+            - extensions:
+                path: $.selectionSet.orders
+                code: validation-failed
+              message: "field 'orders' not found in type: 'query_root'"
+      - description: MCP refuses what GraphQL refuses.
+        url: /mcp
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: tools/call
+          params:
+            name: query
+            arguments:
+              table: orders
+              columns:
+                - id
+        response:
+          jsonrpc: "2.0"
+          id: 1
+          result:
+            isError: true
+
+  # -- the documented HTTP contract -------------------------------------------
+
+  - name: an unknown rest route is 404
+    steps:
+      - url: /api/rest/not-a-route
+        method: GET
+        status: 404
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          code: not-found
+          error: endpoint not found
+
+  - name: a known route with the wrong method is 405
+    steps:
+      - url: /api/rest/products
+        method: POST
+        status: 405
+        headers:
+          X-Donat-Role: anonymous
+        body: {}
+        response:
+          code: method-not-allowed
+          error: "method POST not allowed; allowed: GET"
+
+  # -- a parameter is a value, not a place to put code ------------------------
+
+  - name: a rest parameter carrying a payload is read as a value
+    steps:
+      - description: A quoted SQL fragment is just a slug nobody sells.
+        url: /api/rest/products/%27%20OR%20%271%27%3D%271
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product: []
+      - description: A statement separator is just a slug nobody sells.
+        url: /api/rest/products/1;SELECT%201
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product: []
+      - description: And the shop still answers afterwards.
+        url: /api/rest/products/cat-scratcher
+        method: GET
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        response:
+          product:
+            - slug: cat-scratcher
+              title: Cat Scratcher
+              description: A sturdy scratch post for indoor cats.
+              variants:
+                - sku: CAT-SCRATCH-POST
+                  price_minor: 1599
+                  currency: USD
+                  stock:
+                    available_quantity: 5

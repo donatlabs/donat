@@ -18,6 +18,7 @@ members = [
     "crates/wasm-core",
     "crates/backend",
     "crates/connectors",
+    "crates/testkit",
     "crates/server",
     "crates/conformance",
 ]

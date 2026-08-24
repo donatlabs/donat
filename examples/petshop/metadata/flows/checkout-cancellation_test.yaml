@@ -1,0 +1,217 @@
+# A shopper cancels while the checkout process is mid-authorization. The
+# cancellation claim commits first; the authorization attempt then fails the
+# only way it still can, and the cancellation process proves through the
+# provider's lookup that no authorization ever existed — so nothing is voided
+# and the reserved stock is released. Ownership is proved the same way: only
+# the shopper the order belongs to (or support acting in their name) can
+# cancel it, and cancelling twice cancels once.
+
+# The provider proving it never carried out the mutation it was asked about.
+# The lookup contract is non-null throughout, so an absence still answers
+# every declared field.
+vars:
+  lookup_absent:
+    found: false
+    terminal_absence_proven: true
+    provider_event_id: evt_petshop_lookup_absent
+    provider_mutation_id: ""
+    provider_reference: ""
+    outcome: failed
+    amount_minor: 0
+    currency: USD
+    normalized_payload: { gateway: mock, found: false }
+
+tests:
+  - name: a shopper cancels a pending checkout and the process proves no authorization
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/payment-operation-lookups: ${lookup_absent}
+      - hold: /v1/payment-authorizations
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440940") { cart_id }
+          }
+      # The checkout process reaches its authorization request and waits there.
+      - await: { held: /v1/payment-authorizations }
+      - sql: SELECT id FROM orders WHERE order_status = 'checkout_started'
+        capture: { order_id: id }
+      - graphql: |
+          mutation {
+            cancel_order(order_id: "${order_id}", request_id: "550e8400-e29b-41d4-a716-446655440941") {
+              order_id order_status
+            }
+          }
+      # The claim is committed. Let the authorization attempt finish the only
+      # way it now can: the provider is unavailable, the retries exhaust, and
+      # the checkout process falls through to its own reconciliation.
+      - providers:
+          /v1/payment-authorizations:
+            - { status: 503 }
+            - { status: 503 }
+            - { status: 503 }
+      - release: /v1/payment-authorizations
+      # The cancellation process cancelled the order without a void.
+      - await:
+          terminal: checkout_cancellation
+          expect: { status: cancelled }
+      - sql: SELECT order_status FROM orders WHERE id = '${order_id}'
+        expect: [{ order_status: cancelled }]
+      # A cancelled checkout holds no money: the payment ends failed, and
+      # nothing was ever captured.
+      - sql: SELECT status FROM payment WHERE order_id = '${order_id}'
+        expect: [{ status: failed }]
+      - calls: { path: /v1/payment-authorizations/*/captures, count: 0 }
+      # Proving the authorization absent releases the reserved stock.
+      - sql: SELECT count(*) > 0 AS released FROM inventory_reservation WHERE order_id = '${order_id}' AND status = 'released'
+        expect: [{ released: true }]
+      # A cancellation sells nothing: variant 2 shows the migration's seed
+      # counters again.
+      - sql: SELECT on_hand, reserved FROM inventory_stock WHERE variant_id = 2
+        expect: [{ on_hand: 5, reserved: 2 }]
+      # An authorization that never committed is never voided.
+      - calls: { path: /v1/payment-authorizations/*/voids, count: 0 }
+
+  - name: another shopper cannot cancel this order
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - hold: /v1/payment-authorizations
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440942") { cart_id }
+          }
+      - await: { held: /v1/payment-authorizations }
+      - sql: SELECT id FROM orders WHERE order_status = 'checkout_started'
+        capture: { order_id: id }
+      # Another shopper's session does not see this order at all, so the
+      # cancel command's own lookup refuses it.
+      - as: { role: customer, user: customer-2 }
+      - graphql: |
+          mutation {
+            cancel_order(order_id: "${order_id}", request_id: "550e8400-e29b-41d4-a716-446655440943") {
+              order_id order_status
+            }
+          }
+        expect:
+          errors:
+            - message: command select_one step 'order' did not find a row
+              extensions: { code: validation-failed }
+      # The order is untouched, still waiting on its own authorization.
+      - sql: SELECT order_status FROM orders WHERE id = '${order_id}'
+        expect: [{ order_status: checkout_started }]
+      - release: /v1/payment-authorizations
+
+  - name: support cancels only on a named shopper's behalf
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/payment-operation-lookups: ${lookup_absent}
+      - hold: /v1/payment-authorizations
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440944") { cart_id }
+          }
+      - await: { held: /v1/payment-authorizations }
+      - sql: SELECT id FROM orders WHERE order_status = 'checkout_started'
+        capture: { order_id: id }
+      # cancel_order admits support, but the process it starts is owned: a
+      # support session with no user id passes the command's permission check
+      # and is then refused where the owner would be captured.
+      - as: { role: support }
+      - graphql: |
+          mutation {
+            cancel_order(order_id: "${order_id}", request_id: "550e8400-e29b-41d4-a716-446655440945") {
+              order_id order_status
+            }
+          }
+        expect:
+          errors:
+            - message: 'missing session variable: "x-donat-user-id"'
+              extensions: { code: not-found }
+      # Acting for the named shopper works.
+      - as: { role: support, user: customer-1 }
+      - graphql: |
+          mutation {
+            cancel_order(order_id: "${order_id}", request_id: "550e8400-e29b-41d4-a716-446655440946") {
+              order_id order_status
+            }
+          }
+        expect:
+          data: { cancel_order: { order_id: "${order_id}", order_status: cancellation_requested } }
+      # Let the held authorization fail out so the run settles deterministically.
+      - providers:
+          /v1/payment-authorizations:
+            - { status: 503 }
+            - { status: 503 }
+            - { status: 503 }
+      - release: /v1/payment-authorizations
+      - await:
+          terminal: checkout_cancellation
+          expect: { status: cancelled }
+      - sql: SELECT order_status FROM orders WHERE id = '${order_id}'
+        expect: [{ order_status: cancelled }]
+
+  - name: cancelling twice cancels once
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/payment-operation-lookups: ${lookup_absent}
+      - hold: /v1/payment-authorizations
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440947") { cart_id }
+          }
+      - await: { held: /v1/payment-authorizations }
+      - sql: SELECT id FROM orders WHERE order_status = 'checkout_started'
+        capture: { order_id: id }
+      - graphql: |
+          mutation {
+            cancel_order(order_id: "${order_id}", request_id: "550e8400-e29b-41d4-a716-446655440948") {
+              order_id order_status
+            }
+          }
+        expect:
+          data: { cancel_order: { order_id: "${order_id}", order_status: cancellation_requested } }
+      # A second click with its own request id finds no cancellable order —
+      # the first call already moved it out of checkout_started — and is
+      # refused rather than starting a second cancellation.
+      - graphql: |
+          mutation {
+            cancel_order(order_id: "${order_id}", request_id: "550e8400-e29b-41d4-a716-446655440949") {
+              order_id order_status
+            }
+          }
+        expect:
+          errors:
+            - message: command select_one step 'order' did not find a row
+              extensions: { code: validation-failed }
+      - providers:
+          /v1/payment-authorizations:
+            - { status: 503 }
+            - { status: 503 }
+            - { status: 503 }
+      - release: /v1/payment-authorizations
+      - await:
+          terminal: checkout_cancellation
+          expect: { status: cancelled }
+      # One cancellation process, and no void: the authorization was proven
+      # absent, so there was nothing to give back.
+      - sql: SELECT count(*) FROM donat.process_instances WHERE process_name = 'checkout_cancellation'
+        expect: [{ count: 1 }]
+      - calls: { path: /v1/payment-authorizations/*/voids, count: 0 }

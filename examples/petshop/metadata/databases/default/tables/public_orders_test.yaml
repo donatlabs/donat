@@ -1,0 +1,170 @@
+# What each role is refused: customer data across customers, prices and
+# totals from the storefront, lifecycle mutations from anyone but the role
+# that owns them, and the MCP surface as a way around any of it. Seeded with
+# customer-1's cart and order so that customer-2 has something not to see.
+vars:
+  customer: customer-1
+  order: 00000000-0000-0000-0000-000000000001
+tests:
+  - name: every role is refused what it does not own
+    steps:
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO orders (id, customer_id)
+            VALUES ('00000000-0000-0000-0000-000000000001', 'customer-1');
+      - description: A customer cannot read another customer's carts or orders.
+        url: /v1/graphql
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-2
+        query:
+          query: |
+            query {
+              cart(where: {customer_id: {_eq: "customer-1"}}) { id }
+              orders(where: {customer_id: {_eq: "customer-1"}}) { id }
+            }
+        response:
+          data:
+            cart: []
+            orders: []
+
+      # A role that was not granted a mutation does not see it in the schema:
+      # the refusal is "field not found", never a permission error that would
+      # confirm the field exists. One table, one example per (role, field).
+      - for:
+          - { role: customer, field: insert_product_variant,
+              call: 'insert_product_variant(objects: [{product_id: 1, sku: "BAD-PRICE", price_minor: 1, currency: "USD"}])',
+              why: customers cannot create catalogue variants with a price }
+          - { role: customer, field: insert_order_line,
+              call: 'insert_order_line(objects: [{order_id: "${order}", variant_id: 1, quantity: 1, unit_price_minor: 1, currency: "USD", line_total_minor: 1}])',
+              why: customers cannot write order line prices }
+          - { role: customer, field: update_orders,
+              call: 'update_orders(where: {id: {_eq: "${order}"}}, _set: {total_minor: 1, order_status: "paid"})',
+              why: customers cannot write order totals or lifecycle state }
+          - { role: customer, field: update_inventory_stock,
+              call: 'update_inventory_stock(where: {variant_id: {_eq: 1}}, _set: {reserved: 1})',
+              why: customers cannot reserve stock directly }
+          - { role: staff, field: update_shipment,
+              call: 'update_shipment(where: {id: {_eq: 1}}, _set: {fulfilment_status: "shipped"})',
+              why: staff cannot invoke fulfilment-only shipment mutations }
+          - { role: staff, field: update_refund,
+              call: 'update_refund(where: {id: {_eq: 1}}, _set: {status: "refunded"})',
+              why: staff cannot invoke support-only refund mutations }
+        do:
+          - as: { role: "${item.role}", user: "${customer}" }
+          - graphql: "mutation { ${item.call} { affected_rows } }"
+            expect:
+              errors:
+                - extensions:
+                    path: $.selectionSet.${item.field}
+                    code: validation-failed
+                  message: "field '${item.field}' not found in type: 'mutation_root'"
+
+      - description: >-
+          A request that names no role is refused before any permission is read.
+          There is no admin role and no header this engine believes on its own: a
+          role comes from a verified JWT or from the authentication hook, and this
+          suite's hook refuses a request that named none.
+        url: /v1/graphql
+        status: 401
+        query:
+          query: |
+            query { product { slug } }
+        response:
+          errors:
+            - extensions:
+                path: $
+                code: access-denied
+              message: "Authentication hook unauthorized this request"
+
+      - description: MCP cannot bypass anonymous catalog-only permissions to read customers.
+        url: /mcp
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: anonymous
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: tools/call
+          params:
+            name: query
+            arguments:
+              table: customer
+              columns:
+                - customer_id
+        response:
+          jsonrpc: "2.0"
+          id: 1
+          result:
+            isError: true
+
+  # The four tables a visitor with no account cannot even name: the schema
+  # for the anonymous role has no such fields, so the refusal does not
+  # confirm the data exists.
+  - name: a visitor with no account cannot reach customer data
+    steps:
+      - for:
+          - { field: cart }
+          - { field: orders }
+          - { field: customer }
+          - { field: payment }
+        do:
+          - url: /v1/graphql
+            status: 200
+            headers:
+              X-Donat-Role: anonymous
+            query:
+              query: "query { ${item.field} { id } }"
+            response:
+              errors:
+                - extensions:
+                    path: $.selectionSet.${item.field}
+                    code: validation-failed
+                  message: "field '${item.field}' not found in type: 'query_root'"
+
+  # Support's view of a shopper's orders and the shopper's own view agree:
+  # there is no order the desk can see that its owner cannot.
+  - name: every order belongs to a customer who can see it
+    steps:
+      - sql: |
+          INSERT INTO orders (id, customer_id, order_status, total_minor)
+            VALUES ('${order}', 'customer-1', 'authorized', 2499);
+      - as: { role: support }
+      - graphql: 'query { orders(where: {customer_id: {_eq: "customer-1"}}) { id customer_id order_status total_minor } }'
+        expect:
+          data:
+            orders:
+              - { id: "${order}", customer_id: customer-1, order_status: authorized, total_minor: 2499 }
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { orders { id customer_id order_status total_minor } }'
+        expect:
+          data:
+            orders:
+              - { id: "${order}", customer_id: customer-1, order_status: authorized, total_minor: 2499 }
+
+  # A freshly authorized order always carries a payment in a live state
+  # covering exactly what it charged: 2499 (one DOG-SALMON-1KG) + 799
+  # standard shipping + 160 quoted tax.
+  - name: an authorized order has money behind it
+    steps:
+      - providers: !include ../../../testdata/providers.yaml
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655441101") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          expect: { payment_status: authorized }
+      - sql: |
+          SELECT orders.order_status, orders.total_minor,
+                 payment.status, payment.amount_minor, payment.currency
+          FROM orders JOIN payment ON payment.order_id = orders.id
+        expect:
+          - { order_status: authorized, total_minor: 3458,
+              status: authorized, amount_minor: 3458, currency: USD }

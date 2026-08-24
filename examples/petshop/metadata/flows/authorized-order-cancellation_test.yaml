@@ -1,0 +1,90 @@
+# The cancellation module runs on the order the checkout module just created:
+# it voids the authorization at the provider (never capturing a cent), gives
+# the reserved stock back to the shelf, and finalizes the cancellation.
+tests:
+  - name: a shopper cancels an authorized order and the process voids the payment
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/payment-authorizations/*/voids:
+            provider_event_id: evt_petshop_void_1
+            void_id: void_petshop_1
+            provider_reference: ref_petshop_1
+            status: voided
+            normalized_payload: { gateway: mock, voided: true }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440910") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id, payment_id: /payment_id }
+      - graphql: |
+          mutation {
+            request_authorized_order_cancellation(
+              order_id: "${order_id}", reason: "changed mind",
+              request_id: "550e8400-e29b-41d4-a716-446655440911"
+            ) { order_id }
+          }
+      # The cancellation process reports the order it cancelled.
+      - await:
+          terminal: authorized_order_cancellation
+          expect: { order_id: "${order_id}", status: cancelled }
+      - sql: SELECT count(*) FROM payment WHERE order_id = '${order_id}' AND status = 'voided'
+        expect: [{ count: 1 }]
+      # An unshipped order gives the money back: nothing was ever captured,
+      # and the one void call names the payment whose hold it releases.
+      - calls: { path: /v1/payment-authorizations/*/captures, count: 0 }
+      # The connector SDK percent-encodes every non-alphanumeric byte of a
+      # path slot, so the uuid's hyphens travel as %2D on the wire.
+      - sql: SELECT replace('${payment_id}', '-', '%2D') AS void_path_payment_id
+        capture: { void_path_payment_id: void_path_payment_id }
+      - calls:
+          path: "/v1/payment-authorizations/${void_path_payment_id}/voids"
+          count: 1
+          body: { payment_id: "${payment_id}" }
+
+  - name: cancelling releases the reserved stock
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - providers:
+          /v1/payment-authorizations/*/voids:
+            provider_event_id: evt_petshop_void_2
+            void_id: void_petshop_2
+            provider_reference: ref_petshop_2
+            status: voided
+            normalized_payload: { gateway: mock, voided: true }
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      # The shelf as the migrations seeded it, before anything is reserved.
+      - sql: SELECT on_hand, reserved FROM inventory_stock WHERE variant_id = 2
+        expect: [{ on_hand: 5, reserved: 2 }]
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_checkout(cart_id: 1, request_id: "550e8400-e29b-41d4-a716-446655440912") { cart_id }
+          }
+      - await:
+          terminal: checkout_payment
+          capture: { order_id: /order_id }
+      # The authorized order holds its one unit.
+      - sql: SELECT on_hand, reserved FROM inventory_stock WHERE variant_id = 2
+        expect: [{ on_hand: 5, reserved: 3 }]
+      - graphql: |
+          mutation {
+            request_authorized_order_cancellation(
+              order_id: "${order_id}", reason: "changed my mind",
+              request_id: "550e8400-e29b-41d4-a716-446655440913"
+            ) { order_id }
+          }
+      - await:
+          terminal: authorized_order_cancellation
+          expect: { order_id: "${order_id}", status: cancelled }
+      # The reservation comes back, and cancelling sells nothing.
+      - sql: SELECT on_hand, reserved FROM inventory_stock WHERE variant_id = 2
+        expect: [{ on_hand: 5, reserved: 2 }]

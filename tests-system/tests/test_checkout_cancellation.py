@@ -81,34 +81,6 @@ def lookup_says_authorized(providers, amount_minor: int) -> None:
     )
 
 
-def test_cancelling_before_the_provider_answered_releases_the_shelf(
-    shopper, staff, support, providers, well_stocked, settle_timeout
-):
-    """Nothing was taken, so nothing is owed and the stock goes back."""
-
-    before = d.stock(staff, d.IN_STOCK_VARIANT)
-    order = order_in_checkout(shopper, providers, settle_timeout)
-
-    cancel(shopper, order["id"]).unwrap()
-
-    d.await_order_status(shopper, order["id"], {"cancelled"}, timeout=settle_timeout)
-    providers.await_call(P.LOOKUP)
-
-    payments = d.payments_of(support, order["id"])
-    assert all(payment["status"] not in {"authorized", "captured"} for payment in payments), (
-        f"a cancelled checkout holds no money: {payments}"
-    )
-    assert providers.count(P.CAPTURE) == 0
-
-    released = until(
-        lambda: d.stock(staff, d.IN_STOCK_VARIANT),
-        lambda level: level["reserved"] == before["reserved"],
-        timeout=settle_timeout,
-        description="the cancelled checkout to release its reservation",
-    )
-    assert released["on_hand"] == before["on_hand"], "a cancellation sells nothing"
-
-
 def test_an_authorization_the_provider_did_commit_is_voided(
     shopper, support, providers, well_stocked, settle_timeout
 ):
@@ -134,55 +106,6 @@ def test_an_authorization_the_provider_did_commit_is_voided(
         "an authorization the provider confirms is returned, not forgotten"
     )
     assert providers.count(P.CAPTURE) == 0, "nothing is ever captured on a cancelled order"
-
-
-def test_another_shopper_cannot_cancel_this_order(
-    shopper, other_shopper, providers, well_stocked, settle_timeout
-):
-    order = order_in_checkout(shopper, providers, settle_timeout)
-
-    refused = cancel(other_shopper, order["id"])
-
-    assert refused.errors, "another shopper cannot cancel this order"
-    assert refused.error_code() == "validation-failed"
-
-
-def test_support_cancels_only_on_a_named_shoppers_behalf(
-    store, shopper, support, providers, well_stocked, settle_timeout
-):
-    """`cancel_order` admits support, but the Process it starts is owned.
-
-    A support session with no `x-donat-user-id` passes the command's own
-    permission check and is then refused by the start effect, because the
-    cancellation Process captures its owner from that session variable. Acting
-    for a named shopper works; acting as nobody does not.
-    """
-
-    order = order_in_checkout(shopper, providers, settle_timeout)
-
-    anonymous_desk = cancel(support, order["id"])
-    assert anonymous_desk.error_code() == "not-found"
-    assert anonymous_desk.error_message() == 'missing session variable: "x-donat-user-id"'
-
-    on_behalf_of = store.as_role("support", d.CUSTOMER_ONE)
-    assert not cancel(on_behalf_of, order["id"]).errors
-    d.await_order_status(shopper, order["id"], {"cancelled"}, timeout=settle_timeout)
-
-
-def test_cancelling_twice_cancels_once(
-    shopper, support, providers, well_stocked, settle_timeout
-):
-    order = order_in_checkout(shopper, providers, settle_timeout)
-
-    first = cancel(shopper, order["id"])
-    second = cancel(shopper, order["id"])
-
-    assert not first.errors, first.text
-    # The second call finds no cancellable order — the first one already moved
-    # it — and it must not start a second cancellation Process.
-    d.await_order_status(shopper, order["id"], {"cancelled"}, timeout=settle_timeout)
-    assert providers.count(P.VOID) <= 1, "one cancellation, at most one void"
-    assert second.errors or second.value("data/cancel_order/order_id") == order["id"]
 
 
 def lookup_says_voided(providers) -> None:
@@ -267,3 +190,47 @@ def test_a_void_nobody_can_account_for_is_left_alone(
         description="an unaccounted void to stay unrecorded",
     )
     assert providers.count(P.CAPTURE) == 0, "an order being cancelled is never captured"
+
+
+# -- a void the provider never resolves (from test_cancellation_and_fulfilment.py) ---
+
+
+def authorized_order(shopper, settle_timeout) -> dict:
+    order = d.checkout_to_order(shopper, d.cart_with_one_line(shopper), timeout=settle_timeout)
+    return d.await_order_status(shopper, order["id"], {"authorized"}, timeout=settle_timeout)
+
+
+def request_cancellation(shopper, order_id: str):
+    return shopper.graphql(
+        """
+        mutation Cancel($order: uuid!, $request: uuid!) {
+          request_authorized_order_cancellation(
+            order_id: $order, reason: "changed my mind", request_id: $request
+          ) { order_id }
+        }
+        """,
+        {"order": order_id, "request": d.new_request_id()},
+    )
+
+
+# -- cancelling --------------------------------------------------------------
+
+
+@pytest.mark.serial
+def test_a_void_the_provider_never_confirmed_is_not_claimed(
+    shopper, support, providers, well_stocked, settle_timeout
+):
+    """The store may not report money as returned unless the provider said so."""
+
+    order = authorized_order(shopper, settle_timeout)
+    providers.fail(P.VOID, status=500, times=10)
+
+    request_cancellation(shopper, order["id"]).unwrap()
+    providers.await_call(P.LOOKUP)
+
+    payment = d.payments_of(support, order["id"])[-1]
+    assert payment["status"] == "void_in_progress", (
+        "an unproven void stays in progress rather than becoming 'voided'"
+    )
+    current = [o for o in d.orders_of(shopper) if o["id"] == order["id"]][0]
+    assert current["order_status"] == "cancellation_requested"

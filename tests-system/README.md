@@ -11,6 +11,29 @@ They are not the conformance contract — that lives in
 Donat compatibility. This suite asks a different question: with the whole thing
 deployed, does the store behave like a store?
 
+## What remains here, and why
+
+Most of this suite has moved to declarative `*_test.yaml` files beside the
+petshop metadata (`examples/petshop/metadata/**/*_test.yaml`, run by
+`donat test`), where an application's tests belong. What stays in python is
+exactly what the declarative format cannot say yet, each behind a named
+primitive — or what is about the engine rather than the application:
+
+| Waits on | Tests |
+|---|---|
+| `clock` (deterministic time; today: the "fast" second stand) | `test_b2b_escalation` timers, `test_dunning_reconciliation`, `test_time_based_branches` |
+| `providers … when:` (answers matched on the request body) | `test_checkout_cancellation` lookup branches |
+| provider `timeout` (an answer that outlives the connector deadline) | `test_reconciliation_branches`, one `test_provider_failure_branches` |
+| `await` on a parked (non-terminal) state / a `stays` window | `test_refund_reconciliation`, `test_provider_failure_branches`, one return-label case |
+| `parallel` (two actors at once) | races in `test_checkout_payment`, `test_edges_and_races`, `test_performance` |
+| `ws` (subscriptions) | `test_live_updates` |
+| `upload` (moving real bytes through the store) | byte-moving cases of `test_file_attachments`, `test_file_attacks` |
+| `@contains` matcher (membership in a large list) | `test_role_matrix`, one search/parity introspection case each |
+| engine-level, not application behaviour (JWT verification, generated hostile queries, latency) | token cases in `test_attacks`/`test_catalogue_and_roles`, `test_performance`, `test_store_integrity` whole-stand sweeps |
+
+A test ported to YAML is deleted here in the same change — one source of
+truth. Do not add a new python test for something the YAML format can declare.
+
 ## Running
 
 ```bash

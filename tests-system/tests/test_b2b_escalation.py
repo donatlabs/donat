@@ -1,10 +1,11 @@
-"""Buying on account, all the way up the chain.
+"""Buying on account, all the way up the escalation chain.
 
-A small purchase inside the company's credit goes through by itself. A large
-one waits for an approver. An approver who says nothing hands it to finance,
-and finance saying nothing rejects it. Every rung is a different desk, and the
-deadlines are days — so this runs on the fast stand, where the same flow
-declares them in seconds.
+An approver who says nothing hands it to finance, and finance saying nothing
+rejects it. Every rung is a different desk, and the deadlines are days — so
+this runs on the fast stand, where the same flow declares them in seconds.
+The rungs that need no deadline at all (automatic approval, reaching the
+approver) live in the application's own tests
+(`examples/petshop/metadata/flows/b2b-order-approval_test.yaml`).
 """
 
 from __future__ import annotations
@@ -17,10 +18,6 @@ from petshop_qa import stays, until
 pytestmark = [pytest.mark.providers, pytest.mark.serial]
 
 ORGANIZATION = "00000000-0000-0000-0000-0000000000c1"
-
-#: The decision table routes a quote automatically only when it is inside this
-#: much credit; anything larger is somebody's decision.
-AUTOMATIC_CEILING_MINOR = 10000
 
 
 @pytest.fixture
@@ -74,34 +71,6 @@ def settles_at(approver, approval_id: str, expected: set[str], timeout: float) -
         timeout=timeout,
         description=f"approval {approval_id} to reach {sorted(expected)}",
     )
-
-
-def test_a_small_purchase_inside_the_credit_needs_nobody(
-    shopper, buyer, approver, fast_settle_timeout, fast_providers
-):
-    """One bag of food on account: the company's credit covers it."""
-
-    quoted = submit(buyer, d.cart_with_one_line(shopper, quantity=1)).unwrap()["submit_quote"]
-
-    assert quoted["total_minor"] <= AUTOMATIC_CEILING_MINOR, (
-        f"this test needs a quote inside the automatic ceiling: {quoted}"
-    )
-    settled = settles_at(approver, quoted["approval_id"], {"approved"}, fast_settle_timeout)
-    assert settled["status"] == "approved", (
-        "a purchase inside the credit is approved without a person"
-    )
-
-
-def test_a_large_purchase_waits_for_an_approver(
-    shopper, buyer, approver, fast_settle_timeout, fast_providers
-):
-    quoted = submit(buyer, d.cart_with_one_line(shopper, quantity=5)).unwrap()["submit_quote"]
-
-    assert quoted["total_minor"] > AUTOMATIC_CEILING_MINOR
-    waiting = settles_at(
-        approver, quoted["approval_id"], {"awaiting_approver"}, fast_settle_timeout
-    )
-    assert waiting["status"] == "awaiting_approver"
 
 
 def test_an_approver_who_says_nothing_hands_it_to_finance(

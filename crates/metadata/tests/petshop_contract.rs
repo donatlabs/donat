@@ -21,12 +21,19 @@ fn mapping_key_set(value: &Value) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Every metadata file below `dir`. A `*_test.yaml` beside a metadata file is
+/// that file's test, not metadata: the loader never reads one, and neither
+/// does this walk.
 fn yaml_files_below(dir: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("Petshop metadata directory must be readable") {
         let path = entry.expect("directory entry must be readable").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if path.is_dir() {
             yaml_files_below(&path, files);
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("yaml") {
+        } else if name.ends_with(".yaml") && !name.ends_with("_test.yaml") {
             files.push(path);
         }
     }

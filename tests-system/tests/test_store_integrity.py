@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-from petshop_qa import domain as d
-
 pytestmark = pytest.mark.providers
 
 #: Enough rows to be meaningful without pulling the whole store into memory.
@@ -125,43 +123,3 @@ def test_no_refund_exceeds_the_payment_it_came_from(support):
         assert refund["amount_minor"] > 0, f"refund {refund['id']} returns nothing"
 
 
-def test_every_order_belongs_to_a_customer_who_can_see_it(support, shopper):
-    """Support's view and the shopper's view agree on the shopper's orders."""
-
-    mine = {order["id"] for order in d.orders_of(shopper)}
-    theirs = {
-        order["id"]
-        for order in support.query(
-            """
-            query Orders($customer: String!, $limit: Int!) {
-              orders(
-                where: {customer_id: {_eq: $customer}},
-                order_by: {created_at: desc}, limit: $limit
-              ) { id }
-            }
-            """,
-            {"customer": d.CUSTOMER_ONE, "limit": SAMPLE},
-        )["orders"]
-    }
-
-    assert theirs <= mine, (
-        f"support sees orders for {d.CUSTOMER_ONE} that the shopper cannot: "
-        f"{sorted(theirs - mine)[:5]}"
-    )
-
-
-def test_an_authorized_order_has_money_behind_it(support, shopper, well_stocked, settle_timeout):
-    """Freshly authorized orders always carry a payment in a live state."""
-
-    order = d.checkout_to_order(shopper, d.cart_with_one_line(shopper), timeout=settle_timeout)
-    d.await_order_status(shopper, order["id"], {"authorized"}, timeout=settle_timeout)
-
-    behind = d.payments_of(support, order["id"])
-
-    assert behind, f"authorized order {order['id']} has no payment at all"
-    assert any(payment["status"] in {"authorized", "captured"} for payment in behind), (
-        f"authorized order {order['id']} has no live payment: {behind}"
-    )
-    assert sum(payment["amount_minor"] for payment in behind) >= order["total_minor"], (
-        "the money behind an order covers what it charged"
-    )
