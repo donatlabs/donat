@@ -129,3 +129,52 @@ def test_every_role_can_read_something(store):
         data = actor.graphql('query { __type(name: "query_root") { fields { name } } }').data or {}
         fields = ((data.get("__type") or {}).get("fields")) or []
         assert fields, f"{role} has no query surface at all"
+
+
+# -- the shop advertises its search operators (from test_search.py) ------------
+
+
+def test_the_shop_advertises_that_it_can_be_searched(anonymous):
+    """A search nobody can discover is a search nobody uses.
+
+    Generated clients, IDEs and agents learn what a store can do by reading its
+    schema. If `_ilike` works but is not published, every one of them concludes
+    the catalogue cannot be searched — and a hand-written query is the only way
+    in, which is exactly the knowledge a declarative API is supposed to remove.
+    """
+
+    published = anonymous.query(
+        """
+        query {
+          text: __type(name: "String_comparison_exp") { inputFields { name } }
+          number: __type(name: "Int_comparison_exp") { inputFields { name } }
+        }
+        """
+    )
+    text = {field["name"] for field in published["text"]["inputFields"]}
+    number = {field["name"] for field in published["number"]["inputFields"]}
+
+    assert {"_like", "_ilike", "_nlike", "_nilike"} <= text, (
+        f"the store answers _ilike but does not offer it: {sorted(text)}"
+    )
+    assert not {"_like", "_ilike"} & number, (
+        f"a pattern on a number is not a filter the store can honour: {sorted(number)}"
+    )
+
+
+# -- mcp lists only what a role may touch (from test_surface_parity.py) --------
+
+
+# -- the walls are the same height on every door ----------------------------
+
+
+def test_mcp_lists_only_the_tables_a_role_may_touch(anonymous, staff):
+    public = anonymous.mcp_tool("list_tables", {})
+    inside = staff.mcp_tool("list_tables", {})
+
+    public_tables = {row["name"] for row in public.value("result/structuredContent/tables", [])}
+    staff_tables = {row["name"] for row in inside.value("result/structuredContent/tables", [])}
+
+    assert public_tables, f"the public sees the catalogue: {public.text[:200]}"
+    assert "orders" not in public_tables
+    assert staff_tables > public_tables, "staff see at least what the public sees, and more"

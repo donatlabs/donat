@@ -13,141 +13,11 @@ import pytest
 
 from petshop_qa import domain as d
 from petshop_qa import providers as P
-from petshop_qa import until
 
 pytestmark = pytest.mark.providers
 
 
-# -- MCP writes --------------------------------------------------------------
-
-
-def test_an_agent_writes_through_mcp_under_its_own_role(shopper, well_stocked):
-    """The generic `insert` tool is the same permission as the GraphQL one."""
-
-    cart_id = d.open_cart(shopper)
-
-    written = shopper.mcp_tool(
-        "insert",
-        {
-            "table": "cart_line",
-            "objects": [
-                {"cart_id": cart_id, "variant_id": d.IN_STOCK_VARIANT, "quantity": 3}
-            ],
-            "returning": ["id", "quantity"],
-        },
-    )
-
-    assert written.status == 200, written.text
-    assert written.value("result/isError") is not True, written.text
-    lines = d.read_cart(shopper, cart_id)["lines"]
-    assert [(line["variant_id"], line["quantity"]) for line in lines] == [
-        (d.IN_STOCK_VARIANT, 3)
-    ], "what the agent wrote is what the shopper sees"
-
-
-def test_mcp_obeys_the_same_validator_as_graphql(shopper, well_stocked):
-    """The per-role ceiling on a cart line is not a GraphQL-only rule."""
-
-    cart_id = d.open_cart(shopper)
-
-    refused = shopper.mcp_tool(
-        "insert",
-        {
-            "table": "cart_line",
-            "objects": [
-                {"cart_id": cart_id, "variant_id": d.IN_STOCK_VARIANT, "quantity": 21}
-            ],
-            "returning": ["id"],
-        },
-    )
-
-    assert refused.value("result/isError") is True or refused.value("error") is not None, (
-        f"MCP let a shopper past the twenty-unit cap: {refused.text[:300]}"
-    )
-    assert d.read_cart(shopper, cart_id)["lines"] == []
-
-
-def test_an_agent_cannot_write_a_table_its_role_may_not_touch(shopper):
-    refused = shopper.mcp_tool(
-        "insert",
-        {
-            "table": "product",
-            "objects": [{"category_id": 1, "slug": "agent-made", "title": "No", "status": "published"}],
-            "returning": ["id"],
-        },
-    )
-
-    assert refused.value("result/isError") is True or refused.value("error") is not None, (
-        f"an agent wrote the catalogue: {refused.text[:300]}"
-    )
-
-
-# -- the Relay door ----------------------------------------------------------
-
-
-def test_relay_serves_the_same_catalogue_as_graphql(anonymous):
-    over_graphql = {product["slug"] for product in d.catalogue(anonymous)}
-
-    over_relay = anonymous._post(
-        "/v1/relay",
-        {"query": "query { product(order_by: {id: asc}) { id slug } }"},
-        None,
-        summary="relay catalogue",
-    )
-
-    assert over_relay.status == 200, over_relay.text
-    assert {product["slug"] for product in over_relay.unwrap()["product"]} == over_graphql
-
-
-def test_relay_applies_the_same_permissions(anonymous):
-    refused = anonymous._post(
-        "/v1/relay", {"query": "query { orders { id } }"}, None, summary="relay orders"
-    )
-
-    assert refused.error_code() == "validation-failed", (
-        "the second door is not a way around the first one's walls"
-    )
-
-
 # -- inputs a client should not get away with --------------------------------
-
-
-@pytest.mark.parametrize(
-    "quantity, why",
-    [
-        (0, "a line of nothing is not an order"),
-        (-3, "a negative quantity would credit the shopper"),
-    ],
-)
-def test_a_cart_line_needs_a_real_quantity(shopper, quantity, why):
-    cart_id = d.open_cart(shopper)
-
-    refused = d.add_line(shopper, cart_id, d.IN_STOCK_VARIANT, quantity)
-
-    assert refused.errors, why
-    assert d.read_cart(shopper, cart_id)["lines"] == []
-
-
-def test_a_variant_that_does_not_exist_is_refused(shopper):
-    cart_id = d.open_cart(shopper)
-
-    refused = d.add_line(shopper, cart_id, 999_999, 1)
-
-    assert refused.errors, "a cart line points at something the store sells"
-
-
-def test_a_malformed_query_is_a_client_error_not_a_crash(shopper):
-    broken = shopper.graphql("query { product(order_by: ) { id } }")
-
-    assert broken.status == 200, "a bad query is answered, not dropped"
-    assert broken.errors, "and it is refused"
-
-
-def test_an_unknown_field_names_itself(shopper):
-    unknown = shopper.graphql("query { product { unicorn_count } }")
-
-    assert unknown.error_code() == "validation-failed"
-    assert "unicorn_count" in (unknown.error_message() or "")
 
 
 def test_a_very_long_string_is_handled_rather_than_fatal(shopper):
@@ -223,50 +93,6 @@ def test_two_shoppers_cannot_both_take_the_last_unit(
     )
 
 
-# -- asking twice ------------------------------------------------------------
-
-
-def test_a_replayed_booking_request_books_once(shopper, providers, settle_timeout):
-    import uuid
-
-    request_id = d.new_request_id()
-    slot = f"2030-07-08T11:{uuid.uuid4().hex[:2]}"
-    arguments = {
-        "resource": str(uuid.uuid4()),
-        "slot": slot,
-        "starts": "2030-07-08T11:00:00Z",
-        "expires": "2030-07-08T10:00:00Z",
-        "request": request_id,
-    }
-    mutation = """
-        mutation Hold(
-          $resource: uuid!, $slot: String!, $starts: timestamptz!,
-          $expires: timestamptz!, $request: uuid!
-        ) {
-          start_grooming_booking(
-            service_resource_id: $resource, slot_key: $slot, starts_at: $starts,
-            hold_expires_at: $expires, request_id: $request
-          ) { slot_key }
-        }
-    """
-
-    first = shopper.graphql(mutation, arguments)
-    second = shopper.graphql(mutation, arguments)
-
-    assert first.unwrap() == second.unwrap(), "a replay answers what the first call did"
-    # The booking itself is the Process's work, so it is waited for.
-    bookings = until(
-        lambda: shopper.query(
-            "query B($slot: String!) { grooming_booking(where: {slot_key: {_eq: $slot}}) { id } }",
-            {"slot": slot},
-        )["grooming_booking"],
-        lambda rows: bool(rows),
-        timeout=settle_timeout,
-        description="the held slot to exist",
-    )
-    assert len(bookings) == 1, f"one request id, one booking: {bookings}"
-
-
 # -- one shopper's trouble is not everybody's --------------------------------
 
 
@@ -308,4 +134,38 @@ def test_an_order_waiting_on_a_provider_does_not_hold_up_another_shopper(
     ] not in {"paid", "cancelled"}, "the parked order was never actually in flight"
     assert d.payments_of(support, served["id"])[-1]["status"] == "authorized", (
         "the served order's money moved while another order was waiting"
+    )
+
+
+# -- a race for the last checkout (from test_checkout_payment.py) --------------
+
+
+def test_two_racing_checkouts_of_one_cart_produce_one_order(
+    shopper, providers, well_stocked, settle_timeout
+):
+    """Two tabs, two distinct requests, one basket."""
+
+    cart_id = d.cart_with_one_line(shopper)
+    before = {order["id"] for order in d.orders_of(shopper)}
+    answers: list = []
+
+    def press_pay():
+        answers.append(d.start_checkout(shopper, cart_id))
+
+    racers = [threading.Thread(target=press_pay) for _ in range(2)]
+    for racer in racers:
+        racer.start()
+    for racer in racers:
+        racer.join()
+
+    accepted = [answer for answer in answers if not answer.errors]
+    assert accepted, f"at least one checkout is accepted: {answers}"
+
+    order = d.await_new_order(shopper, known=before, timeout=settle_timeout)
+    d.await_order_status(shopper, order["id"], {"authorized"}, timeout=settle_timeout)
+
+    fresh = [o for o in d.orders_of(shopper) if o["id"] not in before]
+    assert len(fresh) == 1, f"one cart, one order — got {fresh}"
+    assert len(providers.calls_about(P.AUTHORIZE, order_id=order["id"])) == 1, (
+        "and the card is charged once"
     )

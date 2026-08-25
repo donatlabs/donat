@@ -48,9 +48,10 @@ fixtures as ground truth, `clippy -D warnings`, `cargo fmt --check`, insta,
   50–1200 ms in `event_triggers`, `file_attachments`, `petshop_process`),
   which is the usual source of a flake — and the usual target of an agent
   "fixing" one.
-- Plugin skills were edited without measurement. The repository has an
-  instrument for exactly this question — DonatBench's paired `compare` — and
-  the skills had been touched in two commits of `main`'s history.
+- Plugin skills were edited without measurement. An instrument for exactly this
+  question — DonatBench's paired `compare` — is proposed separately (PR #33);
+  the skills had been touched in two commits of `main`'s history with nothing
+  measuring whether the edits helped.
 
 The loop-engineering toolkit was also tried rather than only read:
 `loop init --with-foundry` scaffolded seven root files, three generic skills,
@@ -104,9 +105,27 @@ This is the one part of the loop-engineering failure catalogue taken over
 nearly verbatim, because it describes what an agent does to a timing-dependent
 suite, and ours has three.
 
-**A skill edit names its paired `make evals-compare` result or says why it
-needs none.** The measurement exists (`evals/`, DonatBench); the gate's
-`skills` kind makes its absence visible in the one place it is reviewed.
+**A skill edit names a measurement that it helps or says why it needs none.**
+The gate's `skills` kind makes an unmeasured skill edit say so in the one place
+it is reviewed. A corpus to run the measurement against — DonatBench, proposed
+separately — is not a dependency of this decision: until one is on `main`, the
+honest answer is "no corpus yet", and the gate accepts it.
+
+**Unattended work is a worktree and a pull request, nothing more.** A nightly
+loop on the maintainer's own machine (`make setup-loop-infrastructure`;
+`scripts/loop.sh` runs a job named by a skill under `.claude/skills/<job>/`)
+cuts a fresh worktree from `origin/main`, runs one job headless under the
+maintainer's own subscription, and opens a pull request — with a hard time and
+turn limit, one job at a time behind a lock, the worktree removed whatever
+happens, and one line per run in a journal outside the repository. A systemd
+*user* timer rather than cron, because `Persistent=true` runs a night the
+machine was off the next time it is on, which a desktop needs. The first job,
+`fix-advisories`, resolves what `cargo audit` reports by upgrading a dependency
+and never by excusing it — an excuse is a human's reachability argument, and
+`make gate` refuses a pull request that adds one unasked. The loop's only way
+to touch `main` is the same pull request a person's is: read, then merged, by a
+person. This is the repository's one L2 surface, and it is L2 precisely because
+the gate and the human review stand between the loop and `main`.
 
 **Nothing from the toolkit is adopted.** No `STATE.md`, `LOOP.md`,
 `loop-constraints.md`, budget or run log — `PLAN.md`, `specs/` and this

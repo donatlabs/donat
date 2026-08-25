@@ -211,3 +211,136 @@ async fn real_petshop_catalog_compiles_one_closed_candidate() {
     drop(connectors);
     drop_database(&admin_url, &database_name).await;
 }
+
+/// Every relation an active Petshop command reads or writes. The schema side
+/// of this list — that each exists in the catalog — is asserted beside the
+/// tables, in `metadata/databases/default/tables/tables_test.yaml`.
+const COMMAND_RELATIONS: &[&str] = &[
+    "cart",
+    "cart_checkout_context",
+    "cart_price_candidate",
+    "cart_pricing",
+    "checkout_quote",
+    "checkout_quote_line",
+    "credit_usage",
+    "customer_prescription_order_line",
+    "exchange",
+    "exchange_item",
+    "grooming_booking",
+    "grooming_booking_event",
+    "inventory_allocation",
+    "inventory_allocation_line",
+    "inventory_backorder",
+    "inventory_level",
+    "inventory_reservation",
+    "inventory_stock",
+    "notification_delivery",
+    "order_adjustment",
+    "order_current_authorization",
+    "order_inventory_allocation_candidate",
+    "order_line",
+    "order_return_context",
+    "order_vendor_split_candidate",
+    "orders",
+    "organization",
+    "organization_membership",
+    "payment",
+    "payment_authorization",
+    "payment_capture",
+    "payment_capture_claim",
+    "payment_chargeback",
+    "payment_event",
+    "payment_fraud_decision",
+    "payment_fraud_review",
+    "payment_reconciliation",
+    "payment_reconciliation_resolution",
+    "payment_void",
+    "prescription_event",
+    "prescription_request",
+    "prescription_review",
+    "purchase_approval",
+    "quote",
+    "quote_line",
+    "refund",
+    "return_event",
+    "return_inspection",
+    "return_item",
+    "return_refund_context",
+    "return_request",
+    "shipment",
+    "shipment_item",
+    "shipment_result",
+    "subscription",
+    "subscription_dunning_attempt",
+    "subscription_renewal",
+    "vendor_dispute",
+    "vendor_membership",
+    "vendor_order",
+    "vendor_order_acceptance",
+    "vendor_payout",
+    "vendor_payout_candidate",
+    "vendor_payout_event",
+    "vendor_payout_reconciliation",
+];
+
+#[test]
+fn command_relations_are_tracked_in_petshop_metadata() {
+    let metadata = load_metadata_dir(&petshop_root().join("metadata")).unwrap();
+    let default = metadata
+        .sources
+        .iter()
+        .find(|source| source.name == "default")
+        .expect("Petshop default source");
+    let tracked = default
+        .tables
+        .iter()
+        .map(|entry| entry.table.name().to_string())
+        .collect::<BTreeSet<_>>();
+    let expected = COMMAND_RELATIONS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<BTreeSet<_>>();
+    let missing = expected.difference(&tracked).cloned().collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "active Petshop command relations must be tracked; missing: {missing:?}"
+    );
+}
+
+/// The tracked domain stands on its own: with every runtime section —
+/// commands, rules, connectors, processes — stripped, the tables, their
+/// permissions and relationships still compile against the real catalog.
+#[tokio::test]
+async fn tracked_petshop_domain_compiles_without_runtime_sections() {
+    let (admin_url, database_name, database_url) = create_database("petshop_domain").await;
+    run_migrate(&database_url, &petshop_root().join("migrations"))
+        .await
+        .expect("all Petshop schema migrations apply");
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
+        .await
+        .expect("isolated Petshop database is available");
+    let connection = tokio::spawn(connection);
+    let catalog = donat_catalog::introspect(&client)
+        .await
+        .expect("real Petshop catalog introspects");
+    connection.abort();
+
+    let mut metadata = load_metadata_dir(&petshop_root().join("metadata"))
+        .expect("complete Petshop metadata loads");
+    metadata.commands.clear();
+    metadata.rules = Default::default();
+    metadata.connectors.clear();
+    metadata.processes.clear();
+    let connectors = ConnectorRegistry::build(&metadata).expect("an empty connector set compiles");
+    let candidate = compile_pure_engine_candidate(
+        &metadata,
+        &HashMap::from([("default".to_owned(), catalog)]),
+        &connectors,
+        true,
+    )
+    .expect("the tracked Petshop domain compiles without its runtime sections");
+    assert_eq!(candidate.process_catalog.len(), 0);
+
+    drop_database(&admin_url, &database_name).await;
+}

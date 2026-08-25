@@ -1,0 +1,27 @@
+# The engine-served half of file attachments is one route: the signed
+# completion call. Whatever is put in its path is read as an upload id or
+# refused — a crafted path is never a way into the engine, and the shop keeps
+# serving afterwards.
+tests:
+  - name: a completion path is not a way into the engine
+    steps:
+      - as: { role: anonymous }
+      # Only payloads that survive URL normalization reach the engine: an
+      # encoded dot-segment decodes to a non-uuid, and a well-formed uuid that
+      # nobody issued arrives without the signature the route demands. (A raw
+      # `../` traversal never leaves the client — the URL library resolves it
+      # before the request is sent, so it is not testable from here.)
+      - for:
+          - { payload: "%2e%2e%2f%2e%2e", status: 400, refusal: "Invalid URL: Cannot parse `id` with value `../..`: UUID parsing failed: invalid character: found `.` at 0" }
+          - { payload: "00000000-0000-0000-0000-000000000000", status: 400, refusal: "Failed to deserialize query string: missing field `exp`" }
+        do:
+          - url: /v1/files/complete/${item.payload}
+            method: POST
+            status: ${item.status}
+            response: ${item.refusal}
+          # The store is still itself afterwards.
+          - graphql: 'query { product(where: {slug: {_eq: "cat-scratcher"}}) { slug } }'
+            expect:
+              data:
+                product:
+                  - { slug: cat-scratcher }

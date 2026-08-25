@@ -1,0 +1,107 @@
+# The schema contract the tracked tables rest on: every relation a command
+# reads or writes exists before the engine compiles metadata, and the views
+# commands read keep their non-null columns as NOT NULL domains, so the
+# command's declared output types are honest.
+tests:
+  - name: every command relation exists in the catalog
+    steps:
+      - sql: |
+          SELECT array_agg(name ORDER BY name) AS missing
+          FROM unnest(ARRAY[
+            'cart',
+            'cart_checkout_context',
+            'cart_price_candidate',
+            'cart_pricing',
+            'checkout_quote',
+            'checkout_quote_line',
+            'credit_usage',
+            'customer_prescription_order_line',
+            'exchange',
+            'exchange_item',
+            'grooming_booking',
+            'grooming_booking_event',
+            'inventory_allocation',
+            'inventory_allocation_line',
+            'inventory_backorder',
+            'inventory_level',
+            'inventory_reservation',
+            'inventory_stock',
+            'notification_delivery',
+            'order_adjustment',
+            'order_current_authorization',
+            'order_inventory_allocation_candidate',
+            'order_line',
+            'order_return_context',
+            'order_vendor_split_candidate',
+            'orders',
+            'organization',
+            'organization_membership',
+            'payment',
+            'payment_authorization',
+            'payment_capture',
+            'payment_capture_claim',
+            'payment_chargeback',
+            'payment_event',
+            'payment_fraud_decision',
+            'payment_fraud_review',
+            'payment_reconciliation',
+            'payment_reconciliation_resolution',
+            'payment_void',
+            'prescription_event',
+            'prescription_request',
+            'prescription_review',
+            'purchase_approval',
+            'quote',
+            'quote_line',
+            'refund',
+            'return_event',
+            'return_inspection',
+            'return_item',
+            'return_refund_context',
+            'return_request',
+            'shipment',
+            'shipment_item',
+            'shipment_result',
+            'subscription',
+            'subscription_dunning_attempt',
+            'subscription_renewal',
+            'vendor_dispute',
+            'vendor_membership',
+            'vendor_order',
+            'vendor_order_acceptance',
+            'vendor_payout',
+            'vendor_payout_candidate',
+            'vendor_payout_event',
+            'vendor_payout_reconciliation'
+          ]) AS name
+          WHERE NOT EXISTS (
+            SELECT 1 FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+              AND c.relkind IN ('r', 'p', 'v', 'm')
+              AND c.relname = name
+          )
+        expect:
+          - missing: null
+
+  - name: command-facing views keep their columns as NOT NULL domains
+    steps:
+      - sql: |
+          SELECT count(*) FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relname IN ('cart_checkout_context', 'cart_price_candidate', 'cart_pricing', 'order_current_authorization', 'order_inventory_allocation_candidate', 'inventory_allocation_line', 'order_return_context', 'return_refund_context', 'order_vendor_split_candidate', 'vendor_payout_candidate', 'customer_prescription_order_line')
+        expect:
+          - count: 11
+      - sql: |
+          SELECT c.relname, a.attname, t.typname
+          FROM pg_attribute a
+          JOIN pg_class c ON c.oid = a.attrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_type t ON t.oid = a.atttypid
+          WHERE n.nspname = 'public'
+            AND c.relname IN ('cart_checkout_context', 'cart_price_candidate', 'cart_pricing', 'order_current_authorization', 'order_inventory_allocation_candidate', 'inventory_allocation_line', 'order_return_context', 'return_refund_context', 'order_vendor_split_candidate', 'vendor_payout_candidate', 'customer_prescription_order_line')
+            AND a.attnum > 0
+            AND NOT a.attisdropped
+            AND NOT (t.typtype = 'd' AND t.typnotnull AND t.typname LIKE 'petshop\_required\_%')
+          ORDER BY c.relname, a.attnum
+        expect: []

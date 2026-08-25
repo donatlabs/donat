@@ -20,6 +20,12 @@ that.
   in the pull request for the five short cuts to a green build; `cargo audit`
   and the excuse list are checked nightly; a red build is classified before it
   is touched; nothing from the loop-engineering toolkit is adopted, and why
+- [[decisions/002-an-applications-tests-are-declared-beside-the-thing-they-test]]
+  — a `*_test.yaml` sits beside the metadata file it exercises and `donat
+  test` runs it on a fresh stand per case; the runner lives in
+  `crates/testkit`, shared with the conformance harness; `expect` is a subset
+  match where a fixture's `response` stays exact; a table that grants a role
+  something has a test beside it (`scripts/check_app_tests.py`).
 
 ## Related
 

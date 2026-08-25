@@ -1,0 +1,142 @@
+# A marketplace sells other people's goods.
+#
+# Two rules pull in opposite directions and both have to hold at once. A
+# **buyer** sees the whole catalogue, because a catalogue split by seller is not
+# a marketplace. A **seller** sees only its own orders, payouts and disputes,
+# because the others are somebody else's business.
+#
+# The second rule was absent until it was looked for: `vendor` read
+# `vendor_order` with `filter: {}` and could update it too, so every seller saw
+# and could move every other seller's lines. Isolating a tenant does not answer
+# this — inside one store, sellers are separate from each other, and that is a
+# domain rule rather than a tenancy one.
+#
+# Beside `tables.yaml` because that is where these tables are declared. Its own
+# file rather than a case in `tables_test.yaml`: that one is about the schema
+# contract, and this is about who may see what.
+vars:
+  vendor_a: "11111111-1111-1111-1111-111111111111"
+  vendor_b: "22222222-2222-2222-2222-222222222222"
+
+tests:
+  - name: a seller sees only its own orders while a buyer sees every seller's catalogue
+    steps:
+      - sql: |
+          INSERT INTO customer (customer_id, name, email) VALUES
+            ('seller-a', 'Seller A', 'a@example.com'),
+            ('seller-b', 'Seller B', 'b@example.com');
+          INSERT INTO vendor_membership (vendor_id, user_id) VALUES
+            ('${vendor_a}', 'seller-a'),
+            ('${vendor_b}', 'seller-b');
+
+          INSERT INTO orders (id, customer_id) VALUES
+            ('00000000-0000-0000-0000-0000000000a1', 'customer-1');
+          INSERT INTO order_line (id, order_id, variant_id, quantity,
+                                  unit_price_minor, currency)
+          SELECT '00000000-0000-0000-0000-0000000000b1',
+                 '00000000-0000-0000-0000-0000000000a1', v.id, 1, 500, 'USD'
+            FROM product_variant v ORDER BY v.id LIMIT 1;
+
+          -- One order, two sellers' lines on it. That is the whole point: the
+          -- rows sit side by side and each seller may see exactly one.
+          INSERT INTO vendor_order (id, order_id, order_line_id, vendor_id,
+                                    offer_id, line_sequence, product_category,
+                                    gross_minor, currency, commission_tier,
+                                    commission_bps, status) VALUES
+            ('00000000-0000-0000-0000-0000000000c1',
+             '00000000-0000-0000-0000-0000000000a1',
+             '00000000-0000-0000-0000-0000000000b1', '${vendor_a}',
+             '00000000-0000-0000-0000-0000000000d1',
+             1, 'food', 500, 'USD', 'standard', 1000, 'pending_acceptance'),
+            ('00000000-0000-0000-0000-0000000000c2',
+             '00000000-0000-0000-0000-0000000000a1',
+             '00000000-0000-0000-0000-0000000000b1', '${vendor_b}',
+             '00000000-0000-0000-0000-0000000000d2',
+             2, 'food', 700, 'USD', 'standard', 1000, 'pending_acceptance');
+
+          INSERT INTO vendor_payout (id, payout_cycle_id, vendor_id, payout_key,
+                                     vendor_order_count, gross_minor,
+                                     commission_minor, net_minor, currency, status)
+          VALUES
+            ('00000000-0000-0000-0000-0000000000e1',
+             '00000000-0000-0000-0000-0000000000f1', '${vendor_a}', 'cycle:a:USD',
+             1, 500, 50, 450, 'USD', 'pending'),
+            ('00000000-0000-0000-0000-0000000000e2',
+             '00000000-0000-0000-0000-0000000000f1', '${vendor_b}', 'cycle:b:USD',
+             1, 700, 70, 630, 'USD', 'pending');
+
+      # Each seller, the same query, one row each — and it is their own.
+      - for:
+          - { user: seller-a, gross: 500, net: 450 }
+          - { user: seller-b, gross: 700, net: 630 }
+        do:
+          - as: { role: vendor, user: "${item.user}" }
+          - graphql: |
+              query { vendor_order { gross_minor } }
+            expect:
+              data:
+                vendor_order:
+                  - gross_minor: "${item.gross}"
+          - graphql: |
+              query { vendor_payout { net_minor } }
+            expect:
+              data:
+                vendor_payout:
+                  - net_minor: "${item.net}"
+
+      # The catalogue is not split. A shopper sees what every seller offers,
+      # which is what makes this a marketplace rather than a row of shops.
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          query { product(order_by: { slug: asc }) { slug } }
+        expect:
+          data:
+            product:
+              - slug: cat-scratcher
+              - slug: dog-kibble
+
+  - name: a seller cannot move another seller's line
+    steps:
+      - sql: |
+          INSERT INTO customer (customer_id, name, email) VALUES
+            ('seller-a', 'Seller A', 'a@example.com'),
+            ('seller-b', 'Seller B', 'b@example.com');
+          INSERT INTO vendor_membership (vendor_id, user_id) VALUES
+            ('${vendor_a}', 'seller-a'),
+            ('${vendor_b}', 'seller-b');
+          INSERT INTO orders (id, customer_id) VALUES
+            ('00000000-0000-0000-0000-0000000000a1', 'customer-1');
+          INSERT INTO order_line (id, order_id, variant_id, quantity,
+                                  unit_price_minor, currency)
+          SELECT '00000000-0000-0000-0000-0000000000b1',
+                 '00000000-0000-0000-0000-0000000000a1', v.id, 1, 500, 'USD'
+            FROM product_variant v ORDER BY v.id LIMIT 1;
+          INSERT INTO vendor_order (id, order_id, order_line_id, vendor_id,
+                                    offer_id, line_sequence, product_category,
+                                    gross_minor, currency, commission_tier,
+                                    commission_bps, status) VALUES
+            ('00000000-0000-0000-0000-0000000000c2',
+             '00000000-0000-0000-0000-0000000000a1',
+             '00000000-0000-0000-0000-0000000000b1', '${vendor_b}',
+             '00000000-0000-0000-0000-0000000000d2',
+             2, 'food', 700, 'USD', 'standard', 1000, 'pending_acceptance');
+
+      # Seller A names seller B's line by its id. The update is bounded by
+      # membership, so it reaches nothing — and the row is unchanged after.
+      - as: { role: vendor, user: seller-a }
+      - graphql: |
+          mutation {
+            update_vendor_order(
+              where: { id: { _eq: "00000000-0000-0000-0000-0000000000c2" } }
+              _set: { status: "accepted" }
+            ) { affected_rows }
+          }
+        expect:
+          data:
+            update_vendor_order:
+              affected_rows: 0
+      - sql: |
+          SELECT status FROM vendor_order
+           WHERE id = '00000000-0000-0000-0000-0000000000c2'
+        expect:
+          - status: pending_acceptance

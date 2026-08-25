@@ -86,7 +86,7 @@ a credential.
 
 What we paid: the conformance harness could no longer rely on header trust, so
 every suite now runs behind an authentication hook the harness itself serves
-(`crates/conformance/src/auth_hook.rs`). That is a real cost and a real gain —
+(`crates/testkit/src/auth_hook.rs`). That is a real cost and a real gain —
 the hook path had **zero** conformance coverage while the header path existed,
 and now nearly the whole crate exercises it.
 

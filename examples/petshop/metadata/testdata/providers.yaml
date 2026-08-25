@@ -1,0 +1,37 @@
+# Provider answers the flow tests share, keyed by request path. A test
+# includes this as a `providers` step and adds the paths its module calls.
+# Nothing under testdata/ is metadata: the loader follows only known file
+# names and `!include`s from them.
+
+# The tax provider echoes the quote it was asked about: the checkout process
+# asserts the answer belongs to the quote it sent.
+/v1/tax-quotes:
+  tax_quote_id: tax_quote_petshop_1
+  checkout_quote_id: $request:/checkout_quote_id
+  tax_minor: 160
+  tax_code: US-STANDARD
+  currency: USD
+/v1/payment-authorizations:
+  provider_event_id: evt_petshop_authorize_1
+  authorization_id: auth_petshop_1
+  provider_reference: ref_petshop_1
+  status: authorized
+  normalized_payload: { gateway: mock, captured: false }
+# The carrier and the payment provider answering a shipped allocation.
+/v1/shipments/*/labels:
+  shipment_id: $request:/shipment_id
+  shipment_key: $request:/shipment_key
+  carrier_shipment_reference: carrier_ref_petshop_1
+  tracking_number: TRACK-PETSHOP-1
+  label_url: https://carrier.example/labels/petshop-1.pdf
+  event_id: evt_petshop_label_1
+  outcome: label_created
+/v1/payment-authorizations/*/captures:
+  payment_id: $request:/payment_id
+  shipment_id: $request:/shipment_id
+  amount_minor: $request:/amount_minor
+  provider_event_id: evt_petshop_capture_1
+  capture_id: cap_petshop_1
+  provider_reference: ref_petshop_1
+  status: captured
+  normalized_payload: { gateway: mock, captured: true }

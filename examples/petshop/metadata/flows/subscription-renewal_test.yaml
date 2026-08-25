@@ -1,0 +1,104 @@
+# A subscription renews itself on the worker's schedule: one occurrence is one
+# charge, a replayed occurrence is no charge at all, only the worker may start
+# a renewal, and a subscriber reads no subscription but their own.
+tests:
+  - name: a scheduled renewal charges the subscriber once
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO subscription
+              (customer_id, variant_id, quantity, unit_price_minor, line_total_minor, currency, status)
+          VALUES ('customer-1', 2, 1, 2499, 2499, 'USD', 'active')
+          RETURNING id
+        capture: { subscription_id: id }
+      - as: { role: subscription_worker }
+      - graphql: |
+          mutation {
+            start_subscription_renewal(
+              subscription_id: "${subscription_id}", cron_occurrence: "2030-02-01T00:00:00Z"
+            ) { subscription_id status }
+          }
+      - await:
+          terminal: subscription_renewal
+          expect: { status: renewed }
+      # One renewal, one authorization — and it bills the subscription's own
+      # line total, not a cart.
+      - calls:
+          path: /v1/payment-authorizations
+          count: 1
+          body: { amount_minor: 2499 }
+      - sql: SELECT status FROM subscription_renewal WHERE subscription_id = '${subscription_id}'
+        expect: [{ status: confirmed }]
+      # The audit records every attempt, the scheduled cycle included. One
+      # row at attempt 0 means the ladder was never walked.
+      - sql: SELECT attempt, outcome FROM subscription_dunning_attempt ORDER BY attempt
+        expect: [{ attempt: 0, outcome: authorized }]
+
+  - name: replaying the same occurrence does not charge twice
+    steps:
+      - providers: !include ../testdata/providers.yaml
+      - sql: |
+          INSERT INTO subscription
+              (customer_id, variant_id, quantity, unit_price_minor, line_total_minor, currency, status)
+          VALUES ('customer-1', 2, 1, 2499, 2499, 'USD', 'active')
+          RETURNING id
+        capture: { subscription_id: id }
+      - as: { role: subscription_worker }
+      - graphql: |
+          mutation {
+            start_subscription_renewal(
+              subscription_id: "${subscription_id}", cron_occurrence: "2030-03-01T00:00:00Z"
+            ) { subscription_id status }
+          }
+      - await:
+          terminal: subscription_renewal
+          expect: { status: renewed }
+      # The same cron occurrence fires again: the command replays its recorded
+      # result instead of starting a second process.
+      - graphql: |
+          mutation {
+            start_subscription_renewal(
+              subscription_id: "${subscription_id}", cron_occurrence: "2030-03-01T00:00:00Z"
+            ) { subscription_id status }
+          }
+        expect:
+          data:
+            start_subscription_renewal: { subscription_id: "${subscription_id}" }
+      # A cron that fires twice for one occurrence must not bill twice.
+      - calls: { path: /v1/payment-authorizations, count: 1 }
+
+  - name: a shopper cannot trigger their own renewal
+    steps:
+      # Renewal is the scheduler's mutation alone: the customer role's schema
+      # has no start_subscription_renewal field, so no subscription is needed
+      # for the refusal.
+      - as: { role: customer, user: customer-1 }
+      - graphql: |
+          mutation {
+            start_subscription_renewal(
+              subscription_id: "00000000-0000-0000-0000-0000000000d1",
+              cron_occurrence: "2030-02-01T00:00:00Z"
+            ) { subscription_id status }
+          }
+        expect:
+          errors:
+            - extensions:
+                path: $.selectionSet.start_subscription_renewal
+                code: validation-failed
+              message: "field 'start_subscription_renewal' not found in type: 'mutation_root'"
+
+  - name: a subscriber can read only their own subscription
+    steps:
+      - sql: |
+          INSERT INTO subscription
+              (customer_id, variant_id, quantity, unit_price_minor, line_total_minor, currency, status)
+          VALUES ('customer-1', 2, 1, 2499, 2499, 'USD', 'active'),
+                 ('customer-2', 1, 1, 1599, 1599, 'USD', 'active')
+      # Each shopper sees exactly one row, and it is their own; the other
+      # subscription is absent, not an error.
+      - as: { role: customer, user: customer-1 }
+      - graphql: "query { subscription { customer_id } }"
+        expect: { data: { subscription: [{ customer_id: customer-1 }] } }
+      - as: { role: customer, user: customer-2 }
+      - graphql: "query { subscription { customer_id } }"
+        expect: { data: { subscription: [{ customer_id: customer-2 }] } }

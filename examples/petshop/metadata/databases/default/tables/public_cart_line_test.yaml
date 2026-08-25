@@ -1,0 +1,253 @@
+# A cart line's quantity is bounded by the schema, not by a role: every
+# writer is held to it. On top of that sit the shopper's own edits, the
+# customer role's twenty-unit ceiling (on the insert, the update, and the
+# MCP surface alike), and the refusals a hostile or confused client earns —
+# the same walls on every door.
+tests:
+  - name: the schema refuses a non-positive quantity
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - sql: INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 1, -1)
+        error: check_violation
+
+  # -- changing your mind about a basket: the shopper's own edits, the
+  # per-role ceiling on a line, and another shopper's inability to reach it.
+
+  - name: a shopper changes how many they want
+    steps:
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 2);
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { update_cart_line(where: {id: {_eq: 1}}, _set: {quantity: 5}) { affected_rows } }'
+        expect: { data: { update_cart_line: { affected_rows: 1 } } }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { id quantity } } }'
+        expect:
+          data:
+            cart:
+              - lines:
+                  - { id: 1, quantity: 5 }
+
+  - name: the twenty unit cap holds on the second thought too
+    steps:
+      # A cap enforced only when a line is created would be no cap at all:
+      # add one, then raise it to a hundred.
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { update_cart_line(where: {id: {_eq: 1}}, _set: {quantity: 21}) { affected_rows } }'
+        expect:
+          errors:
+            - message: a cart line is limited to 20 units
+              extensions: { code: validation-failed }
+      # And the basket is what it was.
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { id quantity } } }'
+        expect:
+          data:
+            cart:
+              - lines:
+                  - { id: 1, quantity: 1 }
+
+  - name: a shopper takes something back out
+    steps:
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { delete_cart_line(where: {id: {_eq: 1}}) { affected_rows } }'
+        expect: { data: { delete_cart_line: { affected_rows: 1 } } }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { id } } }'
+        expect: { data: { cart: [{ lines: [] }] } }
+
+  - name: a shopper cannot edit another shopper's basket
+    steps:
+      - sql: |
+          INSERT INTO cart (customer_id) VALUES ('customer-1');
+          INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 2);
+      # Both the update and the delete reach zero rows: the line is outside
+      # the other shopper's world, and the answer is silence, not an error.
+      - as: { role: customer, user: customer-2 }
+      - graphql: 'mutation { update_cart_line(where: {id: {_eq: 1}}, _set: {quantity: 9}) { affected_rows } }'
+        expect: { data: { update_cart_line: { affected_rows: 0 } } }
+      - graphql: 'mutation { delete_cart_line(where: {id: {_eq: 1}}) { affected_rows } }'
+        expect: { data: { delete_cart_line: { affected_rows: 0 } } }
+      # And the owner's basket is untouched.
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { id quantity } } }'
+        expect:
+          data:
+            cart:
+              - lines:
+                  - { id: 1, quantity: 2 }
+
+  # -- inputs a client should not get away with.
+
+  - name: a cart line needs a real quantity
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - as: { role: customer, user: customer-1 }
+      - for:
+          # A line of nothing is not an order; a negative quantity would
+          # credit the shopper.
+          - { quantity: 0 }
+          - { quantity: -3 }
+        do:
+          - graphql: 'mutation { insert_cart_line_one(object: {cart_id: 1, variant_id: 2, quantity: ${item.quantity}}) { id } }'
+            expect:
+              errors: "@present"
+          - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { id } } }'
+            expect: { data: { cart: [{ lines: [] }] } }
+
+  - name: a variant that does not exist is refused
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'mutation { insert_cart_line_one(object: {cart_id: 1, variant_id: 999999, quantity: 1}) { id } }'
+        expect:
+          errors: "@present"
+
+  - name: a malformed query is a client error not a crash
+    steps:
+      - as: { role: customer, user: customer-1 }
+      # A bad query is answered (HTTP 200), and it is refused.
+      - graphql: 'query { product(order_by: ) { id } }'
+        expect:
+          errors: "@present"
+
+  - name: an unknown field names itself
+    steps:
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { product { unicorn_count } }'
+        expect:
+          errors:
+            - message: "field 'unicorn_count' not found in type: 'product'"
+              extensions: { code: validation-failed }
+
+  # -- the MCP surface: the generic tools are the same permission, the same
+  # validator, and the same refusal as GraphQL.
+
+  - name: an agent writes through mcp under its own role
+    steps:
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - url: /mcp
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: tools/call
+          params:
+            name: insert
+            arguments:
+              table: cart_line
+              objects:
+                - { cart_id: 1, variant_id: 2, quantity: 3 }
+              returning: [id, quantity]
+        response:
+          jsonrpc: "2.0"
+          id: 1
+          result:
+            isError: false
+            structuredContent:
+              affected_rows: 1
+              returning:
+                - { id: 1, quantity: 3 }
+      # What the agent wrote is what the shopper sees.
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { variant_id quantity } } }'
+        expect:
+          data:
+            cart:
+              - lines:
+                  - { variant_id: 2, quantity: 3 }
+
+  - name: mcp obeys the same validator as graphql
+    steps:
+      # The per-role ceiling on a cart line is not a GraphQL-only rule.
+      - sql: INSERT INTO cart (customer_id) VALUES ('customer-1')
+      - url: /mcp
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: tools/call
+          params:
+            name: insert
+            arguments:
+              table: cart_line
+              objects:
+                - { cart_id: 1, variant_id: 2, quantity: 21 }
+              returning: [id]
+        response:
+          jsonrpc: "2.0"
+          id: 1
+          result:
+            isError: true
+      # And nothing was written past the cap.
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { cart(where: {id: {_eq: 1}}) { lines { id } } }'
+        expect: { data: { cart: [{ lines: [] }] } }
+
+  - name: an agent cannot write a table its role may not touch
+    steps:
+      - url: /mcp
+        method: POST
+        status: 200
+        headers:
+          X-Donat-Role: customer
+          X-Donat-User-Id: customer-1
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: tools/call
+          params:
+            name: insert
+            arguments:
+              table: product
+              objects:
+                - { category_id: 1, slug: agent-made, title: "No", status: published }
+              returning: [id]
+        response:
+          jsonrpc: "2.0"
+          id: 1
+          result:
+            isError: true
+
+  - name: an agent cannot smuggle sql through a tool argument
+    steps:
+      # The MCP tools take a table and columns by name, not a query: a name
+      # carrying SQL matches nothing and is refused, never spliced.
+      - for:
+          - arguments: { table: 'customer"; DROP TABLE product; --', columns: [customer_id] }
+          - arguments: { table: product, columns: ["id) , (SELECT current_user"] }
+        do:
+          - url: /mcp
+            method: POST
+            status: 200
+            headers:
+              X-Donat-Role: customer
+              X-Donat-User-Id: customer-1
+            body:
+              jsonrpc: "2.0"
+              id: 1
+              method: tools/call
+              params:
+                name: query
+                arguments: "${item.arguments}"
+            response:
+              jsonrpc: "2.0"
+              id: 1
+              result:
+                isError: true
+      # The shop still answers afterwards.
+      - as: { role: customer, user: customer-1 }
+      - graphql: 'query { product { slug } }'
+        expect: { data: { product: "@len 2" } }

@@ -40,7 +40,7 @@ fixtures copied under `crates/conformance/fixtures/` (same relative paths).
      the end.
 4. `@pytest.mark.admin_secret` → nothing. This engine has no admin secret;
    every suite authenticates through the harness's own hook, which turns a
-   fixture's `X-Donat-Role` header into a session (`src/auth_hook.rs`). A
+   fixture's `X-Donat-Role` header into a session (`crates/testkit/src/auth_hook.rs`). A
    class that asserts the *absence* of authentication uses
    `Suite::new(..).no_authentication()` instead.
    `@pytest.mark.hge_env('K', 'v')` → `.env("K", "v")`.

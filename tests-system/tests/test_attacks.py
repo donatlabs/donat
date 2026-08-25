@@ -245,128 +245,7 @@ def test_no_header_is_a_way_in(store):
     assert "allowed roles" in as_staff["errors"][0]["message"].lower(), as_staff
 
 
-# -- widening a mutation -----------------------------------------------------
-
-
-def test_an_unfiltered_update_still_only_reaches_your_own_row(shopper, support):
-    """`where: {}` means "everything I am allowed to touch", not "everything".
-
-    A shopper editing their own name with no filter is ordinary; the same
-    request renaming every customer in the store would be the whole database.
-    """
-
-    before = customer_names(support)
-    assert len(before) > 1, "this test needs a second customer to fail to touch"
-
-    affected = shopper.graphql(
-        'mutation { update_customer(where: {}, _set: {name: "Renamed By Test"}) { affected_rows } }'
-    ).unwrap()["update_customer"]["affected_rows"]
-
-    try:
-        assert affected == 1, f"an unfiltered update reached {affected} rows"
-        after = customer_names(support)
-        assert after[OTHER_CUSTOMER] == before[OTHER_CUSTOMER], (
-            "another shopper was renamed by a request that never named them"
-        )
-    finally:
-        shopper.graphql(
-            "mutation Restore($name: String!) { update_customer(where: {}, _set: {name: $name}) { affected_rows } }",
-            {"name": before[d.CUSTOMER_ONE]},
-        ).unwrap()
-
-
-def test_an_unfiltered_delete_cannot_empty_the_store(shopper, other_shopper, well_stocked):
-    d.cart_with_one_line(shopper)
-    other_cart = d.cart_with_one_line(other_shopper)
-
-    removed = shopper.graphql(
-        "mutation { delete_cart_line(where: {}) { affected_rows } }"
-    ).unwrap()["delete_cart_line"]["affected_rows"]
-
-    assert removed == 1, f"an unfiltered delete reached {removed} rows"
-    assert d.read_cart(other_shopper, other_cart)["lines"], (
-        "another shopper's basket was emptied by a delete that never named it"
-    )
-
-
-def test_a_shopper_has_no_mutation_for_what_the_store_decides(shopper):
-    """Order and payment state are the Process's to write, not a caller's.
-
-    A shopper who could set `order_status` would not need to pay for anything.
-    """
-
-    for attempt in (
-        'mutation { update_orders(where: {}, _set: {order_status: "authorized"}) { affected_rows } }',
-        "mutation { delete_orders(where: {}) { affected_rows } }",
-        "mutation { delete_payment(where: {}) { affected_rows } }",
-    ):
-        refused = shopper.graphql(attempt)
-        assert refused.error_code() == "validation-failed", (
-            f"the mutation exists for a shopper: {attempt} -> {refused.text[:160]}"
-        )
-
-
-def test_a_shopper_cannot_write_their_own_payment_paid(shopper, support, well_stocked, settle_timeout):
-    """A payment says whether money moved. Only the store may say it did.
-
-    The shopper's own commands do move a payment — to `cancellation_requested`
-    or `void_in_progress`, which is a shopper asking to stop one. Everything
-    else about it, above all `captured`, is the answer a provider gave, and a
-    caller who could write it would have bought the order for nothing.
-    """
-
-    order = d.checkout_to_order(shopper, d.cart_with_one_line(shopper), timeout=settle_timeout)
-    # Let the store finish moving the payment itself, so what is measured after
-    # the attempts is the attempts and not the checkout still running.
-    payment = d.await_payment_status(
-        support, order["id"], {"authorized"}, timeout=settle_timeout
-    )
-
-    for column, value in (("status", '"captured"'), ("amount_minor", "1")):
-        refused = shopper.graphql(
-            "mutation Rewrite($id: uuid!) { update_payment(where: {id: {_eq: $id}}, "
-            f"_set: {{{column}: {value}}}) {{ affected_rows }} }}",
-            {"id": payment["id"]},
-        )
-        assert refused.errors, (
-            f"a shopper rewrote payment.{column}: {refused.text[:200]}"
-        )
-
-    after = [row for row in d.payments_of(support, order["id"]) if row["id"] == payment["id"]][0]
-    assert after["status"] == payment["status"] and after["amount_minor"] == payment["amount_minor"], (
-        f"the payment moved anyway: {after} was {payment}"
-    )
-
-
 # -- putting SQL where a value goes ------------------------------------------
-
-
-def test_an_enum_argument_is_an_enum_not_a_fragment_of_sql(anonymous):
-    refused = anonymous.graphql(
-        '{ product(order_by: {slug: "asc; DROP TABLE product"}) { id } }'
-    )
-
-    assert refused.error_code() == "validation-failed"
-    assert d.catalogue(anonymous), "the catalogue is still there"
-
-
-def test_an_agent_cannot_smuggle_sql_through_a_tool_argument(shopper):
-    """The MCP tools take a table and columns by name, not a query.
-
-    An agent is a caller like any other, and the generic tools are the widest
-    argument surface in the store.
-    """
-
-    for arguments in (
-        {"table": 'customer"; DROP TABLE product; --', "columns": ["customer_id"]},
-        {"table": "product", "columns": ["id) , (SELECT current_user"]},
-        {"table": "payment", "columns": ["id"]},
-    ):
-        answer = shopper.mcp_tool("select", arguments)
-        refused = answer.value("result/isError") is True or answer.value("error") is not None
-        assert refused, f"a tool argument was obeyed: {arguments} -> {answer.text[:200]}"
-
-    assert d.catalogue(shopper), "the shop still answers afterwards"
 
 
 def test_a_rest_parameter_carrying_a_payload_is_read_as_a_value(anonymous):
@@ -424,52 +303,45 @@ def test_a_batch_of_operations_is_refused_clearly(store, anonymous):
     assert d.catalogue(anonymous), "the shop still answers afterwards"
 
 
-# -- taking somebody else's turn ---------------------------------------------
+# -- a query of absurd width (from test_shopping_basics.py) --------------------
 
 
-def test_replaying_another_shoppers_request_id_does_not_hand_over_their_answer(
-    shopper, other_shopper, providers, settle_timeout
-):
-    """An idempotency key is scoped to who used it.
+def test_a_query_may_ask_for_as_many_fields_as_it_likes(anonymous):
+    """A wide selection is an ordinary query, not an attack.
 
-    If it were global, knowing somebody's request id would return their result
-    — an order, a booking, a payment — to whoever asked second.
+    A dashboard, a wide table, an export — all of them ask for more fields at
+    once than a hand-written query would, and the answer must be the data in
+    the order it was asked for.
     """
 
-    request_id = d.new_request_id()
-    slot = f"2031-03-04T09:{request_id[:2]}"
-    arguments = {
-        "resource": d.new_request_id(),
-        "slot": slot,
-        "starts": "2031-03-04T09:00:00Z",
-        "expires": "2031-03-04T08:00:00Z",
-        "request": request_id,
-    }
-    mutation = """
-        mutation Hold(
-          $resource: uuid!, $slot: String!, $starts: timestamptz!,
-          $expires: timestamptz!, $request: uuid!
-        ) {
-          start_grooming_booking(
-            service_resource_id: $resource, slot_key: $slot, starts_at: $starts,
-            hold_expires_at: $expires, request_id: $request
-          ) { slot_key }
-        }
-    """
+    width = 120
+    asked = [f"f{index}" for index in range(width)]
+    query = "query { product(order_by: {id: asc}) { %s } }" % " ".join(
+        f"{alias}: slug" for alias in asked
+    )
 
-    mine = shopper.graphql(mutation, arguments).unwrap()
-    theirs = other_shopper.graphql(mutation, arguments)
+    rows = anonymous.query(query)["product"]
 
-    assert mine["start_grooming_booking"]["slot_key"] == slot
-    if not theirs.errors:
-        # A second caller may be allowed to hold their own slot; what they may
-        # not get is the first caller's booking.
-        booked = shopper.query(
-            "query B($slot: String!) { grooming_booking(where: {slot_key: {_eq: $slot}}) { id } }",
-            {"slot": slot},
-        )["grooming_booking"]
-        assert len(booked) <= 1, f"a replayed key produced a second booking: {booked}"
-    assert other_shopper.query(
-        "query B($slot: String!) { grooming_booking(where: {slot_key: {_eq: $slot}}) { id } }",
-        {"slot": slot},
-    )["grooming_booking"] == [], "another shopper was handed the first one's booking"
+    assert rows, "the catalogue is not empty"
+    assert list(rows[0].keys()) == asked, (
+        "a wide answer keeps the order the query asked in: "
+        f"{list(rows[0].keys())[:4]}…{list(rows[0].keys())[-1]}"
+    )
+    assert set(rows[0].values()) == {rows[0]["f0"]}, "and every alias is the same column"
+
+    # The same width through a relationship, where each row is built again.
+    nested = anonymous.query(
+        "query { product(order_by: {id: asc}) { variants { %s } } }"
+        % " ".join(f"{alias}: sku" for alias in asked)
+    )["product"]
+    assert list(nested[0]["variants"][0].keys()) == asked
+
+    # And the same width over an aggregate, whose values belong to the query
+    # level the object is built in — a row set of its own would put them one
+    # level down, where the database refuses them.
+    counted = anonymous.query(
+        "query { product_aggregate { aggregate { %s } } }"
+        % " ".join(f"{alias}: count" for alias in asked)
+    )["product_aggregate"]["aggregate"]
+    assert list(counted.keys()) == asked
+    assert len(set(counted.values())) == 1, "every alias counts the same thing"

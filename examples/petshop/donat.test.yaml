@@ -1,0 +1,23 @@
+# The application's side of a test stand: what `donat test` boots for every
+# `*_test.yaml` under `metadata/`. Where Postgres is and which binary runs are
+# the machine's business (`donat test --help`).
+metadata: metadata
+migrations: migrations
+engine_env:
+  # Every provider the connectors name is played by the runner's stub.
+  PETSHOP_PAYMENT_BASE_URL: ${providers}
+  PETSHOP_PAYMENT_API_TOKEN: petshop-test-payment
+  PETSHOP_TAX_BASE_URL: ${providers}
+  PETSHOP_TAX_API_TOKEN: petshop-test-tax
+  DONAT_MOCK_CARRIER_BASE_URL: ${providers}
+  DONAT_MOCK_CARRIER_TOKEN: petshop-test-carrier
+  PETSHOP_NOTIFICATION_BASE_URL: ${providers}
+  PETSHOP_NOTIFICATION_API_TOKEN: petshop-test-notification
+  PETSHOP_PAYOUT_BASE_URL: ${providers}
+  PETSHOP_PAYOUT_API_TOKEN: petshop-test-payout
+  # The customer avatar names an object store; the registry resolves every
+  # credential before the listener binds, and the engine signs the call that
+  # reports an upload finished.
+  PETSHOP_FILE_SIGNING_SECRET: petshop-test-file-signing
+  PETSHOP_S3_KEY: petshop-test-key
+  PETSHOP_S3_SECRET: petshop-test-secret

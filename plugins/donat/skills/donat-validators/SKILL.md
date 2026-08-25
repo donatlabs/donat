@@ -169,6 +169,6 @@ writes no value.
 - [`examples/petshop/metadata/databases/default/tables/public_cart_line.yaml`](https://github.com/donatlabs/donat/blob/main/examples/petshop/metadata/databases/default/tables/public_cart_line.yaml)
 - [`examples/petshop/metadata/databases/default/tables/public_product_variant.yaml`](https://github.com/donatlabs/donat/blob/main/examples/petshop/metadata/databases/default/tables/public_product_variant.yaml)
   — the `not_null` + comparison pair, with the reasoning in comments
-- [`crates/conformance/fixtures/petshop/validation.yaml`](https://github.com/donatlabs/donat/blob/main/crates/conformance/fixtures/petshop/validation.yaml) — the exact error bodies
+- [`examples/petshop/metadata/databases/default/tables/public_product_variant_test.yaml`](https://github.com/donatlabs/donat/blob/main/examples/petshop/metadata/databases/default/tables/public_product_variant_test.yaml) — the exact error bodies
 - [`knowledgebase/declarative-saas/decisions/032-permission-validators-declare-presence.md`](https://github.com/donatlabs/donat/blob/main/knowledgebase/declarative-saas/decisions/032-permission-validators-declare-presence.md)
   — why refinement is refused rather than inferred

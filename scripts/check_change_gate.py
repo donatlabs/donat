@@ -51,6 +51,9 @@ import tempfile
 FIXTURES_ROOT = "crates/conformance/fixtures/"
 CONFORMANCE_ROOT = "crates/conformance/"
 SKILLS_ROOT = "plugins/donat/skills/"
+# The application-test runner waits on the journal; a `sleep` added here is
+# the same short cut as one in a conformance suite.
+TESTKIT_ROOT = "crates/testkit/"
 TOOLCHAIN = "rust-toolchain.toml"
 AUDIT_CONFIG = ".cargo/audit.toml"
 SERVER_SRC = "crates/server/src/"
@@ -82,7 +85,7 @@ KINDS = {
     "timing": "why the test has to wait on time rather than on an event, and what bounds the wait",
     "ignored-test": "why the test cannot run by default and what runs it",
     "removed-test": "which tests went and what covers their property now",
-    "skills": "the paired `make evals-compare BEFORE=<arm> AFTER=<arm>` result, or why the edit needs no measurement",
+    "skills": "a measurement that the edit helps a skill (a paired benchmark arm, where one exists), or why the edit needs none",
 }
 
 
@@ -221,7 +224,7 @@ def evaluate(diff: Diff) -> list[Finding]:
             findings.append(Finding("audit-ignore", AUDIT_CONFIG, f"{match.group(0)} excused"))
 
     for path, lines in diff.added.items():
-        if path.startswith(CONFORMANCE_ROOT) and path.endswith(".rs"):
+        if (path.startswith(CONFORMANCE_ROOT) or path.startswith(TESTKIT_ROOT)) and path.endswith(".rs"):
             for text in lines:
                 if SLEEP_CALL.search(text):
                     findings.append(Finding("timing", path, text.strip()))
@@ -328,6 +331,7 @@ def self_test() -> int:
             f"{CONFORMANCE_ROOT}tests/commands.rs",
             "#[test]\n#[ignore]\nfn a() { std::thread::sleep(d); }\n",
         )  # timing, ignored-test, removed-test (2 -> 1)
+        _write(repo, f"{TESTKIT_ROOT}src/runner.rs", "fn poll() { std::thread::sleep(d); }\n")  # timing
         _write(repo, f"{CONFORMANCE_ROOT}src/lib.rs", '// harness applies "run_sql" ops\n"run_sql" => {}\n')  # ignored: harness
         _write(repo, f"{SERVER_SRC}auth.rs", 'pub fn role() { let _ = ADMIN_ROLE; }\nfn h() { "run_sql" }\n')  # hard x2
         _write(repo, f"{SERVER_SRC}config.rs", "pub const IDP: &str = \"DONAT_OIDC_ADMIN_ROLE\";\n")  # ignored: not our name
@@ -366,7 +370,11 @@ def self_test() -> int:
         expect(snaps == ["crates/sqlgen/tests/snapshots/select.snap"], f"snapshots: {snaps} (fresh.snap must be free)")
         expect(len(by_kind.get("toolchain", [])) == 1, "toolchain change not seen")
         expect([f.detail for f in by_kind.get("audit-ignore", [])] == ["RUSTSEC-2025-0001 excused"], "advisory not seen")
-        expect(len(by_kind.get("timing", [])) == 1, "sleep in a conformance test not seen")
+        timing = sorted(f.path for f in by_kind.get("timing", []))
+        expect(
+            timing == [f"{CONFORMANCE_ROOT}tests/commands.rs", f"{TESTKIT_ROOT}src/runner.rs"],
+            f"sleep in a conformance test or the testkit runner not seen: {timing}",
+        )
         expect(len(by_kind.get("ignored-test", [])) == 1, "#[ignore] not seen")
         expect([f.detail for f in by_kind.get("removed-test", [])] == ["1 fewer `#[test]` than before"], "net removed test not seen")
         expect(len(by_kind.get("skills", [])) == 1, "skill edit not seen")
