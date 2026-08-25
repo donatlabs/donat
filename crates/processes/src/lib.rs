@@ -572,6 +572,12 @@ pub struct CompiledProcessDefinition {
     pub signals: BTreeMap<String, CompiledProcessSignal>,
     pub states: BTreeMap<String, CompiledProcessState>,
     pub caller_session_variables: BTreeMap<String, BTreeSet<String>>,
+    /// The session variable carrying the tenant, when this process belongs to
+    /// a tenanted source. Named here rather than derived, because the executor
+    /// must be able to pick exactly this one variable out of the persisted
+    /// caller session — a fixed-role state is meant to carry no caller
+    /// identity, and handing it the whole object would quietly give it one.
+    pub tenant_variable: Option<String>,
     pub dependencies: ProcessDependencyClosure,
     pub definition_fingerprint: String,
     pub revision_fingerprint: String,
@@ -819,8 +825,22 @@ fn compile_process(
         state_types.insert(state.id.clone(), compiled.output.clone());
         states.insert(state.id.clone(), compiled);
     }
-    let caller_session_variables =
-        collect_caller_session_variables(process, &closure, &format!("{base}.states"))?;
+    // In a tenanted source the tenant joins every role's caller contract, so
+    // it is captured when the process starts and rehydrated on every later
+    // transition. A durable process outlives the request that started it; if
+    // the tenant were not part of the persisted contract, the first write
+    // after a restart would run with no tenant at all.
+    let tenant_variable = metadata
+        .tenancy
+        .as_ref()
+        .filter(|tenancy| tenancy.source == process.source)
+        .map(|tenancy| tenancy.variable_key());
+    let caller_session_variables = collect_caller_session_variables(
+        process,
+        &closure,
+        tenant_variable.as_deref(),
+        &format!("{base}.states"),
+    )?;
     let definition_fingerprint = definition_fingerprint(process, &input, &output, &signals)?;
     let revision_fingerprint = revision_fingerprint(&definition_fingerprint, &closure)?;
     Ok(CompiledProcessDefinition {
@@ -834,6 +854,7 @@ fn compile_process(
         signals,
         states,
         caller_session_variables,
+        tenant_variable,
         dependencies: closure,
         definition_fingerprint,
         revision_fingerprint,
@@ -843,6 +864,7 @@ fn compile_process(
 fn collect_caller_session_variables(
     process: &Process,
     closure: &ProcessDependencyClosure,
+    tenant_variable: Option<&str>,
     path: &str,
 ) -> Result<BTreeMap<String, BTreeSet<String>>, PlanError> {
     let mut by_role = process
@@ -850,6 +872,11 @@ fn collect_caller_session_variables(
         .iter()
         .map(|permission| (permission.role.clone(), BTreeSet::new()))
         .collect::<BTreeMap<_, _>>();
+    if let Some(tenant) = tenant_variable {
+        for variables in by_role.values_mut() {
+            variables.insert(tenant.to_string());
+        }
+    }
     for permission in &process.permissions {
         if let Some(name) = &permission.owner_session_variable {
             by_role

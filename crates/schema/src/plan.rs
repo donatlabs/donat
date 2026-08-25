@@ -38,6 +38,92 @@ impl Session {
     }
 }
 
+/// Refuse a document whose fragments reach themselves.
+///
+/// `{ product { ...a } } fragment a on product { ...b } fragment b on product
+/// { ...a }` is accepted by the parser and has two braces of nesting, so the
+/// depth guard passes it. Everything that walks a selection set afterwards
+/// recurses forever on it. One traversal here, before any of them.
+fn refuse_fragment_cycles(fragments: &Fragments) -> Result<(), PlanError> {
+    fn reaches(
+        name: &str,
+        fragments: &Fragments,
+        path: &mut Vec<String>,
+        done: &mut HashSet<String>,
+    ) -> Option<String> {
+        if path.iter().any(|seen| seen == name) {
+            return Some(name.to_string());
+        }
+        if done.contains(name) {
+            return None;
+        }
+        let fragment = fragments.get(name)?;
+        path.push(name.to_string());
+        let found = spreads_of(&fragment.selection_set)
+            .into_iter()
+            .find_map(|spread| reaches(&spread, fragments, path, done));
+        path.pop();
+        done.insert(name.to_string());
+        found
+    }
+
+    let mut done = HashSet::new();
+    for name in fragments.keys() {
+        let mut path = Vec::new();
+        if let Some(cycle) = reaches(name, fragments, &mut path, &mut done) {
+            return Err(PlanError::new(
+                "$",
+                "validation-failed",
+                format!("fragment \"{cycle}\" spreads itself, directly or through another"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every fragment named by a spread anywhere in one selection set.
+fn spreads_of(selection_set: &SelectionSet<'static, String>) -> Vec<String> {
+    let mut found = Vec::new();
+    for selection in &selection_set.items {
+        match selection {
+            Selection::FragmentSpread(spread) => found.push(spread.fragment_name.clone()),
+            Selection::Field(field) => found.extend(spreads_of(&field.selection_set)),
+            Selection::InlineFragment(inline) => found.extend(spreads_of(&inline.selection_set)),
+        }
+    }
+    found
+}
+
+/// Fields in one selection set, following fragment spreads once each.
+fn count_nodes(
+    selection_set: &SelectionSet<'static, String>,
+    fragments: &Fragments,
+    seen: &mut HashSet<String>,
+) -> usize {
+    let mut total = 0;
+    for selection in &selection_set.items {
+        match selection {
+            Selection::Field(field) => {
+                total += 1;
+                total += count_nodes(&field.selection_set, fragments, seen);
+            }
+            Selection::InlineFragment(inline) => {
+                total += count_nodes(&inline.selection_set, fragments, seen);
+            }
+            Selection::FragmentSpread(spread) => {
+                if !seen.insert(spread.fragment_name.clone()) {
+                    continue;
+                }
+                if let Some(fragment) = fragments.get(&spread.fragment_name) {
+                    total += count_nodes(&fragment.selection_set, fragments, seen);
+                }
+                seen.remove(&spread.fragment_name);
+            }
+        }
+    }
+    total
+}
+
 pub(crate) fn is_session_var_name(name: &str) -> bool {
     name.get(..8)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-donat-"))
@@ -249,7 +335,7 @@ pub struct Planner<'a> {
     inherited_roles: &'a [donat_metadata::InheritedRole],
     metadata: &'a Metadata,
     remote_schemas: &'a [donat_metadata::RemoteSchema],
-    catalog: &'a Catalog,
+    pub(crate) catalog: &'a Catalog,
     tables: &'a [TableEntry],
     functions: &'a [donat_metadata::FunctionEntry],
     commands: Option<&'a CompiledSourceCommandCatalog>,
@@ -264,6 +350,14 @@ pub struct Planner<'a> {
     /// against. Absent while compiling the role-independent schema, which needs
     /// the *shape* of a file column but never a signature.
     pub(crate) storage: Option<&'a donat_storage::RequestContext<'a>>,
+    /// The tenancy declaration, present only on the planner for the source it
+    /// names. It is resolved once here rather than looked up per table so that
+    /// a planner for an untenanted source cannot accidentally consult it.
+    pub(crate) tenancy: Option<&'a donat_metadata::TenancyMetadata>,
+    /// In-tenant grants, present only on the planner for the source they name.
+    pub(crate) iam: Option<&'a donat_metadata::IamMetadata>,
+    /// Plan entitlements, present only on the planner for the source they name.
+    pub(crate) quotas: Option<&'a donat_metadata::QuotaMetadata>,
     index: Arc<PlannerIndex>,
 }
 
@@ -366,7 +460,7 @@ impl<'a> Planner<'a> {
         finalized_commands: Option<&'a FinalizedSourceCommandCatalog>,
         expose_all_commands: bool,
     ) -> Self {
-        Self::from_parts(
+        let mut planner = Self::from_parts(
             metadata,
             catalog,
             source.tables.as_slice(),
@@ -378,7 +472,22 @@ impl<'a> Planner<'a> {
                 expose_all_commands,
             },
             index,
-        )
+        );
+        // Tenancy names one source. A planner for any other source must not
+        // see the declaration at all, so this is the only place it is attached.
+        planner.tenancy = metadata
+            .tenancy
+            .as_ref()
+            .filter(|tenancy| tenancy.source == source.name);
+        planner.iam = metadata
+            .iam
+            .as_ref()
+            .filter(|iam| iam.source == source.name);
+        planner.quotas = metadata
+            .quotas
+            .as_ref()
+            .filter(|quotas| quotas.source == source.name);
+        planner
     }
 
     fn compile_index_parts(
@@ -490,6 +599,9 @@ impl<'a> Planner<'a> {
             source_kind: command_config.source_kind,
             expose_all_commands: command_config.expose_all_commands,
             storage: None,
+            tenancy: None,
+            iam: None,
+            quotas: None,
             index,
         }
     }
@@ -1185,7 +1297,49 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // Before anything walks them. A spread that reaches itself makes
+        // every later traversal — this planner's included — recurse until the
+        // stack ends, and `query_too_deep` cannot see it because a cycle needs
+        // no nesting to express. The GraphQL specification calls it a
+        // validation error; so does this.
+        refuse_fragment_cycles(&fragments)?;
+        self.refuse_if_too_many_nodes(selection_set, &fragments, session)?;
         self.plan_selected(op, selection_set, &fragments, &vars, session)
+    }
+
+    /// Refuse an operation that asks for more fields than the role may.
+    ///
+    /// Counted over the parsed document, before anything is planned, so the
+    /// refusal costs one traversal and never a statement. Depth is bounded
+    /// elsewhere and is the wrong measure: a hundred roots with a hundred
+    /// fields each is ten thousand nodes at depth two.
+    ///
+    /// A fragment is counted where it is spread, and a cycle among fragments
+    /// is counted once — the parser accepts one, and a limit that recursed on
+    /// it would hang rather than refuse.
+    fn refuse_if_too_many_nodes(
+        &self,
+        selection_set: &SelectionSet<'static, String>,
+        fragments: &Fragments,
+        session: &Session,
+    ) -> Result<(), PlanError> {
+        let Some(ceiling) = self.metadata.limits.nodes.for_role(&session.role) else {
+            return Ok(());
+        };
+        let mut seen = HashSet::new();
+        let counted = count_nodes(selection_set, fragments, &mut seen);
+        if counted > ceiling as usize {
+            return Err(PlanError::new(
+                "$",
+                "validation-failed",
+                format!(
+                    "this operation selects {counted} fields and the ceiling for role \"{}\" is \
+                     {ceiling}. Ask for fewer fields, or page the lists it walks.",
+                    session.role
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Plan an operation that the caller has already selected, using a
@@ -1556,16 +1710,98 @@ impl<'a> Planner<'a> {
         })
     }
 
-    /// The role's row filter as an IR predicate (session vars substituted).
+    /// The role's row filter as an IR predicate (session vars substituted),
+    /// with this deployment's tenant predicate ANDed onto it.
     /// Parsed in a permission-filter context: the filter may reference
     /// columns outside the role's column mask.
+    ///
+    /// The tenant is ANDed *here* rather than inside [`Self::combined_filter`]
+    /// for one reason worth stating: `combined_filter` answers `None` — no
+    /// restriction — as soon as any of the role's filters is `{}`. A role with
+    /// an unrestricted filter on a tenanted table is the ordinary case, and it
+    /// is exactly the case that must still be scoped. Applying the tenant
+    /// after the OR of the role's filters, rather than inside it, is what
+    /// makes `filter: {}` mean "every row of my tenant" instead of "every row".
+    ///
+    /// An empty `ctx.perms` is not a role's view of a table: it is the context
+    /// used while parsing a permission's own filter, where the tenant is
+    /// already being applied one level up. Adding it again there would compare
+    /// the same column twice and, in a relationship filter, against the wrong
+    /// row.
     pub(crate) fn permission_predicate(
         &self,
         ctx: &TableCtx,
         session: &Session,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
-        self.combined_filter(ctx, &ctx.perms, session, path)
+        self.permission_predicate_scoped(ctx, session, true, path)
+    }
+
+    /// [`Self::permission_predicate`], with the tenant bound optionally left
+    /// off.
+    ///
+    /// One caller passes `false`: a command step that declared
+    /// `tenant: unscoped`, which is how somebody reads the invitation that
+    /// admits them to a tenant they do not belong to yet. It is legal only
+    /// under `unscoped_steps: audited`, only on a `select_one` keyed on a
+    /// unique constraint, and only when the command then declares
+    /// `tenant: { from: <this step> }` — so the rest of the statement is
+    /// scoped by what that row said. `donat validate` lists every one.
+    pub(crate) fn permission_predicate_scoped(
+        &self,
+        ctx: &TableCtx,
+        session: &Session,
+        apply_tenant: bool,
+        path: &str,
+    ) -> Result<Option<BoolExp>, PlanError> {
+        self.permission_predicate_full(ctx, session, apply_tenant, true, path)
+    }
+
+    /// [`Self::permission_predicate_scoped`], with the grant bound optionally
+    /// left off.
+    ///
+    /// Command steps pass `false`. A command is authorized once, by its own
+    /// action, and its steps run under a separate narrower permission plane
+    /// that never falls back to the ordinary one. Applying the *table's*
+    /// action inside it as well would mean a merchant had to grant
+    /// `orders:read` before `cancel_order` would run — two grants for one
+    /// operation, one of which nobody asked for.
+    pub(crate) fn permission_predicate_full(
+        &self,
+        ctx: &TableCtx,
+        session: &Session,
+        apply_tenant: bool,
+        apply_iam: bool,
+        path: &str,
+    ) -> Result<Option<BoolExp>, PlanError> {
+        let declared = self.combined_filter(ctx, &ctx.perms, session, path)?;
+        if ctx.perms.is_empty() {
+            return Ok(declared);
+        }
+        let tenant = if apply_tenant {
+            self.tenant_predicate(ctx, session, path)?
+        } else {
+            None
+        };
+        let bounded = match (declared, tenant) {
+            (Some(declared), Some(tenant)) => Some(BoolExp::And(vec![declared, tenant])),
+            (Some(declared), None) => Some(declared),
+            (None, Some(tenant)) => Some(tenant),
+            (None, None) => None,
+        };
+        if !apply_iam {
+            return Ok(bounded);
+        }
+        // A governed role sees the rows its grants allow. A read is the one
+        // operation where "no action" answering with no rows is the right
+        // shape: it is what a role that cannot see a table already gets.
+        self.with_iam(
+            bounded,
+            ctx,
+            session,
+            donat_metadata::IamOperation::Select,
+            path,
+        )
     }
 
     /// A declared file column's projection (spec 008): the closed object built

@@ -92,6 +92,7 @@ fn session() -> Session {
 
 fn app_state(db_path: &str) -> Arc<AppState> {
     Arc::new(AppState {
+        rate_limiter: Default::default(),
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap(metadata(db_path)))),
         connectors: Arc::new(donat_server::connectors::ConnectorRegistry::empty()),
         default_url: "postgres://unused".to_string(),

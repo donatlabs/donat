@@ -30,6 +30,7 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: fulfilment
     permission:
       columns:
@@ -46,10 +47,12 @@ select_permissions:
       filter:
         order_status:
           _in: [authorized, paid, fulfilled]
+      unbounded: operator
   - role: support
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: payment_worker
     permission:
       columns:
@@ -59,14 +62,17 @@ select_permissions:
         - total_minor
         - currency
       filter: {}
+      unbounded: worker
   - role: marketplace_worker
     permission:
       columns: "*"
       filter: {}
+      unbounded: worker
   - role: subscription_worker
     permission:
       columns: "*"
       filter: {}
+      unbounded: worker
 command_select_permissions:
   - role: customer
     permission:
@@ -97,6 +103,7 @@ insert_permissions:
     permission:
       columns: "*"
       check: {}
+      unbounded: worker
 command_update_permissions:
   - role: customer
     permission:
@@ -117,9 +124,11 @@ update_permissions:
         - cancellation_reason
       filter: {}
       check: {}
+      unbounded: operator
   - role: payment_worker
     permission:
       columns:
         - order_status
       filter: {}
       check: {}
+      unbounded: worker

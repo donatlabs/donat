@@ -13,6 +13,7 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: payment_worker
     permission:
       columns:
@@ -22,6 +23,7 @@ select_permissions:
         - quantity
         - status
       filter: {}
+      unbounded: worker
 command_select_permissions:
   - role: customer
     permission:
@@ -50,3 +52,4 @@ update_permissions:
         - status
       filter: {}
       check: {}
+      unbounded: worker

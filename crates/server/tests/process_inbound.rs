@@ -664,6 +664,7 @@ async fn corrupted_webhook_wait_marker_fails_closed_without_an_acknowledgeable_a
 
 async fn shared_state(metadata: Metadata, connectors: Arc<ConnectorRegistry>) -> SharedState {
     let state = Arc::new(AppState {
+        rate_limiter: Default::default(),
         engine: tokio::sync::RwLock::new(Arc::new(
             Engine::bootstrap_checked(metadata).expect("initial metadata compiles"),
         )),

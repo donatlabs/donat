@@ -4779,6 +4779,7 @@ mod tests {
         )
         .expect("MCP engine snapshot compiles");
         Arc::new(crate::state::AppState {
+            rate_limiter: Default::default(),
             engine: tokio::sync::RwLock::new(Arc::new(engine)),
             connectors: Arc::new(crate::connectors::ConnectorRegistry::empty()),
             default_url: url,
@@ -6685,6 +6686,7 @@ mod tests {
 
     fn select_perm(cols: donat_metadata::Columns) -> donat_metadata::SelectPermission {
         donat_metadata::SelectPermission {
+            unbounded: None,
             columns: cols,
             filter: json!({}),
             limit: None,
@@ -6830,12 +6832,14 @@ mod tests {
             perm_entry(
                 "left",
                 donat_metadata::DeletePermission {
+                    unbounded: None,
                     filter: json!({ "id": { "_eq": 1 } }),
                 },
             ),
             perm_entry(
                 "right",
                 donat_metadata::DeletePermission {
+                    unbounded: None,
                     filter: json!({ "id": { "_eq": 2 } }),
                 },
             ),

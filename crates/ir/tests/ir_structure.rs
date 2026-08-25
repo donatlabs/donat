@@ -184,6 +184,7 @@ fn insert_mutation_rows_align_with_columns_and_none_is_null() {
     // Invariant the executor relies on: every row has one entry per
     // insertion column; None serializes to JSON null (rendered DEFAULT).
     let insert = InsertMutation {
+        quota: None,
         table: table("author"),
         columns: vec![
             ("id".into(), "integer".into()),
@@ -228,6 +229,7 @@ fn command_mutation_keeps_resolved_execution_facts_and_projection() {
     let root = MutationRoot::Command {
         alias: "submitted".into(),
         command: CommandMutation {
+            authorization: None,
             identity: CommandIdentity {
                 source: "default".into(),
                 name: "create_order".into(),

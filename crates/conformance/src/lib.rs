@@ -749,6 +749,8 @@ fn default_metadata_with_configuration(
 ) -> Metadata {
     Metadata {
         version: 3,
+        permissions: Default::default(),
+        limits: Default::default(),
         sources: vec![Source {
             name: "default".to_string(),
             kind: backend.source_kind(),
@@ -774,6 +776,9 @@ fn default_metadata_with_configuration(
         media: Default::default(),
         ingest_schemas: vec![],
         recurrence: Default::default(),
+        tenancy: None,
+        iam: None,
+        quotas: None,
     }
 }
 
@@ -2128,6 +2133,27 @@ impl Running {
             )
             .unwrap();
         }
+        if let Some(tenancy) = &md.tenancy {
+            std::fs::write(
+                dir.join("tenancy.yaml"),
+                serde_yaml::to_string(tenancy).expect("serialize tenancy"),
+            )
+            .unwrap();
+        }
+        if let Some(iam) = &md.iam {
+            std::fs::write(
+                dir.join("iam.yaml"),
+                serde_yaml::to_string(iam).expect("serialize iam"),
+            )
+            .unwrap();
+        }
+        if let Some(quotas) = &md.quotas {
+            std::fs::write(
+                dir.join("quotas.yaml"),
+                serde_yaml::to_string(quotas).expect("serialize quotas"),
+            )
+            .unwrap();
+        }
         if md.mcp.is_configured() {
             std::fs::write(
                 dir.join("mcp.yaml"),
@@ -2400,6 +2426,61 @@ impl Running {
             "set_storage must be called before the engine spawns"
         );
         self.metadata.borrow_mut().storage = storage;
+    }
+
+    /// Declare engine-wide tenancy before the engine starts.
+    ///
+    /// Suites build their tables in their own schema, so the declaration is
+    /// written with `{schema}` placeholders and filled in here rather than
+    /// hard-coding `public`.
+    pub fn set_tenancy(&self, tenancy: Json) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "set_tenancy must be called before the engine spawns"
+        );
+        let filled: Json = serde_json::from_str(
+            &serde_json::to_string(&tenancy)
+                .expect("tenancy declaration serializes")
+                .replace("{schema}", &self.schema),
+        )
+        .expect("tenancy declaration parses");
+        let tenancy: donat_metadata::TenancyMetadata =
+            serde_json::from_value(filled).expect("fixture tenancy");
+        self.metadata.borrow_mut().tenancy = Some(tenancy);
+    }
+
+    /// Declare in-tenant grants before the engine starts. `{schema}` is filled
+    /// in the same way `set_tenancy` fills it.
+    pub fn set_iam(&self, iam: Json) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "set_iam must be called before the engine spawns"
+        );
+        let filled: Json = serde_json::from_str(
+            &serde_json::to_string(&iam)
+                .expect("iam declaration serializes")
+                .replace("{schema}", &self.schema),
+        )
+        .expect("iam declaration parses");
+        let iam: donat_metadata::IamMetadata = serde_json::from_value(filled).expect("fixture iam");
+        self.metadata.borrow_mut().iam = Some(iam);
+    }
+
+    /// Declare plan entitlements before the engine starts.
+    pub fn set_quotas(&self, quotas: Json) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "set_quotas must be called before the engine spawns"
+        );
+        let filled: Json = serde_json::from_str(
+            &serde_json::to_string(&quotas)
+                .expect("quota declaration serializes")
+                .replace("{schema}", &self.schema),
+        )
+        .expect("quota declaration parses");
+        let quotas: donat_metadata::QuotaMetadata =
+            serde_json::from_value(filled).expect("fixture quotas");
+        self.metadata.borrow_mut().quotas = Some(quotas);
     }
 
     /// Declare a file column on a tracked table before the engine starts.
@@ -3446,6 +3527,7 @@ mod tests {
             "migrate",
             "oidc_login",
             "petshop_yaml",
+            "pethub",
             "process_activity",
             "process_inbound",
             "processes",
@@ -3455,6 +3537,7 @@ mod tests {
             "rules",
             "security",
             "subscriptions",
+            "tenancy",
         ];
 
         let test_dir = workspace_root().join("crates/conformance/tests");

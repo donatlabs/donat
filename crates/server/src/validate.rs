@@ -167,6 +167,43 @@ async fn check_consistency_inner(
 
     validate_tracked_objects(&validation_metadata, &catalog, &mut problems);
 
+    // The tenant column a table is *assumed* to carry is the one thing the
+    // metadata loader cannot check, and the one whose absence would be a 500
+    // on the first query instead of a refusal to deploy.
+    //
+    // Only against the database that was actually introspected. Mapping every
+    // Postgres source to this one catalog would check a tenanted source
+    // against somebody else's tables — and the failure that matters here is
+    // the false negative: a table reported as carrying a tenant column
+    // because a different database has one.
+    let postgres_sources = validation_metadata
+        .sources
+        .iter()
+        .filter(|source| source.kind == SourceKind::Postgres)
+        .map(|source| source.name.clone())
+        .collect::<Vec<_>>();
+    match (selected_source, postgres_sources.as_slice()) {
+        (Some(name), _) => {
+            let catalogs = HashMap::from([(name.to_string(), catalog.clone())]);
+            for error in donat_schema::validate_tenancy_catalog(&validation_metadata, &catalogs) {
+                push_plan_error(&mut problems, error);
+            }
+        }
+        (None, [only]) => {
+            let catalogs = HashMap::from([(only.clone(), catalog.clone())]);
+            for error in donat_schema::validate_tenancy_catalog(&validation_metadata, &catalogs) {
+                push_plan_error(&mut problems, error);
+            }
+        }
+        (None, _) if metadata.tenancy.is_some() => problems.push(
+            "tenancy is declared and this deployment has more than one Postgres source, so \
+             `validate` cannot tell which database to check it against. Re-run with `--source \
+             <name>`."
+                .to_string(),
+        ),
+        (None, _) => {}
+    }
+
     // Inherited-role mutation permission conflicts are evaluated only for the
     // selected source view, never against an introspection snapshot borrowed
     // from another source.

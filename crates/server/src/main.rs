@@ -158,8 +158,93 @@ enum Command {
     /// Deploy-time connector credential lifecycle (OAuth2).
     #[command(subcommand)]
     Connector(ConnectorCommand),
+    /// Derive the schema `tenancy.yaml` implies, instead of writing it.
+    #[command(subcommand)]
+    Tenancy(TenancyCommand),
     /// Run an application's `*_test.yaml` files against a fresh stand each.
     Test(TestArgs),
+}
+
+/// The tenancy migration, derived.
+///
+/// `tenancy.yaml` is short and the migration under it is not, and every line
+/// of it follows from the declaration plus the catalogue. Deriving it removes
+/// the class of mistake a hand-written one carries: a column scoped to a store
+/// while something keyed by it is still scoped to the deployment.
+///
+/// This writes a file; it does not apply one. The serving binary runs no DDL,
+/// and a schema change nobody read is the opposite of a deploy gate.
+#[derive(clap::Subcommand, Debug)]
+enum TenancyCommand {
+    /// Write the migration the declaration implies.
+    Plan(TenancyPlanArgs),
+    /// Report what differs, write nothing, exit non-zero if anything does.
+    Check(TenancyCheckArgs),
+    /// Read one tenant's rows out, before removing it or on request.
+    Export(TenancyExportArgs),
+    /// Remove one tenant. Refuses while the registry still serves it.
+    Erase(TenancyEraseArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct TenancyExportArgs {
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    #[arg(long)]
+    source: Option<String>,
+    /// The tenant to read out.
+    #[arg(long)]
+    tenant: String,
+    /// Where to write one JSON file per table that has rows.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct TenancyEraseArgs {
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    #[arg(long)]
+    source: Option<String>,
+    /// The tenant to remove.
+    #[arg(long)]
+    tenant: String,
+    /// Repeat the tenant id. A flag that is merely present is a flag that gets
+    /// pasted; this one has to be typed.
+    #[arg(long)]
+    confirm: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct TenancyPlanArgs {
+    /// Metadata directory (defaults to --metadata-dir).
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    /// Metadata source (defaults to the only one).
+    #[arg(long)]
+    source: Option<String>,
+    /// Where to write the migration.
+    #[arg(long, default_value = "migrations")]
+    out: PathBuf,
+    /// The version stamp for the file name. Defaults to the current time.
+    #[arg(long)]
+    stamp: Option<String>,
+    /// The tenant every row already in the database belongs to. Required where
+    /// a tracked table is not empty, because the key cannot be `NOT NULL`
+    /// without one — which is what turning a single-tenant deployment into a
+    /// tenanted one always needs.
+    #[arg(long)]
+    backfill: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct TenancyCheckArgs {
+    /// Metadata directory (defaults to --metadata-dir).
+    #[arg(long)]
+    metadata_dir: Option<PathBuf>,
+    /// Metadata source (defaults to the only one).
+    #[arg(long)]
+    source: Option<String>,
 }
 
 /// `donat test`: the application's tests are declarations too.
@@ -801,6 +886,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Connector(command)) => {
             return run_connector_command(&args, command).await;
         }
+        Some(Command::Tenancy(command)) => {
+            return run_tenancy_command(&args, command).await;
+        }
         _ => {}
     }
 
@@ -849,23 +937,25 @@ async fn main() -> anyhow::Result<()> {
     //
     // Absent, a named provider supplies one — the same facts, said once. What
     // is derived and why it is safe to derive is `OidcConfig::derived_jwt`.
+    let mut jwt_is_derived = false;
     let jwt_raw = match std::env::var("DONAT_GRAPHQL_JWT_SECRET")
         .ok()
         .filter(|raw| !raw.trim().is_empty())
     {
         Some(raw) => Some(raw),
-        None => match oidc.as_ref().and_then(|config| config.derived_jwt()) {
+        None => match oidc.as_ref().and_then(|config| config.derived_jwt(None)) {
             Some(derived) => {
                 tracing::info!(
                     target: "donat::auth",
                     "no DONAT_GRAPHQL_JWT_SECRET; verifying tokens as the configured provider issues them"
                 );
+                jwt_is_derived = true;
                 Some(derived)
             }
             None => None,
         },
     };
-    let jwt = jwt_raw
+    let mut jwt = jwt_raw
         .map(|raw| jwt::JwtConfig::from_env_value(&raw))
         .transpose()
         .map_err(|e| anyhow::anyhow!("DONAT_GRAPHQL_JWT_SECRET is unusable: {e}"))?;
@@ -914,6 +1004,8 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => donat_metadata::Metadata {
             version: 3,
+            permissions: Default::default(),
+            limits: Default::default(),
             sources: vec![],
             inherited_roles: vec![],
             query_collections: vec![],
@@ -933,8 +1025,72 @@ async fn main() -> anyhow::Result<()> {
             media: Default::default(),
             ingest_schemas: vec![],
             recurrence: Default::default(),
+            tenancy: None,
+            iam: None,
+            quotas: None,
         },
     };
+
+    // The derived claims map is built before the metadata is read, so it keys
+    // the tenant under the default spelling. A deployment scoping on
+    // `X-Hasura-Tenant-Id` is legal, and that map would carry the claim under a
+    // name nothing reads — so once the declaration is known, it is rebuilt.
+    if jwt_is_derived
+        && let Some(tenancy) = &metadata.tenancy
+        && let Some(config) = &oidc
+        && let Some(raw) = config.derived_jwt(Some(&tenancy.variable_key()))
+    {
+        jwt =
+            Some(jwt::JwtConfig::from_env_value(&raw).map_err(|e| {
+                anyhow::anyhow!("the derived token configuration is unusable: {e}")
+            })?);
+    }
+
+    // A tenanted deployment whose tokens cannot carry a tenant refuses every
+    // request to every tenanted table, one at a time, for as long as it runs.
+    // The one place that is worth learning is here.
+    if let Some(tenancy) = &metadata.tenancy {
+        let derived_says_nothing = jwt_is_derived
+            && oidc
+                .as_ref()
+                .is_some_and(|oidc| oidc.tenant_claim.is_none());
+        // A configuration a deployment wrote itself is checked the same way,
+        // where it can be: a `claims_map` is an exhaustive list, so a tenant
+        // variable missing from it can never arrive. Restricting this to the
+        // derived case left the deployment most likely to have hand-written
+        // the map — and therefore most likely to have forgotten an entry —
+        // as the one that found out a request at a time.
+        // Only where the claims_map is what actually answers. An auth hook
+        // returns a session before `state.jwt` is ever consulted, so its map is
+        // dead configuration and refusing over it would stop a deployment whose
+        // every request does carry a tenant. A derived map is covered by the
+        // branch above, which knows why it is short.
+        let declared_says_nothing = !jwt_is_derived
+            && auth_hook.is_none()
+            && jwt
+                .as_ref()
+                .and_then(|jwt| jwt.can_carry(&tenancy.variable))
+                == Some(false);
+        if derived_says_nothing || declared_says_nothing {
+            anyhow::bail!(
+                "source `{}` declares tenancy on {}, but nothing in this deployment says where \
+                 a token carries it: {}. Without it every request to a tenanted table is \
+                 refused for carrying no tenant.",
+                tenancy.source,
+                tenancy.variable,
+                if derived_says_nothing {
+                    "token verification is derived from DONAT_OIDC, so set \
+                     DONAT_OIDC_TENANT_CLAIM to the JSON path of that claim (for example \
+                     `$.tenant_id`), or configure DONAT_GRAPHQL_JWT_SECRET with a claims_map \
+                     of your own"
+                } else {
+                    "DONAT_GRAPHQL_JWT_SECRET declares a claims_map and that map has no entry \
+                     for this variable, so add one naming the claim the provider puts the \
+                     tenant in"
+                }
+            );
+        }
+    }
 
     // The identity provider's own accounts, when a deployment configured a key
     // for them. The declaration ships in the binary; what a deployment says is
@@ -976,6 +1132,7 @@ async fn main() -> anyhow::Result<()> {
         jwt.spawn_refresher(reqwest::Client::new());
     }
     let state: SharedState = Arc::new(AppState {
+        rate_limiter: Default::default(),
         engine: tokio::sync::RwLock::new(Arc::new(Engine::bootstrap_checked(metadata)?)),
         connectors,
         default_url: database_url,
@@ -1204,6 +1361,99 @@ async fn main() -> anyhow::Result<()> {
 /// directory that declares the instance, and the database of the source that
 /// holds its credentials. Both are resolved exactly as `validate` resolves
 /// them, so a deployment names its source once and every command agrees.
+/// Derive the tenancy migration, or report the difference.
+///
+/// Both need the same two things `validate` needs — a metadata directory and a
+/// database — and they are resolved the same way, so a deployment that can run
+/// `validate` can run these without learning new arguments.
+async fn run_tenancy_command(args: &Args, command: &TenancyCommand) -> anyhow::Result<()> {
+    // The two that remove or read a tenant resolve the same selection and
+    // then go their own way.
+    match command {
+        TenancyCommand::Export(export) => {
+            let selected = resolve_validate_selection(
+                args,
+                &ValidateArgs {
+                    metadata_dir: export.metadata_dir.clone(),
+                    source: export.source.clone(),
+                },
+                |name| std::env::var(name),
+            )?;
+            return donat_server::tenancy_cli::export(
+                &selected.metadata_dir,
+                &selected.database_url,
+                &export.tenant,
+                &export.out,
+            )
+            .await;
+        }
+        TenancyCommand::Erase(erase) => {
+            let selected = resolve_validate_selection(
+                args,
+                &ValidateArgs {
+                    metadata_dir: erase.metadata_dir.clone(),
+                    source: erase.source.clone(),
+                },
+                |name| std::env::var(name),
+            )?;
+            return donat_server::tenancy_cli::erase(
+                &selected.metadata_dir,
+                &selected.database_url,
+                &erase.tenant,
+                &erase.confirm,
+            )
+            .await;
+        }
+        _ => {}
+    }
+
+    let (metadata_dir, source, out, stamp, backfill) = match command {
+        TenancyCommand::Plan(plan) => (
+            plan.metadata_dir.clone(),
+            plan.source.clone(),
+            Some(plan.out.clone()),
+            plan.stamp.clone(),
+            plan.backfill.clone(),
+        ),
+        TenancyCommand::Check(check) => (
+            check.metadata_dir.clone(),
+            check.source.clone(),
+            None,
+            None,
+            None,
+        ),
+        // Handled above; the match is exhaustive so a third command cannot be
+        // added without deciding what it does here.
+        TenancyCommand::Export(_) | TenancyCommand::Erase(_) => unreachable!(),
+    };
+    let selected = resolve_validate_selection(
+        args,
+        &ValidateArgs {
+            metadata_dir,
+            source,
+        },
+        |name| std::env::var(name),
+    )?;
+
+    match out {
+        None => {
+            donat_server::tenancy_cli::check(&selected.metadata_dir, &selected.database_url).await
+        }
+        Some(out) => {
+            let stamp =
+                stamp.unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d%H%M%S").to_string());
+            donat_server::tenancy_cli::plan(
+                &selected.metadata_dir,
+                &selected.database_url,
+                &out,
+                &stamp,
+                backfill.as_deref(),
+            )
+            .await
+        }
+    }
+}
+
 async fn run_connector_command(args: &Args, command: &ConnectorCommand) -> anyhow::Result<()> {
     use donat_server::credentials::cli::{self, ConnectorTarget};
 

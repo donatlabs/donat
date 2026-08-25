@@ -41,6 +41,7 @@ conformance harness (`crates/conformance`).
 | `crates/testkit` | Test stand + the `*_test.yaml` runner behind `donat test`; the stubs and matching `crates/conformance` shares |
 | `crates/conformance` | Native conformance harness + fixtures (the conformance source of truth) |
 | `apps/ui` | Platform UI (`@refinest/*` + React) over the engine's GraphQL. Its own npm project, outside the Cargo workspace and `make test`. Not an admin surface — an ordinary role rendered; see `knowledgebase/platform/decisions/001-*` |
+| `examples/pethub` | Petshop composed unchanged (`extends:`) plus a platform layer: tenancy, in-tenant grants, plan ceilings |
 | `knowledgebase/` | Design notes and ADRs (Obsidian-style, see `_index.md`) |
 | `PLAN.md` | Architecture, milestones, decision log |
 
@@ -193,6 +194,16 @@ never cleans itself up.
 - **Every change needs tests**: unit/insta in the touched crate AND the
   conformance crate green (`make conformance`) after rebuilding the engine
   binary.
+- **A tenant is declared, never repeated.** Where `tenancy.yaml` exists the
+  predicate is ANDed at one choke point and the preset injected into every
+  write; a tracked table with neither the key nor a declared exemption stops
+  the boot. The tenant is a claim and never a header, for the same reason a
+  role is. Isolation is not ownership: scoping only by tenant still hands every
+  seller every other seller's rows.
+- **What a permission does not bound, it declares.** `permissions.yaml` with
+  `unbounded_permissions: declared` makes every permission that admits rows it
+  does not bound to the caller name a reason — `catalogue`, `operator`,
+  `worker` or `command`. Default is `unchecked`, so v2 metadata still loads.
 - **An application's tests are declarations beside the thing they test.** A
   `*_test.yaml` sits next to the metadata file it exercises
   (`public_orders.yaml` → `public_orders_test.yaml`), never in Rust; `donat

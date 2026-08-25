@@ -32,6 +32,7 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: payment_worker
     permission:
       columns:
@@ -42,14 +43,17 @@ select_permissions:
         - currency
         - provider_reference
       filter: {}
+      unbounded: worker
   - role: reconciliation_worker
     permission:
       columns: "*"
       filter: {}
+      unbounded: worker
   - role: subscription_worker
     permission:
       columns: "*"
       filter: {}
+      unbounded: worker
 command_select_permissions:
   - role: payment_worker
     permission:
@@ -64,6 +68,7 @@ command_select_permissions:
         - currency
         - provider_reference
       filter: {}
+      unbounded: worker
 # A payment is money, so a shopper reaches it only through their own commands
 # — `begin_checkout` opens one, `cancel_order` and
 # `request_authorized_order_cancellation` ask for it to be stopped. There is no
@@ -101,14 +106,17 @@ insert_permissions:
     permission:
       columns: "*"
       check: {}
+      unbounded: worker
 update_permissions:
   - role: support
     permission:
       columns: "*"
       filter: {}
       check: {}
+      unbounded: operator
   - role: payment_worker
     permission:
       columns: "*"
       filter: {}
       check: {}
+      unbounded: worker

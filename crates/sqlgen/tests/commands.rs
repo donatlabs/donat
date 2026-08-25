@@ -101,6 +101,7 @@ fn decision_root(
     rows: &[(&str, &str, i64)],
 ) -> MutationRoot {
     root(CommandMutation {
+        authorization: None,
         identity: command_identity(command_name),
         name: command_name.to_owned(),
         steps: vec![CommandExecutionStep::Decision {
@@ -219,6 +220,7 @@ fn allocation_root(command_name: &str, maximum_rows: u32) -> MutationRoot {
             .collect()
     };
     root(CommandMutation {
+        authorization: None,
         identity: command_identity(command_name),
         name: command_name.to_owned(),
         steps: vec![
@@ -426,9 +428,14 @@ fn install_command_identity_catalog(tx: &mut Transaction<'_>) {
     install_command_catalog(tx);
 }
 
+/// `CREATE SCHEMA IF NOT EXISTS` is not atomic: two tests reaching it at once
+/// both see the schema missing, both insert into `pg_namespace`, and the second
+/// fails on its unique index. The advisory lock serialises them, the same way
+/// `install_command_catalog_client` already serialises its migration.
 fn install_check_violation_helper(tx: &mut Transaction<'_>) {
     tx.batch_execute(
         r#"
+        SELECT pg_advisory_xact_lock(604630062);
         CREATE SCHEMA IF NOT EXISTS donat;
         CREATE OR REPLACE FUNCTION donat.check_violation(msg text)
         RETURNS json AS $$
@@ -443,6 +450,9 @@ fn install_check_violation_helper(tx: &mut Transaction<'_>) {
 
 fn install_check_violation_helper_client(client: &mut Client) {
     client
+        .query_one("SELECT pg_advisory_lock(604630062)", &[])
+        .expect("serialize schema creation in tests");
+    client
         .batch_execute(
             r#"
             CREATE SCHEMA IF NOT EXISTS donat;
@@ -455,6 +465,9 @@ fn install_check_violation_helper_client(client: &mut Client) {
             "#,
         )
         .expect("permission-check helper installs for direct SQLgen execution");
+    client
+        .query_one("SELECT pg_advisory_unlock(604630062)", &[])
+        .expect("release the schema-creation lock");
 }
 
 fn install_command_catalog_client(client: &mut Client) {
@@ -558,6 +571,7 @@ fn idempotent_insert_root_with_id(
     status: &str,
 ) -> MutationRoot {
     root(CommandMutation {
+        authorization: None,
         identity: command_identity(command_name),
         name: command_name.to_owned(),
         steps: vec![CommandExecutionStep::Insert {
@@ -612,6 +626,7 @@ fn relational_batch_root(
     ];
     let updated_columns = vec![column("variant_id", "int4"), column("reserved", "int4")];
     root(CommandMutation {
+        authorization: None,
         identity: command_identity(command_name),
         name: command_name.to_owned(),
         steps: vec![
@@ -795,6 +810,7 @@ fn command_renderer_lowers_guard_and_session_scoped_idempotency() {
     let root = MutationRoot::Command {
         alias: "submitted".to_owned(),
         command: CommandMutation {
+            authorization: None,
             identity: command_identity("create_order"),
             name: "create_order".to_owned(),
             steps: vec![],
@@ -847,6 +863,7 @@ fn command_v6_writer_generates_and_replays_one_durable_invocation_uuid() {
 
 fn effectful_command_root(start_policy: ProcessStartPolicy) -> MutationRoot {
     root(CommandMutation {
+        authorization: None,
         identity: command_identity("create_order"),
         name: "create_order".to_owned(),
         steps: vec![],
@@ -1171,6 +1188,7 @@ fn assert_no_effect_command_state(tx: &mut Transaction<'_>) {
 #[test]
 fn command_renderer_fails_closed_for_non_list_insert_many_ir() {
     let malformed = root(CommandMutation {
+        authorization: None,
         identity: command_identity("malformed_batch"),
         name: "malformed_batch".to_owned(),
         steps: vec![CommandExecutionStep::InsertMany {
@@ -1210,6 +1228,7 @@ fn bounded_argument_rows_render_one_typed_postgres_cte() {
     let _catalog_lock = command_catalog_test_lock();
     let input = "_cmd_step_0_input";
     let root = root(CommandMutation {
+        authorization: None,
         identity: command_identity("sum_lines"),
         name: "sum_lines".to_owned(),
         steps: vec![
@@ -1294,6 +1313,7 @@ fn bounded_argument_rows_render_one_typed_postgres_cte() {
 fn bounded_argument_rows_keep_update_many_exact_key_gates() {
     let input = "_cmd_step_0_input";
     let root = root(CommandMutation {
+        authorization: None,
         identity: command_identity("update_lines"),
         name: "update_lines".to_owned(),
         steps: vec![
@@ -1346,6 +1366,7 @@ fn bounded_argument_rows_keep_update_many_exact_key_gates() {
 fn projected_scalar_steps_render_as_bounded_single_item_lists() {
     let _catalog_lock = command_catalog_test_lock();
     let root = root(CommandMutation {
+        authorization: None,
         identity: command_identity("project_one"),
         name: "project_one".to_owned(),
         steps: vec![CommandExecutionStep::Project {
@@ -1722,6 +1743,7 @@ fn command_insert_many_rule_binding_uses_each_current_item_value() {
     .expect("create the command target table");
 
     let command = root(CommandMutation {
+        authorization: None,
         identity: command_identity("item_rule_batch"),
         name: "item_rule_batch".to_owned(),
         steps: vec![CommandExecutionStep::InsertMany {
@@ -1867,6 +1889,7 @@ fn command_assertion_rejection_does_not_reach_later_dml_trigger() {
     .expect("create trigger-sensitive command target");
 
     let command = root(CommandMutation {
+        authorization: None,
         identity: command_identity("assert_trigger_command"),
         name: "assert_trigger_command".to_owned(),
         steps: vec![
@@ -1957,6 +1980,7 @@ fn command_required_update_rejection_does_not_reach_later_dml_trigger() {
     .expect("create required-update trigger-sensitive command target");
 
     let command = root(CommandMutation {
+        authorization: None,
         identity: command_identity("required_update_trigger_command"),
         name: "required_update_trigger_command".to_owned(),
         steps: vec![
@@ -2063,6 +2087,7 @@ fn command_required_select_rejection_does_not_reach_later_dml_trigger() {
     .expect("create required-select trigger-sensitive command target");
 
     let command = root(CommandMutation {
+        authorization: None,
         identity: command_identity("required_select_trigger_command"),
         name: "required_select_trigger_command".to_owned(),
         steps: vec![
@@ -2167,6 +2192,7 @@ fn command_required_delete_rejection_does_not_reach_later_dml_trigger() {
     .expect("create required-delete trigger-sensitive command target");
 
     let command = root(CommandMutation {
+        authorization: None,
         identity: command_identity("required_delete_trigger_command"),
         name: "required_delete_trigger_command".to_owned(),
         steps: vec![
@@ -2341,6 +2367,7 @@ fn command_insert_many_executes_postgres_typed_items_in_declared_input_order() {
     install_check_violation_helper(&mut tx);
 
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        authorization: None,
         identity: command_identity("create_lines"),
         name: "create_lines".to_owned(),
         steps: vec![CommandExecutionStep::InsertMany {
@@ -2560,6 +2587,7 @@ fn command_concurrent_retry_waits_for_claim_and_replays_one_canonical_result() {
 #[test]
 fn command_renderer_snapshots_guarded_insert_and_declared_projection() {
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        authorization: None,
         identity: command_identity("create_order"),
         name: "create_order".to_owned(),
         steps: vec![CommandExecutionStep::Insert {
@@ -2615,6 +2643,7 @@ fn command_renderer_snapshots_guarded_insert_and_declared_projection() {
 fn command_renderer_snapshots_select_one_then_update() {
     let order_id = column("id", "uuid");
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        authorization: None,
         identity: command_identity("approve_order"),
         name: "approve_order".to_owned(),
         steps: vec![
@@ -2682,6 +2711,7 @@ fn command_renderer_snapshots_select_one_then_update() {
 fn command_renderer_snapshots_insert_many_and_assert() {
     let order_id = column("id", "uuid");
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        authorization: None,
         identity: command_identity("create_order_lines"),
         name: "create_order_lines".to_owned(),
         steps: vec![
@@ -3234,6 +3264,7 @@ fn command_renderer_executes_pure_forms_typed_results_and_false_conditional_gate
         pg_type: "boolean".to_owned(),
     };
     let sql = donat_sqlgen::mutation_to_sql(&root(CommandMutation {
+        authorization: None,
         identity: command_identity("pure_and_conditional"),
         name: "pure_and_conditional".to_owned(),
         steps: vec![
@@ -3520,6 +3551,7 @@ fn step_scoped_idempotent_root(
     key: &str,
 ) -> MutationRoot {
     root(CommandMutation {
+        authorization: None,
         identity: command_identity(command_name),
         name: command_name.to_owned(),
         steps: vec![

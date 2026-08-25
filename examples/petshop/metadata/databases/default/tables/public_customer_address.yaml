@@ -16,6 +16,7 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
 insert_permissions:
   - role: customer
     permission:

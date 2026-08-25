@@ -1,0 +1,19 @@
+# Platform-owned reference data: every store reads the same rows, and no store
+# writes any of them. `shared: read_only` in `tenancy.yaml` is what makes that
+# a rule rather than an intention — a write permission for a tenant-facing role
+# here fails the deploy, because a shared writable table is a channel from one
+# tenant to another.
+table:
+  name: plan
+  schema: public
+select_permissions:
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+      unbounded: operator
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+      unbounded: operator

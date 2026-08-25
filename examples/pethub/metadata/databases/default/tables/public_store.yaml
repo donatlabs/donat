@@ -1,0 +1,22 @@
+# The tenant registry. It is keyed by its own identifier rather than by a
+# `tenant_id` column, which is why `tenancy.yaml` names it under `keys:` and
+# not under `exempt:` — exempting it would let a member of any store read every
+# store there is.
+#
+# Nobody writes it through CRUD: a store is created by the platform, and the
+# ceiling below is read from `plan_code`, so a role that could write this row
+# could move itself to a richer plan. `donat validate` refuses that.
+table:
+  name: store
+  schema: public
+select_permissions:
+  - role: staff
+    permission:
+      columns: "*"
+      filter: {}
+      unbounded: operator
+  - role: support
+    permission:
+      columns: "*"
+      filter: {}
+      unbounded: operator

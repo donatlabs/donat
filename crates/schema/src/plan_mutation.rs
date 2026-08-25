@@ -110,6 +110,32 @@ impl ResolvedCommandStepKind {
     }
 }
 
+/// Where a command's writes take their tenant from.
+///
+/// `Session` is every command but two. `Step` is the one that creates a tenant
+/// and the one that admits somebody to a tenant they are not in yet — both of
+/// which say so in their own declaration.
+enum CommandTenantSource {
+    Session,
+    /// This very step is the one that creates the tenant, so there is nothing
+    /// to preset it from and nothing to bound it by — the row being written is
+    /// the answer.
+    Creating,
+    /// The step this command takes its tenant from has not run yet.
+    ///
+    /// Ordinary for the reads that come first: a registration looks up a plan
+    /// and a founder before it inserts the tenant row, and neither of those
+    /// needs a tenant to be scoped by — the command declares that it
+    /// establishes one, so nothing before that point is in one. A *write*
+    /// arriving here is a different matter and is refused, because it would
+    /// otherwise store a row belonging to nobody.
+    Pending,
+    Step {
+        cte: String,
+        column: CommandColumn,
+    },
+}
+
 impl<'a> Planner<'a> {
     /// Does the role have any mutation permission at all (respecting
     /// backend_only)? Donat reports "no mutations exist" when not.
@@ -671,6 +697,9 @@ impl<'a> Planner<'a> {
                 role: session.role.clone(),
             },
             name: definition.name.clone(),
+            authorization: self
+                .command_authorization(&definition.name, session, path)?
+                .map(Box::new),
             steps,
             guards,
             result,
@@ -983,6 +1012,41 @@ impl<'a> Planner<'a> {
                 output.guaranteed_non_empty = guaranteed_non_empty;
                 output
             };
+
+        // Resolved once for the step: every write below takes its tenant from
+        // the same place, and the establishing step has already run by now.
+        let tenant_source =
+            self.command_tenant_source(command, &step.name, previous_steps, path)?;
+        let tenant_bound_by_session = matches!(tenant_source, CommandTenantSource::Session);
+        // A step may read outside the tenant, and says so on itself.
+        let step_scoped = step.tenant != Some(donat_metadata::StepTenant::Unscoped);
+        // A scoped read is scoped by the *session's* tenant, which is the wrong
+        // tenant whenever this command's is not the session's: a command that
+        // establishes one, or takes it from a looked-up row, would read tenant
+        // A while writing tenant B, in one statement, and nothing about the
+        // answer would say so. There is no third tenant to compare against
+        // here, so the step is refused rather than answered from the wrong one
+        // — the author says `tenant: unscoped` and takes the audit, or reads a
+        // table the declaration already marked shared.
+        if step_scoped
+            && !tenant_bound_by_session
+            && let Some(tenancy) = self.tenancy
+            && let Some(table) = step.operation.read_table()
+            && matches!(
+                tenancy.table_scope(table),
+                donat_metadata::TableScope::Key(_) | donat_metadata::TableScope::ScopeVia(_)
+            )
+        {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "step `{}` reads `{table}` scoped by the caller's tenant, but this command \
+                     takes its own tenant from elsewhere, so the two would disagree. Declare \
+                     `tenant: unscoped` on the step if reading outside the tenant is intended.",
+                    step.name
+                ),
+            ));
+        }
         match &step.operation {
             CommandStepOperation::Assert { assert } => {
                 let rule = self.resolve_command_rule(
@@ -1036,7 +1100,8 @@ impl<'a> Planner<'a> {
                     session,
                     path,
                 )?;
-                let filter = self.permission_predicate(&context, session, path)?;
+                let filter =
+                    self.permission_predicate_full(&context, session, step_scoped, false, path)?;
                 let resolved = CommandExecutionStep::SelectOne {
                     name: step.name.clone(),
                     cte: cte.clone(),
@@ -1071,7 +1136,8 @@ impl<'a> Planner<'a> {
                 )?;
                 let order_by =
                     self.command_columns(&select_many.table, &select_many.order_by, path)?;
-                let filter = self.permission_predicate(&context, session, path)?;
+                let filter =
+                    self.permission_predicate_full(&context, session, true, false, path)?;
                 let resolved = CommandExecutionStep::SelectMany {
                     name: step.name.clone(),
                     cte: cte.clone(),
@@ -1392,10 +1458,18 @@ impl<'a> Planner<'a> {
                     &permission.set,
                     &insert.table,
                     session,
+                    &tenant_source,
                     path,
                 )?;
                 let returning = self.command_columns(&insert.table, &insert.returning, path)?;
-                let check = self.parse_check_exp(&permission.check, &context, session, path)?;
+                let check = self.command_check_exp(
+                    &permission.check,
+                    &context,
+                    session,
+                    donat_metadata::IamOperation::Insert,
+                    tenant_bound_by_session,
+                    path,
+                )?;
                 let resolved = CommandExecutionStep::Insert {
                     name: step.name.clone(),
                     cte: cte.clone(),
@@ -1442,11 +1516,19 @@ impl<'a> Planner<'a> {
                     &permission.set,
                     &insert_when.table,
                     session,
+                    &tenant_source,
                     path,
                 )?;
                 let returning =
                     self.command_columns(&insert_when.table, &insert_when.returning, path)?;
-                let check = self.parse_check_exp(&permission.check, &context, session, path)?;
+                let check = self.command_check_exp(
+                    &permission.check,
+                    &context,
+                    session,
+                    donat_metadata::IamOperation::Insert,
+                    tenant_bound_by_session,
+                    path,
+                )?;
                 Ok((
                     CommandExecutionStep::InsertWhen {
                         name: step.name.clone(),
@@ -1529,11 +1611,19 @@ impl<'a> Planner<'a> {
                     &permission.set,
                     &insert_many.table,
                     session,
+                    &tenant_source,
                     path,
                 )?;
                 let returning =
                     self.command_columns(&insert_many.table, &insert_many.returning, path)?;
-                let check = self.parse_check_exp(&permission.check, &context, session, path)?;
+                let check = self.command_check_exp(
+                    &permission.check,
+                    &context,
+                    session,
+                    donat_metadata::IamOperation::Insert,
+                    tenant_bound_by_session,
+                    path,
+                )?;
                 let table = Table {
                     schema: context.info.schema.clone(),
                     name: context.info.name.clone(),
@@ -1609,15 +1699,28 @@ impl<'a> Planner<'a> {
                     &permission.set,
                     &update.table,
                     session,
+                    &tenant_source,
                     path,
                 )?;
                 let returning = self.command_columns(&update.table, &update.returning, path)?;
-                let filter =
-                    self.command_permission_filter(&permission.filter, &context, session, path)?;
-                let check = match &permission.check {
-                    Some(check) => self.parse_check_exp(check, &context, session, path)?,
-                    None => None,
-                };
+                let filter = self.command_permission_filter(
+                    &permission.filter,
+                    &context,
+                    session,
+                    tenant_bound_by_session,
+                    path,
+                )?;
+                // Always through `parse_check_exp`, even with nothing
+                // declared: the tenant bound lives there, and a permission
+                // that declares no check must not be the way out of it.
+                let check = self.command_check_exp(
+                    permission.check.as_ref().unwrap_or(&Json::Null),
+                    &context,
+                    session,
+                    donat_metadata::IamOperation::Update,
+                    tenant_bound_by_session,
+                    path,
+                )?;
                 let resolved = CommandExecutionStep::Update {
                     name: step.name.clone(),
                     cte: cte.clone(),
@@ -1677,16 +1780,29 @@ impl<'a> Planner<'a> {
                     &permission.set,
                     &update_when.table,
                     session,
+                    &tenant_source,
                     path,
                 )?;
                 let returning =
                     self.command_columns(&update_when.table, &update_when.returning, path)?;
-                let filter =
-                    self.command_permission_filter(&permission.filter, &context, session, path)?;
-                let check = match &permission.check {
-                    Some(check) => self.parse_check_exp(check, &context, session, path)?,
-                    None => None,
-                };
+                let filter = self.command_permission_filter(
+                    &permission.filter,
+                    &context,
+                    session,
+                    tenant_bound_by_session,
+                    path,
+                )?;
+                // Always through `parse_check_exp`, even with nothing
+                // declared: the tenant bound lives there, and a permission
+                // that declares no check must not be the way out of it.
+                let check = self.command_check_exp(
+                    permission.check.as_ref().unwrap_or(&Json::Null),
+                    &context,
+                    session,
+                    donat_metadata::IamOperation::Update,
+                    tenant_bound_by_session,
+                    path,
+                )?;
                 Ok((
                     CommandExecutionStep::UpdateWhen {
                         name: step.name.clone(),
@@ -1794,6 +1910,7 @@ impl<'a> Planner<'a> {
                     &permission.set,
                     &update_many.table,
                     session,
+                    &tenant_source,
                     path,
                 )?;
                 let check = update_many
@@ -1818,12 +1935,21 @@ impl<'a> Planner<'a> {
                     .transpose()?;
                 let returning =
                     self.command_columns(&update_many.table, &update_many.returning, path)?;
-                let filter =
-                    self.command_permission_filter(&permission.filter, &context, session, path)?;
-                let permission_check = match &permission.check {
-                    Some(check) => self.parse_check_exp(check, &context, session, path)?,
-                    None => None,
-                };
+                let filter = self.command_permission_filter(
+                    &permission.filter,
+                    &context,
+                    session,
+                    tenant_bound_by_session,
+                    path,
+                )?;
+                let permission_check = self.command_check_exp(
+                    permission.check.as_ref().unwrap_or(&Json::Null),
+                    &context,
+                    session,
+                    donat_metadata::IamOperation::Update,
+                    tenant_bound_by_session,
+                    path,
+                )?;
                 let resolved = CommandExecutionStep::UpdateMany {
                     name: step.name.clone(),
                     cte: cte.clone(),
@@ -1870,8 +1996,13 @@ impl<'a> Planner<'a> {
                     path,
                 )?;
                 let returning = self.command_columns(&delete.table, &delete.returning, path)?;
-                let filter =
-                    self.command_permission_filter(&permission.filter, &context, session, path)?;
+                let filter = self.command_permission_filter(
+                    &permission.filter,
+                    &context,
+                    session,
+                    tenant_bound_by_session,
+                    path,
+                )?;
                 let resolved = CommandExecutionStep::Delete {
                     name: step.name.clone(),
                     cte: cte.clone(),
@@ -2889,6 +3020,34 @@ impl<'a> Planner<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        // The replay journal is keyed `(command_identity, scope_hash, key)`, and
+        // `command_identity` is source + command + role only (ADR-008). The
+        // tenant appears nowhere in it, so without this two tenants that pick
+        // the same idempotency key — a request id, an order number, anything a
+        // client generates — would each be served the other's recorded result.
+        // Nothing about that failure is visible from the data plane: both
+        // callers get a well-formed answer for a command they did run.
+        //
+        // A caller with no tenant is left alone deliberately. It can only have
+        // touched exempt tables, because every tenanted one refused it, so
+        // there is no other tenant's result for it to collide with.
+        let scope = match self.tenancy {
+            Some(tenancy) => {
+                let mut scoped = Vec::with_capacity(scope.len() + 1);
+                if let Some(value) = session
+                    .var(&tenancy.variable_key())
+                    .filter(|value| !value.is_empty())
+                {
+                    scoped.push(CommandExecutionValue::Scalar {
+                        value: Scalar::Json(Json::String(value.to_owned())),
+                        pg_type: "text".to_owned(),
+                    });
+                }
+                scoped.extend(scope);
+                scoped
+            }
+            None => scope,
+        };
         let input = Scalar::Json(Json::Object(
             arguments
                 .iter()
@@ -2914,14 +3073,40 @@ impl<'a> Planner<'a> {
         filter: &Json,
         context: &TableCtx<'a>,
         session: &Session,
+        bound_by_session: bool,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
-        if filter.is_null() || filter.as_object().is_some_and(|object| object.is_empty()) {
-            return Ok(None);
-        }
-        let filter_context = self.filter_ctx_of(context);
-        self.parse_bool_exp(filter, &filter_context, session, true, path)
-            .map(Some)
+        self.write_permission_filter_bounded(filter, context, session, bound_by_session, path)
+    }
+
+    /// A command write's check: what the permission declared, the tenant bound
+    /// when the session is what supplies it, and the registry's status gate.
+    ///
+    /// The gate is here rather than in the step's filter for the same reason
+    /// it is in an ordinary update's check — a filtered step reports a command
+    /// that ran and changed nothing, which is not an answer to "may I".
+    fn command_check_exp(
+        &self,
+        check: &Json,
+        context: &TableCtx<'a>,
+        session: &Session,
+        operation: donat_metadata::IamOperation,
+        bound_by_session: bool,
+        path: &str,
+    ) -> Result<Option<BoolExp>, PlanError> {
+        let tenant = if bound_by_session {
+            crate::tenancy::CheckTenant::Session
+        } else {
+            crate::tenancy::CheckTenant::Step
+        };
+        self.write_check_expression(
+            check,
+            context,
+            session,
+            crate::tenancy::CheckAuthorization::CommandStep(operation),
+            tenant,
+            path,
+        )
     }
 
     fn apply_command_presets(
@@ -2930,6 +3115,7 @@ impl<'a> Planner<'a> {
         presets: &BTreeMap<String, Json>,
         table: &donat_metadata::QualifiedTable,
         session: &Session,
+        source: &CommandTenantSource,
         path: &str,
     ) -> Result<(), PlanError> {
         let info = self.catalog_table(table).ok_or_else(|| {
@@ -2968,7 +3154,135 @@ impl<'a> Planner<'a> {
                 assignments.push(assignment);
             }
         }
+        // The command plane is a separate, narrower set of permissions
+        // (ADR-019) that never falls back to the ordinary ones, so it needs
+        // the tenant applied here as well as in the CRUD path. This is the one
+        // place a command's writes assign a preset, which is why it is the one
+        // place this is done.
+        if let Some((column, value)) =
+            self.command_tenant_assignment(table, session, source, path)?
+        {
+            let assignment = CommandAssignment { value, column };
+            match assignments
+                .iter_mut()
+                .find(|existing| existing.column.name == assignment.column.name)
+            {
+                Some(existing) => *existing = assignment,
+                None => assignments.push(assignment),
+            }
+        }
         Ok(())
+    }
+
+    /// Where this command's writes get their tenant.
+    ///
+    /// Resolved per step rather than per command because the establishing step
+    /// has to have run first: `register_merchant` inserts the tenant row and
+    /// only then can every later write reference it.
+    fn command_tenant_source(
+        &self,
+        command: &CompiledCommand,
+        step_name: &str,
+        previous_steps: &BTreeMap<String, ResolvedCommandStep>,
+        path: &str,
+    ) -> Result<CommandTenantSource, PlanError> {
+        let Some(tenancy) = self.tenancy else {
+            return Ok(CommandTenantSource::Session);
+        };
+        let Some(declared) = command.definition().tenant.as_ref() else {
+            return Ok(CommandTenantSource::Session);
+        };
+        let reference = declared.step();
+        if reference.step == step_name {
+            return Ok(CommandTenantSource::Creating);
+        }
+        let Some(step) = previous_steps.get(&reference.step) else {
+            return Ok(CommandTenantSource::Pending);
+        };
+        if step.many {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "command `{}` takes its tenant from step `{}`, which returns many rows",
+                    command.definition().name,
+                    reference.step
+                ),
+            ));
+        }
+        let name = reference.column.as_deref().unwrap_or(&tenancy.key);
+        let column = step.columns.get(name).cloned().ok_or_else(|| {
+            PlanError::validation(
+                path,
+                format!(
+                    "step `{}` does not return a column `{name}` to take the tenant from",
+                    reference.step
+                ),
+            )
+        })?;
+        Ok(CommandTenantSource::Step {
+            cte: step.cte.clone(),
+            column,
+        })
+    }
+
+    /// The tenant column and value a command's write must carry, taken from
+    /// the session.
+    ///
+    /// A command that *creates* a tenant has no tenant in its session yet, and
+    /// declaring where its key comes from instead is the `tenant:` block on a
+    /// command. Until that exists, such a command fails here rather than
+    /// writing a row with somebody else's tenant or none at all — which is the
+    /// right way round for a gate to be incomplete.
+    fn command_tenant_assignment(
+        &self,
+        table: &donat_metadata::QualifiedTable,
+        session: &Session,
+        source: &CommandTenantSource,
+        path: &str,
+    ) -> Result<Option<(CommandColumn, CommandExecutionValue)>, PlanError> {
+        let Some(tenancy) = self.tenancy else {
+            return Ok(None);
+        };
+        let donat_metadata::TableScope::Key(name) = tenancy.table_scope(table) else {
+            return Ok(None);
+        };
+        let Some(info) = self.catalog_table(table) else {
+            return Ok(None);
+        };
+        let Some(column) = info.column(name).map(command_column) else {
+            return Err(PlanError::new(
+                path,
+                "unexpected",
+                format!(
+                    "table \"{table}\" has no tenant key column \"{name}\"; this deployment \
+                     cannot be served safely"
+                ),
+            ));
+        };
+        let value = match source {
+            CommandTenantSource::Creating => return Ok(None),
+            CommandTenantSource::Pending => {
+                return Err(PlanError::validation(
+                    path,
+                    format!(
+                        "this write into `{table}` runs before the step its tenant comes from, \
+                         so it would store a row belonging to nobody. Move it after that step."
+                    ),
+                ));
+            }
+            CommandTenantSource::Session => CommandExecutionValue::Scalar {
+                value: Scalar::Json(Json::String(self.tenant_value(session, path)?)),
+                pg_type: column.pg_type.clone(),
+            },
+            CommandTenantSource::Step {
+                cte,
+                column: step_column,
+            } => CommandExecutionValue::StepColumn {
+                cte: cte.clone(),
+                column: step_column.clone(),
+            },
+        };
+        Ok(Some((column, value)))
     }
 
     fn command_item_fields(
@@ -3761,6 +4075,15 @@ impl<'a> Planner<'a> {
             }
             preset_values.push((col.clone(), Scalar::Json(resolved)));
         }
+        // The tenant is the last preset applied, so it wins over a declared
+        // one naming the same column as well as over the caller's value.
+        if let Some((column, _, value)) = self.tenant_preset(ctx, session, path)? {
+            if !columns.contains(&column) {
+                columns.push(column.clone());
+            }
+            preset_values.retain(|(existing, _)| existing != &column);
+            preset_values.push((column, Scalar::Json(Json::String(value))));
+        }
 
         let typed_columns: Vec<(String, String)> = columns
             .iter()
@@ -3791,7 +4114,17 @@ impl<'a> Planner<'a> {
             })
             .collect();
 
-        let check = self.parse_check_exp(&perm.check, ctx, session, path)?;
+        // Insert and update both carry a check the database evaluates over the
+        // rows they wrote, so a caller without the action is told no rather
+        // than quietly writing nothing.
+        let check = self.write_check_expression(
+            &perm.check,
+            ctx,
+            session,
+            crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Insert),
+            crate::tenancy::CheckTenant::Session,
+            path,
+        )?;
         let check_path = format!("{path}.args.objects");
         let mut validators = self.resolved_validators(
             ctx,
@@ -3864,6 +4197,7 @@ impl<'a> Planner<'a> {
         }
 
         Ok(InsertMutation {
+            quota: self.quota_consumption(ctx, session, true, path)?,
             table: Table {
                 schema: ctx.info.schema.clone(),
                 name: ctx.info.name.clone(),
@@ -3906,6 +4240,23 @@ impl<'a> Planner<'a> {
         let Some(remote_ctx) = self.table_ctx_by_name(&manual.remote_table, &session.role) else {
             return Ok(None);
         };
+        // A nested child lands in a CTE of its own, and the counter moves by
+        // what the *top-level* statement wrote. A ceiling one write path walks
+        // around is a ceiling the tenant chooses to ignore — the same reason
+        // `validate_quota_declaration` refuses a command writer on a counted
+        // table — so the nested path is refused rather than left uncounted.
+        if let Some(quotas) = self.quotas
+            && quotas.consumed_by(&remote_ctx.entry.table).is_some()
+        {
+            return Err(PlanError::validation(
+                path,
+                format!(
+                    "`{}` is counted against a plan, and a nested insert would create a row \
+                     without moving the counter. Insert it directly instead.",
+                    remote_ctx.entry.table
+                ),
+            ));
+        }
         let remote_perm = self
             .resolve_role_perm(&remote_ctx.entry.insert_permissions, &session.role, |p| {
                 !p.backend_only || session.backend_request
@@ -4013,6 +4364,18 @@ impl<'a> Planner<'a> {
                     .unwrap();
                 columns.push((col.clone(), pg_type));
                 row.push(Some(Scalar::Json(resolved)));
+            }
+        }
+        // A nested insert writes a second table, and it is scoped by the same
+        // rule as the first: the child row belongs to the caller's tenant, not
+        // to whichever tenant the parent's data named.
+        if let Some((column, pg_type, value)) = self.tenant_preset(&remote_ctx, session, path)? {
+            match columns.iter().position(|(existing, _)| existing == &column) {
+                Some(index) => row[index] = Some(Scalar::Json(Json::String(value))),
+                None => {
+                    columns.push((column, pg_type));
+                    row.push(Some(Scalar::Json(Json::String(value))));
+                }
             }
         }
 
@@ -4137,12 +4500,9 @@ impl<'a> Planner<'a> {
         if !update_columns.is_empty()
             && let Some(update_perm) = update_perm
         {
-            if !update_perm.filter.is_null()
-                && !update_perm.filter.as_object().is_some_and(|o| o.is_empty())
+            if let Some(filter) =
+                self.write_permission_filter(&update_perm.filter, ctx, session, path)?
             {
-                let filter_ctx = self.filter_ctx_of(ctx);
-                let filter =
-                    self.parse_bool_exp(&update_perm.filter, &filter_ctx, session, true, path)?;
                 predicate = Some(match predicate.take() {
                     Some(p) => BoolExp::And(vec![p, filter]),
                     None => filter,
@@ -4169,6 +4529,26 @@ impl<'a> Planner<'a> {
                     column: col.clone(),
                     pg_type: info.sql_type().to_string(),
                     value: Scalar::Json(resolved),
+                });
+            }
+            // An upsert that matched an existing row still writes it, so the
+            // same preset applies to the DO UPDATE branch as to the insert.
+            //
+            // Inside this block, and only inside it. sqlgen renders DO NOTHING
+            // exactly when both `update_columns` and `set_ops` are empty, so a
+            // preset added unconditionally would turn every insert-or-ignore
+            // on a tenanted table into a DO UPDATE — and the tenant bound
+            // above, which lives on the same branch, would not be there to
+            // bound it. That is a caller overwriting another tenant's row by
+            // colliding with its unique key.
+            if let Some((column, pg_type, value)) = self.tenant_preset(ctx, session, path)? {
+                set_ops.retain(
+                    |op| !matches!(op, SetOp::Set { column: existing, .. } if existing == &column),
+                );
+                set_ops.push(SetOp::Set {
+                    column,
+                    pg_type,
+                    value: Scalar::Json(Json::String(value)),
                 });
             }
         }
@@ -4347,12 +4727,24 @@ impl<'a> Planner<'a> {
                 value: Scalar::Json(resolved),
             });
         }
-
         if sets.is_empty() {
             return Err(PlanError::validation(
                 path,
                 "at least any one of _set, _inc, _append is expected",
             ));
+        }
+        // After the guard, never before it: an update whose only assignment
+        // was the tenant preset would otherwise be accepted as an update that
+        // sets nothing.
+        if let Some((column, pg_type, value)) = self.tenant_preset(ctx, session, path)? {
+            sets.retain(
+                |op| !matches!(op, SetOp::Set { column: existing, .. } if existing == &column),
+            );
+            sets.push(SetOp::Set {
+                column,
+                pg_type,
+                value: Scalar::Json(Json::String(value)),
+            });
         }
 
         // Predicate: pk/user where AND the role's update filter.
@@ -4360,9 +4752,8 @@ impl<'a> Planner<'a> {
         if let Some(w) = user_where {
             predicates.push(w);
         }
-        if !perm.filter.is_null() && !perm.filter.as_object().is_some_and(|o| o.is_empty()) {
-            let filter_ctx = self.filter_ctx_of(ctx);
-            predicates.push(self.parse_bool_exp(&perm.filter, &filter_ctx, session, true, path)?);
+        if let Some(filter) = self.write_permission_filter(&perm.filter, ctx, session, path)? {
+            predicates.push(filter);
         }
         let predicate = match predicates.len() {
             0 => None,
@@ -4370,10 +4761,14 @@ impl<'a> Planner<'a> {
             _ => Some(BoolExp::And(predicates)),
         };
 
-        let check = match &perm.check {
-            Some(check) => self.parse_check_exp(check, ctx, session, path)?,
-            None => None,
-        };
+        let check = self.write_check_expression(
+            perm.check.as_ref().unwrap_or(&Json::Null),
+            ctx,
+            session,
+            crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Update),
+            crate::tenancy::CheckTenant::Session,
+            path,
+        )?;
         let validators = self.resolved_validators(
             ctx,
             &ctx.entry.update_permissions,
@@ -4549,9 +4944,8 @@ impl<'a> Planner<'a> {
         if let Some(w) = user_where {
             predicates.push(w);
         }
-        if !perm.filter.is_null() && !perm.filter.as_object().is_some_and(|o| o.is_empty()) {
-            let filter_ctx = self.filter_ctx_of(ctx);
-            predicates.push(self.parse_bool_exp(&perm.filter, &filter_ctx, session, true, path)?);
+        if let Some(filter) = self.write_permission_filter(&perm.filter, ctx, session, path)? {
+            predicates.push(filter);
         }
         let predicate = match predicates.len() {
             0 => None,
@@ -4563,6 +4957,19 @@ impl<'a> Planner<'a> {
             self.parse_mutation_output(ctx, kind, field, fragments, vars, session, path)?;
 
         Ok(DeleteMutation {
+            // A delete now carries a check of its own, so a caller without the
+            // grant — or one whose tenant stopped being served — is refused
+            // rather than told it removed nothing.
+            check: self.write_check_expression(
+                &Json::Null,
+                ctx,
+                session,
+                crate::tenancy::CheckAuthorization::Table(donat_metadata::IamOperation::Delete),
+                crate::tenancy::CheckTenant::SessionBoundElsewhere,
+                path,
+            )?,
+            check_path: path.to_string(),
+            quota: self.quota_consumption(ctx, session, false, path)?,
             table: Table {
                 schema: ctx.info.schema.clone(),
                 name: ctx.info.name.clone(),
@@ -4611,17 +5018,7 @@ impl<'a> Planner<'a> {
         session: &Session,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
-        if check.is_null() || check.as_object().is_some_and(|o| o.is_empty()) {
-            return Ok(None);
-        }
-        let filter_ctx = self.filter_ctx_of(ctx);
-        Ok(Some(self.parse_bool_exp(
-            check,
-            &filter_ctx,
-            session,
-            true,
-            path,
-        )?))
+        self.write_permission_filter(check, ctx, session, path)
     }
 
     /// The mutation's selection set: `{ affected_rows, returning }` or the

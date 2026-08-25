@@ -15,7 +15,10 @@ Load `donat-tables-and-permissions`, `donat-schema-and-migrations` and
    how relationships are declared, how session variables are spelled, whether
    column masks are explicit or `"*"`.
 
-2. **Migration** `V{YYYYMMDDHHMMSS}__create_<table>.sql`. Decide nullability
+2. **Migration** `V{YYYYMMDDHHMMSS}__create_<table>.sql`. If the deployment
+   has a `tenancy.yaml`, the table needs its tenant key and an index on it, or
+   a declared exemption — and any `UNIQUE` over a value somebody chose needs
+   `(tenant_id, …)`. See `donat-multitenancy`. Decide nullability
    deliberately: a nullable column forces every validator touching it to
    declare presence. Add the unique constraints and indexes the row filters
    will need — a filter traversing a relationship that has no index is a
@@ -33,6 +36,12 @@ Load `donat-tables-and-permissions`, `donat-schema-and-migrations` and
    Anything absent is denied. Do not add a role that "can see everything"
    without saying out loud why, and never reach for an admin role — there
    isn't one.
+
+   Where a permission genuinely does not bound rows to the caller, say which of
+   `catalogue`, `operator`, `worker` or `command` it is — as an `unbounded:`
+   key if the directory sets `unbounded_permissions: declared`, and out loud
+   either way. A forgotten bound and a deliberate one are both `filter: {}`.
+   Under `tenancy.yaml`, being tenant-scoped is not being caller-bound.
 
 5. **Validators** for value rules that bind one role, ordered so the most
    specific diagnosis comes first, each with its own message. Declare presence

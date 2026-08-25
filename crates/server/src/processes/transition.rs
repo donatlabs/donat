@@ -2896,15 +2896,44 @@ fn validate_state_output(
         .map_err(|error| anyhow!("Process state output violated its compiled contract: {error}"))
 }
 
+/// The tenant variable this instance started with, as a one-entry session.
+///
+/// Empty when the deployment is not tenanted, which is every deployment that
+/// declares no `tenancy.yaml`. Exactly one variable is lifted out — the one
+/// the compiled definition names — so a fixed-role state still carries no
+/// caller identity, only the tenant its instance belongs to.
+fn persisted_tenant(
+    definition: &CompiledProcessDefinition,
+    snapshot: &TransitionSnapshot,
+) -> HashMap<String, String> {
+    let Some(object) = snapshot.caller_session.as_ref().and_then(Json::as_object) else {
+        return HashMap::new();
+    };
+    let Some(name) = definition.tenant_variable.as_ref() else {
+        return HashMap::new();
+    };
+    object
+        .get(name)
+        .and_then(Json::as_str)
+        .map(|value| HashMap::from([(name.clone(), value.to_owned())]))
+        .unwrap_or_default()
+}
+
 fn process_command_session(
     definition: &CompiledProcessDefinition,
     role: &CompiledProcessCommandRole,
     snapshot: &TransitionSnapshot,
 ) -> anyhow::Result<Session> {
     match role {
+        // A fixed role carries no caller identity by design — but it still
+        // runs inside one tenant's instance, and a write it makes must land
+        // there. The tenant is read from the persisted caller session rather
+        // than from anywhere ambient: an instance is the only thing that knows
+        // which tenant this execution belongs to, and it recorded that when it
+        // started.
         CompiledProcessCommandRole::Fixed { role } => Ok(Session {
             role: role.clone(),
-            vars: HashMap::new(),
+            vars: persisted_tenant(definition, snapshot),
             backend_request: false,
         }),
         CompiledProcessCommandRole::Caller {

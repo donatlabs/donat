@@ -11,8 +11,17 @@ tests:
           VALUES ('USD', 100000) RETURNING id
         capture: { organization_id: id }
       - sql: |
+          -- The approver is a person inside the buying organization, not an
+          -- officer of the shop: `purchase_approval` is scoped by membership,
+          -- so an approver who belongs to nobody sees no approvals and can
+          -- decide nothing. `organization_membership.user_id` references
+          -- `customer`, so they exist as one first.
+          INSERT INTO customer (customer_id, name, email)
+          VALUES ('approver-1', 'Priya Approver', 'priya@example.com')
+          ON CONFLICT (customer_id) DO NOTHING;
           INSERT INTO organization_membership (organization_id, user_id)
-          VALUES ('${organization_id}', 'customer-1');
+          VALUES ('${organization_id}', 'customer-1'),
+                 ('${organization_id}', 'approver-1');
           INSERT INTO cart (customer_id) VALUES ('customer-1');
           -- Five units clear the automatic-credit ceiling, so the quote must
           -- be routed to a human approver rather than consuming credit on its own.
@@ -57,8 +66,17 @@ tests:
           VALUES ('USD', 100000) RETURNING id
         capture: { organization_id: id }
       - sql: |
+          -- The approver is a person inside the buying organization, not an
+          -- officer of the shop: `purchase_approval` is scoped by membership,
+          -- so an approver who belongs to nobody sees no approvals and can
+          -- decide nothing. `organization_membership.user_id` references
+          -- `customer`, so they exist as one first.
+          INSERT INTO customer (customer_id, name, email)
+          VALUES ('approver-1', 'Priya Approver', 'priya@example.com')
+          ON CONFLICT (customer_id) DO NOTHING;
           INSERT INTO organization_membership (organization_id, user_id)
-          VALUES ('${organization_id}', 'customer-1');
+          VALUES ('${organization_id}', 'customer-1'),
+                 ('${organization_id}', 'approver-1');
           INSERT INTO cart (customer_id) VALUES ('customer-1');
           INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
       - as: { role: b2b_buyer, user: customer-1 }
@@ -94,8 +112,17 @@ tests:
           VALUES ('USD', 100000) RETURNING id
         capture: { organization_id: id }
       - sql: |
+          -- The approver is a person inside the buying organization, not an
+          -- officer of the shop: `purchase_approval` is scoped by membership,
+          -- so an approver who belongs to nobody sees no approvals and can
+          -- decide nothing. `organization_membership.user_id` references
+          -- `customer`, so they exist as one first.
+          INSERT INTO customer (customer_id, name, email)
+          VALUES ('approver-1', 'Priya Approver', 'priya@example.com')
+          ON CONFLICT (customer_id) DO NOTHING;
           INSERT INTO organization_membership (organization_id, user_id)
-          VALUES ('${organization_id}', 'customer-1');
+          VALUES ('${organization_id}', 'customer-1'),
+                 ('${organization_id}', 'approver-1');
           INSERT INTO cart (customer_id) VALUES ('customer-1');
           -- One unit at 2499 sits inside the 10000 automatic-credit ceiling.
           INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 1);
@@ -126,8 +153,17 @@ tests:
           VALUES ('USD', 100000) RETURNING id
         capture: { organization_id: id }
       - sql: |
+          -- The approver is a person inside the buying organization, not an
+          -- officer of the shop: `purchase_approval` is scoped by membership,
+          -- so an approver who belongs to nobody sees no approvals and can
+          -- decide nothing. `organization_membership.user_id` references
+          -- `customer`, so they exist as one first.
+          INSERT INTO customer (customer_id, name, email)
+          VALUES ('approver-1', 'Priya Approver', 'priya@example.com')
+          ON CONFLICT (customer_id) DO NOTHING;
           INSERT INTO organization_membership (organization_id, user_id)
-          VALUES ('${organization_id}', 'customer-1');
+          VALUES ('${organization_id}', 'customer-1'),
+                 ('${organization_id}', 'approver-1');
           INSERT INTO cart (customer_id) VALUES ('customer-1');
           INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
       - as: { role: b2b_buyer, user: customer-1 }
@@ -155,8 +191,17 @@ tests:
           VALUES ('USD', 100000) RETURNING id
         capture: { organization_id: id }
       - sql: |
+          -- The approver is a person inside the buying organization, not an
+          -- officer of the shop: `purchase_approval` is scoped by membership,
+          -- so an approver who belongs to nobody sees no approvals and can
+          -- decide nothing. `organization_membership.user_id` references
+          -- `customer`, so they exist as one first.
+          INSERT INTO customer (customer_id, name, email)
+          VALUES ('approver-1', 'Priya Approver', 'priya@example.com')
+          ON CONFLICT (customer_id) DO NOTHING;
           INSERT INTO organization_membership (organization_id, user_id)
-          VALUES ('${organization_id}', 'customer-1');
+          VALUES ('${organization_id}', 'customer-1'),
+                 ('${organization_id}', 'approver-1');
           INSERT INTO cart (customer_id) VALUES ('customer-1');
           INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
       - as: { role: b2b_buyer, user: customer-1 }
@@ -194,8 +239,17 @@ tests:
           VALUES ('USD', 100000) RETURNING id
         capture: { organization_id: id }
       - sql: |
+          -- The approver is a person inside the buying organization, not an
+          -- officer of the shop: `purchase_approval` is scoped by membership,
+          -- so an approver who belongs to nobody sees no approvals and can
+          -- decide nothing. `organization_membership.user_id` references
+          -- `customer`, so they exist as one first.
+          INSERT INTO customer (customer_id, name, email)
+          VALUES ('approver-1', 'Priya Approver', 'priya@example.com')
+          ON CONFLICT (customer_id) DO NOTHING;
           INSERT INTO organization_membership (organization_id, user_id)
-          VALUES ('${organization_id}', 'customer-1');
+          VALUES ('${organization_id}', 'customer-1'),
+                 ('${organization_id}', 'approver-1');
           INSERT INTO cart (customer_id) VALUES ('customer-1');
           INSERT INTO cart_line (cart_id, variant_id, quantity) VALUES (1, 2, 5);
       - as: { role: b2b_buyer, user: customer-1 }

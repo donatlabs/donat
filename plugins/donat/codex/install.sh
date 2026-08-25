@@ -21,6 +21,7 @@ prompts=(
   donat-add-command.md
   donat-add-process.md
   donat-review.md
+  donat-set-goal.md
 )
 
 if [[ "${1:-}" == "--uninstall" ]]; then
@@ -48,7 +49,8 @@ Installed:
   prompts  -> $prompts_dest  (${#prompts[@]} files)
 
 Available in Codex as:
-  /donat-new-app  /donat-add-table  /donat-add-command  /donat-add-process  /donat-review
+  /donat-new-app  /donat-add-table  /donat-add-command  /donat-add-process
+  /donat-review   /donat-set-goal
 
 One manual step remains. Append the project rules to the AGENTS.md of the
 repository that builds on donat, so Codex loads them without being asked:

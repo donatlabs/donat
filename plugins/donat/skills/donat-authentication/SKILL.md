@@ -78,6 +78,15 @@ rotation story.
 `allowed_skew` (seconds) forgives clock drift. `audience` must match what the
 provider stamps: on Auth0 the API identifier, on Rauthy the client id.
 
+## A tenant travels the same way
+
+If the application serves several customer organisations, the tenant is one
+more claim — `DONAT_OIDC_TENANT_CLAIM` names its path, and it reaches the
+engine exactly as the role does. No header supplies one: `X-Donat-Role` selects
+among roles a token already granted, and there is nothing for a tenant header
+to select among. A tenanted deployment where nothing carries the claim refuses
+to boot rather than serving. See `donat-multitenancy`.
+
 ## claims_map, and the trap in it
 
 `claims_map` is a pure lookup — each session variable is a JSON path into the

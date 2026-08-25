@@ -69,8 +69,9 @@ Mode first, then architecture, then the domain skill.
 4. The domain skill: `donat-tables-and-permissions`, `donat-validators`,
    `donat-rules`, `donat-commands`, `donat-processes`, `donat-connectors`,
    `donat-schema-and-migrations`, `donat-api-surfaces`,
-   `donat-file-attachments`, `donat-authentication`, `donat-automation`,
-   `donat-embedded-go`, `donat-platform-ui`, `donat-deploy-and-verify`.
+   `donat-file-attachments`, `donat-authentication`, `donat-multitenancy`,
+   `donat-automation`, `donat-embedded-go`, `donat-platform-ui`,
+   `donat-deploy-and-verify`.
 
 Examples:
 
@@ -80,6 +81,9 @@ Examples:
   `donat-app-architecture`, then `donat-processes`.
 - "The cart limit should be 20" → mode, then `donat-validators` — and check the
   layer, because the wrong layer here binds every writer.
+- "Each shop should only see its own data" → mode, then `donat-multitenancy`.
+  Then ask whether one shop contains several sellers, because that is a second
+  question the tenant does not answer.
 
 ## Talk in their language; write the repository in English
 
@@ -138,6 +142,8 @@ These thoughts mean stop — you are rationalising:
 | "They asked for a screen, so I'll build a page" | A screen is a resource config on the platform. `donat-platform-ui`. |
 | "We're speaking Russian, so I'll comment in Russian" | Talk in their language, write the repository in English. Only end-user copy follows the product. |
 | "I'll hide that field in the UI" | Hiding is UX. If the role can read it, it is readable. |
+| "It's tenant-scoped, so it's bounded" | A tenant is isolation. Who owns the row *inside* it is a second question. |
+| "`filter: {}` here is obviously deliberate" | Then write it down. A forgotten bound looks identical. |
 | "I'll add an admin role just for now" | There is no admin role. Ever. Convert the request. |
 | "Permissions can be enforced in the client" | The API is the boundary. There is no other one. |
 | "This is obviously how it works" | Read the file the skill points at. The example is the spec. |

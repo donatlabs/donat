@@ -290,3 +290,45 @@ statically registered, and attributable. The processor escape surface is
 substantially reduced, existing HTTP/Stripe behavior remains a migration
 oracle, and connector work can progress independently without inventing any
 process-owned persistence or public execution surface.
+
+---
+
+## Per-tenant credentials: what it would take (2026-08-23)
+
+[[097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]] defers
+per-tenant connector credentials and points here, because this is where the
+question was left open. Having looked at what it would cost, the shape is
+smaller than either decision implied, and worth writing down before somebody
+budgets it as a rewrite.
+
+**The dimension already exists.** `donat.connector_credential` is keyed by
+`(source, connector, instance, subject)`, and `subject` is the provider account
+the credential belongs to. Storing one credential per tenant needs no new
+column, no change to the sealing envelope — the AAD already binds `subject` —
+and no migration of anything sealed.
+
+**The runtime already refuses the ambiguity.** `CredentialRuntime::subject`
+lists the subjects for an instance and requires exactly one: none is
+`NO_CREDENTIAL`, more than one is `AMBIGUOUS_CREDENTIAL`. Multiple accounts per
+instance are therefore modelled and deliberately turned away, for want of
+anything that says which to pick. **A tenant is exactly the thing that says
+which to pick.**
+
+**What is actually missing is one thread of plumbing.** `CredentialRuntime` is
+built once per source and holds no per-request state, so the tenant has to
+arrive per acquisition — from the activity attempt, whose process session
+already carries it under the caller-session contract this branch added. Until
+it does, `subject` has nothing to choose with, which is why the ambiguity is
+refused rather than guessed.
+
+**And one deliberate consequence to decide.** `examples/pethub`'s migration
+records that provider-issued identifiers are globally unique *only while one
+deployment holds one provider account*. Per-tenant credentials end that, and
+the unique constraints over `provider_event_id` and its neighbours become
+per-tenant on the same day. That is named in the migration already; it stops
+being a note and becomes work at that point.
+
+Not built here, and not started: threading a request-scoped value into a
+credential path is where a subtle mistake becomes a token used for the wrong
+account, and it deserves its own slice rather than the tail of another.
+

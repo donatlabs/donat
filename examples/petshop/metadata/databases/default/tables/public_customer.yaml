@@ -62,6 +62,7 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
 update_permissions:
   - role: customer
     permission:

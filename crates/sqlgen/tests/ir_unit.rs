@@ -122,6 +122,7 @@ fn aggregate_column_guard_wraps_case() {
 #[test]
 fn insert_check_expression_wraps_check_violation() {
     let insert = InsertMutation {
+        quota: None,
         table: table("public", "author"),
         columns: vec![("name".into(), "text".into())],
         rows: vec![vec![Some(Scalar::Json(json!("bob")))]],
@@ -220,6 +221,7 @@ fn update_jsonb_append_uses_concat_and_null_coalesce() {
 #[test]
 fn insert_after_parent_object_relationship_runs_child_insert_from_parent_returning() {
     let insert = InsertMutation {
+        quota: None,
         table: table("public", "author"),
         columns: vec![("name".into(), "text".into())],
         rows: vec![vec![Some(Scalar::Json(json!("Ada")))]],
@@ -260,6 +262,7 @@ fn insert_after_parent_object_relationship_runs_child_insert_from_parent_returni
 #[test]
 fn after_parent_nested_check_reads_parent_from_insert_cte() {
     let insert = InsertMutation {
+        quota: None,
         table: table("public", "author"),
         columns: vec![
             ("name".into(), "text".into()),
@@ -316,6 +319,7 @@ fn after_parent_nested_check_reads_parent_from_insert_cte() {
 #[test]
 fn insert_missing_values_render_default_and_do_nothing() {
     let insert = InsertMutation {
+        quota: None,
         table: table("public", "author"),
         columns: vec![("id".into(), "int4".into()), ("name".into(), "text".into())],
         // Ragged objects: absent values must become DEFAULT, not NULL.
@@ -348,6 +352,7 @@ fn insert_missing_values_render_default_and_do_nothing() {
 #[test]
 fn on_conflict_do_update_applies_filter_and_presets() {
     let insert = InsertMutation {
+        quota: None,
         table: table("public", "author"),
         columns: vec![("id".into(), "int4".into()), ("name".into(), "text".into())],
         rows: vec![vec![

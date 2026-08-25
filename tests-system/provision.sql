@@ -36,6 +36,20 @@ INSERT INTO organization_membership (organization_id, user_id)
 VALUES ('00000000-0000-0000-0000-0000000000c1', 'customer-1')
 ON CONFLICT DO NOTHING;
 
+-- The approver is a person inside the buying organization, not an officer of
+-- the shop: `purchase_approval` is scoped by membership, so an approver who
+-- belongs to nobody sees no approvals and can decide nothing. That is the rule
+-- working, which makes seeding the membership part of stating the business.
+-- `organization_membership.user_id` references `customer`, so the person has to
+-- exist as one before they can belong to anything.
+INSERT INTO customer (customer_id, name, email)
+VALUES ('approver-1', 'Priya Approver', 'priya@example.com')
+ON CONFLICT (customer_id) DO NOTHING;
+
+INSERT INTO organization_membership (organization_id, user_id)
+VALUES ('00000000-0000-0000-0000-0000000000c1', 'approver-1')
+ON CONFLICT DO NOTHING;
+
 INSERT INTO subscription (
   id, customer_id, variant_id, quantity, unit_price_minor, line_total_minor, currency, status
 )

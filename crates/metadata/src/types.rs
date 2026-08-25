@@ -100,6 +100,44 @@ pub struct Metadata {
         skip_serializing_if = "crate::recurrence::RecurrenceMetadata::is_empty"
     )]
     pub recurrence: crate::recurrence::RecurrenceMetadata,
+    /// Engine-wide tenancy from the optional `tenancy.yaml` section: which
+    /// source is tenanted, which session variable carries the tenant, and
+    /// which tables say something other than "I carry the default key".
+    ///
+    /// An absent file leaves the engine exactly as it is today. A present one
+    /// is not a filter added to some tables — it is a compiler layer applied
+    /// to all of them, and a tracked table that says nothing about its tenant
+    /// stops the deployment rather than serving every tenant's rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<crate::tenancy::TenancyMetadata>,
+    /// In-tenant authorization from the optional `iam.yaml` section: the grant
+    /// relation, which compiled roles are served through it, and how a table
+    /// operation names the action it needs.
+    ///
+    /// Tenancy decides which rows exist for a caller; this decides which of the
+    /// operations on them that caller may perform. It requires tenancy, because
+    /// a grant is held inside one tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iam: Option<crate::iam::IamMetadata>,
+    /// Plan entitlements from the optional `quotas.yaml` section: the counters,
+    /// the ceilings, and which writes consume which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quotas: Option<crate::quotas::QuotaMetadata>,
+
+    /// Deployment-wide permission policy from the optional `permissions.yaml`.
+    /// Absent means the default, which is what unconverted v2 metadata gets.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::bounds::PermissionsMetadata::is_default"
+    )]
+    pub permissions: crate::bounds::PermissionsMetadata,
+
+    /// What one caller may ask for, from the optional `limits.yaml`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::limits::LimitsMetadata::is_empty"
+    )]
+    pub limits: crate::limits::LimitsMetadata,
 }
 
 /// One named deployment instance of a connector module compiled into the
@@ -564,6 +602,18 @@ pub struct ConnectorSerializeBy {
 pub struct Command {
     pub name: String,
     pub source: String,
+    /// Where this command's tenant comes from, when the session is not the
+    /// answer.
+    ///
+    /// Every other command in a tenanted source is scoped by the caller's
+    /// tenant, and that is the default this field does not need to state. Two
+    /// commands cannot be: the one that *creates* a tenant, whose caller is in
+    /// none yet, and the one that admits somebody to a tenant they do not
+    /// belong to. Both say so here rather than being special-cased by the
+    /// compiler, so `donat validate` can list them and a reviewer can count
+    /// them on one hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<CommandTenant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<CommandPermission>,
     #[serde(default, deserialize_with = "deserialize_command_arguments")]
@@ -578,6 +628,54 @@ pub struct Command {
     pub idempotency: Option<CommandIdempotency>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<CommandEffect>,
+}
+
+/// Where a command's tenant comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum CommandTenant {
+    /// This statement creates the tenant. The key for every write below comes
+    /// from the named step rather than from the session, and the idempotency
+    /// scope carries no tenant because there is not one yet.
+    Establishes { establishes: TenantFromStep },
+    /// The tenant is whatever the named row said it was. Legal only when that
+    /// step is a `select_one` keyed on a unique constraint — the lookup key is
+    /// unguessable, and that is the actual authorization.
+    From { from: TenantFromStep },
+}
+
+impl CommandTenant {
+    pub fn step(&self) -> &TenantFromStep {
+        match self {
+            CommandTenant::Establishes { establishes } => establishes,
+            CommandTenant::From { from } => from,
+        }
+    }
+
+    pub fn establishes(&self) -> bool {
+        matches!(self, CommandTenant::Establishes { .. })
+    }
+}
+
+/// The step, and the column of it holding the tenant. `column` defaults to the
+/// tenancy key, which is what a row of an ordinary tenanted table carries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantFromStep {
+    pub step: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+}
+
+/// What one step does about the tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepTenant {
+    /// Read without the tenant bound. Legal only under
+    /// `unscoped_steps: audited`, only on a unique `select_one`, and only when
+    /// the command then declares `tenant: { from: <this step> }` — so the rest
+    /// of the statement is scoped by what the row said.
+    Unscoped,
 }
 
 /// A classic explicit role allowed to invoke a command. This is an additional
@@ -764,6 +862,9 @@ pub struct CommandGuard {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CommandStep {
     pub name: String,
+    /// Absent means "scoped like everything else".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<StepTenant>,
     #[serde(flatten)]
     pub operation: CommandStepOperation,
 }
@@ -825,6 +926,21 @@ pub enum CommandStepOperation {
     InsertWhen {
         insert_when: ConditionalInsertCommandStep,
     },
+}
+
+impl CommandStepOperation {
+    /// The table a *read* step reads, if this is one.
+    ///
+    /// Only the reads: a write's tenant is a preset resolved from the
+    /// command's own declaration, so it is never scoped by the session and has
+    /// nothing to disagree about.
+    pub fn read_table(&self) -> Option<&QualifiedTable> {
+        match self {
+            CommandStepOperation::SelectOne { select_one } => Some(&select_one.table),
+            CommandStepOperation::SelectMany { select_many } => Some(&select_many.table),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3123,6 +3239,11 @@ pub struct SelectPermission {
     pub allow_aggregations: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub computed_fields: Vec<String>,
+    /// Why this permission admits rows it does not bound to the caller.
+    /// Required where the deployment sets `unbounded_permissions: declared`,
+    /// and refused wherever the expression does bound one (see `bounds.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded: Option<crate::bounds::UnboundedReason>,
 }
 
 /// One entry of a write permission's `validate` list.
@@ -3195,6 +3316,11 @@ pub struct InsertPermission {
     pub backend_only: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validate: Vec<PermissionValidator>,
+    /// Why this permission admits rows it does not bound to the caller.
+    /// Required where the deployment sets `unbounded_permissions: declared`,
+    /// and refused wherever the expression does bound one (see `bounds.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded: Option<crate::bounds::UnboundedReason>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3209,12 +3335,22 @@ pub struct UpdatePermission {
     pub set: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validate: Vec<PermissionValidator>,
+    /// Why this permission admits rows it does not bound to the caller.
+    /// Required where the deployment sets `unbounded_permissions: declared`,
+    /// and refused wherever the expression does bound one (see `bounds.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded: Option<crate::bounds::UnboundedReason>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeletePermission {
     #[serde(default)]
     pub filter: BoolExp,
+    /// Why this permission admits rows it does not bound to the caller.
+    /// Required where the deployment sets `unbounded_permissions: declared`,
+    /// and refused wherever the expression does bound one (see `bounds.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbounded: Option<crate::bounds::UnboundedReason>,
 }
 
 /// Column list: either an explicit list or `"*"`.

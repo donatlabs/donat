@@ -20,6 +20,7 @@ select_permissions:
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
   - role: fulfilment
     permission:
       columns: "*"
@@ -27,10 +28,12 @@ select_permissions:
         order:
           order_status:
             _eq: paid
+      unbounded: operator
   - role: support
     permission:
       columns: "*"
       filter: {}
+      unbounded: operator
 command_select_permissions:
   - role: subscription_worker
     permission:
@@ -43,12 +46,14 @@ command_select_permissions:
         - line_total_minor
         - currency
       filter: {}
+      unbounded: worker
   - role: veterinary_reviewer
     permission:
       columns:
         - id
         - prescription_release_id
       filter: {}
+      unbounded: operator
 command_insert_permissions:
   - role: customer
     permission:
@@ -62,6 +67,7 @@ insert_permissions:
     permission:
       columns: "*"
       check: {}
+      unbounded: worker
 update_permissions:
   - role: veterinary_reviewer
     permission:
@@ -69,3 +75,4 @@ update_permissions:
         - prescription_release_id
       filter: {}
       check: {}
+      unbounded: operator

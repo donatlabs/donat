@@ -273,7 +273,7 @@ pub fn compile(state: &CoreState, input: &CompileInput) -> PlanV1 {
     let storage_ctx = if state.storage.is_empty() {
         None
     } else {
-        match request_storage(state, input) {
+        match request_storage(state, input, &session) {
             Ok(ctx) => Some(ctx),
             Err(e) => return error_plan(&e),
         }
@@ -782,6 +782,7 @@ fn shape_error(path: &str, code: &str, message: &str) -> ShapeResult {
 fn request_storage<'a>(
     state: &'a CoreState,
     input: &CompileInput,
+    session: &donat_schema::Session,
 ) -> Result<donat_storage::RequestContext<'a>, PlanError> {
     let Some(raw) = input.now.as_deref() else {
         return Err(PlanError::new(
@@ -803,6 +804,16 @@ fn request_storage<'a>(
         .with_timezone(&chrono::Utc);
 
     Ok(donat_storage::RequestContext {
+        // The embedded engine is the same engine. Leaving this `None` signed
+        // uploads outside the tenant prefix here while the server put them
+        // inside it, so the same declaration meant two different key layouts
+        // depending on how the engine was hosted.
+        tenant: state
+            .metadata
+            .tenancy
+            .as_ref()
+            .and_then(|tenancy| session.var(&tenancy.variable_key()).map(str::to_string))
+            .filter(|value| !value.is_empty()),
         registry: &state.storage,
         now,
         // Production mints a fresh id per request; the entropy comes from the
@@ -862,9 +873,12 @@ pub struct CompletionUrls {
 
 /// Sign the operations that finish one upload.
 pub fn file_completion(state: &CoreState, input: &CompletionInput) -> CompletionResult {
-    let Ok(upload_id) = uuid::Uuid::parse_str(&input.upload_id) else {
+    // Parsed but not used to build a key: the final key is derived from the
+    // staged one, because recomputing it would drop the tenant prefix. The
+    // parse stays as the shape check it always was.
+    if uuid::Uuid::parse_str(&input.upload_id).is_err() {
         return completion_error("upload_id is not a uuid");
-    };
+    }
     let Ok(now) = chrono::DateTime::parse_from_rfc3339(&input.now) else {
         return completion_error("`now` is not an RFC 3339 instant");
     };
@@ -877,7 +891,15 @@ pub fn file_completion(state: &CoreState, input: &CompletionInput) -> Completion
         return completion_error(&format!("unknown storage backend '{}'", input.backend));
     };
 
-    let final_key = spec.object_key(upload_id);
+    // Derived from the staging address rather than recomputed, for the same
+    // reason `crates/server/src/files.rs` derives it: the prefix an object was
+    // staged under is a property of the request that minted it, and a
+    // recomputed key would drop a tenant prefix and land the bytes outside it.
+    let final_key = input
+        .staging_key
+        .strip_suffix(".part")
+        .unwrap_or(&input.staging_key)
+        .to_string();
     let (copy_url, copy_headers) = s3.presign_copy(&input.staging_key, &final_key, now, 60);
     CompletionResult::Urls(CompletionUrls {
         head_url: s3.presign("HEAD", &input.staging_key, now, 60),
