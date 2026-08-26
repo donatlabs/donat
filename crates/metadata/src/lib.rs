@@ -7,6 +7,7 @@ pub mod bounds;
 pub mod documents;
 pub mod iam;
 pub mod ingest;
+pub mod invoke;
 pub mod limits;
 mod loader;
 pub mod local;
@@ -34,6 +35,10 @@ pub use ingest::{
     INGEST_CAPABILITY, INGEST_INPUT_KEYS, INGEST_SCALARS, IngestBounds, IngestColumn,
     IngestRowErrorPolicy, IngestSchema, IngestSchemaError, IngestSchemaKind, IngestSheetSelector,
     schema_pin, validate_ingest_schemas,
+};
+pub use invoke::{
+    Bind, Foreach, InvokeSession, InvokeTarget, ThenCommand, Unnest, cron_target, event_target,
+    validate_invoke_targets,
 };
 pub use limits::{Ceiling, LimitsMetadata};
 pub use loader::{LoadError, load_metadata_dir};

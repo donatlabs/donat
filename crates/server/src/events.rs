@@ -193,7 +193,7 @@ async fn run(state: SharedState, shutdown: tokio_util::sync::CancellationToken) 
         "event delivery loop started"
     );
     loop {
-        if let Err(e) = tick(&state).await {
+        if let Err(e) = tick(&state, &shutdown).await {
             tracing::warn!(error = %e, "event tick failed");
         }
         // Event delivery is at-least-once by contract, so the seam between
@@ -205,19 +205,20 @@ async fn run(state: SharedState, shutdown: tokio_util::sync::CancellationToken) 
     }
 }
 
-async fn tick(state: &SharedState) -> anyhow::Result<()> {
+async fn tick(
+    state: &SharedState,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    let engine = state.engine_snapshot().await;
     // Index event triggers by name (across all tables/sources).
-    let triggers: HashMap<String, EventTrigger> = {
-        let engine = state.engine.read().await;
-        engine
-            .metadata
-            .sources
-            .iter()
-            .flat_map(|s| s.tables.iter())
-            .flat_map(|t| t.event_triggers.iter())
-            .map(|et| (et.name.clone(), et.clone()))
-            .collect()
-    };
+    let triggers: HashMap<String, &EventTrigger> = engine
+        .metadata
+        .sources
+        .iter()
+        .flat_map(|s| s.tables.iter())
+        .flat_map(|t| t.event_triggers.iter())
+        .map(|et| (et.name.clone(), et))
+        .collect();
     if triggers.is_empty() {
         return Ok(());
     }
@@ -264,6 +265,41 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
             continue;
         };
         let retry = trigger.retry_conf.clone().unwrap_or_default();
+
+        // An `invoke` target: expand into its one work item, which runs on
+        // its own claim afterwards, and mark this event delivered.
+        match donat_metadata::event_target(trigger) {
+            Ok(Some(_)) => {
+                crate::invoke::expand_event(&tx, &trigger_name, id).await?;
+                tx.execute(
+                    "INSERT INTO donat.event_invocation_logs (event_id, status, request, response) \
+                     VALUES ($1, NULL, $2, $3)",
+                    &[
+                        &id,
+                        &json!({ "invoke": trigger_name }),
+                        &json!({ "work_items": 1 }),
+                    ],
+                )
+                .await?;
+                tx.execute(
+                    "UPDATE donat.event_log SET status = 'delivered', tries = tries + 1 \
+                     WHERE id = $1",
+                    &[&id],
+                )
+                .await?;
+                continue;
+            }
+            Ok(None) => {}
+            Err(message) => {
+                tracing::warn!(trigger = %trigger_name, %id, %message, "event trigger dropped");
+                tx.execute(
+                    "UPDATE donat.event_log SET status = 'error' WHERE id = $1",
+                    &[&id],
+                )
+                .await?;
+                continue;
+            }
+        }
 
         let envelope = json!({
             "id": id.to_string(),
@@ -316,6 +352,8 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         }
     }
     tx.commit().await?;
+
+    crate::invoke::deliver_due(state, crate::invoke::Kind::Event, shutdown).await?;
     Ok(())
 }
 
@@ -368,6 +406,7 @@ mod tests {
             definition: def,
             webhook: Some("http://h".into()),
             webhook_from_env: None,
+            invoke: None,
             retry_conf: None,
             headers: vec![],
             comment: None,

@@ -4,9 +4,15 @@
 //! request the engine's cron delivery loop sends, so a test can assert the
 //! exact envelope and headers. Behavior by path:
 //!
-//! - `/ok` (and anything else)  → always 200.
+//! - `/ok` (and anything else)  → always 200, body `{}`.
 //! - `/fail-then-ok`            → 500 on the first hit, 200 afterwards (to
 //!   exercise retries).
+//! - `/list`, `/get-list`       → 200 with a two-item list, so that a stub
+//!   playing an action handler has an output an `invoke` trigger's `then`
+//!   can walk.
+//! - `/fail-then-list`          → 500 once, then the same list.
+//! - `/echo-fail`               → 400 whose message repeats `input.token`,
+//!   the way an API that rejects a credential often does.
 //!
 //! Raw HTTP/1.1, one request per connection (`Connection: close`), matching
 //! the dependency-free style of the rest of the harness.
@@ -17,12 +23,13 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value as Json;
 
-type ParsedRequest = (String, Json, Vec<(String, String)>);
+type ParsedRequest = (String, String, Json, Vec<(String, String)>);
 
 /// One recorded delivery: the request path, parsed JSON body, and headers
 /// (lower-cased names).
 #[derive(Clone)]
 pub struct Received {
+    pub method: String,
     pub path: String,
     pub body: Json,
     pub headers: Vec<(String, String)>,
@@ -69,7 +76,7 @@ pub fn spawn() -> CronWebhook {
             let Ok(mut stream) = stream else { continue };
             let received = received_thread.clone();
             std::thread::spawn(move || {
-                if let Some((path, body, headers)) = read_request(&mut stream) {
+                if let Some((method, path, body, headers)) = read_request(&mut stream) {
                     // Decide the status from the count BEFORE this request, so
                     // `/fail-then-ok` fails exactly once.
                     let prior = received
@@ -78,21 +85,52 @@ pub fn spawn() -> CronWebhook {
                         .iter()
                         .filter(|r| r.path == path)
                         .count();
+                    let echoed_token = body
+                        .pointer("/input/token")
+                        .and_then(Json::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     received.lock().unwrap().push(Received {
+                        method,
                         path: path.clone(),
                         body,
                         headers,
                     });
-                    let status = if path.starts_with("/fail-then-ok") {
+                    let list = || {
+                        serde_json::json!([
+                            { "identifier": "A-1", "title": "one" },
+                            { "identifier": "A-2", "title": "two" }
+                        ])
+                    };
+                    let (status, body) = if path.starts_with("/echo-fail") {
+                        (
+                            400,
+                            serde_json::json!({
+                                "message": format!("invalid token {echoed_token}"),
+                                "code": "unauthorized"
+                            }),
+                        )
+                    } else if path.starts_with("/fail-then-list") {
+                        if prior == 0 {
+                            (500, Json::Object(Default::default()))
+                        } else {
+                            (200, list())
+                        }
+                    } else if path.starts_with("/fail-then-ok") {
                         // 500 on the first hit, 200 afterwards (retry → success).
-                        if prior == 0 { 500 } else { 200 }
+                        (
+                            if prior == 0 { 500 } else { 200 },
+                            Json::Object(Default::default()),
+                        )
                     } else if path.starts_with("/fail") {
                         // Always fails — exercises retry exhaustion.
-                        500
+                        (500, Json::Object(Default::default()))
+                    } else if path.starts_with("/list") || path.starts_with("/get-list") {
+                        (200, list())
                     } else {
-                        200
+                        (200, Json::Object(Default::default()))
                     };
-                    write_response(&mut stream, status);
+                    write_response(&mut stream, status, &body);
                 }
             });
         }
@@ -119,7 +157,9 @@ fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let mut lines = head.split("\r\n");
     let request_line = lines.next()?;
-    let path = request_line.split_whitespace().nth(1)?.to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
 
     let mut headers = Vec::new();
     let mut content_len = 0usize;
@@ -143,18 +183,18 @@ fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
         body_bytes.extend_from_slice(&tmp[..n]);
     }
     let body: Json = serde_json::from_slice(&body_bytes).unwrap_or(Json::Null);
-    Some((path, body, headers))
+    Some((method, path, body, headers))
 }
 
-fn write_response(stream: &mut TcpStream, status: u16) {
-    let body = b"{}";
+fn write_response(stream: &mut TcpStream, status: u16, body: &Json) {
+    let body = serde_json::to_vec(body).unwrap_or_default();
     let reason = if status == 200 { "OK" } else { "Error" };
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body);
+    let _ = stream.write_all(&body);
     let _ = stream.flush();
 }
 

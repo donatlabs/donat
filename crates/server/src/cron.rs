@@ -363,7 +363,7 @@ async fn run(state: SharedState, shutdown: tokio_util::sync::CancellationToken) 
         "cron delivery loop started"
     );
     loop {
-        if let Err(e) = tick(&state).await {
+        if let Err(e) = tick(&state, &shutdown).await {
             tracing::warn!(error = %e, "cron tick failed");
         }
         // A delivery already committed is not repeated; stopping between ticks
@@ -376,8 +376,12 @@ async fn run(state: SharedState, shutdown: tokio_util::sync::CancellationToken) 
 }
 
 /// One materialize-then-deliver pass.
-async fn tick(state: &SharedState) -> anyhow::Result<()> {
-    let triggers = { state.engine.read().await.metadata.cron_triggers.clone() };
+async fn tick(
+    state: &SharedState,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    let engine = state.engine_snapshot().await;
+    let triggers = &engine.metadata.cron_triggers;
     if triggers.is_empty() {
         return Ok(());
     }
@@ -390,7 +394,7 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
     // Materialize the next upcoming occurrence per trigger. ON CONFLICT makes
     // this idempotent: the same occurrence is enqueued at most once.
     let now = Utc::now();
-    for t in &triggers {
+    for t in triggers {
         match next_occurrence(t, now) {
             Some(next) => {
                 // A run the declared gap policy drops is announced, so an
@@ -467,22 +471,52 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
             continue;
         }
 
-        let envelope = json!({
-            "id": id.to_string(),
-            "name": trigger_name,
-            "scheduled_time": scheduled_time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "payload": trigger.payload.clone(),
-        });
+        // The target: a webhook to post to, or an action/command to run here.
+        // The loader refuses a trigger with both or neither, so `Err` is a
+        // snapshot that did not come through it.
+        let invoke = match donat_metadata::cron_target(trigger) {
+            Ok(invoke) => invoke,
+            Err(message) => {
+                tracing::warn!(trigger = %trigger_name, %id, %message, "cron trigger dropped");
+                tx.execute(
+                    "UPDATE donat.cron_events SET status = 'dead' WHERE id = $1",
+                    &[&id],
+                )
+                .await?;
+                continue;
+            }
+        };
 
-        let (http_status, response_body) = deliver(state, trigger, &envelope).await;
-        let success = http_status
-            .map(|s| (200..300).contains(&s))
-            .unwrap_or(false);
+        let (success, http_status, request, response_body) = match invoke {
+            // Expand into work items; each runs on its own claim afterwards,
+            // so no HTTP happens under this occurrence's lock.
+            Some(invoke) => {
+                let request =
+                    json!({ "invoke": invoke.action.as_deref().or(invoke.command.as_deref()) });
+                match crate::invoke::expand_cron(&tx, state, &engine, trigger, invoke, id).await {
+                    Ok(expanded) => (true, None, request, json!({ "work_items": expanded })),
+                    Err(e) => (false, None, request, json!({ "error": e.to_string() })),
+                }
+            }
+            None => {
+                let envelope = json!({
+                    "id": id.to_string(),
+                    "name": trigger_name,
+                    "scheduled_time": scheduled_time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "payload": trigger.payload.clone(),
+                });
+                let (http_status, response_body) = deliver(state, trigger, &envelope).await;
+                let success = http_status
+                    .map(|s| (200..300).contains(&s))
+                    .unwrap_or(false);
+                (success, http_status, envelope, response_body)
+            }
+        };
 
         tx.execute(
             "INSERT INTO donat.cron_event_invocation_logs (event_id, status, request, response) \
              VALUES ($1, $2, $3, $4)",
-            &[&id, &http_status, &envelope, &response_body],
+            &[&id, &http_status, &request, &response_body],
         )
         .await?;
 
@@ -515,6 +549,8 @@ async fn tick(state: &SharedState) -> anyhow::Result<()> {
         }
     }
     tx.commit().await?;
+
+    crate::invoke::deliver_due(state, crate::invoke::Kind::Cron, shutdown).await?;
     Ok(())
 }
 
@@ -526,7 +562,7 @@ async fn deliver(
     trigger: &CronTrigger,
     envelope: &Json,
 ) -> (Option<i32>, Json) {
-    let url = resolve_url_template(&trigger.webhook);
+    let url = resolve_url_template(trigger.webhook.as_deref().unwrap_or_default());
     let timeout = trigger
         .retry_conf
         .as_ref()
@@ -593,8 +629,9 @@ mod tests {
 
     fn trigger(schedule: &str, timezone: Option<&str>, dst: Option<CronDstPolicy>) -> CronTrigger {
         CronTrigger {
+            invoke: None,
             name: "t".into(),
-            webhook: "http://localhost/hook".into(),
+            webhook: Some("http://localhost/hook".into()),
             schedule: schedule.into(),
             payload: Json::Null,
             include_in_metadata: true,

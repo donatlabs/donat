@@ -156,7 +156,7 @@ Decisions are ADRs in the knowledge base, not entries here. Each domain's
 | [[declarative-saas/_index]] | 82 | Commands, rules, durable processes, connectors, files, tenancy, grants, declared bounds |
 | [[multi-backend/_index]] | 15 | The backend trait, per-dialect assembly, the matrix, multi-source |
 | [[api-surfaces/_index]] | 13 | REST and MCP, session compatibility, identity boundaries |
-| [[embedded-sdk/_index]] | 9 | Embedding and native hooks (deferred) |
+| [[embedded-sdk/_index]] | 10 | Embedding and native hooks (deferred); triggers that invoke a declared target |
 | [[operations/_index]] | 6 | Bounded requests, TLS posture, drain and readiness, upstream ceilings, the deploy gate |
 | [[platform/_index]] | 4 | The platform UI as an ordinary role rendered, and what a platform still lacks |
 

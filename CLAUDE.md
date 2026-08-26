@@ -214,6 +214,14 @@ never cleans itself up.
   --check` and `clippy -D warnings` are CI gates and both change meaning
   between releases. Bumping it is a deliberate commit that carries whatever
   reformatting the new toolchain wants.
+- **A trigger that needs no receiver names an `invoke`.** A cron or event
+  trigger may run an existing action or command in the engine, as a declared
+  classic role with session variables bound from the row (`invoke:` in
+  `cron_triggers.yaml` / `event_triggers`). It is the same resolver a GraphQL
+  call takes; the only privilege it has is reading the row it binds from, and
+  what it journals is redacted by that role's select permission. Never a
+  request back to `/v1/graphql`, never a minted token, never a bypass role.
+  See `knowledgebase/embedded-sdk/decisions/010-*`.
 - **A background loop must be drainable.** Wait with
   `donat_server::shutdown::idle`, never a bare `tokio::time::sleep`: a loop
   that cannot observe the shutdown token cannot be drained on `SIGTERM`, which

@@ -17,6 +17,9 @@ new system to operate.
 | "the provider calls us back" | inbound connector webhook | **none** |
 | "make a document / call a library" | action without `handler:` + Go function | **none** (Go host) |
 | "at 03:00 UTC, call *that* system" | cron trigger | a URL, which usually already exists |
+| "every N minutes, for each tenant, pull from *their* account" | cron trigger with `invoke` | **none** |
+| "when the token is saved, sync once" | event trigger with `invoke` | **none** |
+| "every night, for every active store, start the flow" | cron trigger with `invoke: { command }` | **none** |
 
 The two "(Go host)" rows depend on the engine running inside a Go program —
 see `donat-embedded-go`. On the standalone `donat-server`, those same
@@ -73,6 +76,77 @@ dropped (`skip`, which is logged, never silent). `repeated_time` picks which of
 the two instants is *the* run — it fires once either way.
 
 **Ask:** *"on the night the clocks change, should this run late or not at all?"*
+
+## Invoke — a schedule or a row change that runs a declared target
+
+A trigger does not have to end at a URL. `invoke` names an action or a
+command that already exists, the classic role it runs as, and which columns
+of the triggering row become its session variables and arguments. The engine
+runs it in-process, by the same path a GraphQL call would take — so the
+target's `permissions`, guards and tenant scoping are the ones every client
+gets. No receiver, no minted token, no request back to `/v1/graphql`.
+
+```yaml
+# cron_triggers.yaml — pull each workspace's issues as its owner, with its token
+- name: pull_linear_issues
+  schedule: "*/5 * * * *"
+  retry_conf: { num_retries: 3, retry_interval_seconds: 30 }
+  invoke:
+    action: linear_issues                  # actions.yaml; role must be in its permissions
+    session:
+      role: user
+      vars:
+        x-donat-user-id:   { column: owner }
+        x-donat-tenant-id: { column: owner }
+    foreach:                               # the rows that are work items
+      table: { schema: public, name: workspace }
+      where: { linear_token: { _is_null: false } }
+    arguments:
+      token: { column: linear_token }      # write-only column: bindable here, never selectable
+    then:                                  # one command per item of the answer
+      foreach: $
+      command: ingest_linear_issue
+      arguments: { identifier: { item: identifier }, title: { item: title } }
+
+# a schedule that starts a flow: the command carries start_process
+- name: nightly_settlement
+  schedule: "0 3 * * *"
+  invoke:
+    command: start_settlement
+    session: { role: operator, vars: { x-donat-tenant-id: { column: id } } }
+    foreach: { table: { schema: public, name: store }, where: { status: { _eq: active } } }
+    arguments: { store_id: { column: id } }
+```
+
+On an event trigger the same block has no `foreach`: the row is the one that
+changed (NEW on insert/update, OLD on delete).
+
+- **Exactly one target.** `webhook` xor `invoke`; inside `invoke`, `action`
+  xor `command`. `then` follows an action's answer and has no place on a
+  command target. `donat validate` names the trigger that gets this wrong.
+- **The session is declared, never implied.** `role` must be on the target's
+  permissions; `vars` are `x-donat-*` / `x-hasura-*` only, and each should be
+  `{ column: … }` — a `literal` user id runs every row as that one person. On a tenanted
+  source a command target (or a `then` command) must bind the tenant
+  variable — otherwise the writes have no tenant, and validate refuses.
+- **`foreach.where` is closed:** `_is_null`, `_eq` against a literal, `_and`.
+  It is a cross-tenant, permission-free read, which is why it stays small.
+  `unnest: [{ column: team_ids, as: team_id }]` fans one row out per array
+  element; the alias is a column for binds and for `key`.
+- **A bound secret is never journaled.** `donat.trigger_invocations.input`
+  shows `***` for any column the role cannot select. That is the contract a
+  write-only token was declared under.
+- **At-least-once, per work item.** The occurrence expands into one journal
+  row per work item; each is retried on its own under the trigger's
+  `retry_conf`. The handler and the `then` command must be idempotent —
+  give the command a unique key or an idempotency key.
+- `DONAT_CRON_INVOKE_EXPAND_LIMIT` (100) caps work items per poll;
+  `DONAT_INVOKE_THEN_LIMIT` (100) caps items of one answer — a larger answer
+  is an error that names the cap, never a silent truncation.
+
+**Ask:** *"who is this running as, for each row?"* If the answer is "nobody in
+particular", it is a webhook to a system that has its own credentials; if it
+is "that customer", it is an `invoke`.
 
 ## Event triggers — reacting to a write
 
@@ -220,6 +294,9 @@ minimum.
 | "Stripe calls us when payment settles" | inbound connector webhook |
 | "generate a PDF" | action without `handler:` + Go function |
 | "call our legacy system on a schedule" | cron trigger → the URL that system already exposes |
+| "every five minutes, pull each customer's data with their token" | cron trigger with `invoke: { action, foreach, then }` |
+| "every night, start the settlement flow for every store" | cron trigger with `invoke: { command, foreach }` |
+| "when the integration token is saved, sync once" | event trigger with `invoke` |
 
 ## Talking about it to a non-technical partner
 
@@ -243,6 +320,8 @@ cheaper to ask now.
 6. Nothing atomic implemented as a post-commit handler.
 7. Inbound: `webhook_secret`, `correlate`, `guard`, `deadline`, `on_timeout`.
 8. Every action lists its `permissions`.
+8a. Every `invoke` names a role already on its target, binds the tenant
+    variable where the source is tenanted, and its command is idempotent.
 9. Database triggers only for mechanical bookkeeping or unmediated writes, each
    with a comment saying which.
 10. `donat validate` green; a fired trigger observed, not assumed.
@@ -258,6 +337,9 @@ cheaper to ask now.
 - [`crates/conformance/tests/cron_triggers.rs`](https://github.com/donatlabs/donat/blob/main/crates/conformance/tests/cron_triggers.rs)
   and [`event_triggers.rs`](https://github.com/donatlabs/donat/blob/main/crates/conformance/tests/event_triggers.rs)
   — the delivery contract CI asserts
+- [`crates/conformance/tests/invoke_triggers.rs`](https://github.com/donatlabs/donat/blob/main/crates/conformance/tests/invoke_triggers.rs)
+  — a cron tick pulling per tenant with a write-only token, a `then` command
+  running as that tenant, a schedule starting a command directly
 - [`examples/lending-golang/handlers.go`](https://github.com/donatlabs/donat/blob/main/examples/lending-golang/handlers.go)
   — in-process event handlers, no webhook
 - [`examples/lending-golang/metadata/actions.yaml`](https://github.com/donatlabs/donat/blob/main/examples/lending-golang/metadata/actions.yaml)

@@ -2409,6 +2409,17 @@ impl Running {
             .expect("with_cron_webhook() was not called on this suite")
     }
 
+    /// Edit the accumulated metadata in place before the engine spawns — for
+    /// the sections that have no dedicated helper (actions, commands, custom
+    /// types, a table entry written whole).
+    pub fn edit_metadata(&self, edit: impl FnOnce(&mut Metadata)) {
+        assert!(
+            self.engine.borrow().is_none(),
+            "edit_metadata must be called before the engine spawns"
+        );
+        edit(&mut self.metadata.borrow_mut());
+    }
+
     /// Register a cron trigger in the metadata before the engine spawns.
     /// Panics if the engine has already started (metadata is read at boot).
     pub fn add_cron_trigger(&self, trigger: CronTrigger) {
@@ -3520,6 +3531,7 @@ mod tests {
             "graphql_mutations",
             "graphql_queries",
             "introspection_descriptions",
+            "invoke_triggers",
             "jwk",
             "jwt",
             "jwt_claims_map",
