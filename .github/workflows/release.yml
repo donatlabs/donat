@@ -209,17 +209,19 @@ jobs:
           done
           curl -sf -m 5 localhost:8080/healthz
 
-          # The seeded catalogue, as the anonymous role.
-          body=$(curl -sf -m 5 'localhost:8080/api/rest/pets?limit=3' \
-            -H 'X-Donat-Admin-Secret: petshop-secret' -H 'X-Donat-Role: anonymous')
+          # The seeded catalogue. The example declares `anonymous` as its
+          # unauthorized role, so a request with no credential at all is
+          # that role — no header names one, and none is sent.
+          body=$(curl -sf -m 5 'localhost:8080/api/rest/pets?limit=3')
           grep -q '"name":"Rex"' <<< "$body" || { echo "unexpected pets body: $body"; exit 1; }
 
-          # A permission is proven by what it refuses: a role-less request to
-          # an unknown path gets the role error, never a 404 to enumerate by.
-          refusal=$(curl -sf -m 5 localhost:8080/api/rest/does/not/exist \
-            -H 'X-Donat-Admin-Secret: petshop-secret')
-          grep -q 'x-donat-role header is required' <<< "$refusal" \
-            || { echo "expected the role-required refusal, got: $refusal"; exit 1; }
+          # The same anonymous caller at a path no endpoint declares gets the
+          # REST not-found body — the one `rest/unknown_endpoint.yaml` asserts
+          # — and never a page or a stack trace.
+          status=$(curl -s -o /tmp/refusal -w '%{http_code}' -m 5 \
+            localhost:8080/api/rest/does/not/exist)
+          test "$status" = 404 && grep -q '"endpoint not found"' /tmp/refusal \
+            || { echo "expected the REST not-found refusal, got $status: $(cat /tmp/refusal)"; exit 1; }
 
       # The image carries the UI and serves it itself, so the release
       # has to prove both halves of that: the panel is reachable, and it has
