@@ -201,3 +201,58 @@ fn cron_event_past_tolerance_is_dropped() {
         "no invocation log for a dropped event"
     );
 }
+
+/// One row per (trigger, occurrence): a `*/5` slot is one instant on the
+/// grid, so polls in the same slot converge on one `scheduled` row instead
+/// of one per poll — which is what delivered the same occurrence a dozen
+/// times on a stand (0.8.0).
+#[test]
+fn cron_materializes_one_row_per_occurrence_across_polls() {
+    let s = Suite::new("cron_one_row_per_slot")
+        .with_cron_webhook()
+        .start();
+    s.add_cron_trigger(
+        serde_json::from_value(json!({
+            "name": "every_five",
+            "webhook": "{{CRON_WEBHOOK_BASE}}/ok",
+            "schedule": "*/5 * * * *",
+            "retry_conf": { "num_retries": 0 }
+        }))
+        .expect("valid cron trigger"),
+    );
+    let _ = s.base_url();
+    // A past-due occurrence, delivered by the same tick that materializes:
+    // once it is delivered at least one materialize pass has run, and with a
+    // 1 s poll several more have by the time the checks below are read.
+    seed_past_due(s.db_url(), "every_five", 30);
+    wait_until(
+        || status_count(s.db_url(), "every_five", "delivered") == 1,
+        Duration::from_secs(15),
+        "the seeded occurrence delivered",
+    );
+    wait_until(
+        || status_count(s.db_url(), "every_five", "scheduled") >= 1,
+        Duration::from_secs(15),
+        "the next occurrence materialized",
+    );
+    let mut c = postgres::Client::connect(s.db_url(), postgres::NoTls).expect("connect suite db");
+    let (rows, distinct_minutes, off_grid): (i64, i64, i64) = {
+        let r = c
+            .query_one(
+                "SELECT count(*), count(DISTINCT date_trunc('minute', scheduled_time)), \
+                        count(*) FILTER (WHERE scheduled_time <> date_trunc('minute', scheduled_time)) \
+                 FROM donat.cron_events WHERE trigger_name = $1 AND status = 'scheduled'",
+                &[&"every_five"],
+            )
+            .expect("materialized rows");
+        (r.get(0), r.get(1), r.get(2))
+    };
+    assert_eq!(
+        off_grid, 0,
+        "a */5 occurrence is on the minute, sub-second zero"
+    );
+    assert_eq!(
+        rows, distinct_minutes,
+        "one scheduled row per occurrence, however many polls saw it"
+    );
+}
