@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, LocalResult, NaiveDateTime, TimeDelta, TimeZone, Utc};
+use chrono::{DateTime, LocalResult, NaiveDateTime, TimeDelta, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use serde_json::{Value as Json, json};
@@ -62,16 +62,34 @@ pub struct NextOccurrence {
 /// module to fall back on. Metadata loading refuses all three, so reaching
 /// `None` means the trigger did not come through the loader.
 pub fn next_occurrence(trigger: &CronTrigger, after: DateTime<Utc>) -> Option<NextOccurrence> {
-    let Some(zone) = &trigger.timezone else {
-        return next_after(&trigger.schedule, after).map(|at| NextOccurrence {
+    let next = match &trigger.timezone {
+        None => next_after(&trigger.schedule, after).map(|at| NextOccurrence {
             at,
             skipped: Vec::new(),
-        });
+        })?,
+        Some(zone) => {
+            let tz: Tz = zone.parse().ok()?;
+            let dst = trigger.dst.as_ref()?;
+            let cron = Cron::from_str(&trigger.schedule).ok()?;
+            next_in_zone(&cron, tz, dst, after)?
+        }
     };
-    let tz: Tz = zone.parse().ok()?;
-    let dst = trigger.dst.as_ref()?;
-    let cron = Cron::from_str(&trigger.schedule).ok()?;
-    next_in_zone(&cron, tz, dst, after)
+    Some(NextOccurrence {
+        at: on_the_grid(next.at),
+        skipped: next.skipped,
+    })
+}
+
+/// An occurrence is an instant on the schedule's grid, never the poll that
+/// found it. `croner` snaps the minute and second to the expression but
+/// carries the sub-second of `after` through, and `Utc::now()` has
+/// microseconds — so two polls in one slot would name two occurrences, and
+/// the unique (trigger_name, scheduled_time) that makes materialization
+/// idempotent would never see the same value twice. A cron expression has no
+/// finer grain than a second, so the sub-second is dropped here, once, for
+/// both the UTC and the zoned path.
+fn on_the_grid(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.with_nanosecond(0).unwrap_or(at)
 }
 
 /// Wall-clock times are searched with `croner` over naive time (a naive value
@@ -687,6 +705,33 @@ mod tests {
             after = next.at;
         }
         fired
+    }
+
+    /// A `*/5 * * * *` slot is 14:40:00.000000, not a fan of timestamps in
+    /// that second. `croner` snaps minute and second to the grid but keeps the
+    /// sub-second of `after`, and `Utc::now()` has microseconds — so without
+    /// truncation every poll enqueued a "new" occurrence and the unique
+    /// (trigger_name, scheduled_time) never collapsed them.
+    #[test]
+    fn an_occurrence_is_on_the_grid_whatever_the_poll_instant_was() {
+        let t = trigger("*/5 * * * *", None, None);
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 14, 36, 7).unwrap();
+        let a = next_occurrence(&t, base + TimeDelta::microseconds(256_822)).unwrap();
+        let b = next_occurrence(&t, base + TimeDelta::microseconds(263_797)).unwrap();
+        assert_eq!(a.at, Utc.with_ymd_and_hms(2026, 8, 26, 14, 40, 0).unwrap());
+        assert_eq!(a.at, b.at, "two polls in the same slot name one occurrence");
+        assert_eq!(a.at.timestamp_subsec_nanos(), 0);
+
+        // The zoned path goes through the same door.
+        let z = berlin(
+            "*/5 * * * *",
+            DstSkippedTime::Skip,
+            DstRepeatedTime::FireAtFirst,
+        );
+        let za = next_occurrence(&z, base + TimeDelta::microseconds(256_822)).unwrap();
+        let zb = next_occurrence(&z, base + TimeDelta::microseconds(263_797)).unwrap();
+        assert_eq!(za.at, zb.at);
+        assert_eq!(za.at.timestamp_subsec_nanos(), 0);
     }
 
     #[test]
