@@ -21,6 +21,7 @@ pub mod gql;
 pub mod help;
 pub mod idp_admin;
 pub mod idp_proxy;
+pub mod invoke;
 pub mod jwt;
 pub mod local;
 pub mod mcp;

@@ -45,6 +45,8 @@ pub enum LoadError {
     Storage { path: PathBuf, message: String },
     #[error("invalid cron trigger metadata ({path}): {message}")]
     CronTriggers { path: PathBuf, message: String },
+    #[error("invalid event trigger metadata (under {path}): {message}")]
+    EventTriggers { path: PathBuf, message: String },
     #[error("invalid document template metadata ({path}): {message}")]
     Templates { path: PathBuf, message: String },
     #[error("invalid media metadata ({path}): {message}")]
@@ -335,6 +337,27 @@ fn validate_composed(dir: &Path, metadata: &Metadata) -> Result<(), LoadError> {
         path: dir.join("cron_triggers.yaml"),
         message,
     })?;
+    // An `invoke` names things other sections declared — an action, a
+    // command, a role on them — so it is checked once they are all loaded.
+    let invoke_errors = crate::invoke::validate_invoke_targets(metadata);
+    if !invoke_errors.is_empty() {
+        // Named after the file the analyst has to open: a cron trigger's
+        // problem is in cron_triggers.yaml, an event trigger's is beside
+        // its table.
+        let (cron, event): (Vec<_>, Vec<_>) = invoke_errors
+            .into_iter()
+            .partition(|e| e.starts_with("cron trigger"));
+        if !cron.is_empty() {
+            return Err(LoadError::CronTriggers {
+                path: dir.join("cron_triggers.yaml"),
+                message: cron.join("; "),
+            });
+        }
+        return Err(LoadError::EventTriggers {
+            path: dir.join("tables"),
+            message: event.join("; "),
+        });
+    }
     // Tenancy is checked last because every rule it applies is a rule about
     // something another section declared: a source, a tracked table, a
     // relationship, a permission.

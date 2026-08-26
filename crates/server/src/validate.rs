@@ -166,6 +166,7 @@ async fn check_consistency_inner(
     }
 
     validate_tracked_objects(&validation_metadata, &catalog, &mut problems);
+    validate_invoke_targets(&validation_metadata, &catalog, &mut problems);
 
     // The tenant column a table is *assumed* to carry is the one thing the
     // metadata loader cannot check, and the one whose absence would be a 500
@@ -363,6 +364,271 @@ fn validate_tracked_objects(
     }
 }
 
+/// The half of an `invoke` declaration only the database can check: the
+/// `foreach` table exists, every column a bind or predicate names is a
+/// column of it, an unnest alias shadows nothing, and a table with no
+/// declared `key` has a primary key to identify its work items by.
+///
+/// The loader already refused unknown targets, roles and argument names;
+/// what is left would otherwise be a failed tick in the log after deploy.
+fn validate_invoke_targets(
+    metadata: &Metadata,
+    catalog: &donat_catalog::Catalog,
+    problems: &mut Vec<String>,
+) {
+    use donat_metadata::{Bind, InvokeTarget};
+
+    fn bound_columns(invoke: &InvokeTarget) -> Vec<&str> {
+        invoke
+            .session
+            .vars
+            .values()
+            .chain(invoke.arguments.values())
+            .chain(invoke.then.iter().flat_map(|then| then.arguments.values()))
+            .filter_map(|bind| match bind {
+                Bind::Column { column } => Some(column.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn where_columns<'a>(where_: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        let Some(map) = where_.as_object() else {
+            return;
+        };
+        for (key, value) in map {
+            if key == "_and" {
+                for item in value.as_array().into_iter().flatten() {
+                    where_columns(item, out);
+                }
+            } else if !key.starts_with('_') {
+                out.push(key.as_str());
+            }
+        }
+    }
+
+    for trigger in &metadata.cron_triggers {
+        let Some(invoke) = &trigger.invoke else {
+            continue;
+        };
+        let Some(foreach) = &invoke.foreach else {
+            continue;
+        };
+        let is_postgres = metadata
+            .sources
+            .iter()
+            .any(|s| s.name == foreach.source && s.kind == SourceKind::Postgres);
+        if !is_postgres {
+            continue;
+        }
+        let what = format!("cron trigger \"{}\"", trigger.name);
+        let (schema, name) = (foreach.table.schema(), foreach.table.name());
+        let Some(table) = catalog.table(schema, name) else {
+            problems.push(format!(
+                "{what}: foreach table \"{schema}.{name}\" does not exist in the database"
+            ));
+            continue;
+        };
+        let has_column = |column: &str| table.columns.iter().any(|c| c.name == column);
+        let aliases: Vec<&str> = foreach.unnest.iter().map(|u| u.as_.as_str()).collect();
+        for unnest in &foreach.unnest {
+            if !has_column(&unnest.column) {
+                problems.push(format!(
+                    "{what}: unnest column \"{}\" is not a column of \"{schema}.{name}\"",
+                    unnest.column
+                ));
+            }
+            if has_column(&unnest.as_) {
+                problems.push(format!(
+                    "{what}: unnest alias \"{}\" is also a column of \"{schema}.{name}\"",
+                    unnest.as_
+                ));
+            }
+        }
+        let mut named = bound_columns(invoke);
+        if let Some(where_) = &foreach.where_ {
+            where_columns(where_, &mut named);
+        }
+        named.extend(foreach.key.iter().map(String::as_str));
+        named.sort_unstable();
+        named.dedup();
+        for column in named {
+            if !aliases.contains(&column) && !has_column(column) {
+                problems.push(format!(
+                    "{what}: \"{column}\" is neither a column of \"{schema}.{name}\" nor an \
+                     unnest alias"
+                ));
+            }
+        }
+        if foreach.key.is_empty() && table.primary_key.is_empty() {
+            problems.push(format!(
+                "{what}: \"{schema}.{name}\" has no primary key; declare `foreach.key`"
+            ));
+        }
+    }
+
+    for source in &metadata.sources {
+        if source.kind != SourceKind::Postgres {
+            continue;
+        }
+        for entry in &source.tables {
+            let (schema, name) = (entry.table.schema(), entry.table.name());
+            let Some(table) = catalog.table(schema, name) else {
+                continue;
+            };
+            for trigger in &entry.event_triggers {
+                let Some(invoke) = &trigger.invoke else {
+                    continue;
+                };
+                let mut named = bound_columns(invoke);
+                named.sort_unstable();
+                named.dedup();
+                for column in named {
+                    if !table.columns.iter().any(|c| c.name == column) {
+                        problems.push(format!(
+                            "event trigger \"{}\": \"{column}\" is not a column of \
+                             \"{schema}.{name}\"",
+                            trigger.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn push_plan_error(problems: &mut Vec<String>, error: PlanError) {
     problems.push(format!("{}: {}", error.path, error.message));
+}
+
+#[cfg(test)]
+mod invoke_tests {
+    use super::*;
+    use donat_catalog::{Catalog, ColumnInfo, RelationKind, TableInfo};
+    use serde_json::json;
+
+    fn catalog(primary_key: &[&str]) -> Catalog {
+        let column = |name: &str| ColumnInfo {
+            name: name.into(),
+            pg_type: "text".into(),
+            pg_typmod: -1,
+            native_type: None,
+            nullable: true,
+            has_default: false,
+        };
+        let mut catalog = Catalog::default();
+        catalog.tables.insert(
+            "public.workspace".into(),
+            TableInfo {
+                schema: "public".into(),
+                name: "workspace".into(),
+                relation_kind: RelationKind::Table,
+                unique_keys: vec![],
+                columns: vec![
+                    column("id"),
+                    column("owner"),
+                    column("linear_token"),
+                    column("team_ids"),
+                ],
+                primary_key: primary_key.iter().map(|k| k.to_string()).collect(),
+                foreign_keys: vec![],
+            },
+        );
+        catalog
+    }
+
+    fn metadata(foreach: serde_json::Value, arguments: serde_json::Value) -> Metadata {
+        serde_json::from_value(json!({
+            "version": 3,
+            "sources": [{
+                "name": "default",
+                "kind": "postgres",
+                "configuration": { "connection_info": { "database_url": "postgres://x" } },
+                "tables": [{ "table": { "schema": "public", "name": "workspace" } }]
+            }],
+            "actions": [{
+                "name": "pull",
+                "definition": { "arguments": [{ "name": "token", "type": "String!" }], "handler": "http://h" },
+                "permissions": [{ "role": "user" }]
+            }],
+            "cron_triggers": [{
+                "name": "pull",
+                "schedule": "* * * * *",
+                "invoke": {
+                    "action": "pull",
+                    "session": { "role": "user", "vars": { "x-donat-user-id": { "column": "owner" } } },
+                    "foreach": foreach,
+                    "arguments": arguments
+                }
+            }]
+        }))
+        .expect("metadata")
+    }
+
+    #[test]
+    fn a_bind_names_a_column_or_an_alias() {
+        let mut problems = Vec::new();
+        validate_invoke_targets(
+            &metadata(
+                json!({ "table": { "schema": "public", "name": "workspace" },
+                        "unnest": [{ "column": "team_ids", "as": "team_id" }] }),
+                json!({ "token": { "column": "team_id" } }),
+            ),
+            &catalog(&["id"]),
+            &mut problems,
+        );
+        assert_eq!(problems, Vec::<String>::new());
+
+        validate_invoke_targets(
+            &metadata(
+                json!({ "table": { "schema": "public", "name": "workspace" },
+                        "where": { "ghost": { "_is_null": false } } }),
+                json!({ "token": { "column": "secret" } }),
+            ),
+            &catalog(&["id"]),
+            &mut problems,
+        );
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("\"secret\" is neither a column"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("\"ghost\" is neither a column"))
+        );
+    }
+
+    #[test]
+    fn a_missing_table_and_a_missing_key_are_named() {
+        let mut problems = Vec::new();
+        validate_invoke_targets(
+            &metadata(
+                json!({ "table": { "schema": "public", "name": "nope" } }),
+                json!({ "token": { "column": "linear_token" } }),
+            ),
+            &catalog(&["id"]),
+            &mut problems,
+        );
+        assert!(
+            problems[0].contains("foreach table \"public.nope\" does not exist"),
+            "{problems:?}"
+        );
+
+        let mut problems = Vec::new();
+        validate_invoke_targets(
+            &metadata(
+                json!({ "table": { "schema": "public", "name": "workspace" } }),
+                json!({ "token": { "column": "linear_token" } }),
+            ),
+            &catalog(&[]),
+            &mut problems,
+        );
+        assert!(
+            problems[0].contains("has no primary key; declare `foreach.key`"),
+            "{problems:?}"
+        );
+    }
 }

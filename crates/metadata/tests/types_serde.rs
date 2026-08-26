@@ -484,7 +484,7 @@ comment: nightly reminders
 ";
     let ct: CronTrigger = serde_yaml::from_str(yaml).expect("cron trigger must load");
     assert_eq!(ct.name, "send_reminders");
-    assert_eq!(ct.webhook, "{{WEBHOOK_BASE}}/cron");
+    assert_eq!(ct.webhook.as_deref(), Some("{{WEBHOOK_BASE}}/cron"));
     assert_eq!(ct.schedule, "*/5 * * * *");
     assert_eq!(ct.payload, json!({ "kind": "reminder" }));
     assert!(ct.include_in_metadata);

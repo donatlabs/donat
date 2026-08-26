@@ -189,24 +189,48 @@ impl Caller {
     }
 }
 
-async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCode, Json)> {
-    let ActionInvocation {
+/// Why an action call produced no answer, before any GraphQL shape is put
+/// on it. Both the GraphQL resolver and a background `invoke` map these; the
+/// strings are the contract the resolver has always had.
+#[derive(Debug)]
+pub(crate) enum ActionFailure {
+    /// The declaration cannot be served by this binary.
+    NoHandler(String),
+    /// A request or response transform did not render.
+    Transform(String),
+    /// The request did not complete, or the body could not be read.
+    Transport(String),
+    /// The handler answered with a non-2xx status: Donat's error shape.
+    Handler { message: String, extensions: Json },
+}
+
+/// One action call, GraphQL-free: what the handler is sent and what it
+/// answers, after the response transform and before shaping to
+/// `output_type`.
+pub(crate) struct ActionCall<'a> {
+    pub(crate) state: &'a SharedState,
+    pub(crate) session: &'a Session,
+    pub(crate) action: &'a ActionEntry,
+    pub(crate) input: JsonMap<String, Json>,
+    /// The client's request headers, when a client made this call.
+    /// `forward_client_headers` has nothing to forward from a background
+    /// invocation.
+    pub(crate) headers: Option<&'a HeaderMap>,
+}
+
+/// Call the handler the way a GraphQL field would — the same payload, the
+/// same transforms, the same headers and timeout — and give back its answer.
+///
+/// This is the one resolver. A GraphQL call reaches it with the field's
+/// arguments; an `invoke` trigger reaches it with values bound from a row.
+pub(crate) async fn perform_action(call: ActionCall<'_>) -> Result<Json, ActionFailure> {
+    let ActionCall {
         state,
-        engine,
         session,
         action,
-        field,
-        variables,
+        input,
         headers,
-        custom_types,
-    } = invocation;
-    let path = format!("$.selectionSet.{}", field.name);
-
-    // Resolve the field arguments into the `input` object.
-    let mut input = JsonMap::new();
-    for (name, value) in &field.arguments {
-        input.insert(name.clone(), value_to_json(value, variables));
-    }
+    } = call;
 
     // Session variables, as Donat passes them (lowercased).
     let mut session_vars = JsonMap::new();
@@ -228,15 +252,11 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
     // the declaration at boot; this is the guard for a snapshot that reached a
     // request some other way.
     let Some(handler) = action.definition.handler.as_deref() else {
-        return Err(err(
-            &path,
-            "unexpected",
-            format!(
-                "action '{}' declares no handler, so it runs only in an embedded host \
-                 that registers a function for it",
-                action.name
-            ),
-        ));
+        return Err(ActionFailure::NoHandler(format!(
+            "action '{}' declares no handler, so it runs only in an embedded host \
+             that registers a function for it",
+            action.name
+        )));
     };
     let base_url = resolve_url_template(handler);
     // The request as it would be sent with no transform: the Donat shape.
@@ -244,7 +264,7 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
     if let Some(transform) = &action.definition.request_transform {
         let context = crate::transform::context(&base_url, &payload, &session_vars);
         if let Err(message) = crate::transform::apply(&mut outgoing, transform, &context) {
-            return Err(err(&path, "unexpected", message));
+            return Err(ActionFailure::Transform(message));
         }
     }
     let mut req = outgoing.into_request(&state.http);
@@ -258,7 +278,9 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
     if let Some(seconds) = action.definition.timeout {
         req = req.timeout(std::time::Duration::from_secs(seconds));
     }
-    if action.definition.forward_client_headers {
+    if action.definition.forward_client_headers
+        && let Some(headers) = headers
+    {
         // The caller's session travels only to the provider this engine
         // already proxies for the same browser.
         //
@@ -294,11 +316,9 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
     let response = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return Err(err(
-                &path,
-                "unexpected",
-                format!("http exception when calling webhook: {e}"),
-            ));
+            return Err(ActionFailure::Transport(format!(
+                "http exception when calling webhook: {e}"
+            )));
         }
     };
     let status = response.status();
@@ -325,11 +345,9 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
         match crate::upstream::read_json(response, crate::upstream::max_body_bytes()).await {
             Ok(body) => body,
             Err(error) => {
-                return Err(err(
-                    &path,
-                    "unexpected",
-                    format!("http exception when calling webhook: {error}"),
-                ));
+                return Err(ActionFailure::Transport(format!(
+                    "http exception when calling webhook: {error}"
+                )));
             }
         };
 
@@ -354,22 +372,64 @@ async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCo
                 json!({ "path": "$", "code": code })
             }
         };
-        return Err((
-            StatusCode::OK,
-            json!({ "errors": [ { "extensions": extensions, "message": message } ] }),
-        ));
+        return Err(ActionFailure::Handler {
+            message,
+            extensions,
+        });
     }
 
     // A response transform runs before the answer is shaped, because it is
     // what makes the answer shapeable: the handler's fields become the ones
     // `output_type` promises.
-    let body = match &action.definition.response_transform {
-        None => body,
-        Some(transform) => {
-            match crate::transform::apply_response(transform, &body, &session_vars) {
-                Ok(body) => body,
-                Err(message) => return Err(err(&path, "unexpected", message)),
-            }
+    match &action.definition.response_transform {
+        None => Ok(body),
+        Some(transform) => crate::transform::apply_response(transform, &body, &session_vars)
+            .map_err(ActionFailure::Transform),
+    }
+}
+
+async fn call_action(invocation: ActionInvocation<'_>) -> Result<Json, (StatusCode, Json)> {
+    let ActionInvocation {
+        state,
+        engine,
+        session,
+        action,
+        field,
+        variables,
+        headers,
+        custom_types,
+    } = invocation;
+    let path = format!("$.selectionSet.{}", field.name);
+
+    // Resolve the field arguments into the `input` object.
+    let mut input = JsonMap::new();
+    for (name, value) in &field.arguments {
+        input.insert(name.clone(), value_to_json(value, variables));
+    }
+
+    let body = match perform_action(ActionCall {
+        state,
+        session,
+        action,
+        input,
+        headers: Some(headers),
+    })
+    .await
+    {
+        Ok(body) => body,
+        Err(ActionFailure::NoHandler(message))
+        | Err(ActionFailure::Transform(message))
+        | Err(ActionFailure::Transport(message)) => {
+            return Err(err(&path, "unexpected", message));
+        }
+        Err(ActionFailure::Handler {
+            message,
+            extensions,
+        }) => {
+            return Err((
+                StatusCode::OK,
+                json!({ "errors": [ { "extensions": extensions, "message": message } ] }),
+            ));
         }
     };
 

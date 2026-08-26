@@ -29,6 +29,7 @@ reasoning never has to be reconstructed.
 - [[decisions/007-event-triggers-yaml-and-deploy-time-ddl]] — table event triggers: YAML metadata plus deploy-time trigger DDL
 - [[decisions/008-the-embedded-core-compiles-its-own-snapshot]] — the core compiles rules and commands at `core_init`; a command's hooks come from its resolved steps
 - [[decisions/009-connectors-are-not-a-go-extension-point]] — connectors are unreachable without the Process runtime, and would break the reviewed factory boundary even with it
+- [[decisions/010-a-trigger-invokes-a-declared-target-under-a-declared-session]] — a cron or event trigger runs an action or command in the engine, as a declared role with variables bound from the row; no receiver, no minted token
 
 ## Architecture Overview (leading candidate)
 

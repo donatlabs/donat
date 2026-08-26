@@ -2382,8 +2382,12 @@ pub fn action_visible_to_role(action: &ActionEntry, role: &str) -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CronTrigger {
     pub name: String,
-    /// Webhook URL ({{ENV}} templates allowed).
-    pub webhook: String,
+    /// Webhook URL ({{ENV}} templates allowed). One of `webhook` / `invoke`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
+    /// Run an action or command in the engine instead of posting to a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoke: Option<crate::invoke::InvokeTarget>,
     /// Standard 5-field cron expression. Evaluated in UTC unless `timezone`
     /// names a zone to read its wall-clock fields in.
     pub schedule: String,
@@ -3034,6 +3038,10 @@ pub struct EventTrigger {
     pub webhook: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_from_env: Option<String>,
+    /// Run an action or command in the engine instead of posting to a URL;
+    /// then neither `webhook` nor `webhook_from_env` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoke: Option<crate::invoke::InvokeTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_conf: Option<EventRetryConf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
