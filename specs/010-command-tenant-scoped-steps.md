@@ -94,7 +94,6 @@ pub(crate) enum TenantRef {
   then forces every call site to state its arm instead of inheriting
   `Session` silently. Only `write_tenant_predicate` keeps a `Session`
   wrapper beside `write_tenant_predicate_from`.
-- `write_tenant_predicate` likewise gains a `_from` form.
 - `permission_predicate_full(ctx, session, apply_tenant: bool, apply_iam, path)`
   → `apply_tenant: Option<&TenantRef>` (`None` = unscoped).
   `permission_predicate_scoped(.., true, ..)` passes `Some(&TenantRef::Session)`.
@@ -108,7 +107,8 @@ pub(crate) enum TenantRef {
   Establishing,            // the establishing insert itself: nothing
   ```
   `write_check_expression` applies the gate for `Session`,
-  `SessionBoundElsewhere` and `Step`, via `serving_gate_from`.
+  `SessionBoundElsewhere` and `Step`, via `serving_gate` with the arm
+  `gate_tenant()` yields.
 
 ### 3.4 `crates/schema/src/plan_mutation.rs`
 
