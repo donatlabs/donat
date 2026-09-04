@@ -87,12 +87,13 @@ pub(crate) enum TenantRef {
 - `fn tenant_op(&self, tenant: &TenantRef, session, path) -> Result<CompareOp>`:
   `Session` → `Eq(Scalar::Json(tenant_value(session)?))`;
   `Step` → `CompareStepColumn { cte, column }`.
-- `tenant_compare`, `tenant_via_relationship`, `registry_serving` take
-  `&TenantRef` and call `tenant_op`. `tenant_predicate` (the twelve-caller
-  choke point) keeps its signature and passes `TenantRef::Session`; add
-  `tenant_predicate_from(ctx, session, &TenantRef, path)`.
-- `serving_gate(ctx, session, path)` → `serving_gate_from(ctx, session, &TenantRef, path)`;
-  keep the old name as the `Session` wrapper.
+- `tenant_compare`, `tenant_via_relationship`, `registry_serving`,
+  `tenant_predicate` and `serving_gate` take `&TenantRef` and call
+  `tenant_op`. As implemented, `tenant_predicate` and `serving_gate` gained
+  the parameter themselves rather than growing `_from` twins: the compiler
+  then forces every call site to state its arm instead of inheriting
+  `Session` silently. Only `write_tenant_predicate` keeps a `Session`
+  wrapper beside `write_tenant_predicate_from`.
 - `write_tenant_predicate` likewise gains a `_from` form.
 - `permission_predicate_full(ctx, session, apply_tenant: bool, apply_iam, path)`
   → `apply_tenant: Option<&TenantRef>` (`None` = unscoped).

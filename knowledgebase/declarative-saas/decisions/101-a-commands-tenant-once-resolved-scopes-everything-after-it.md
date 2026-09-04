@@ -111,6 +111,12 @@ What it costs:
 - **The order of steps is now a deploy-time fact.** A write or a scoped read
   before the tenant step used to fail at request time, or not at all; it now
   stops the deployment. The metadata validator names the step to move it after.
+- **A declared cross-tenant read keeps its subject bound.** `tenant_predicate`
+  answers a `cross_tenant_reads` entry before it looks at the arm, so a
+  step-sourced command reading such a table for such a role is bounded by the
+  caller's subject, not by the step's tenant. That is the same read the role
+  already holds through the CRUD plane, so nothing widens; it is named here
+  because the table in the spec does not describe it.
 - **One conformance case flips.** `join_and_peek` asserted that a scoped read
   after the `from` step is refused; it now asserts that the read is bounded by
   the invitation's tenant and sees nothing of the caller's.
