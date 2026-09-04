@@ -523,3 +523,53 @@ fn a_tenant_declaration_without_tenancy_is_refused() {
         "unexpected message: {message}"
     );
 }
+
+/// From the tenant step onward a command has a tenant, and every write after
+/// it carries that value. Before it there is nothing to carry, so a write
+/// placed there is refused at deploy rather than storing a row that belongs to
+/// nobody (`knowledgebase/declarative-saas/decisions/101-*`).
+#[test]
+fn a_write_before_the_tenant_step_is_refused_at_deploy() {
+    let commands = ACCEPT.replace(
+        "  steps:\n    - name: invite\n",
+        "  steps:\n    - name: early\n      insert:\n        table: { schema: public, name: iam_membership }\n        object: { user_id: { arg: token } }\n        returning: [tenant_id]\n    - name: invite\n",
+    );
+    let dir = build_with_commands("write_before_tenant_step", &commands, Some(TENANCY_YAML));
+    let message = tenancy_error(load_metadata_dir(&dir));
+    assert!(
+        message.contains("step `early` — an insert — runs before it")
+            && message.contains("Move it after `invite`"),
+        "unexpected message: {message}"
+    );
+}
+
+/// A scoped read before the tenant step would be answered from the caller's
+/// tenant, which is not this command's. It is refused the same way.
+#[test]
+fn a_scoped_read_before_the_tenant_step_is_refused_at_deploy() {
+    let commands = ACCEPT.replace(
+        "  steps:\n    - name: invite\n",
+        "  steps:\n    - name: peek\n      select_many:\n        table: { schema: public, name: iam_membership }\n        by: { user_id: { arg: token } }\n        order_by: [user_id]\n        returning: [tenant_id]\n        maximum_rows: 10\n    - name: invite\n",
+    );
+    let dir = build_with_commands("read_before_tenant_step", &commands, Some(TENANCY_YAML));
+    let message = tenancy_error(load_metadata_dir(&dir));
+    assert!(
+        message.contains("step `peek` reads `public.iam_membership`, a tenanted table, before it"),
+        "unexpected message: {message}"
+    );
+}
+
+/// After the tenant step an update is an ordinary bounded write: its predicate
+/// compares against what the step resolved. The blanket refusal of updates in
+/// a `from` command is gone.
+#[test]
+fn an_update_after_the_tenant_step_is_accepted() {
+    let commands = [
+        ACCEPT,
+        "    - name: mark\n      update:\n        table: { schema: public, name: iam_membership }\n        where: { user_id: { arg: token } }\n        set: { role: { literal: member } }\n        returning: [tenant_id]\n",
+    ]
+    .concat();
+    let dir = build_with_commands("update_after_tenant_step", &commands, Some(TENANCY_YAML));
+    let metadata = load_metadata_dir(&dir).expect("an update after the tenant step loads");
+    assert_eq!(metadata.commands[0].steps.len(), 2);
+}

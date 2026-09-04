@@ -368,11 +368,14 @@ const ONBOARDING_SQL: &str = "\
 CREATE TABLE public.store (id text PRIMARY KEY, status text NOT NULL);
 CREATE TABLE public.member (tenant_id text NOT NULL, user_id text NOT NULL, \
     PRIMARY KEY (tenant_id, user_id));
-CREATE TABLE public.invite (token text PRIMARY KEY, tenant_id text NOT NULL);
+CREATE TABLE public.invite (token text PRIMARY KEY, tenant_id text NOT NULL, \
+    redeemed boolean NOT NULL DEFAULT false);
 CREATE TABLE public.plan (code text PRIMARY KEY, label text NOT NULL);
 INSERT INTO public.plan VALUES ('free', 'Free');
 INSERT INTO public.store VALUES ('tenant-alpha', 'active'), ('tenant-beta', 'active');
-INSERT INTO public.invite VALUES ('unguessable-beta-token', 'tenant-beta');
+INSERT INTO public.invite (token, tenant_id) VALUES \
+    ('unguessable-beta-token', 'tenant-beta'), ('unguessable-alpha-token', 'tenant-alpha');
+INSERT INTO public.member VALUES ('tenant-alpha', 'person-both'), ('tenant-beta', 'person-both');
 ";
 
 fn onboarding_metadata() -> donat_metadata::Metadata {
@@ -415,6 +418,9 @@ fn onboarding_metadata() -> donat_metadata::Metadata {
                     "table": { "schema": "public", "name": "invite" },
                     "command_select_permissions": [
                         { "role": "joiner", "permission": { "columns": "*", "filter": {} } }
+                    ],
+                    "command_update_permissions": [
+                        { "role": "joiner", "permission": { "columns": ["redeemed"], "filter": {}, "check": {} } }
                     ]
                 },
                 {
@@ -512,11 +518,9 @@ fn onboarding_metadata() -> donat_metadata::Metadata {
                 "result": { "joined": { "step": "member", "column": "tenant_id" } }
             },
             {
-                // Deliberately malformed, and only ever invoked by the test
-                // that proves it is refused: a scoped read placed after the
-                // step this command takes its tenant from. The read would be
-                // scoped by the caller's tenant while every write went to the
-                // invite's, and one statement would quietly hold both.
+                // A scoped read placed after the step this command takes its
+                // tenant from. It is bounded by what that step resolved — the
+                // invite's tenant — and not by the caller's, who has none.
                 "name": "join_and_peek",
                 "source": "default",
                 "permissions": [{ "role": "joiner" }],
@@ -541,13 +545,49 @@ fn onboarding_metadata() -> donat_metadata::Metadata {
                         "select_many": {
                             "table": { "schema": "public", "name": "member" },
                             "by": { "user_id": { "arg": "user_id" } },
-                            "order_by": ["user_id"],
-                            "returning": ["user_id"],
+                            "order_by": ["tenant_id"],
+                            "returning": ["tenant_id", "user_id"],
                             "maximum_rows": 10
                         }
                     }
                 ],
-                "result": { "peeked": { "step": "invite", "column": "tenant_id" } }
+                "result": { "peeked": { "step": "peek" } }
+            },
+            {
+                // An update after the tenant step. Its `where` names a token
+                // the caller supplies, and the tenant bound decides whether
+                // that row is in scope at all.
+                "name": "redeem_invite",
+                "source": "default",
+                "permissions": [{ "role": "joiner" }],
+                "tenant": { "from": { "step": "invite", "column": "tenant_id" } },
+                "arguments": [
+                    { "name": "token", "type": "String!" },
+                    { "name": "other_token", "type": "String!" }
+                ],
+                "steps": [
+                    {
+                        "name": "invite",
+                        "tenant": "unscoped",
+                        "select_one": {
+                            "table": { "schema": "public", "name": "invite" },
+                            "by": { "token": { "arg": "token" } },
+                            "returning": ["token", "tenant_id"],
+                            "require_found": true
+                        }
+                    },
+                    {
+                        "name": "mark",
+                        "update": {
+                            "table": { "schema": "public", "name": "invite" },
+                            "where": { "token": { "arg": "other_token" } },
+                            "set": { "redeemed": { "literal": true } },
+                            "returning": ["token", "tenant_id", "redeemed"],
+                            "require_affected": true
+                        }
+                    }
+                ],
+                "result": { "redeemed": { "step": "mark", "column": "tenant_id" } }
             }
         ],
         "tenancy": {
@@ -596,16 +636,16 @@ fn onboarding_suite() -> Running {
     s
 }
 
-/// A scoped read after the step the tenant came from is refused, not answered.
+/// A scoped read after the step the tenant came from is bounded by that
+/// tenant, not by the caller's.
 ///
 /// `from:` exists precisely because the command's tenant is not the caller's.
-/// A read left scoped after that point is therefore scoped by the *wrong*
-/// tenant — it would answer from the caller's while every write went to the
-/// invite's, in one statement, with nothing in the result saying so. The step
-/// names itself instead, and the author declares `tenant: unscoped` if reading
-/// outside the tenant is what they meant.
+/// Once the step has run, the tenant it resolved is a single value in a CTE,
+/// and every later read compares against it: `person-both` is a member of two
+/// stores, and the read placed after the beta invitation sees only the beta
+/// membership. The caller, who carries no tenant at all, contributes nothing.
 #[test]
-fn a_scoped_read_after_the_tenant_step_is_refused() {
+fn a_read_after_the_tenant_step_is_bounded_by_that_tenant() {
     let s = onboarding_suite();
     let joiner = token_for("joiner", None, "person-joiner");
 
@@ -613,14 +653,102 @@ fn a_scoped_read_after_the_tenant_step_is_refused() {
         &s,
         &joiner,
         json!({ "query": "mutation { join_and_peek(token: \"unguessable-beta-token\", \
-                          user_id: \"person-joiner\") { peeked } }" }),
+                          user_id: \"person-both\") { peeked { tenant_id user_id } } }" }),
     );
     assert_eq!(code, 200, "{resp}");
-    let message = resp["errors"][0]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("peek") && message.contains("tenant"),
-        "the step was answered from the caller's tenant instead of refused: {resp}"
+    assert_eq!(
+        resp["data"]["join_and_peek"]["peeked"],
+        json!([{ "tenant_id": "tenant-beta", "user_id": "person-both" }]),
+        "the read after the tenant step was not bounded by the invite's tenant: {resp}"
     );
+}
+
+/// An update after the tenant step carries the same bound in its predicate.
+/// Naming another tenant's row in `where` finds nothing — the row is out of
+/// scope, not merely unchanged — and the row is left as it was.
+#[test]
+fn an_update_after_the_tenant_step_cannot_reach_another_tenants_row() {
+    let s = onboarding_suite();
+    let joiner = token_for("joiner", None, "person-joiner");
+
+    // The invite's own tenant: the row is in scope and the update lands.
+    let (code, resp) = query(
+        &s,
+        &joiner,
+        json!({ "query": "mutation { redeem_invite(token: \"unguessable-beta-token\", \
+                          other_token: \"unguessable-beta-token\") { redeemed } }" }),
+    );
+    assert_eq!(code, 200, "{resp}");
+    assert_eq!(
+        resp["data"]["redeem_invite"]["redeemed"], "tenant-beta",
+        "{resp}"
+    );
+
+    // Another tenant's row, named by a token the caller happens to hold: the
+    // tenant bound excludes it, `require_affected` reports it, and nothing
+    // moved. Reading the invite out of tenant beta must not let a write reach
+    // tenant alpha in the same statement.
+    let (code, resp) = query(
+        &s,
+        &joiner,
+        json!({ "query": "mutation { redeem_invite(token: \"unguessable-beta-token\", \
+                          other_token: \"unguessable-alpha-token\") { redeemed } }" }),
+    );
+    assert_eq!(code, 200, "{resp}");
+    assert!(
+        resp["errors"].is_array(),
+        "an update after the tenant step reached another tenant's row: {resp}"
+    );
+    let mut client =
+        postgres::Client::connect(s.db_url(), postgres::NoTls).expect("connect to suite database");
+    let redeemed: bool = client
+        .query_one(
+            "SELECT redeemed FROM public.invite WHERE token = 'unguessable-alpha-token'",
+            &[],
+        )
+        .expect("read the alpha invite")
+        .get(0);
+    assert!(
+        !redeemed,
+        "the alpha invite was redeemed through tenant beta's command"
+    );
+}
+
+/// The registry's serving gate applies to a command whose tenant came from a
+/// step, by the value that step resolved. A valid invitation into a store the
+/// registry stopped serving is refused, exactly as a member of that store is.
+#[test]
+fn an_invitation_into_a_store_the_registry_stopped_serving_is_refused() {
+    let s = onboarding_suite();
+    let joiner = token_for("joiner", None, "person-joiner");
+    let mut client =
+        postgres::Client::connect(s.db_url(), postgres::NoTls).expect("connect to suite database");
+    client
+        .execute(
+            "UPDATE public.store SET status = 'suspended' WHERE id = $1",
+            &[&BETA],
+        )
+        .expect("suspend the store");
+
+    let (code, resp) = query(
+        &s,
+        &joiner,
+        json!({ "query": "mutation { accept_invite(token: \"unguessable-beta-token\", \
+                          user_id: \"person-joiner\") { joined } }" }),
+    );
+    assert_eq!(code, 200, "{resp}");
+    assert!(
+        resp["errors"].is_array(),
+        "an invitation into a suspended store was accepted: {resp}"
+    );
+    let joined: i64 = client
+        .query_one(
+            "SELECT count(*) FROM public.member WHERE tenant_id = $1 AND user_id = 'person-joiner'",
+            &[&BETA],
+        )
+        .expect("count memberships")
+        .get(0);
+    assert_eq!(joined, 0, "the membership landed in a suspended store");
 }
 
 /// Signing up a merchant runs no DDL and needs no tenant in the token: the

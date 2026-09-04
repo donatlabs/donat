@@ -200,36 +200,77 @@ pub(crate) enum CheckAuthorization {
     CommandStep(donat_metadata::IamOperation),
 }
 
+/// Where a tenant value comes from when a predicate needs one.
+///
+/// Every tenant predicate is built the same way from any arm. The session
+/// arm is the ordinary case: the claim a verified token carried. The step
+/// arms are a command whose tenant is not the caller's — one that reads it
+/// off a row an unscoped lookup found, or one that establishes it — and whose
+/// tenant therefore lives in the CTE of the step that resolved it. That step
+/// is single-row by construction, so `(SELECT <column> FROM <cte> LIMIT 1)`
+/// is a scalar and compares exactly as a literal does
+/// (`knowledgebase/declarative-saas/decisions/101-*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantRef {
+    /// The caller's tenant claim.
+    Session,
+    /// The tenant column of a single-row command step that has already run.
+    Step { cte: String, column: String },
+    /// The tenant column of the step that *created* the tenant in this very
+    /// statement. Bounds like [`TenantRef::Step`]; not gated by the registry,
+    /// because the registry row lives in a data-modifying CTE the rest of the
+    /// statement cannot see — it is the row this command is writing.
+    Established { cte: String, column: String },
+}
+
+impl TenantRef {
+    /// Whether the registry's serving gate is read for this tenant.
+    fn gated(&self) -> bool {
+        !matches!(self, TenantRef::Established { .. })
+    }
+}
+
 /// Where a write's check gets its tenant, and whether it needs to state the
 /// bound again.
 ///
-/// Two questions that look like one. *Whose tenant is this* decides whether
-/// the registry's status gate can be read at all — a command creating a tenant
-/// has none in its session to look up. *Is the bound already stated* decides
-/// whether the check repeats it: an update and a delete carry it in their
-/// predicate, so repeating it in the check would be noise, while an insert has
-/// no predicate at all and the check is the only place it can go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Two questions that look like one. *Whose tenant is this* decides what the
+/// registry's status gate compares against — the session's claim, or the value
+/// a command step resolved. *Is the bound already stated* decides whether the
+/// check repeats it: an update and a delete carry it in their predicate, so
+/// repeating it in the check would be noise, while an insert has no predicate
+/// at all and the check is the only place it can go — unless a preset already
+/// pins the column, which is what a step-sourced tenant does.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckTenant {
     /// The caller's session supplies it, and the check states the bound.
     Session,
     /// The caller's session supplies it, and the predicate already stated it.
     SessionBoundElsewhere,
-    /// A step of this command supplies it, so neither the bound nor the gate
-    /// can be expressed here.
-    Step,
+    /// A step of this command supplies it. The bound is the preset (insert)
+    /// or the predicate (update, delete); the gate is read by that value.
+    Step { cte: String, column: String },
+    /// The tenant is created by this very statement: this write is the
+    /// establishing step, or one after it. The bound, where there is one, is
+    /// the preset; there is no registry row to gate on that the statement can
+    /// see, because the row being written is the registry row.
+    Establishing,
 }
 
 impl CheckTenant {
-    fn repeats_the_bound(self) -> bool {
+    fn repeats_the_bound(&self) -> bool {
         matches!(self, CheckTenant::Session)
     }
 
-    fn comes_from_the_session(self) -> bool {
-        matches!(
-            self,
-            CheckTenant::Session | CheckTenant::SessionBoundElsewhere
-        )
+    /// What the serving gate compares against, if it applies at all.
+    fn gate_tenant(&self) -> Option<TenantRef> {
+        match self {
+            CheckTenant::Session | CheckTenant::SessionBoundElsewhere => Some(TenantRef::Session),
+            CheckTenant::Step { cte, column } => Some(TenantRef::Step {
+                cte: cte.clone(),
+                column: column.clone(),
+            }),
+            CheckTenant::Establishing => None,
+        }
     }
 }
 
@@ -241,10 +282,17 @@ impl<'a> Planner<'a> {
     /// from [`Planner::permission_predicate`] rather than from the twelve
     /// places that ask for a row filter, because a guarantee applied at twelve
     /// call sites is a guarantee that is one new call site away from a leak.
+    ///
+    /// `tenant` says where the value lives. Every ordinary read passes the
+    /// session arm. The command plane is the one caller that passes the step
+    /// arm: from the step a command takes its tenant from onward, every read
+    /// is bounded by what that step resolved rather than by the session, which
+    /// for such a command carries no tenant at all.
     pub(crate) fn tenant_predicate(
         &self,
         ctx: &TableCtx,
         session: &Session,
+        tenant: &TenantRef,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
         let Some(tenancy) = self.tenancy else {
@@ -266,13 +314,16 @@ impl<'a> Planner<'a> {
         let bound = match tenancy.table_scope(&ctx.entry.table) {
             donat_metadata::TableScope::Shared => return Ok(None),
             donat_metadata::TableScope::Key(column) => {
-                self.tenant_compare(ctx.info, &ctx.entry.table, column, session, path)?
+                self.tenant_compare(ctx.info, &ctx.entry.table, column, session, tenant, path)?
             }
             donat_metadata::TableScope::ScopeVia(relationship) => {
-                self.tenant_via_relationship(ctx, relationship, session, path)?
+                self.tenant_via_relationship(ctx, relationship, session, tenant, path)?
             }
         };
-        Ok(Some(self.with_serving_gate(bound, session, path)?))
+        if !tenant.gated() {
+            return Ok(Some(bound));
+        }
+        Ok(Some(self.with_serving_gate(bound, session, tenant, path)?))
     }
 
     /// AND the registry's status gate onto a tenant bound.
@@ -288,17 +339,48 @@ impl<'a> Planner<'a> {
         &self,
         bound: BoolExp,
         session: &Session,
+        tenant: &TenantRef,
         path: &str,
     ) -> Result<BoolExp, PlanError> {
         Ok(BoolExp::And(vec![
             bound,
-            self.registry_serving(session, path)?,
+            self.registry_serving(session, tenant, path)?,
         ]))
+    }
+
+    /// The comparison a tenant key column is held to: `= <literal>` for the
+    /// session's claim, `= (SELECT <column> FROM <cte> LIMIT 1)` for a step's.
+    ///
+    /// Every tenant predicate goes through here, so the two arms cannot drift:
+    /// a bound that reads the session in one place and the step in another
+    /// would be the disagreement the command plane used to refuse outright.
+    fn tenant_op(
+        &self,
+        session: &Session,
+        tenant: &TenantRef,
+        path: &str,
+    ) -> Result<CompareOp, PlanError> {
+        Ok(match tenant {
+            TenantRef::Session => CompareOp::Eq(Scalar::Json(serde_json::Value::String(
+                self.tenant_value(session, path)?,
+            ))),
+            TenantRef::Step { cte, column } | TenantRef::Established { cte, column } => {
+                CompareOp::CompareStepColumn {
+                    cte: cte.clone(),
+                    column: column.clone(),
+                }
+            }
+        })
     }
 
     /// `EXISTS (SELECT 1 FROM <registry> WHERE <key> = <tenant> AND <status>
     /// IN (<serving>))`.
-    fn registry_serving(&self, session: &Session, path: &str) -> Result<BoolExp, PlanError> {
+    fn registry_serving(
+        &self,
+        session: &Session,
+        tenant: &TenantRef,
+        path: &str,
+    ) -> Result<BoolExp, PlanError> {
         let tenancy = self.tenancy.expect("called only for a tenanted source");
         let registry = &tenancy.registry;
         let Some(info) = self
@@ -333,9 +415,7 @@ impl<'a> Planner<'a> {
                 BoolExp::Compare {
                     column: registry.key.clone(),
                     pg_type: column_type(&registry.key)?,
-                    op: CompareOp::Eq(Scalar::Json(serde_json::Value::String(
-                        self.tenant_value(session, path)?,
-                    ))),
+                    op: self.tenant_op(session, tenant, path)?,
                 },
                 BoolExp::Compare {
                     column: registry.status.column.clone(),
@@ -391,13 +471,14 @@ impl<'a> Planner<'a> {
         })
     }
 
-    /// `<tenant key> = <the caller's tenant>`.
+    /// `<tenant key> = <the tenant>`, from the session or from a step.
     fn tenant_compare(
         &self,
         info: &donat_catalog_types::TableInfo,
         table: &MetadataTable,
         column: &str,
         session: &Session,
+        tenant: &TenantRef,
         path: &str,
     ) -> Result<BoolExp, PlanError> {
         let Some(info_column) = info.columns.iter().find(|c| c.name == column) else {
@@ -416,9 +497,7 @@ impl<'a> Planner<'a> {
         Ok(BoolExp::Compare {
             column: column.to_string(),
             pg_type: info_column.sql_type().to_string(),
-            op: CompareOp::Eq(Scalar::Json(serde_json::Value::String(
-                self.tenant_value(session, path)?,
-            ))),
+            op: self.tenant_op(session, tenant, path)?,
         })
     }
 
@@ -434,6 +513,7 @@ impl<'a> Planner<'a> {
         ctx: &TableCtx,
         relationship: &str,
         session: &Session,
+        tenant: &TenantRef,
         path: &str,
     ) -> Result<BoolExp, PlanError> {
         let Some((remote_table, join)) = self.relationship_target(ctx, relationship, path) else {
@@ -468,8 +548,14 @@ impl<'a> Planner<'a> {
                 ),
             ));
         };
-        let predicate =
-            self.tenant_compare(remote_info, &remote_table, remote_key, session, path)?;
+        let predicate = self.tenant_compare(
+            remote_info,
+            &remote_table,
+            remote_key,
+            session,
+            tenant,
+            path,
+        )?;
         Ok(BoolExp::Relationship {
             table: Table {
                 schema: remote_table.schema().to_string(),
@@ -518,6 +604,18 @@ impl<'a> Planner<'a> {
         session: &Session,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
+        self.write_tenant_predicate_from(ctx, session, &TenantRef::Session, path)
+    }
+
+    /// [`Self::write_tenant_predicate`], with the tenant taken from wherever
+    /// the caller says it lives.
+    pub(crate) fn write_tenant_predicate_from(
+        &self,
+        ctx: &TableCtx,
+        session: &Session,
+        tenant: &TenantRef,
+        path: &str,
+    ) -> Result<Option<BoolExp>, PlanError> {
         let Some(tenancy) = self.tenancy else {
             return Ok(None);
         };
@@ -527,6 +625,7 @@ impl<'a> Planner<'a> {
                 &ctx.entry.table,
                 column,
                 session,
+                tenant,
                 path,
             )?)),
             _ => Ok(None),
@@ -543,6 +642,7 @@ impl<'a> Planner<'a> {
         &self,
         ctx: &TableCtx,
         session: &Session,
+        tenant: &TenantRef,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
         let Some(tenancy) = self.tenancy else {
@@ -554,35 +654,42 @@ impl<'a> Planner<'a> {
         ) {
             return Ok(None);
         }
-        self.registry_serving(session, path).map(Some)
+        self.registry_serving(session, tenant, path).map(Some)
     }
 
-    /// A write permission's row filter, with the tenant added only when the
-    /// caller's session is what bounds this write.
+    /// A write permission's row filter, with the tenant bound added from
+    /// wherever this write's tenant lives — or not at all.
     ///
-    /// A command that establishes its own tenant, or takes one from a row it
-    /// looked up, has no session tenant to compare against — and the value it
-    /// does have lives in another CTE, which a row predicate cannot reference.
-    /// Those writes are bounded by the preset that pins the column and by the
-    /// unique lookup the command declared, which is why declaring one is a
-    /// deploy-time requirement rather than a convenience.
+    /// `None` is the write that *creates* the tenant: there is nothing yet to
+    /// compare against, and the row being written is the answer. A command
+    /// that took its tenant from a step passes that step, and the bound is
+    /// then the same predicate a session-scoped write carries, compared to
+    /// what the step resolved instead of to the claim.
     pub(crate) fn write_permission_filter_bounded(
         &self,
         filter: &serde_json::Value,
         ctx: &TableCtx<'a>,
         session: &Session,
-        bound_by_session: bool,
+        tenant: Option<&TenantRef>,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
-        if bound_by_session {
-            return self.write_permission_filter(filter, ctx, session, path);
-        }
-        if filter.is_null() || filter.as_object().is_some_and(|object| object.is_empty()) {
-            return Ok(None);
-        }
-        let filter_context = self.filter_ctx_of(ctx);
-        self.parse_bool_exp(filter, &filter_context, session, true, path)
-            .map(Some)
+        let declared =
+            if filter.is_null() || filter.as_object().is_some_and(|object| object.is_empty()) {
+                None
+            } else {
+                let filter_context = self.filter_ctx_of(ctx);
+                Some(self.parse_bool_exp(filter, &filter_context, session, true, path)?)
+            };
+        let bound = match tenant {
+            Some(tenant) => self.write_tenant_predicate_from(ctx, session, tenant, path)?,
+            None => None,
+        };
+        Ok(match (declared, bound) {
+            (Some(declared), Some(bound)) => Some(BoolExp::And(vec![declared, bound])),
+            (Some(declared), None) => Some(declared),
+            (None, Some(bound)) => Some(bound),
+            (None, None) => None,
+        })
     }
 
     /// A write permission's row filter with the tenant ANDed onto it.
@@ -640,15 +747,12 @@ impl<'a> Planner<'a> {
         {
             conjuncts.push(bound);
         }
-        // Only when the session is what supplied the tenant. A command that
-        // *establishes* one has no tenant in its session to look up — it is
-        // writing the registry row this gate would read — and one that takes
-        // its tenant from a looked-up row holds that value in another CTE,
-        // which this predicate cannot reach. Both are reviewed as a whole
-        // through their `tenant:` declaration, which is why declaring one is a
-        // deploy-time requirement rather than a convenience.
-        if tenant.comes_from_the_session()
-            && let Some(gate) = self.serving_gate(ctx, session, path)?
+        // The gate is read by whichever tenant this write has — the session's
+        // claim, or the value a command step resolved. The one write with no
+        // gate is the one that *creates* the tenant: it is writing the
+        // registry row the gate would read.
+        if let Some(gate_tenant) = tenant.gate_tenant()
+            && let Some(gate) = self.serving_gate(ctx, session, &gate_tenant, path)?
         {
             conjuncts.push(gate);
         }

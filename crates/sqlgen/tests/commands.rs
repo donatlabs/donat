@@ -3672,3 +3672,115 @@ fn command_idempotency_scoped_by_a_step_result_executes_and_replays() {
 
     tx.rollback().expect("roll back step-scoped execution");
 }
+
+/// A command whose tenant came from a step compares every later tenant bound
+/// against that step's column — the read predicate, the registry's serving
+/// gate in a write's check — as a scalar subquery over the step's CTE, the
+/// same shape a step-sourced preset already renders
+/// (`knowledgebase/declarative-saas/decisions/101-*`).
+#[test]
+fn command_step_sourced_tenant_bounds_later_steps_by_the_steps_column() {
+    let from_step = |column: &str| CompareOp::CompareStepColumn {
+        cte: "_cmd_step_0".to_owned(),
+        column: column.to_owned(),
+    };
+    let serving_gate = BoolExp::Exists {
+        table: table("store"),
+        predicate: Box::new(BoolExp::And(vec![
+            BoolExp::Compare {
+                column: "id".to_owned(),
+                pg_type: "text".to_owned(),
+                op: from_step("tenant_id"),
+            },
+            BoolExp::Compare {
+                column: "status".to_owned(),
+                pg_type: "text".to_owned(),
+                op: CompareOp::In(vec![Scalar::Json(json!("active"))]),
+            },
+        ])),
+    };
+    let command = root(CommandMutation {
+        authorization: None,
+        identity: command_identity("accept_invite"),
+        name: "accept_invite".to_owned(),
+        steps: vec![
+            // The unscoped lookup the tenant comes from: no tenant bound.
+            CommandExecutionStep::SelectOne {
+                name: "invite".to_owned(),
+                cte: "_cmd_step_0".to_owned(),
+                table: table("invite"),
+                by: vec![assignment("token", "text", json!("unguessable"))],
+                returning: vec![column("token", "text"), column("tenant_id", "text")],
+                require_found: true,
+                filter: None,
+                error_path: "$.selectionSet.accept_invite".to_owned(),
+            },
+            // A read after it, bounded by what the step resolved.
+            CommandExecutionStep::SelectMany {
+                name: "peek".to_owned(),
+                cte: "_cmd_step_1".to_owned(),
+                table: table("member"),
+                equality: vec![assignment("user_id", "text", json!("person"))],
+                order_by: vec![column("tenant_id", "text")],
+                returning: vec![column("tenant_id", "text"), column("user_id", "text")],
+                require_non_empty: false,
+                filter: Some(BoolExp::And(vec![
+                    BoolExp::Compare {
+                        column: "tenant_id".to_owned(),
+                        pg_type: "text".to_owned(),
+                        op: from_step("tenant_id"),
+                    },
+                    serving_gate.clone(),
+                ])),
+                error_path: "$.selectionSet.accept_invite".to_owned(),
+            },
+            // A write after it: the preset pins the tenant, the check gates.
+            CommandExecutionStep::Insert {
+                name: "member".to_owned(),
+                cte: "_cmd_step_2".to_owned(),
+                table: table("member"),
+                object: vec![
+                    assignment("user_id", "text", json!("person")),
+                    CommandAssignment {
+                        column: column("tenant_id", "text"),
+                        value: CommandExecutionValue::StepColumn {
+                            cte: "_cmd_step_0".to_owned(),
+                            column: column("tenant_id", "text"),
+                        },
+                    },
+                ],
+                returning: vec![column("tenant_id", "text")],
+                check: Some(serving_gate),
+                error_path: "$.selectionSet.accept_invite".to_owned(),
+            },
+        ],
+        guards: vec![],
+        result: vec![CommandResultField {
+            name: "joined".to_owned(),
+            value: CommandResultValue::StepColumn {
+                cte: "_cmd_step_2".to_owned(),
+                column: column("tenant_id", "text"),
+            },
+        }],
+        idempotency: None,
+        effects: vec![],
+        selection: vec![CommandResultSelection::Scalar {
+            alias: "joined".to_owned(),
+            field: "joined".to_owned(),
+        }],
+    });
+
+    let sql = donat_sqlgen::mutation_to_sql(&command);
+    let bound = "\"tenant_id\" = (SELECT \"tenant_id\" FROM \"_cmd_step_0\" LIMIT 1)";
+    assert!(
+        sql.contains(bound),
+        "the read is not bounded by the step: {sql}"
+    );
+    let gate = "\"id\" = (SELECT \"tenant_id\" FROM \"_cmd_step_0\" LIMIT 1)";
+    assert_eq!(
+        sql.matches(gate).count(),
+        2,
+        "the registry gate must be read by the step's tenant in the read and in the check: {sql}"
+    );
+    insta::assert_snapshot!(sql);
+}

@@ -87,6 +87,8 @@ plane: business commands, rules, durable processes, and compiled connectors.
 - [[decisions/097-a-tenant-is-a-compiler-layer-not-a-filter-somebody-remembered]]
 - [[decisions/098-a-compiled-role-is-the-shape-and-a-grant-is-the-scope]]
 - [[decisions/099-an-unbounded-permission-says-so]]
+- [[decisions/100-a-tenant-leaves-the-way-it-arrived]]
+- [[decisions/101-a-commands-tenant-once-resolved-scopes-everything-after-it]]
 
 ## Reference governance
 
