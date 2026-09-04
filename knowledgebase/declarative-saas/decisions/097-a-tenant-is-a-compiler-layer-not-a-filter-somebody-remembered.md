@@ -220,3 +220,9 @@ documents the repetition this ADR rejects, in DDN as well as v2 — and the
 comparison names two things this decision does not cover: nothing here bounds
 what a tenant *consumes*, and the bound reaches only requests that go through
 the engine.*
+
+*Amended 2026-09-04: the first implementation of `tenant: { from: <step> }`
+refused every scoped read, update and delete after that step, and skipped the
+registry gate for its writes, on the grounds that a row predicate cannot
+reference another CTE. It can — the step is single-row — and
+[[101-a-commands-tenant-once-resolved-scopes-everything-after-it]] says so.*

@@ -130,10 +130,66 @@ enum CommandTenantSource {
     /// arriving here is a different matter and is refused, because it would
     /// otherwise store a row belonging to nobody.
     Pending,
+    /// The step this command's tenant comes from has run, and this is its
+    /// column. `established` says the step *created* the tenant in this very
+    /// statement — so the registry row exists only in a data-modifying CTE
+    /// the rest of the statement cannot see, and the serving gate is not read.
     Step {
         cte: String,
         column: CommandColumn,
+        established: bool,
     },
+}
+
+impl CommandTenantSource {
+    /// The tenant a read or a write's row predicate at this point is bounded
+    /// by, or `None` when there is not one yet.
+    fn tenant_ref(&self) -> Option<crate::tenancy::TenantRef> {
+        match self {
+            CommandTenantSource::Session => Some(crate::tenancy::TenantRef::Session),
+            CommandTenantSource::Step {
+                cte,
+                column,
+                established: false,
+            } => Some(crate::tenancy::TenantRef::Step {
+                cte: cte.clone(),
+                column: column.name.clone(),
+            }),
+            CommandTenantSource::Step {
+                cte,
+                column,
+                established: true,
+            } => Some(crate::tenancy::TenantRef::Established {
+                cte: cte.clone(),
+                column: column.name.clone(),
+            }),
+            CommandTenantSource::Creating | CommandTenantSource::Pending => None,
+        }
+    }
+
+    /// What a write's check at this point carries.
+    ///
+    /// `Pending` never reaches a check: the preset is resolved first and
+    /// refuses a write before the tenant step. It maps to the establishing
+    /// shape only so that the match is total.
+    fn check_tenant(&self) -> crate::tenancy::CheckTenant {
+        match self {
+            CommandTenantSource::Session => crate::tenancy::CheckTenant::Session,
+            CommandTenantSource::Step {
+                cte,
+                column,
+                established: false,
+            } => crate::tenancy::CheckTenant::Step {
+                cte: cte.clone(),
+                column: column.name.clone(),
+            },
+            CommandTenantSource::Step {
+                established: true, ..
+            }
+            | CommandTenantSource::Creating
+            | CommandTenantSource::Pending => crate::tenancy::CheckTenant::Establishing,
+        }
+    }
 }
 
 impl<'a> Planner<'a> {
@@ -1017,19 +1073,18 @@ impl<'a> Planner<'a> {
         // the same place, and the establishing step has already run by now.
         let tenant_source =
             self.command_tenant_source(command, &step.name, previous_steps, path)?;
-        let tenant_bound_by_session = matches!(tenant_source, CommandTenantSource::Session);
         // A step may read outside the tenant, and says so on itself.
         let step_scoped = step.tenant != Some(donat_metadata::StepTenant::Unscoped);
-        // A scoped read is scoped by the *session's* tenant, which is the wrong
-        // tenant whenever this command's is not the session's: a command that
-        // establishes one, or takes it from a looked-up row, would read tenant
-        // A while writing tenant B, in one statement, and nothing about the
-        // answer would say so. There is no third tenant to compare against
-        // here, so the step is refused rather than answered from the wrong one
-        // — the author says `tenant: unscoped` and takes the audit, or reads a
-        // table the declaration already marked shared.
+        // Where a scoped read of this step is bounded: the session's tenant,
+        // or — once the step this command takes its tenant from has run — the
+        // value that step resolved. Before that step there is nothing to
+        // bound by, and a scoped read of a tenanted table is refused rather
+        // than answered from the caller's tenant, which is not this
+        // command's. The deploy-time check in `donat_metadata::tenancy` names
+        // the same shape first; this is the belt behind it.
+        let read_tenant = tenant_source.tenant_ref();
         if step_scoped
-            && !tenant_bound_by_session
+            && read_tenant.is_none()
             && let Some(tenancy) = self.tenancy
             && let Some(table) = step.operation.read_table()
             && matches!(
@@ -1037,12 +1092,18 @@ impl<'a> Planner<'a> {
                 donat_metadata::TableScope::Key(_) | donat_metadata::TableScope::ScopeVia(_)
             )
         {
+            let resolved_at = command
+                .definition()
+                .tenant
+                .as_ref()
+                .map(|declared| declared.step().step.clone())
+                .unwrap_or_default();
             return Err(PlanError::validation(
                 path,
                 format!(
-                    "step `{}` reads `{table}` scoped by the caller's tenant, but this command \
-                     takes its own tenant from elsewhere, so the two would disagree. Declare \
-                     `tenant: unscoped` on the step if reading outside the tenant is intended.",
+                    "step `{}` reads `{table}`, which is scoped by a tenant, but this command's \
+                     tenant is not resolved until step `{resolved_at}` runs. Move the read after \
+                     that step, or read a table `tenancy.yaml` marks shared.",
                     step.name
                 ),
             ));
@@ -1100,8 +1161,17 @@ impl<'a> Planner<'a> {
                     session,
                     path,
                 )?;
-                let filter =
-                    self.permission_predicate_full(&context, session, step_scoped, false, path)?;
+                let filter = self.permission_predicate_full(
+                    &context,
+                    session,
+                    if step_scoped {
+                        read_tenant.as_ref()
+                    } else {
+                        None
+                    },
+                    false,
+                    path,
+                )?;
                 let resolved = CommandExecutionStep::SelectOne {
                     name: step.name.clone(),
                     cte: cte.clone(),
@@ -1136,8 +1206,13 @@ impl<'a> Planner<'a> {
                 )?;
                 let order_by =
                     self.command_columns(&select_many.table, &select_many.order_by, path)?;
-                let filter =
-                    self.permission_predicate_full(&context, session, true, false, path)?;
+                let filter = self.permission_predicate_full(
+                    &context,
+                    session,
+                    read_tenant.as_ref(),
+                    false,
+                    path,
+                )?;
                 let resolved = CommandExecutionStep::SelectMany {
                     name: step.name.clone(),
                     cte: cte.clone(),
@@ -1467,7 +1542,7 @@ impl<'a> Planner<'a> {
                     &context,
                     session,
                     donat_metadata::IamOperation::Insert,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 let resolved = CommandExecutionStep::Insert {
@@ -1526,7 +1601,7 @@ impl<'a> Planner<'a> {
                     &context,
                     session,
                     donat_metadata::IamOperation::Insert,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 Ok((
@@ -1621,7 +1696,7 @@ impl<'a> Planner<'a> {
                     &context,
                     session,
                     donat_metadata::IamOperation::Insert,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 let table = Table {
@@ -1707,7 +1782,7 @@ impl<'a> Planner<'a> {
                     &permission.filter,
                     &context,
                     session,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 // Always through `parse_check_exp`, even with nothing
@@ -1718,7 +1793,7 @@ impl<'a> Planner<'a> {
                     &context,
                     session,
                     donat_metadata::IamOperation::Update,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 let resolved = CommandExecutionStep::Update {
@@ -1789,7 +1864,7 @@ impl<'a> Planner<'a> {
                     &permission.filter,
                     &context,
                     session,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 // Always through `parse_check_exp`, even with nothing
@@ -1800,7 +1875,7 @@ impl<'a> Planner<'a> {
                     &context,
                     session,
                     donat_metadata::IamOperation::Update,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 Ok((
@@ -1939,7 +2014,7 @@ impl<'a> Planner<'a> {
                     &permission.filter,
                     &context,
                     session,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 let permission_check = self.command_check_exp(
@@ -1947,7 +2022,7 @@ impl<'a> Planner<'a> {
                     &context,
                     session,
                     donat_metadata::IamOperation::Update,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 let resolved = CommandExecutionStep::UpdateMany {
@@ -2000,7 +2075,7 @@ impl<'a> Planner<'a> {
                     &permission.filter,
                     &context,
                     session,
-                    tenant_bound_by_session,
+                    &tenant_source,
                     path,
                 )?;
                 let resolved = CommandExecutionStep::Delete {
@@ -3068,19 +3143,24 @@ impl<'a> Planner<'a> {
         }))
     }
 
+    /// A command update's or delete's row filter: what the permission
+    /// declared, ANDed with the tenant bound from wherever this command's
+    /// tenant lives.
     fn command_permission_filter(
         &self,
         filter: &Json,
         context: &TableCtx<'a>,
         session: &Session,
-        bound_by_session: bool,
+        tenant_source: &CommandTenantSource,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
-        self.write_permission_filter_bounded(filter, context, session, bound_by_session, path)
+        let tenant = tenant_source.tenant_ref();
+        self.write_permission_filter_bounded(filter, context, session, tenant.as_ref(), path)
     }
 
     /// A command write's check: what the permission declared, the tenant bound
-    /// when the session is what supplies it, and the registry's status gate.
+    /// when the session is what supplies it, and the registry's status gate
+    /// read by whichever tenant this command has.
     ///
     /// The gate is here rather than in the step's filter for the same reason
     /// it is in an ordinary update's check — a filtered step reports a command
@@ -3091,20 +3171,15 @@ impl<'a> Planner<'a> {
         context: &TableCtx<'a>,
         session: &Session,
         operation: donat_metadata::IamOperation,
-        bound_by_session: bool,
+        tenant_source: &CommandTenantSource,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
-        let tenant = if bound_by_session {
-            crate::tenancy::CheckTenant::Session
-        } else {
-            crate::tenancy::CheckTenant::Step
-        };
         self.write_check_expression(
             check,
             context,
             session,
             crate::tenancy::CheckAuthorization::CommandStep(operation),
-            tenant,
+            tenant_source.check_tenant(),
             path,
         )
     }
@@ -3222,6 +3297,7 @@ impl<'a> Planner<'a> {
         Ok(CommandTenantSource::Step {
             cte: step.cte.clone(),
             column,
+            established: declared.establishes(),
         })
     }
 
@@ -3277,6 +3353,7 @@ impl<'a> Planner<'a> {
             CommandTenantSource::Step {
                 cte,
                 column: step_column,
+                ..
             } => CommandExecutionValue::StepColumn {
                 cte: cte.clone(),
                 column: step_column.clone(),

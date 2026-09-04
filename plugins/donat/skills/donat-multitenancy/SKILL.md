@@ -97,10 +97,20 @@ A command declares where its tenant comes from:
 | `tenant: establishes` | registration: the command creates the tenant it then writes into |
 | `tenant: { from: <step> }` | the tenant is read from a row an earlier step resolved |
 
-A read before the establishing step resolves normally; a **write** before it is
-refused, because that row would belong to nobody. A step may be
-`tenant: unscoped` only where `unscoped_steps: audited` is declared, and
-`donat validate` lists every such use.
+From the tenant step onward the command *has* a tenant, and everything after
+it is scoped by that value exactly as a session-scoped command is scoped by
+its claim: a `select_one`/`select_many` is bounded by it and gated by the
+registry, an `update`/`delete` carries it in its predicate, an `insert` takes
+it as a preset. Before the tenant step there is nothing to scope by, so a
+write or a read of a tenanted table placed there is refused at deploy, naming
+the step to move it after; a read of a `shared` table before it is fine. The
+tenant step itself may be `tenant: unscoped` only where `unscoped_steps:
+audited` is declared, and `donat validate` lists every such use.
+
+This is what lets a service identity — a connector holding a
+`client_credentials` token with no tenant claim — resolve its tenant in its
+first step (an unscoped `select_one` on a mapping table keyed by the external
+account) and then read and write inside that tenant in the same statement.
 
 The tenant joins every command idempotency scope and rides with a durable
 process instance, so two tenants that pick the same idempotency key do not

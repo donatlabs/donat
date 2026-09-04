@@ -716,33 +716,64 @@ fn validate_command_tenancy(
             }
         }
 
-        // A command that takes its tenant from a step has no session tenant to
-        // bound a write by, and the value it does have lives in another CTE —
-        // which a row predicate cannot reference. An insert is safe anyway,
-        // because the preset pins the column it writes. An update or a delete
-        // is not: it would be bounded only by its own `where`, and an update
-        // would additionally move whatever it matched into this command's
-        // tenant. There is no predicate that would fix it, so the shape is
-        // refused instead.
-        if command.tenant.is_some() {
-            for (step_index, step) in command.steps.iter().enumerate() {
-                let kind = match &step.operation {
-                    crate::types::CommandStepOperation::Update { .. } => "update",
-                    crate::types::CommandStepOperation::UpdateMany { .. } => "update_many",
-                    crate::types::CommandStepOperation::UpdateWhen { .. } => "update_when",
-                    crate::types::CommandStepOperation::Delete { .. } => "delete",
-                    _ => continue,
+        // A command that takes its tenant from a step has that tenant from
+        // the step onward — every later read is bounded by it and every later
+        // write carries it (`knowledgebase/declarative-saas/decisions/101-*`).
+        // Before the step there is nothing to bound by: a write placed there
+        // would store a row belonging to nobody, and a scoped read would be
+        // answered from the caller's tenant, which is not this command's.
+        // Both are refused here, at deploy, naming the step to move after.
+        // Reads of shared reference data are fine before it — a registration
+        // still looks up its plan before it inserts the tenant row.
+        if let Some(declared) = &command.tenant
+            && let Some(resolved_at) = command
+                .steps
+                .iter()
+                .position(|step| step.name == declared.step().step)
+        {
+            let tenant_step = &declared.step().step;
+            for (step_index, step) in command.steps.iter().enumerate().take(resolved_at) {
+                use crate::types::CommandStepOperation as Op;
+                let step_path = format!("{path}.steps[{step_index}]");
+                let write = match &step.operation {
+                    Op::Insert { .. } => Some("insert"),
+                    Op::InsertMany { .. } => Some("insert_many"),
+                    Op::InsertWhen { .. } => Some("insert_when"),
+                    Op::Update { .. } => Some("update"),
+                    Op::UpdateMany { .. } => Some("update_many"),
+                    Op::UpdateWhen { .. } => Some("update_when"),
+                    Op::Delete { .. } => Some("delete"),
+                    Op::AllocateMany { .. } => Some("allocate_many"),
+                    _ => None,
                 };
-                errors.push(TenancyDeclarationError::new(
-                    format!("{path}.steps[{step_index}]"),
-                    format!(
-                        "command `{}` takes its tenant from a step, so step `{}` — an {kind} — \
-                         cannot be bounded by one: the tenant it would compare against lives in \
-                         another CTE, which a row predicate cannot reach. Split the write into a \
-                         command scoped by the session, or express it as an insert.",
-                        command.name, step.name
-                    ),
-                ));
+                if let Some(kind) = write {
+                    errors.push(TenancyDeclarationError::new(
+                        &step_path,
+                        format!(
+                            "command `{}` takes its tenant from step `{tenant_step}`, but step \
+                             `{}` — an {kind} — runs before it, so the row it writes would belong \
+                             to nobody. Move it after `{tenant_step}`.",
+                            command.name, step.name
+                        ),
+                    ));
+                    continue;
+                }
+                if step.tenant == Some(crate::types::StepTenant::Unscoped) {
+                    continue;
+                }
+                if let Some(table) = step.operation.read_table()
+                    && !tenancy.is_shared(table)
+                {
+                    errors.push(TenancyDeclarationError::new(
+                        &step_path,
+                        format!(
+                            "command `{}` takes its tenant from step `{tenant_step}`, but step \
+                             `{}` reads `{table}`, a tenanted table, before it, so nothing bounds \
+                             that read. Move it after `{tenant_step}`.",
+                            command.name, step.name
+                        ),
+                    ));
+                }
             }
         }
 

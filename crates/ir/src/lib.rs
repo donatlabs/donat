@@ -413,6 +413,14 @@ pub enum CompareOp {
         join: Vec<(String, String)>,
         column: String,
     },
+    /// Column compared for equality to a column of a single-row command step:
+    /// `col = (SELECT column FROM cte LIMIT 1)`. Produced by the tenancy
+    /// layer for a command whose tenant comes from a step it ran, and by
+    /// nothing a client writes.
+    CompareStepColumn {
+        cte: String,
+        column: String,
+    },
     /// jsonb `?`: has top-level key.
     HasKey(Scalar),
     /// jsonb `?|` / `?&`: has any/all of the keys.

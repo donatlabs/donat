@@ -1754,15 +1754,23 @@ impl<'a> Planner<'a> {
         apply_tenant: bool,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
-        self.permission_predicate_full(ctx, session, apply_tenant, true, path)
+        let tenant = apply_tenant.then_some(crate::tenancy::TenantRef::Session);
+        self.permission_predicate_full(ctx, session, tenant.as_ref(), true, path)
     }
 
-    /// [`Self::permission_predicate_scoped`], with the grant bound optionally
-    /// left off.
+    /// [`Self::permission_predicate_scoped`], with the tenant taken from
+    /// wherever the caller says it lives and the grant bound optionally left
+    /// off.
     ///
-    /// Command steps pass `false`. A command is authorized once, by its own
-    /// action, and its steps run under a separate narrower permission plane
-    /// that never falls back to the ordinary one. Applying the *table's*
+    /// `tenant: None` leaves the tenant bound off entirely — the one unscoped
+    /// step. The command plane passes the step arm for every read placed after
+    /// the step its command takes its tenant from, so those reads are bounded
+    /// by what that step resolved rather than by a session that carries no
+    /// tenant (`knowledgebase/declarative-saas/decisions/101-*`).
+    ///
+    /// Command steps pass `apply_iam: false`. A command is authorized once, by
+    /// its own action, and its steps run under a separate narrower permission
+    /// plane that never falls back to the ordinary one. Applying the *table's*
     /// action inside it as well would mean a merchant had to grant
     /// `orders:read` before `cancel_order` would run — two grants for one
     /// operation, one of which nobody asked for.
@@ -1770,7 +1778,7 @@ impl<'a> Planner<'a> {
         &self,
         ctx: &TableCtx,
         session: &Session,
-        apply_tenant: bool,
+        tenant: Option<&crate::tenancy::TenantRef>,
         apply_iam: bool,
         path: &str,
     ) -> Result<Option<BoolExp>, PlanError> {
@@ -1778,10 +1786,9 @@ impl<'a> Planner<'a> {
         if ctx.perms.is_empty() {
             return Ok(declared);
         }
-        let tenant = if apply_tenant {
-            self.tenant_predicate(ctx, session, path)?
-        } else {
-            None
+        let tenant = match tenant {
+            Some(tenant) => self.tenant_predicate(ctx, session, tenant, path)?,
+            None => None,
         };
         let bounded = match (declared, tenant) {
             (Some(declared), Some(tenant)) => Some(BoolExp::And(vec![declared, tenant])),

@@ -1063,6 +1063,14 @@ impl Ctx {
                     conds.join(" AND ")
                 )
             }
+            // The same shape the command plane renders for a step-sourced
+            // value (`command_value_sql_scoped`): the step is single-row by
+            // construction, so the subquery is a scalar.
+            CompareOp::CompareStepColumn { cte, column } => format!(
+                "{col} = (SELECT {} FROM {} LIMIT 1)",
+                quote_ident(column),
+                quote_ident(cte)
+            ),
             CompareOp::HasKey(v) => format!("{col} ? {}", scalar_sql(&dialect, v, "text")),
             CompareOp::HasKeysAny(keys) => format!("{col} ?| {}", text_array(keys)),
             CompareOp::HasKeysAll(keys) => format!("{col} ?& {}", text_array(keys)),
